@@ -18,4 +18,4 @@ data:
 # Default Ollama settings (used when --env linux)
 llm:
   ollama_base_url: "http://localhost:11434"
-  ollama_model: "deepseek-r1:70b"
+  ollama_model: "gpt-oss:20b"
