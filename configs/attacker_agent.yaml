@@ -1,0 +1,13 @@
+# Attacker LLM Agent Configuration
+
+llm:
+  model: "gpt-4o-mini"
+  temperature: 0.7
+
+available_attacks:
+  - sign_flip
+  - noise_injection
+  - scaling
+
+memory:
+  persist_path: "checkpoints/attacker_memory"

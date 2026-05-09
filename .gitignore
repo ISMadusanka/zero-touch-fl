@@ -1,0 +1,14 @@
+# Runtime artifacts
+data/mnist_raw/
+checkpoints/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# IDE
+.vscode/
+.idea/

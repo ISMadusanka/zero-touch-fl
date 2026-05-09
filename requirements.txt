@@ -1,0 +1,6 @@
+torch>=2.0
+torchvision
+openai>=1.0
+faiss-cpu
+pyyaml
+numpy
