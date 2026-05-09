@@ -5,8 +5,10 @@ Two-phase system:
   Phase 2 (Round 4+):   Attack/defend simulation with LLM agents.
 
 Usage:
-  python main.py              # Resume from checkpoint if available
-  python main.py --fresh      # Force fresh training (Phase 1)
+  python main.py                    # Windows/OpenAI (default)
+  python main.py --env linux        # Linux/Ollama backend
+  python main.py --fresh            # Force fresh training (Phase 1)
+  python main.py --env linux --fresh
 """
 
 import argparse
@@ -333,15 +335,35 @@ def _save_round_log(log: RoundLog):
 def main():
     parser = argparse.ArgumentParser(description="Zero-Touch Federated Learning")
     parser.add_argument("--fresh", action="store_true", help="Force fresh Phase 1 training")
+    parser.add_argument(
+        "--env",
+        choices=["linux", "windows"],
+        default="windows",
+        help="Running environment: 'linux' uses Ollama, 'windows' uses OpenAI (default: windows)",
+    )
     args = parser.parse_args()
 
     setup_logging()
     logger.info("Starting Zero-Touch Federated Learning System")
+    logger.info(f"Environment: {args.env}")
 
     # Load configs
     base_config = load_config("configs/base.yaml")
     attacker_config = load_config("configs/attacker_agent.yaml")
     defender_config = load_config("configs/defender_agent.yaml")
+
+    # Inject LLM backend based on --env flag
+    llm_backend = "ollama" if args.env == "linux" else "openai"
+    llm_defaults = base_config.get("llm", {})
+
+    for agent_cfg in (attacker_config, defender_config):
+        agent_cfg.setdefault("llm", {})
+        agent_cfg["llm"]["backend"] = llm_backend
+        # Propagate global Ollama settings (agent-level values take priority)
+        agent_cfg["llm"].setdefault("ollama_base_url", llm_defaults.get("ollama_base_url", "http://localhost:11434"))
+        agent_cfg["llm"].setdefault("ollama_model", llm_defaults.get("ollama_model", "deepseek-r1:70b"))
+
+    logger.info(f"LLM backend: {llm_backend}")
 
     fl = base_config["fl"]
     data_cfg = base_config["data"]

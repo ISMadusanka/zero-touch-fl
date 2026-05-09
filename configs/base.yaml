@@ -14,3 +14,8 @@ data:
   dataset: "mnist"
   iid: true
   data_dir: "./data/mnist_raw"
+
+# Default Ollama settings (used when --env linux)
+llm:
+  ollama_base_url: "http://localhost:11434"
+  ollama_model: "deepseek-r1:70b"

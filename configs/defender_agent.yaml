@@ -1,8 +1,9 @@
 # Defender LLM Agent Configuration
 
 llm:
-  model: "gpt-4o-mini"
+  model: "gpt-4o-mini"            # OpenAI backend model
   temperature: 0.3
+  ollama_model: "deepseek-r1:70b"  # Ollama backend model
 
 initial_strategy:
   method: "norm_threshold"

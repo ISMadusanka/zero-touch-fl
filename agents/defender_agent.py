@@ -9,7 +9,7 @@ import hashlib
 import logging
 import numpy as np
 
-from agents.llm_client import LLMClient
+from agents.llm_client import create_llm_client
 from storage.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -48,9 +48,20 @@ class DefenderAgent:
     """LLM-powered defender that adapts only when an attack passes through."""
 
     def __init__(self, config: dict):
-        self.llm = LLMClient(
-            model=config.get("llm", {}).get("model", "gpt-4o-mini"),
-            temperature=config.get("llm", {}).get("temperature", 0.3),
+        llm_cfg = config.get("llm", {})
+        backend = llm_cfg.get("backend", "openai")
+
+        # Pick model name based on backend
+        if backend == "ollama":
+            model = llm_cfg.get("ollama_model", "deepseek-r1:70b")
+        else:
+            model = llm_cfg.get("model", "gpt-4o-mini")
+
+        self.llm = create_llm_client(
+            backend=backend,
+            model=model,
+            temperature=llm_cfg.get("temperature", 0.3),
+            ollama_base_url=llm_cfg.get("ollama_base_url", "http://localhost:11434"),
         )
         initial = config.get("initial_strategy", {})
         self.current_strategy = {
