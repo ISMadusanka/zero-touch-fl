@@ -37,13 +37,15 @@ from core.types import RoundLog
 
 def setup_logging():
     os.makedirs("logs/round_data", exist_ok=True)
+    # Force UTF-8 to avoid Windows cp1252 encoding errors
+    file_handler = logging.FileHandler("logs/system.log", mode="a", encoding="utf-8")
+    stream_handler = logging.StreamHandler(
+        open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)
+    )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        handlers=[
-            logging.FileHandler("logs/system.log", mode="a"),
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=[file_handler, stream_handler],
     )
 
 logger = logging.getLogger("main")
@@ -76,6 +78,12 @@ def run_training_phase(config: dict):
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
     )
 
+    # Log data sizes
+    for i, loader in enumerate(client_loaders):
+        logger.info(f"  Client {i} training samples: {len(loader.dataset)}")
+    logger.info(f"  Test samples: {len(test_loader.dataset)}")
+    logger.info(f"  Total training samples: {sum(len(l.dataset) for l in client_loaders)}")
+
     # Server
     server = FedServer(device=fl["device"])
 
@@ -105,7 +113,13 @@ def run_training_phase(config: dict):
         for client in clients:
             update = client.train(server.model)
             updates.append(update)
-            logger.info(f"  Client {client.client_id} trained")
+            meta = update.metadata
+            logger.info(
+                f"  Client {client.client_id} trained — "
+                f"acc: {meta.get('train_accuracy', 0):.4f}, "
+                f"loss: {meta.get('train_loss', 0):.4f}, "
+                f"samples: {meta.get('train_samples', 0)}"
+            )
 
         # Aggregate (no detection in Phase 1)
         from core.types import DetectionVerdict

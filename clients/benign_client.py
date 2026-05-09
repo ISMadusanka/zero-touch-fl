@@ -23,15 +23,32 @@ class BenignClient:
         optimizer = torch.optim.SGD(model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss()
 
+        total_correct, total_samples, total_loss = 0, 0, 0.0
+
         for _ in range(self.local_epochs):
             for data, target in self.data_loader:
                 data, target = data.to(self.device), target.to(self.device)
                 optimizer.zero_grad()
-                loss = criterion(model(data), target)
+                output = model(data)
+                loss = criterion(output, target)
                 loss.backward()
                 optimizer.step()
+
+                # Track training accuracy
+                pred = output.argmax(dim=1)
+                total_correct += pred.eq(target).sum().item()
+                total_samples += target.size(0)
+                total_loss += loss.item() * target.size(0)
+
+        train_accuracy = total_correct / total_samples if total_samples > 0 else 0.0
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
 
         return ModelUpdate(
             client_id=self.client_id,
             weights={k: v.cpu() for k, v in model.state_dict().items()},
+            metadata={
+                "train_accuracy": train_accuracy,
+                "train_loss": avg_loss,
+                "train_samples": total_samples,
+            },
         )

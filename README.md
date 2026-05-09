@@ -15,6 +15,7 @@ Two-phase system on MNIST:
 pip install -r requirements.txt
 export OPENAI_API_KEY="sk-..."
 for windows set OPENAI_API_KEY=sk-proj-xxxxxxxx
+powershell $env:OPENAI_API_KEY="sk-proj-your_actual_key_here"
 ```
 
 ## Usage
