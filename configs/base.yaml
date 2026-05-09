@@ -5,7 +5,7 @@ fl:
   simulation_rounds: 20       # Phase 2: attack/defend rounds
   n_clients: 5
   malicious_client_id: 0      # 0-indexed client that becomes adversarial
-  local_epochs: 2
+  local_epochs: 5
   batch_size: 64
   lr: 0.01
   device: "cpu"
