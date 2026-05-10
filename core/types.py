@@ -33,3 +33,6 @@ class RoundLog:
     attack_detected: bool
     attacker_adapted: bool
     defender_adapted: bool
+    all_clients_flagged: bool = False
+    round_skipped: bool = False
+
