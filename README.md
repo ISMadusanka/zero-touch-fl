@@ -59,6 +59,8 @@ python main.py --fresh
 
 # Combine flags
 python main.py --env linux --fresh
+
+python visualize_rounds.py
 ```
 
 ## Configuration
