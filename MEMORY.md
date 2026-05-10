@@ -60,10 +60,51 @@ A FAISS vector index storing **every past round** as a 384-dim embedding. At que
 
 ### What is stored per entry
 
-Each entry consists of:
+Each entry consists of two parts:
 
-1. **Vector (384-dim `float32`)** — the round outcome dict serialized to JSON and encoded by `all-MiniLM-L6-v2` sentence-transformer
-2. **Metadata** — the exact same dict stored in short-term memory (see fields above)
+**Part 1 — Vector embedding (for similarity search):**
+- The round outcome dict is serialized to JSON (`json.dumps(data, sort_keys=True)`)
+- Encoded by `all-MiniLM-L6-v2` sentence-transformer → **384-dim `float32` vector**
+- Stored in the FAISS `IndexFlatL2` index
+
+**Part 2 — Metadata (the actual data returned to the LLM):**
+
+Attacker Agent — stored parameters per entry:
+```python
+{
+    "round":          int,    # Global round number
+    "strategy": {
+        "attack_type": str,   # "sign_flip" | "noise_injection" | "scaling"
+        "params":      dict,  # e.g. {"scale": 3.0} or {}
+        "reasoning":   str    # LLM's explanation for choosing this attack
+    },
+    "was_detected":   bool,   # Whether the defender caught this attack
+    "accuracy_after": float   # Model accuracy after this round
+}
+```
+
+Defender Agent — stored parameters per entry:
+```python
+{
+    "round":    int,          # Global round number
+    "strategy": {
+        "method":    str,     # "norm_threshold" | "cosine_threshold" | "combined"
+        "params":    dict,    # e.g. {"threshold": 2.0}
+        "reasoning": str      # LLM's explanation for choosing this defense
+    },
+    "attack_passed_through": bool,  # Whether the attacker evaded detection
+    "verdicts": [                   # Detection result for each client
+        {
+            "client_id":  int,
+            "suspicious": bool,
+            "confidence": float,    # 0.0–1.0
+            "reason":     str       # e.g. "norm_ratio=2.5>2.0"
+        }
+    ]
+}
+```
+
+> These are the **same fields** stored in short-term memory. The difference is that long-term memory also has the vector embedding, enabling similarity-based retrieval instead of recency-based.
 
 ### Retrieval process
 
