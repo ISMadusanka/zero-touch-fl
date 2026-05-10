@@ -5,9 +5,10 @@ If the defense succeeded (caught the attack), the same strategy is kept.
 """
 
 import json
-import hashlib
 import logging
 import numpy as np
+
+from agents.embedder import embed, get_dimension
 
 from agents.llm_client import create_llm_client
 from storage.vector_store import VectorStore
@@ -70,7 +71,7 @@ class DefenderAgent:
             "reasoning": "initial default",
         }
         self.memory = VectorStore(
-            dimension=64,
+            dimension=get_dimension(),
             persist_path=config.get("memory", {}).get("persist_path"),
         )
         self.history: list[dict] = []
@@ -143,9 +144,9 @@ class DefenderAgent:
         return result
 
     def _make_vector(self, data: dict) -> np.ndarray:
-        """Create a simple hash-based feature vector for FAISS indexing."""
-        raw = json.dumps(data, sort_keys=True, default=str).encode()
-        h = hashlib.sha256(raw).digest()
-        vec = np.frombuffer(h, dtype=np.uint8).astype(np.float32)
-        vec = np.tile(vec, 2)[:64]
-        return vec
+        """Create a semantic embedding vector for FAISS indexing.
+
+        Uses SentenceTransformers so that similar contexts (e.g. close
+        detection outcomes, similar features) map to nearby vectors.
+        """
+        return embed(data)
