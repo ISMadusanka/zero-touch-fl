@@ -27,9 +27,10 @@ from clients.benign_client import BenignClient
 from clients.malicious_client import MaliciousClient
 from server.fed_server import FedServer
 from server.aggregation import FedAvgAggregator
-from detector.anomaly_detector import AnomalyDetector
+from detector.layered_detector import LayeredDetector
+from detector.explainability import ExplainabilityEngine
 from agents.attacker_agent import AttackerAgent
-from agents.defender_agent import DefenderAgent
+# from agents.defender_agent import DefenderAgent # LLM defender bypassed for Phase 1 output
 from storage.checkpoint import save_state, load_state, state_exists
 from core.types import RoundLog
 
@@ -74,7 +75,7 @@ def run_training_phase(config: dict):
     logger.info("=" * 60)
 
     # Data
-    client_loaders, test_loader = get_data_loaders(
+    client_loaders, test_loader, root_loader = get_data_loaders(
         n_clients=fl["n_clients"],
         batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
@@ -144,7 +145,7 @@ def run_training_phase(config: dict):
     save_state(server.get_global_weights(), client_weights, baseline_accuracy)
     logger.info("Phase 1 state saved to checkpoints/")
 
-    return server.get_global_weights(), client_weights, baseline_accuracy, test_loader
+    return server.get_global_weights(), client_weights, baseline_accuracy, test_loader, root_loader
 
 # ---------------------------------------------------------------------------
 # Phase 2: Attack/Defend Simulation
@@ -155,9 +156,9 @@ def run_simulation(
     client_weights: list[dict],
     baseline_accuracy: float,
     test_loader,
+    root_loader,
     config: dict,
     attacker_config: dict,
-    defender_config: dict,
 ):
     """Run the attack/defend simulation loop."""
     fl = config["fl"]
@@ -170,13 +171,12 @@ def run_simulation(
     logger.info(f"  Baseline accuracy: {baseline_accuracy:.4f}")
     logger.info("=" * 60)
 
-    # Components
+    # Purely Mathematical Components (No LLMs in Phase 1)
     server = FedServer(device=fl["device"])
     server.set_global_weights(copy.deepcopy(global_weights))
     aggregator = FedAvgAggregator()
-    detector = AnomalyDetector()
-    attacker_agent = AttackerAgent(attacker_config)
-    defender_agent = DefenderAgent(defender_config)
+    detector = LayeredDetector(root_loader=root_loader, device=fl["device"])
+    explain_engine = ExplainabilityEngine()
     malicious_client = MaliciousClient(client_id=malicious_id)
 
     # State tracking
@@ -193,17 +193,11 @@ def run_simulation(
         current_global = server.get_global_weights()
 
         # ------------------------------------------------------------------
-        # Step 1: Attacker decides strategy
+        # Step 1: Attack is hardcoded for Phase 1 research
         # ------------------------------------------------------------------
-        attacker_context = {
-            "baseline_accuracy": baseline_accuracy,
-            "current_accuracy": current_accuracy,
-            "was_detected": last_attack_detected,
-        }
-        attack_strategy = attacker_agent.decide(attacker_context)
-        attack_name = attack_strategy.get("attack_type", "sign_flip")
-        attack_params = attack_strategy.get("params", {})
-        logger.info(f"Attacker strategy: {attack_name} with params={attack_params}")
+        attack_name = "sign_flip"
+        attack_params = {}
+        logger.info(f"Phase 1 Attack (Static): {attack_name}")
 
         # ------------------------------------------------------------------
         # Step 2: Build all client updates
@@ -228,26 +222,44 @@ def run_simulation(
             updates.append(update)
 
         # ------------------------------------------------------------------
-        # Step 3: Defender decides strategy
+        # Step 3 & 4: 4-Layer Defense Pipeline + SHAP Explainability
         # ------------------------------------------------------------------
-        update_features = detector.get_features(updates, current_global)
-        defender_context = {
-            "update_features": update_features,
-            "attack_passed_through": last_attack_passed,
-        }
-        defend_strategy = defender_agent.decide(defender_context)
-        logger.info(f"Defender strategy: {defend_strategy.get('method')} with params={defend_strategy.get('params')}")
+        # In Phase 1, we don't consult the LLM for strategy yet. 
+        # We just run the pipeline and output the evidence.
+        evidence = detector.analyze(updates, server.model)
+        
+        # Add SHAP explanations for each client
+        for cid_str, features in evidence.items():
+            logger.info(f"Feature Vector for {cid_str}: {json.dumps(features)}")
+            explanation = explain_engine.explain(features)
+            evidence[cid_str]["explainability"] = explanation
 
-        # ------------------------------------------------------------------
-        # Step 4: Anomaly detection
-        # ------------------------------------------------------------------
-        verdicts = detector.analyze(updates, current_global, defend_strategy)
+        # TODO [Step 2.2]: Temporal Analysis - Track drift of client features over last N rounds
+        # TODO [Step 2.2]: Correlation Analysis - Compare feature similarity between clients to detect collusion
+        
+        logger.info("\n" + "="*40)
+        logger.info("PHASE 1 DEFENSE OUTPUT (Security Evidence)")
+        logger.info("="*40)
+        logger.info(json.dumps(evidence, indent=2))
+        logger.info("="*40 + "\n")
+
+        # Save evidence to file for research
+        with open(f"logs/round_data/evidence_round_{round_num}.json", "w") as f:
+            json.dump(evidence, f, indent=2)
+        logger.info(f"Evidence saved to logs/round_data/evidence_round_{round_num}.json")
+
+        # For aggregation in this modular mode, we can use a simple rule:
+        # reject any client that is flagged by Layer 4 (Trimmed) or has low trust.
+        from core.types import DetectionVerdict
+        verdicts = []
+        for cid_str, e in evidence.items():
+            cid = int(cid_str.split("_")[1])
+            is_suspicious = e["layer_4_is_trimmed"] or e["layer_1_fl_trust"] < 0.5
+            verdicts.append(DetectionVerdict(cid, is_suspicious, e["layer_1_fl_trust"], "statistical_pipeline"))
 
         # Check if the malicious client was detected
         malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)
         attack_detected = malicious_verdict.is_suspicious
-        attack_passed = not attack_detected
-
         logger.info(f"Detection result: malicious client {'DETECTED' if attack_detected else 'PASSED THROUGH'}")
 
         # ------------------------------------------------------------------
@@ -263,31 +275,12 @@ def run_simulation(
         logger.info(f"Test accuracy after aggregation: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
 
         # ------------------------------------------------------------------
-        # Step 7: Record outcomes for both agents
-        # ------------------------------------------------------------------
-        attacker_agent.record_outcome(
-            round_num=round_num,
-            strategy=attack_strategy,
-            was_detected=attack_detected,
-            accuracy=current_accuracy,
-        )
-        defender_agent.record_outcome(
-            round_num=round_num,
-            strategy=defend_strategy,
-            attack_passed=attack_passed,
-            verdicts=[
-                {"client_id": v.client_id, "suspicious": v.is_suspicious, "confidence": v.confidence, "reason": v.reason}
-                for v in verdicts
-            ],
-        )
-
-        # ------------------------------------------------------------------
-        # Step 8: Save round data to file
+        # Step 8: Save round data
         # ------------------------------------------------------------------
         round_log = RoundLog(
             round_num=round_num,
-            attack_strategy={"type": attack_name, "params": attack_params, "reasoning": attack_strategy.get("reasoning", "")},
-            defend_strategy=defend_strategy,
+            attack_strategy={"type": attack_name, "params": attack_params, "reasoning": "Static Phase 1 Attack"},
+            defend_strategy={"method": "4_layer_pipeline", "params": {}},
             verdicts=[
                 {"client_id": v.client_id, "suspicious": v.is_suspicious, "confidence": v.confidence, "reason": v.reason}
                 for v in verdicts
@@ -295,14 +288,14 @@ def run_simulation(
             test_accuracy=current_accuracy,
             baseline_accuracy=baseline_accuracy,
             attack_detected=attack_detected,
-            attacker_adapted=last_attack_detected is True,    # adapted this round because caught last round
-            defender_adapted=last_attack_passed is True,      # adapted this round because failed last round
+            attacker_adapted=False,
+            defender_adapted=False,
         )
         _save_round_log(round_log)
 
-        # Update state for next round
-        last_attack_detected = attack_detected
-        last_attack_passed = attack_passed
+        # STOP AFTER ONE ROUND as per user request ("no need to automate again and again")
+        logger.info("Modular Phase 1 Defense complete. Stopping execution.")
+        break
 
     logger.info("\n" + "=" * 60)
     logger.info("SIMULATION COMPLETE")
@@ -368,8 +361,8 @@ def main():
     fl = base_config["fl"]
     data_cfg = base_config["data"]
 
-    # Prepare test loader (needed for both phases)
-    _, test_loader = get_data_loaders(
+    # Prepare data loaders
+    client_loaders, test_loader, root_loader = get_data_loaders(
         n_clients=fl["n_clients"],
         batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
@@ -381,17 +374,17 @@ def main():
         global_weights, client_weights, baseline_accuracy = loaded
     else:
         logger.info("No checkpoint found (or --fresh) — running Phase 1")
-        global_weights, client_weights, baseline_accuracy, test_loader = run_training_phase(base_config)
+        global_weights, client_weights, baseline_accuracy, test_loader, root_loader = run_training_phase(base_config)
 
-    # Phase 2
+    # Phase 2 (Modular Single-Round)
     run_simulation(
         global_weights=global_weights,
         client_weights=client_weights,
         baseline_accuracy=baseline_accuracy,
         test_loader=test_loader,
+        root_loader=root_loader,
         config=base_config,
         attacker_config=attacker_config,
-        defender_config=defender_config,
     )
 
 

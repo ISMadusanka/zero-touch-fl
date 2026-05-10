@@ -24,13 +24,21 @@ def partition_iid(dataset, n_clients: int):
 
 
 def get_data_loaders(n_clients: int, batch_size: int, data_dir: str = "./data/mnist_raw"):
-    """Return per-client train loaders and a global test loader."""
+    """Return per-client train loaders, a global test loader, and a server root loader."""
     train_dataset, test_dataset = load_mnist(data_dir)
-    shards = partition_iid(train_dataset, n_clients)
+    
+    # Take 100 samples for the server root dataset
+    indices = torch.randperm(len(train_dataset)).tolist()
+    root_indices = indices[:500]
+    remaining_indices = indices[500:]
+    
+    root_loader = DataLoader(Subset(train_dataset, root_indices), batch_size=batch_size, shuffle=False)
+    
+    shards = partition_iid(Subset(train_dataset, remaining_indices), n_clients)
 
     client_loaders = [
         DataLoader(Subset(train_dataset, shard), batch_size=batch_size, shuffle=True)
         for shard in shards
     ]
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
-    return client_loaders, test_loader
+    return client_loaders, test_loader, root_loader
