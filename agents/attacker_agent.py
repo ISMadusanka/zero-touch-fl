@@ -5,9 +5,10 @@ If the attack succeeded (passed through), the same strategy is reused.
 """
 
 import json
-import hashlib
 import logging
 import numpy as np
+
+from agents.embedder import embed, get_dimension
 
 from agents.llm_client import create_llm_client
 from storage.vector_store import VectorStore
@@ -65,7 +66,7 @@ class AttackerAgent:
         )
         self.available_attacks = config.get("available_attacks", ["sign_flip"])
         self.memory = VectorStore(
-            dimension=64,
+            dimension=get_dimension(),
             persist_path=config.get("memory", {}).get("persist_path"),
         )
         self.current_strategy: dict | None = None
@@ -139,10 +140,9 @@ class AttackerAgent:
         return result
 
     def _make_vector(self, data: dict) -> np.ndarray:
-        """Create a simple hash-based feature vector for FAISS indexing."""
-        raw = json.dumps(data, sort_keys=True, default=str).encode()
-        h = hashlib.sha256(raw).digest()
-        # Expand hash to dimension-64 float vector
-        vec = np.frombuffer(h, dtype=np.uint8).astype(np.float32)
-        vec = np.tile(vec, 2)[:64]  # sha256 = 32 bytes → tile to 64
-        return vec
+        """Create a semantic embedding vector for FAISS indexing.
+
+        Uses SentenceTransformers so that similar contexts (e.g. close
+        accuracies, same detection outcomes) map to nearby vectors.
+        """
+        return embed(data)

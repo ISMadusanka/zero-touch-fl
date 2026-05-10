@@ -5,3 +5,4 @@ requests
 faiss-cpu
 pyyaml
 numpy
+sentence-transformers
