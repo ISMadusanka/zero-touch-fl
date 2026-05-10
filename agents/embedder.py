@@ -48,6 +48,7 @@ def embed(data: dict) -> np.ndarray:
     """
     text = json.dumps(data, sort_keys=True, default=str)
     model = _get_model()
+    logger.info(f"Generating semantic embedding for state vector: {text}")
     vec = model.encode(text, convert_to_numpy=True)
     return vec.astype(np.float32).flatten()
 
