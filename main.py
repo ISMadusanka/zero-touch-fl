@@ -18,10 +18,8 @@ import logging
 import os
 import sys
 import yaml
-from dotenv import load_dotenv
+import numpy as np
 
-# Load environment variables from .env file
-load_dotenv()
 # import torch
 
 from data.mnist_loader import get_data_loaders
@@ -260,14 +258,21 @@ def run_simulation(
         logger.info(json.dumps(evidence, indent=2))
         logger.info("="*40 + "\n")
 
-        # ------------------------------------------------------------------
-        # Phase 3: LLM Threat Reasoning (Final Verdict)
-        # ------------------------------------------------------------------
-        logger.info("\n" + "="*40)
-        logger.info("PHASE 3: LLM THREAT REASONING")
-        logger.info("="*40)
+        # --- ADDED: Calculate Group Context for Relative Reasoning ---
+        group_stats = {
+            "avg_trust": float(np.mean([f["layer_1_fl_trust"] for f in evidence.values()])),
+            "avg_cluster_score": float(np.mean([f["layer_2_cluster_score"] for f in evidence.values()])),
+            "avg_clip_score": float(np.mean([f["layer_3_clipping_score"] for f in evidence.values()])),
+            "avg_trim_score": float(np.mean([f["layer_4_trim_score"] for f in evidence.values()])),
+            "round_number": round_num
+        }
         
-        llm_verdicts = defender_agent.analyze_evidence(evidence)
+        full_context = {
+            "group_context": group_stats,
+            "client_evidence": evidence
+        }
+
+        llm_verdicts = defender_agent.analyze_evidence(full_context)
         logger.info("LLM Security Verdicts:")
         logger.info(json.dumps(llm_verdicts, indent=2))
         

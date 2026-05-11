@@ -19,23 +19,15 @@ class LayeredDetector:
         self.device = device
 
     def analyze(self, updates: list[ModelUpdate], global_model: torch.nn.Module) -> dict:
-        """
-        Runs the 4-layer pipeline and returns a structured evidence JSON.
-        """
-        # 1. Flatten updates into vectors
+        """Runs the 4-layer pipeline with strict vector alignment."""
+        # 1. Flatten updates into vectors with a unified helper
         deltas = []
-        global_params = {k: v.to(self.device) for k, v in global_model.state_dict().items()}
-        
         for u in updates:
-            flat = torch.cat([
-                (u.weights[k].to(self.device) - global_params[k]).flatten().float()
-                for k in global_params
-            ])
-            deltas.append(flat)
+            deltas.append(self._flatten_update(u.weights, global_model.state_dict()))
         
         deltas_stack = torch.stack(deltas) # (N, D)
         
-        # --- Layer 1: FLTrust ---
+        # --- Layer 1: FLTrust (Stricter sigmoid) ---
         root_update = self._compute_root_update(global_model)
         fl_trust_scores = self._compute_fl_trust(deltas_stack, root_update)
 
@@ -61,22 +53,28 @@ class LayeredDetector:
         
         return evidence
 
+    def _flatten_update(self, update_weights: dict, global_weights: dict) -> torch.Tensor:
+        """Ensures 100% alignment by iterating over sorted state_dict keys."""
+        flat_parts = []
+        for k in sorted(global_weights.keys()):
+            delta = (update_weights[k].to(self.device) - global_weights[k].to(self.device))
+            flat_parts.append(delta.flatten().float())
+        return torch.cat(flat_parts)
+
     def _compute_root_update(self, global_model: torch.nn.Module) -> torch.Tensor:
         """Calculates a clean update using the server's root dataset."""
         if self.root_loader is None:
-            # Fallback: if no root data, use mean of all updates (less secure but functional)
             return None
         
-        # Simple one-epoch train on root data
         model_copy = type(global_model)()
         model_copy.load_state_dict(global_model.state_dict())
         model_copy.to(self.device)
         model_copy.train()
         
-        optimizer = torch.optim.SGD(model_copy.parameters(), lr=0.05) # Increased LR
+        # Use a more aggressive optimizer for the root update
+        optimizer = torch.optim.Adam(model_copy.parameters(), lr=0.01)
         criterion = torch.nn.CrossEntropyLoss()
         
-        # Train for 2 epochs on root data for a stronger reference signal
         for _ in range(2):
             for data, target in self.root_loader:
                 data, target = data.to(self.device), target.to(self.device)
@@ -86,21 +84,18 @@ class LayeredDetector:
                 loss.backward()
                 optimizer.step()
         
-        # Calculate delta
-        root_delta = torch.cat([
-            (p.data - global_model.state_dict()[k].to(self.device)).flatten()
-            for k, p in model_copy.named_parameters()
-        ])
-        return root_delta
+        # Flatten using the exact same logic as client updates
+        return self._flatten_update(model_copy.state_dict(), global_model.state_dict())
 
     def _compute_fl_trust(self, deltas: torch.Tensor, root_update: torch.Tensor) -> torch.Tensor:
-        """Layer 1: Sigmoid-Scaled FLTrust score for better Non-IID tolerance."""
+        """Layer 1: Sharpened Sigmoid-Scaled FLTrust score."""
         if root_update is None:
             return torch.ones(len(deltas))
         
         cos = torch.nn.functional.cosine_similarity(deltas, root_update.unsqueeze(0))
-        # Applied Sigmoid scaling: torch.sigmoid(8 * (cos - 0.15))
-        trust = torch.sigmoid(8 * (cos - 0.15))
+        # Sharpened curve: torch.sigmoid(12 * (cos - 0.25))
+        # Any negative similarity (Sign-Flip) is forced to hard zero.
+        trust = torch.where(cos > 0, torch.sigmoid(12 * (cos - 0.25)), torch.zeros_like(cos))
         return trust
 
     def _compute_clusters(self, deltas: torch.Tensor) -> np.ndarray:

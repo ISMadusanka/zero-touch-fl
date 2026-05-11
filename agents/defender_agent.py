@@ -69,12 +69,10 @@ For each client, you will receive a JSON object containing:
 </layer_definitions>
 
 <reasoning_rules>
-1. **Relative Comparison is Mandatory.** In Non-IID settings, all trust scores might be lower (e.g., 0.4). The client with the highest relative trust and normal cluster/Z-scores is likely BENIGN.
-2. **Correlation Patterns:**
-   - **CRITICAL:** Low Trust (<0.2) + High Cluster Score (>5.0) + High Z-Score (>3.0).
-   - **SUSPICIOUS:** Zero Trust + Safe Z-Score (Potential Stealth Attack).
-   - **BENIGN:** High relative Trust + Cluster Score ~1.0 + Clipping Score ~1.0.
-3. **Distinguish Noise from Attack:** Non-IID drift causes low trust, but only malicious attacks typically trigger high Cluster and Z-scores simultaneously.
+1. **The Golden Rule (Relative Anchor):** In FL, honest clients with Non-IID data will have low trust (e.g., 0.3) and high clipping (e.g., 1.5). **DO NOT flag them as CRITICAL.** Identify the client with the *highest relative trust*—that is your BENIGN anchor.
+2. **The Attacker's Signature:** Look for a "Step Function" drop. If 4 clients have Trust ~0.4 and 1 client has Trust ~0.001, only the 0.001 client is MALICIOUS.
+3. **De-prioritize Labels:** The "risk_label" from the surrogate model (XGBoost) can be overly aggressive. Use it as a hint, but the **Feature Vector** is your ground truth.
+4. **Distinguish Noise from Attack:** Non-IID drift causes low trust, but only malicious attacks typically trigger high Cluster scores and extreme Z-scores (e.g., >5.0) simultaneously.
 </reasoning_rules>
 
 <evaluation_steps>
