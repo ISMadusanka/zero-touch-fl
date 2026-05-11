@@ -94,13 +94,39 @@ class LayeredDetector:
         return root_delta
 
     def _compute_fl_trust(self, deltas: torch.Tensor, root_update: torch.Tensor) -> torch.Tensor:
-        """Layer 1: Sigmoid-Scaled FLTrust score for better Non-IID tolerance."""
+        """
+        Layer 1: Relative FLTrust scoring. 
+        Instead of absolute thresholds (which fail in Non-IID), we score clients based on 
+        how their directional similarity compares to the rest of the group.
+        
+        Outliers (either too low OR suspiciously high compared to the group) are penalized.
+        """
         if root_update is None:
             return torch.ones(len(deltas))
         
+        # 1. Compute raw cosine similarity with root update
         cos = torch.nn.functional.cosine_similarity(deltas, root_update.unsqueeze(0))
-        # Applied Sigmoid scaling: torch.sigmoid(8 * (cos - 0.15))
-        trust = torch.sigmoid(8 * (cos - 0.15))
+        
+        if len(cos) < 2:
+            return torch.ones(len(deltas))
+
+        # 2. Compute group statistics for similarities
+        mean_cos = torch.mean(cos)
+        std_cos = torch.std(cos) + 1e-9
+        
+        # 3. Calculate Z-scores (How many standard deviations from the group mean?)
+        z_scores = (cos - mean_cos) / std_cos
+        
+        # 4. Convert Z-scores to a 0-1 Trust Score
+        # We use a Gaussian kernel (RBF): exp(-0.5 * z^2)
+        # Clients near the group average get ~1.0 trust.
+        # Clients that are outliers (in either direction) get scores closer to 0.0.
+        trust = torch.exp(-0.5 * (z_scores**2))
+        
+        # 5. Optional: Additionally penalize anything with negative raw cosine similarity
+        # (Negative similarity is almost always a sign of a strong attack like sign-flip)
+        trust = torch.where(cos < 0, trust * 0.1, trust)
+        
         return trust
 
     def _compute_clusters(self, deltas: torch.Tensor) -> np.ndarray:

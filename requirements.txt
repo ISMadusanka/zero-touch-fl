@@ -6,3 +6,6 @@ faiss-cpu
 pyyaml
 numpy
 sentence-transformers
+xgboost
+shap
+pandas
