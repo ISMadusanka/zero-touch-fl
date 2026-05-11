@@ -82,9 +82,9 @@ def get_data_loaders(n_clients: int, batch_size: int, data_dir: str = "./data/mn
                      iid: bool = True):
     """Return per-client train loaders, a global test loader, and a server root loader."""
     train_dataset, test_dataset = load_mnist(data_dir)
-    # Take 500 samples for the server root dataset (crucial for FLTrust)
+    # Take 1500 samples for the server root dataset (crucial for FLTrust)
     indices = torch.randperm(len(train_dataset)).tolist()
-    root_indices = indices[:500]
+    root_indices = indices[:1500]
     remaining_indices = indices[500:]
 
     root_loader = DataLoader(Subset(train_dataset, root_indices), batch_size=batch_size, shuffle=False)

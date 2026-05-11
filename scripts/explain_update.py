@@ -23,6 +23,14 @@ def main():
         model.load_model(MODEL_PATH)
         explainer = shap.TreeExplainer(model)
         
+        # Map incoming scores to the model's expected feature keys
+        if "layer_2_cluster_score" in feature_dict:
+            feature_dict["layer_2_cluster"] = feature_dict.pop("layer_2_cluster_score")
+        if "layer_3_clipping_score" in feature_dict:
+            feature_dict["layer_3_clipping"] = feature_dict.pop("layer_3_clipping_score")
+        if "layer_4_trim_score" in feature_dict:
+            feature_dict["layer_4_is_trimmed"] = feature_dict.pop("layer_4_trim_score")
+
         df = pd.DataFrame([feature_dict])
         feature_order = [
             "layer_1_fl_trust", 
@@ -75,15 +83,22 @@ def main():
                 else: desc += "Strong alignment with root."
                 
             elif feat == "layer_2_cluster":
-                desc = f"Cluster ID: {int(val)}. "
-                desc += "Isolated outlier group." if val != 0 else "Benign majority group."
+                desc = f"Cluster Anomaly Score: {val:.4f}. "
+                if val > 3.0: desc += "Severe group outlier."
+                elif val > 1.5: desc += "Suspicious deviation from group."
+                else: desc += "Aligned with benign majority."
                 
             elif feat == "layer_3_clipping":
-                desc = f"Clipping ratio: {val:.4f}. "
-                desc += "Aggressive influence capped." if val < 0.9 else "Safe update magnitude."
+                desc = f"Clipping Score: {val:.4f}. "
+                if val > 2.0: desc += "Severe oversized influence detected."
+                elif val > 1.3: desc += "Potentially suspicious magnitude."
+                else: desc += "Normal update magnitude."
                 
             elif feat == "layer_4_is_trimmed":
-                desc = "Statistical outlier (trimmed)." if val else "Standard distribution range."
+                desc = f"Trim Z-Score: {val:.4f}. "
+                if val > 3.0: desc += "Extreme statistical outlier."
+                elif val > 2.0: desc += "Significant deviation from mean."
+                else: desc += "Within standard distribution."
                 
             else: # raw_norm
                 desc = f"L2 Norm: {val:.4f}."

@@ -237,7 +237,8 @@ def run_simulation(
         verdicts = []
         for cid_str, features in evidence.items():
             cid = int(cid_str.split("_")[1])
-            is_suspicious = features["layer_1_fl_trust"] < 0.1
+            # Use 0.5 as the sigmoid threshold (which is 0.15 raw cosine)
+            is_suspicious = features["layer_1_fl_trust"] < 0.5
             verdicts.append(DetectionVerdict(
                 client_id=cid,
                 is_suspicious=is_suspicious,
@@ -286,15 +287,6 @@ def run_simulation(
         with open(f"logs/round_data/evidence_round_{round_num}.json", "w") as f:
             json.dump(evidence, f, indent=2)
         # logger.info(f"Evidence saved to logs/round_data/evidence_round_{round_num}.json")
-
-        # For aggregation in this modular mode, we can use a simple rule:
-        # reject any client that is flagged by Layer 4 (Trimmed) or has low trust.
-        from core.types import DetectionVerdict
-        verdicts = []
-        for cid_str, e in evidence.items():
-            cid = int(cid_str.split("_")[1])
-            is_suspicious = e["layer_4_is_trimmed"] or e["layer_1_fl_trust"] < 0.5
-            verdicts.append(DetectionVerdict(cid, is_suspicious, e["layer_1_fl_trust"], "statistical_pipeline"))
 
         # Check if the malicious client was detected
         malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)
