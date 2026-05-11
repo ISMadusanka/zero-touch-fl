@@ -95,37 +95,46 @@ class LayeredDetector:
 
     def _compute_fl_trust(self, deltas: torch.Tensor, root_update: torch.Tensor) -> torch.Tensor:
         """
-        Layer 1: Relative FLTrust scoring. 
-        Instead of absolute thresholds (which fail in Non-IID), we score clients based on 
-        how their directional similarity compares to the rest of the group.
+        Layer 1: Consensus-Weighted FLTrust.
+        Instead of absolute thresholds, we measure how much each client's direction 
+        aligns with the Root Update AND the group's directional consensus.
         
-        Outliers (either too low OR suspiciously high compared to the group) are penalized.
+        An attacker (like sign-flip) may accidentally align with the root in Non-IID,
+        but they will fail to align with the honest majority of the group.
         """
         if root_update is None:
             return torch.ones(len(deltas))
         
-        # 1. Compute raw cosine similarity with root update
-        cos = torch.nn.functional.cosine_similarity(deltas, root_update.unsqueeze(0))
+        # 1. Directional similarity to Root Update
+        cos_root = torch.nn.functional.cosine_similarity(deltas, root_update.unsqueeze(0))
         
-        if len(cos) < 2:
-            return torch.ones(len(deltas))
-
-        # 2. Compute group statistics for similarities
-        mean_cos = torch.mean(cos)
-        std_cos = torch.std(cos) + 1e-9
+        # 2. Group Consensus: Pairwise Directional Similarity
+        # Normalize deltas to unit vectors
+        norms = torch.norm(deltas, dim=1, keepdim=True) + 1e-9
+        deltas_unit = deltas / norms
+        # Compute NxN cosine similarity matrix
+        pairwise_sim = torch.mm(deltas_unit, deltas_unit.t())
         
-        # 3. Calculate Z-scores (How many standard deviations from the group mean?)
-        z_scores = (cos - mean_cos) / std_cos
+        # Calculate each client's average agreement with the group (excluding self)
+        # agreement[i] = average cosine similarity of client i with all others
+        group_agreement = (pairwise_sim.sum(dim=1) - 1.0) / (len(deltas) - 1)
         
-        # 4. Convert Z-scores to a 0-1 Trust Score
-        # We use a Gaussian kernel (RBF): exp(-0.5 * z^2)
-        # Clients near the group average get ~1.0 trust.
-        # Clients that are outliers (in either direction) get scores closer to 0.0.
-        trust = torch.exp(-0.5 * (z_scores**2))
+        # 3. Relative Agreement Ranking
+        # Scale agreement to 0-1. The "most divergent" client gets 0.0 relative agreement.
+        min_a = group_agreement.min()
+        max_a = group_agreement.max()
+        rel_agreement = (group_agreement - min_a) / (max_a - min_a + 1e-9)
         
-        # 5. Optional: Additionally penalize anything with negative raw cosine similarity
-        # (Negative similarity is almost always a sign of a strong attack like sign-flip)
-        trust = torch.where(cos < 0, trust * 0.1, trust)
+        # 4. Final Trust Score
+        # We combine the root similarity with the relative group consensus.
+        # This ensures that even if a sign-flip attacker accidentally aligns with the root,
+        # their lack of consensus with honest clients will penalize their trust score.
+        # We use a soft sigmoid on cos_root to handle Non-IID drift.
+        trust_base = torch.sigmoid(10 * (cos_root - 0.1)) 
+        trust = trust_base * rel_agreement
+        
+        # If a client has negative agreement with the group, they are highly suspicious
+        trust = torch.where(group_agreement < 0, trust * 0.2, trust)
         
         return trust
 
