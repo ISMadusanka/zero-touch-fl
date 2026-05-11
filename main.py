@@ -17,8 +17,11 @@ import json
 import logging
 import os
 import sys
-
 import yaml
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 # import torch
 
 from data.mnist_loader import get_data_loaders
@@ -30,7 +33,7 @@ from server.aggregation import FedAvgAggregator
 from detector.layered_detector import LayeredDetector
 from detector.explainability import ExplainabilityEngine
 from agents.attacker_agent import AttackerAgent
-# from agents.defender_agent import DefenderAgent # LLM defender bypassed for Phase 1 output
+from agents.defender_agent import DefenderAgent
 from storage.checkpoint import save_state, load_state, state_exists
 from core.types import RoundLog
 
@@ -79,6 +82,7 @@ def run_training_phase(config: dict):
         n_clients=fl["n_clients"],
         batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
+        iid=data_cfg.get("iid", True),
     )
 
     # Log data sizes
@@ -159,6 +163,7 @@ def run_simulation(
     root_loader,
     config: dict,
     attacker_config: dict,
+    defender_config: dict,
 ):
     """Run the attack/defend simulation loop."""
     fl = config["fl"]
@@ -178,10 +183,12 @@ def run_simulation(
     detector = LayeredDetector(root_loader=root_loader, device=fl["device"])
     explain_engine = ExplainabilityEngine()
     malicious_client = MaliciousClient(client_id=malicious_id)
+    defender_agent = DefenderAgent(defender_config)
 
     # State tracking
     last_attack_detected = None    # None on first round
     last_attack_passed = None      # None on first round
+    last_all_clients_flagged = None  # None on first round
     current_accuracy = baseline_accuracy
 
     for sim_round in range(1, fl["simulation_rounds"] + 1):
@@ -221,32 +228,64 @@ def run_simulation(
                 logger.info(f"  Client {cid}: honest (saved weights)")
             updates.append(update)
 
+        # Step 3: Run 4-Layer Defense and SHAP
         # ------------------------------------------------------------------
-        # Step 3 & 4: 4-Layer Defense Pipeline + SHAP Explainability
-        # ------------------------------------------------------------------
-        # In Phase 1, we don't consult the LLM for strategy yet. 
-        # We just run the pipeline and output the evidence.
         evidence = detector.analyze(updates, server.model)
         
+        # Compile initial mathematical verdicts (Base for LLM to override)
+        from core.types import DetectionVerdict
+        verdicts = []
+        for cid_str, features in evidence.items():
+            cid = int(cid_str.split("_")[1])
+            is_suspicious = features["layer_1_fl_trust"] < 0.1
+            verdicts.append(DetectionVerdict(
+                client_id=cid,
+                is_suspicious=is_suspicious,
+                confidence=0.7,
+                reason="Mathematical suspicion based on low FLTrust score"
+            ))
+
         # Add SHAP explanations for each client
         for cid_str, features in evidence.items():
             logger.info(f"Feature Vector for {cid_str}: {json.dumps(features)}")
             explanation = explain_engine.explain(features)
             evidence[cid_str]["explainability"] = explanation
 
-        # TODO [Step 2.2]: Temporal Analysis - Track drift of client features over last N rounds
-        # TODO [Step 2.2]: Correlation Analysis - Compare feature similarity between clients to detect collusion
-        
+        # Step 4: Show Explainable Evidence (Phase 2 Output)
+        # ------------------------------------------------------------------
         logger.info("\n" + "="*40)
-        logger.info("PHASE 1 DEFENSE OUTPUT (Security Evidence)")
+        logger.info("PHASE 2: EXPLAINABLE EVIDENCE")
         logger.info("="*40)
         logger.info(json.dumps(evidence, indent=2))
         logger.info("="*40 + "\n")
 
+        # ------------------------------------------------------------------
+        # Phase 3: LLM Threat Reasoning (Final Verdict)
+        # ------------------------------------------------------------------
+        logger.info("\n" + "="*40)
+        logger.info("PHASE 3: LLM THREAT REASONING")
+        logger.info("="*40)
+        
+        llm_verdicts = defender_agent.analyze_evidence(evidence)
+        logger.info("LLM Security Verdicts:")
+        logger.info(json.dumps(llm_verdicts, indent=2))
+        
+        # Override mathematical verdicts with LLM's final decision
+        for cid_str, verdict_data in llm_verdicts.items():
+            if cid_str.startswith("client_"):
+                cid = int(cid_str.split("_")[1])
+                # Find the mathematical verdict and update it
+                for v in verdicts:
+                    if v.client_id == cid:
+                        v.is_suspicious = verdict_data.get("verdict") in ["CRITICAL", "DANGEROUS", "SUSPICIOUS"]
+                        v.reason = verdict_data.get("reasoning", v.reason)
+                        v.confidence = 1.0 # LLM-enforced
+                        evidence[cid_str]["llm_final"] = verdict_data
+
         # Save evidence to file for research
         with open(f"logs/round_data/evidence_round_{round_num}.json", "w") as f:
             json.dump(evidence, f, indent=2)
-        logger.info(f"Evidence saved to logs/round_data/evidence_round_{round_num}.json")
+        # logger.info(f"Evidence saved to logs/round_data/evidence_round_{round_num}.json")
 
         # For aggregation in this modular mode, we can use a simple rule:
         # reject any client that is flagged by Layer 4 (Trimmed) or has low trust.
@@ -260,47 +299,78 @@ def run_simulation(
         # Check if the malicious client was detected
         malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)
         attack_detected = malicious_verdict.is_suspicious
-        logger.info(f"Detection result: malicious client {'DETECTED' if attack_detected else 'PASSED THROUGH'}")
+        attack_passed = not attack_detected
+        n_flagged = sum(1 for v in verdicts if v.is_suspicious)
+        all_clients_flagged = n_flagged == len(verdicts)
+
+        # logger.info(f"Detection result: malicious client {'DETECTED' if attack_detected else 'PASSED THROUGH'}")
+        # logger.info(f"Detection summary: {n_flagged}/{len(verdicts)} clients flagged")
 
         # ------------------------------------------------------------------
         # Step 5: Aggregation (exclude detected clients)
         # ------------------------------------------------------------------
         new_weights = aggregator.aggregate(updates, verdicts)
-        server.set_global_weights(new_weights)
+
+        if new_weights is None:
+            # All clients flagged → skip round, keep global model unchanged
+            # logger.warning(
+            #     f"Round {round_num}: all clients flagged — global model NOT updated"
+            # )
+            pass
+        else:
+            server.set_global_weights(new_weights)
 
         # ------------------------------------------------------------------
         # Step 6: Evaluate
         # ------------------------------------------------------------------
         current_accuracy = server.evaluate(test_loader)
-        logger.info(f"Test accuracy after aggregation: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
+        # logger.info(f"Test accuracy after aggregation: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
 
         # ------------------------------------------------------------------
-        # Step 8: Save round data
+        # Step 7: Record outcomes
         # ------------------------------------------------------------------
-        round_log = RoundLog(
+        defender_agent.record_outcome(
             round_num=round_num,
-            attack_strategy={"type": attack_name, "params": attack_params, "reasoning": "Static Phase 1 Attack"},
-            defend_strategy={"method": "4_layer_pipeline", "params": {}},
+            strategy={},
+            attack_passed=attack_passed,
+            all_clients_flagged=all_clients_flagged,
             verdicts=[
                 {"client_id": v.client_id, "suspicious": v.is_suspicious, "confidence": v.confidence, "reason": v.reason}
                 for v in verdicts
             ],
+        )
+
+        # ------------------------------------------------------------------
+        # Step 8: Save round data to file
+        # ------------------------------------------------------------------
+        round_log = RoundLog(
+            round_num=round_num,
+            attack_strategy={},
+            defend_strategy={},
+            verdicts=[v.__dict__ for v in verdicts],
             test_accuracy=current_accuracy,
             baseline_accuracy=baseline_accuracy,
             attack_detected=attack_detected,
             attacker_adapted=False,
             defender_adapted=False,
+            all_clients_flagged=all_clients_flagged,
+            round_skipped=False,
         )
         _save_round_log(round_log)
 
-        # STOP AFTER ONE ROUND as per user request ("no need to automate again and again")
-        logger.info("Modular Phase 1 Defense complete. Stopping execution.")
+        # Update state for next round
+        last_attack_detected = attack_detected
+        last_attack_passed = attack_passed
+        last_all_clients_flagged = all_clients_flagged
+
+        # STOP AFTER ONE ROUND as per user request
+        # logger.info("Modular Phase 3 Defense complete. Stopping execution.")
         break
 
-    logger.info("\n" + "=" * 60)
-    logger.info("SIMULATION COMPLETE")
-    logger.info(f"Final accuracy: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
-    logger.info("=" * 60)
+    # logger.info("\n" + "=" * 60)
+    # logger.info("SIMULATION COMPLETE")
+    # logger.info(f"Final accuracy: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
+    # logger.info("=" * 60)
 
 
 def _save_round_log(log: RoundLog):
@@ -316,6 +386,8 @@ def _save_round_log(log: RoundLog):
         "attack_detected": log.attack_detected,
         "attacker_adapted": log.attacker_adapted,
         "defender_adapted": log.defender_adapted,
+        "all_clients_flagged": log.all_clients_flagged,
+        "round_skipped": log.round_skipped,
     }
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
@@ -366,6 +438,7 @@ def main():
         n_clients=fl["n_clients"],
         batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
+        iid=data_cfg.get("iid", True),
     )
 
     if state_exists() and not args.fresh:
@@ -385,6 +458,7 @@ def main():
         root_loader=root_loader,
         config=base_config,
         attacker_config=attacker_config,
+        defender_config=defender_config,
     )
 
 

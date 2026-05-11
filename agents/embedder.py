@@ -24,11 +24,14 @@ def _get_model():
     """Lazy-load the SentenceTransformer model (singleton)."""
     global _model
     if _model is None:
-        from sentence_transformers import SentenceTransformer
-
-        logger.info(f"Loading SentenceTransformer model: {_MODEL_NAME}")
-        _model = SentenceTransformer(_MODEL_NAME)
-        logger.info("SentenceTransformer model loaded")
+        try:
+            from sentence_transformers import SentenceTransformer
+            logger.info(f"Loading SentenceTransformer model: {_MODEL_NAME}")
+            _model = SentenceTransformer(_MODEL_NAME)
+            logger.info("SentenceTransformer model loaded")
+        except ImportError:
+            logger.warning("SentenceTransformer not installed — using fallback embedding")
+            return None
     return _model
 
 
@@ -48,6 +51,16 @@ def embed(data: dict) -> np.ndarray:
     """
     text = json.dumps(data, sort_keys=True, default=str)
     model = _get_model()
+    if model is None:
+        # Simple fallback: deterministic hash-based vector
+        import hashlib
+        h = hashlib.sha256(text.encode()).digest()
+        # Repeat hash to fill 384 dimensions (48 bytes * 8 = 384 bits?) 
+        # No, bytes are different. Let's just expand it.
+        # 384 dimensions / (32 bytes from SHA256) = 12 repetitions
+        vec = np.frombuffer(h * 12, dtype=np.uint8).astype(np.float32)[:_EMBEDDING_DIM]
+        return vec.flatten()
+
     logger.info(f"Generating semantic embedding for state vector: {text}")
     vec = model.encode(text, convert_to_numpy=True)
     return vec.astype(np.float32).flatten()

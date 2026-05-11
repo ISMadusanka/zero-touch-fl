@@ -73,16 +73,18 @@ class LayeredDetector:
         model_copy.to(self.device)
         model_copy.train()
         
-        optimizer = torch.optim.SGD(model_copy.parameters(), lr=0.01)
+        optimizer = torch.optim.SGD(model_copy.parameters(), lr=0.05) # Increased LR
         criterion = torch.nn.CrossEntropyLoss()
         
-        for data, target in self.root_loader:
-            data, target = data.to(self.device), target.to(self.device)
-            optimizer.zero_grad()
-            output = model_copy(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
+        # Train for 2 epochs on root data for a stronger reference signal
+        for _ in range(2):
+            for data, target in self.root_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                output = model_copy(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
         
         # Calculate delta
         root_delta = torch.cat([
@@ -97,7 +99,8 @@ class LayeredDetector:
             return torch.ones(len(deltas))
         
         cos = torch.nn.functional.cosine_similarity(deltas, root_update.unsqueeze(0))
-        return torch.clamp(cos, min=0.0)
+        # Add 0.05 smoothing to prevent absolute zero in non-IID noise
+        return torch.clamp(cos + 0.05, min=0.0, max=1.0)
 
     def _compute_clusters(self, deltas: torch.Tensor) -> np.ndarray:
         """Layer 2: PCA (2D) + K-Means (K=2) using pure Torch."""
