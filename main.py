@@ -18,10 +18,6 @@ import logging
 import os
 import sys
 import yaml
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
 # import torch
 
 from data.mnist_loader import get_data_loaders
