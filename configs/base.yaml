@@ -12,7 +12,7 @@ fl:
 
 data:
   dataset: "mnist"
-  iid: true
+  iid: false
   data_dir: "./data/mnist_raw"
 
 # Default Ollama settings (used when --env linux)
