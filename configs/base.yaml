@@ -1,13 +1,13 @@
 # Federated Learning Configuration
 
 fl:
-  training_rounds: 3          # Phase 1: honest training rounds
+  training_rounds: 15          # Increased for gradient stability
   simulation_rounds: 2000       # Phase 2: attack/defend rounds
   n_clients: 5
   malicious_client_id: 0      # 0-indexed client that becomes adversarial
-  local_epochs: 5
+  local_epochs: 5              # Increased to strengthen client deltas
   batch_size: 64
-  lr: 0.01
+  lr: 0.002
   device: "cpu"
 
 data:

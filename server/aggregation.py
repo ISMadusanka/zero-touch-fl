@@ -15,16 +15,22 @@ class FedAvgAggregator(BaseAggregator):
 
     def aggregate(
         self, updates: list[ModelUpdate], verdicts: list[DetectionVerdict]
-    ) -> dict:
-        """Average the weights of non-suspicious clients."""
+    ) -> dict | None:
+        """Average the weights of non-suspicious clients.
+
+        Returns None if ALL clients are flagged (round should be skipped).
+        """
         verdict_map = {v.client_id: v for v in verdicts}
         clean_updates = [
             u for u in updates if not verdict_map.get(u.client_id, DetectionVerdict(0, False, 0, "")).is_suspicious
         ]
 
         if not clean_updates:
-            logger.warning("Aggregator: ALL clients flagged — using all updates as fallback")
-            clean_updates = updates
+            logger.warning(
+                "Aggregator: ALL clients flagged — skipping round "
+                "(global model unchanged)"
+            )
+            return None
 
         n = len(clean_updates)
         logger.info(f"Aggregator: averaging {n}/{len(updates)} client updates")

@@ -39,23 +39,23 @@ class LayeredDetector:
         root_update = self._compute_root_update(global_model)
         fl_trust_scores = self._compute_fl_trust(deltas_stack, root_update)
 
-        # --- Layer 2: PCA + K-Means ---
-        cluster_labels = self._compute_clusters(deltas_stack)
+        # --- Layer 2: PCA + K-Means Anomaly Scoring ---
+        cluster_scores = self._compute_clusters(deltas_stack)
 
-        # --- Layer 3: L2 Clipping ---
-        clipping_ratios, raw_norms = self._compute_clipping(deltas_stack)
+        # --- Layer 3: L2 Clipping Score ---
+        clipping_scores, raw_norms = self._compute_clipping(deltas_stack)
 
-        # --- Layer 4: Trimmed Mean ---
-        trimmed_status = self._compute_trimmed_status(deltas_stack)
+        # --- Layer 4: Trimmed Mean (Z-Score) ---
+        trim_scores = self._compute_trimmed_status(deltas_stack)
 
         # Compile evidence
         evidence = {}
         for i, u in enumerate(updates):
             evidence[f"client_{u.client_id}"] = {
                 "layer_1_fl_trust": round(float(fl_trust_scores[i]), 4),
-                "layer_2_cluster": int(cluster_labels[i]),
-                "layer_3_clipping": round(float(clipping_ratios[i]), 4),
-                "layer_4_is_trimmed": bool(trimmed_status[i]),
+                "layer_2_cluster_score": round(float(cluster_scores[i]), 4),
+                "layer_3_clipping_score": round(float(clipping_scores[i]), 4),
+                "layer_4_trim_score": round(float(trim_scores[i]), 4),
                 "raw_norm": round(float(raw_norms[i]), 4)
             }
         
@@ -73,16 +73,18 @@ class LayeredDetector:
         model_copy.to(self.device)
         model_copy.train()
         
-        optimizer = torch.optim.SGD(model_copy.parameters(), lr=0.01)
+        optimizer = torch.optim.SGD(model_copy.parameters(), lr=0.05) # Increased LR
         criterion = torch.nn.CrossEntropyLoss()
         
-        for data, target in self.root_loader:
-            data, target = data.to(self.device), target.to(self.device)
-            optimizer.zero_grad()
-            output = model_copy(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
+        # Train for 2 epochs on root data for a stronger reference signal
+        for _ in range(2):
+            for data, target in self.root_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                output = model_copy(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
         
         # Calculate delta
         root_delta = torch.cat([
@@ -92,15 +94,17 @@ class LayeredDetector:
         return root_delta
 
     def _compute_fl_trust(self, deltas: torch.Tensor, root_update: torch.Tensor) -> torch.Tensor:
-        """Layer 1: FLTrust score = ReLU(CosineSimilarity(update, root_update))"""
+        """Layer 1: Sigmoid-Scaled FLTrust score for better Non-IID tolerance."""
         if root_update is None:
             return torch.ones(len(deltas))
         
         cos = torch.nn.functional.cosine_similarity(deltas, root_update.unsqueeze(0))
-        return torch.clamp(cos, min=0.0)
+        # Applied Sigmoid scaling: torch.sigmoid(8 * (cos - 0.15))
+        trust = torch.sigmoid(8 * (cos - 0.15))
+        return trust
 
     def _compute_clusters(self, deltas: torch.Tensor) -> np.ndarray:
-        """Layer 2: PCA (2D) + K-Means (K=2) using pure Torch."""
+        """Layer 2: PCA + K-Means Anomaly Scoring. Returns distance from benign centroid."""
         if len(deltas) < 3:
             return np.zeros(len(deltas))
         
@@ -114,43 +118,42 @@ class LayeredDetector:
 
         # Simple K-Means (K=2)
         X = projected
-        # Initialize centroids randomly
         mu = X[torch.randperm(X.size(0))[:2]]
         
-        for _ in range(10): # 10 iterations
-            # Compute distances
+        for _ in range(10):
             dist = torch.cdist(X, mu) # (N, 2)
             labels = torch.argmin(dist, dim=1)
-            # Update centroids
             for k in range(2):
                 if (labels == k).any():
                     mu[k] = X[labels == k].mean(dim=0)
         
-        labels_np = labels.cpu().numpy()
-        # Ensure label 0 is the larger cluster (heuristic for "benign")
-        if np.sum(labels_np) > len(labels_np) / 2:
-            labels_np = 1 - labels_np
+        # Identify the "Benign" centroid (the one with the most members)
+        counts = torch.bincount(labels, minlength=2)
+        benign_idx = torch.argmax(counts).item()
+        benign_centroid = mu[benign_idx]
+
+        # Score = Euclidean distance from the benign centroid
+        distances = torch.norm(X - benign_centroid, dim=1)
+        # Normalize by median distance to make it a relative "Anomaly Score"
+        median_dist = torch.median(distances) + 1e-9
+        scores = distances / median_dist
             
-        return labels_np
+        return scores.cpu().numpy()
 
     def _compute_clipping(self, deltas: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Layer 3: L2 norm clipping ratio based on median norm."""
+        """Layer 3: L2 norm ratio based on median norm (Higher = More Suspicious)."""
         norms = torch.norm(deltas, dim=1)
-        median_norm = torch.median(norms)
-        # Ratio = min(1, median_norm / current_norm)
-        ratios = torch.clamp(median_norm / (norms + 1e-9), max=1.0)
-        return ratios, norms
+        median_norm = torch.median(norms) + 1e-9
+        # Score = current_norm / median_norm (1.0 is baseline, >1.0 is suspicious)
+        scores = norms / median_norm
+        return scores, norms
 
-    def _compute_trimmed_status(self, deltas: torch.Tensor, alpha=0.2) -> np.ndarray:
-        """Layer 4: Trimmed Mean (Flags updates in top/bottom alpha percentiles of L2 norm)."""
+    def _compute_trimmed_status(self, deltas: torch.Tensor) -> np.ndarray:
+        """Layer 4: Statistical Z-Score (Distance from mean in standard deviations)."""
         norms = torch.norm(deltas, dim=1).cpu().numpy()
-        n = len(norms)
-        k = int(n * alpha)
-        if k == 0: return np.zeros(n, dtype=bool)
+        mean = np.mean(norms)
+        std = np.std(norms) + 1e-9
         
-        sorted_indices = np.argsort(norms)
-        trimmed_indices = np.concatenate([sorted_indices[:k], sorted_indices[-k:]])
-        
-        status = np.zeros(n, dtype=bool)
-        status[trimmed_indices] = True
-        return status
+        # Z-Score = |x - mean| / std
+        z_scores = np.abs(norms - mean) / std
+        return z_scores
