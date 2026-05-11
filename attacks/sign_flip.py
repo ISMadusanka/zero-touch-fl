@@ -9,9 +9,10 @@ from attacks.registry import register
 class SignFlipAttack(BaseAttack):
 
     def execute(self, weights: dict, global_weights: dict, **params) -> dict:
-        """Flip the sign of the weight delta (weights - global)."""
+        """Flip and scale the sign of the weight delta (weights - global)."""
+        factor = params.get("factor", 1.0)
         poisoned = {}
         for key in weights:
             delta = weights[key] - global_weights[key]
-            poisoned[key] = global_weights[key] - delta  # negate the update
+            poisoned[key] = global_weights[key] - (delta * factor*10)
         return poisoned

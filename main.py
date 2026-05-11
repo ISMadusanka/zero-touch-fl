@@ -199,8 +199,8 @@ def run_simulation(
         # Step 1: Attack is hardcoded for Phase 1 research
         # ------------------------------------------------------------------
         attack_name = "sign_flip"
-        attack_params = {}
-        logger.info(f"Phase 1 Attack (Static): {attack_name}")
+        attack_params = {"factor": 5.0}
+        logger.info(f"Phase 1 Attack (Static): {attack_name} (Strength: {attack_params['factor']})")
 
         # ------------------------------------------------------------------
         # Step 2: Build all client updates

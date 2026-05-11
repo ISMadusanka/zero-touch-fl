@@ -37,7 +37,7 @@ Respond with ONLY a JSON object:
 }}
 
 Attack parameter ranges:
-- sign_flip: no params needed
+- sign_flip: {{"factor": 1.0 to 10.0}}
 - noise_injection: {{"scale": 0.1 to 10.0}}
 - scaling: {{"factor": 1.5 to 100.0}}
 
