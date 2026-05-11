@@ -1,7 +1,7 @@
 # Federated Learning Configuration
 
 fl:
-  training_rounds: 15          # Increased for gradient stability
+  training_rounds: 20      # Increased for gradient stability
   simulation_rounds: 2000       # Phase 2: attack/defend rounds
   n_clients: 5
   malicious_client_id: 0      # 0-indexed client that becomes adversarial

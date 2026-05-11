@@ -15,10 +15,15 @@ import argparse
 import copy
 import json
 import logging
-import os
-import sys
 import yaml
 import numpy as np
+import os
+import sys
+from dotenv import load_dotenv
+
+# Load .env if it exists (local dev), otherwise rely on server env
+if os.path.exists(".env"):
+    load_dotenv()
 
 # import torch
 
@@ -43,9 +48,7 @@ def setup_logging():
     os.makedirs("logs/round_data", exist_ok=True)
     # Force UTF-8 to avoid Windows cp1252 encoding errors
     file_handler = logging.FileHandler("logs/system.log", mode="a", encoding="utf-8")
-    stream_handler = logging.StreamHandler(
-        open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)
-    )
+    stream_handler = logging.StreamHandler(sys.stdout)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -258,6 +261,7 @@ def run_simulation(
         logger.info(json.dumps(evidence, indent=2))
         logger.info("="*40 + "\n")
 
+        """
         # --- ADDED: Calculate Group Context for Relative Reasoning ---
         group_stats = {
             "avg_trust": float(np.mean([f["layer_1_fl_trust"] for f in evidence.values()])),
@@ -287,11 +291,13 @@ def run_simulation(
                         v.reason = verdict_data.get("reasoning", v.reason)
                         v.confidence = 1.0 # LLM-enforced
                         evidence[cid_str]["llm_final"] = verdict_data
+        """
 
-        # Save evidence to file for research
+        # Save raw feature evidence to file for debugging
         with open(f"logs/round_data/evidence_round_{round_num}.json", "w") as f:
             json.dump(evidence, f, indent=2)
-        # logger.info(f"Evidence saved to logs/round_data/evidence_round_{round_num}.json")
+        logger.info(f"Raw Feature Evidence saved for Round {round_num}")
+        logger.info(json.dumps(evidence, indent=2))
 
         # Check if the malicious client was detected
         malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)
@@ -300,8 +306,8 @@ def run_simulation(
         n_flagged = sum(1 for v in verdicts if v.is_suspicious)
         all_clients_flagged = n_flagged == len(verdicts)
 
-        # logger.info(f"Detection result: malicious client {'DETECTED' if attack_detected else 'PASSED THROUGH'}")
-        # logger.info(f"Detection summary: {n_flagged}/{len(verdicts)} clients flagged")
+        logger.info(f"Detection result: malicious client {'DETECTED' if attack_detected else 'PASSED THROUGH'}")
+        logger.info(f"Detection summary: {n_flagged}/{len(verdicts)} clients flagged")
 
         # ------------------------------------------------------------------
         # Step 5: Aggregation (exclude detected clients)
@@ -310,9 +316,9 @@ def run_simulation(
 
         if new_weights is None:
             # All clients flagged → skip round, keep global model unchanged
-            # logger.warning(
-            #     f"Round {round_num}: all clients flagged — global model NOT updated"
-            # )
+            logger.warning(
+                f"Round {round_num}: all clients flagged — global model NOT updated"
+            )
             pass
         else:
             server.set_global_weights(new_weights)
@@ -321,7 +327,7 @@ def run_simulation(
         # Step 6: Evaluate
         # ------------------------------------------------------------------
         current_accuracy = server.evaluate(test_loader)
-        # logger.info(f"Test accuracy after aggregation: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
+        logger.info(f"Test accuracy after aggregation: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
 
         # ------------------------------------------------------------------
         # Step 7: Record outcomes
@@ -364,10 +370,10 @@ def run_simulation(
         # logger.info("Modular Phase 3 Defense complete. Stopping execution.")
         break
 
-    # logger.info("\n" + "=" * 60)
-    # logger.info("SIMULATION COMPLETE")
-    # logger.info(f"Final accuracy: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
-    # logger.info("=" * 60)
+    logger.info("\n" + "=" * 60)
+    logger.info("SIMULATION COMPLETE")
+    logger.info(f"Final accuracy: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
+    logger.info("=" * 60)
 
 
 def _save_round_log(log: RoundLog):

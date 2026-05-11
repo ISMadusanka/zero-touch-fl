@@ -75,7 +75,7 @@ class LayeredDetector:
         optimizer = torch.optim.Adam(model_copy.parameters(), lr=0.01)
         criterion = torch.nn.CrossEntropyLoss()
         
-        for _ in range(2):
+        for _ in range(5):  # Increased from 2 to 5 for better signal quality
             for data, target in self.root_loader:
                 data, target = data.to(self.device), target.to(self.device)
                 optimizer.zero_grad()
@@ -93,9 +93,12 @@ class LayeredDetector:
             return torch.ones(len(deltas))
         
         cos = torch.nn.functional.cosine_similarity(deltas, root_update.unsqueeze(0))
-        # Sharpened curve: torch.sigmoid(12 * (cos - 0.25))
-        # Any negative similarity (Sign-Flip) is forced to hard zero.
-        trust = torch.where(cos > 0, torch.sigmoid(12 * (cos - 0.25)), torch.zeros_like(cos))
+        
+        # Debug: Log raw cosine similarities
+        for i, c in enumerate(cos):
+            logger.info(f"  Client {i} Raw Cosine Similarity: {c.item():.4f}")
+        # Sharpened curve: lowered center from 0.25 to 0.15 for non-IID sensitivity
+        trust = torch.where(cos > 0, torch.sigmoid(12 * (cos - 0.15)), torch.zeros_like(cos))
         return trust
 
     def _compute_clusters(self, deltas: torch.Tensor) -> np.ndarray:
