@@ -22,19 +22,20 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
 You are an adversarial agent in a federated learning system.
-Your goal: modify the model weights you receive so that the poisoned update
-degrades the global model's accuracy while evading anomaly detection.
+Your goal: modify a SUBSET of the model weights to degrade the global model's accuracy while evading anomaly detection.
 
-You receive the COMPLETE model weights of a client as JSON.
 The model architecture is:
   AvgPool2d(4) → Flatten → Linear(49, 16) → ReLU → Linear(16, 10)
   Total trainable parameters: 970
 
-Weight keys and shapes:
-  - "net.2.weight": shape [16, 49]  (784 values)
-  - "net.2.bias":   shape [16]       (16 values)
-  - "net.4.weight": shape [10, 16]  (160 values)
-  - "net.4.bias":   shape [10]       (10 values)
+You receive a randomly selected SUBSET of the client's model weights as JSON.
+Format of received weights:
+{{
+    "layer_name": {{
+        "indices": [list of 1D positions in the flattened layer],
+        "values": [corresponding weight values]
+    }}
+}}
 
 You also receive:
   - baseline_accuracy: the clean model accuracy
@@ -43,26 +44,24 @@ You also receive:
   - history: summary of past rounds
 
 YOUR TASK:
-Modify the client weights strategically to poison the model.
+1. Modify the provided weight values strategically.
+2. Decide how many weights you want to target in the NEXT round (between {min_weights} and {max_weights}). If you were detected, targeting fewer weights might be subtler. If you weren't detected, targeting more weights might degrade accuracy faster.
+
 You MUST return a JSON object with this EXACT structure:
 
 {{
     "modified_weights": {{
-        "net.2.weight": [[...], [...], ...],
-        "net.2.bias": [...],
-        "net.4.weight": [[...], [...], ...],
-        "net.4.bias": [...]
+        "layer_name": [new_val1, new_val2, ...],
+        "another_layer": [new_val1, ...]
     }},
-    "reasoning": "<brief explanation of what you changed and why>"
+    "next_num_weights": <integer between {min_weights} and {max_weights}>,
+    "reasoning": "<brief explanation of your strategy>"
 }}
 
 IMPORTANT RULES:
-1. You MUST return ALL weight keys with the EXACT same shapes as the input.
-2. Make subtle, strategic modifications — large changes get detected easily.
-3. If your last attack was detected, make smaller, more targeted changes.
-4. If your last attack was too subtle (accuracy didn't drop), be more aggressive.
-5. Consider targeting specific neurons or layers rather than uniform noise.
-6. Return valid JSON numbers (no NaN, no Infinity)."""
+1. In `modified_weights`, include ONLY the layers provided to you.
+2. For each layer, provide a list of numbers matching the EXACT length of the "values" list you received. These will replace the original values at the given "indices".
+3. Return valid JSON numbers (no NaN, no Infinity)."""
 
 
 class AttackerAgent:
@@ -85,6 +84,12 @@ class AttackerAgent:
             ollama_base_url=llm_cfg.get("ollama_base_url", "http://localhost:11434"),
         )
         self.precision = config.get("weight_precision", 6)
+        
+        # Subset configurations
+        self.num_weights = config.get("initial_weights", 100)
+        self.min_weights = config.get("min_weights", 100)
+        self.max_weights = config.get("max_weights", 400)
+        
         self.memory = VectorStore(
             dimension=get_dimension(),
             persist_path=config.get("memory", {}).get("persist_path"),
@@ -164,8 +169,14 @@ class AttackerAgent:
         else:
             similar = []
 
-        # Serialize weights for LLM consumption
-        serialized_client = self._serialize_weights(client_weights)
+        # Serialize weights for LLM consumption (only a subset)
+        serialized_client, metadata = self._serialize_weights_subset(client_weights, self.num_weights)
+
+        # Format system prompt with subset limits
+        formatted_system_prompt = SYSTEM_PROMPT.format(
+            min_weights=self.min_weights, 
+            max_weights=self.max_weights
+        )
 
         user_msg = json.dumps({
             "client_weights": serialized_client,
@@ -176,14 +187,14 @@ class AttackerAgent:
             "similar_past_experiences": similar,
         }, default=str)
 
-        logger.info(f"Attacker: sending {len(user_msg)} chars to LLM (weights included)")
+        logger.info(f"Attacker: sending {len(user_msg)} chars to LLM ({self.num_weights} weights included)")
 
         # ---- Save the full request payload to a log file ----
         self._round_counter += 1
         payload_data = {
             "round": self._round_counter,
             "request": {
-                "system_prompt": SYSTEM_PROMPT,
+                "system_prompt": formatted_system_prompt,
                 "client_weights": serialized_client,
                 "baseline_accuracy": context.get("baseline_accuracy"),
                 "current_accuracy": context.get("current_accuracy"),
@@ -192,7 +203,7 @@ class AttackerAgent:
             },
         }
 
-        result = self.llm.call(SYSTEM_PROMPT, user_msg)
+        result = self.llm.call(formatted_system_prompt, user_msg)
 
         # ---- Append the LLM response to the log ----
         payload_data["response"] = result
@@ -207,11 +218,11 @@ class AttackerAgent:
             logger.warning(f"Failed to save LLM payload log: {e}")
 
         # Validate and deserialize the response
-        modified = self._parse_llm_response(result, client_weights)
+        modified = self._parse_llm_response(result, client_weights, metadata)
         return modified
 
-    def _parse_llm_response(self, result: dict, original_weights: dict) -> dict:
-        """Parse the LLM response and convert back to PyTorch tensors.
+    def _parse_llm_response(self, result: dict, original_weights: dict, metadata: dict) -> dict:
+        """Parse the LLM response and apply modified subset to original weights.
 
         Falls back to original weights (no modification) if parsing fails.
         """
@@ -222,12 +233,30 @@ class AttackerAgent:
                 "reasoning": "fallback: LLM response invalid",
             }
 
+        modified_tensors = copy.deepcopy(original_weights)
         try:
-            modified_tensors = self._deserialize_weights(
-                result["modified_weights"], original_weights
-            )
+            mod_w = result["modified_weights"]
+            for key, indices in metadata.items():
+                if key in mod_w:
+                    new_vals = mod_w[key]
+                    if len(new_vals) == len(indices):
+                        flat_tensor = modified_tensors[key].flatten()
+                        for i, idx in enumerate(indices):
+                            flat_tensor[idx] = float(new_vals[i])
+                        modified_tensors[key] = flat_tensor.reshape(modified_tensors[key].shape)
+                    else:
+                        logger.warning(f"Length mismatch for {key}: expected {len(indices)}, got {len(new_vals)}")
+
+            # Extract and update next_num_weights
+            next_num = result.get("next_num_weights", self.num_weights)
+            try:
+                next_num = int(next_num)
+                self.num_weights = max(self.min_weights, min(self.max_weights, next_num))
+            except ValueError:
+                pass
+
             reasoning = result.get("reasoning", "no reasoning provided")
-            logger.info(f"Attacker LLM reasoning: {reasoning}")
+            logger.info(f"Attacker LLM reasoning: {reasoning} (Next subset size: {self.num_weights})")
             return {
                 "modified_weights": modified_tensors,
                 "reasoning": reasoning,
@@ -239,45 +268,50 @@ class AttackerAgent:
                 "reasoning": f"fallback: deserialization error — {e}",
             }
 
-    def _serialize_weights(self, weights: dict) -> dict:
-        """Convert PyTorch state_dict tensors to JSON-serializable nested lists.
+    def _serialize_weights_subset(self, weights: dict, num_weights: int) -> tuple[dict, dict]:
+        """Convert PyTorch state_dict tensors to JSON-serializable subset dict.
 
-        Rounds floats to ``self.precision`` decimal places to reduce token count.
+        Randomly selects `num_weights` across all layers.
+        Returns:
+            serialized: {"layer": {"indices": [...], "values": [...]}}
+            metadata: {"layer": [indices...]}
         """
+        # Count total params
+        param_counts = {k: v.numel() for k, v in weights.items()}
+        total_params = sum(param_counts.values())
+        
+        # Randomly select indices
+        num_weights = min(num_weights, total_params)
+        selected_flat_indices = np.random.choice(total_params, num_weights, replace=False)
+        selected_flat_indices.sort()
+        
         serialized = {}
+        metadata = {}
+        
+        current_offset = 0
         for key, tensor in weights.items():
-            values = tensor.detach().cpu().float().numpy()
-            # Round to reduce token count
-            values = np.round(values, self.precision)
-            serialized[key] = values.tolist()
-        return serialized
+            numel = tensor.numel()
+            # Find which selected indices fall into this layer
+            layer_mask = (selected_flat_indices >= current_offset) & (selected_flat_indices < current_offset + numel)
+            layer_flat_indices = selected_flat_indices[layer_mask] - current_offset
+            
+            if len(layer_flat_indices) > 0:
+                flat_tensor = tensor.detach().cpu().float().flatten().numpy()
+                values = flat_tensor[layer_flat_indices]
+                values = np.round(values, self.precision).tolist()
+                
+                indices_list = layer_flat_indices.tolist()
+                serialized[key] = {
+                    "indices": indices_list,
+                    "values": values
+                }
+                metadata[key] = indices_list
+            
+            current_offset += numel
+            
+        return serialized, metadata
 
-    def _deserialize_weights(self, data: dict, reference: dict) -> dict:
-        """Convert JSON nested lists back to PyTorch tensors.
 
-        Uses the ``reference`` state_dict to enforce correct shapes and dtypes.
-        """
-        deserialized = {}
-        for key, ref_tensor in reference.items():
-            if key not in data:
-                logger.warning(f"Key '{key}' missing in LLM response — using original")
-                deserialized[key] = copy.deepcopy(ref_tensor)
-                continue
-
-            tensor = torch.tensor(data[key], dtype=ref_tensor.dtype)
-
-            # Shape validation
-            if tensor.shape != ref_tensor.shape:
-                logger.warning(
-                    f"Shape mismatch for '{key}': got {tensor.shape}, "
-                    f"expected {ref_tensor.shape} — using original"
-                )
-                deserialized[key] = copy.deepcopy(ref_tensor)
-                continue
-
-            deserialized[key] = tensor
-
-        return deserialized
 
     def _make_vector(self, data: dict) -> np.ndarray:
         """Create a semantic embedding vector for FAISS indexing.

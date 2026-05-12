@@ -8,5 +8,10 @@ llm:
 # Decimal places for weight serialization (controls token usage)
 weight_precision: 6
 
+# Dynamic weight subset configuration
+initial_weights: 100
+min_weights: 100
+max_weights: 400
+
 memory:
   persist_path: "checkpoints/attacker_memory"
