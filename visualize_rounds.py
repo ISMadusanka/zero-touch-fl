@@ -46,6 +46,7 @@ ATTACK_TYPE_COLORS = {
     "sign_flip":       "#FF6584",
     "scale_attack":    "#F7971E",
     "zero_update":     "#43E97B",
+    "gaussian_noise":  "#00C9FF",
 }
 
 DEFEND_METHOD_COLORS = {
@@ -263,7 +264,7 @@ def plot_attack_params(rounds, out_dir):
     scales = []
     for r in rounds:
         p = r["attack_strategy"].get("params", {})
-        scales.append(p.get("scale", p.get("factor", None)))
+        scales.append(p.get("scale", p.get("factor", p.get("sigma", p.get("c", p.get("k", None))))))
 
     if all(s is None for s in scales):
         return  # nothing to plot

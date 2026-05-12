@@ -14,12 +14,24 @@ A sliding window of the **last 5 round outcomes** from `self.history[-5:]`, prov
 {
     "round":          int,    # Global round number (e.g. 4, 5, 6)
     "strategy": {
-        "attack_type": str,   # "sign_flip" | "noise_injection" | "scaling"
-        "params":      dict,  # e.g. {"scale": 3.0} or {}
+        "attack_type": str,   # "sign_flip" | "noise_injection" | "scaling" | "gaussian_noise"
+        "params":      dict,  # e.g. {"scale": 3.0}, {"sigma": 1.0}, {"c": 2.0, "k": 50}, or {}
         "reasoning":   str    # LLM's explanation
     },
     "was_detected":   bool,   # True if defender caught this attack
-    "accuracy_after": float   # Global model accuracy after this round
+    "accuracy_after": float,  # Global model accuracy after this round
+    "attack_metadata": {      # Optional — present when attack provides metadata
+        "k":           int|str,  # Number of flipped weights, or "all"
+        "total_params": int,     # Total model parameters
+        "flipped_per_layer": {   # Count of flipped weights per layer
+            "fc1.weight": int, "fc2.bias": int, ...
+        },
+        "flipped_indices_per_layer": {  # Exact indices flipped per layer
+            "fc1.weight": [int, ...], ...
+        },
+        "avg_flipped_grad_magnitude":   float,  # Mean |gradient| of flipped weights
+        "avg_unflipped_grad_magnitude": float   # Mean |gradient| of untouched weights
+    }
 }
 ```
 
@@ -74,12 +86,20 @@ Attacker Agent — stored parameters per entry:
 {
     "round":          int,    # Global round number
     "strategy": {
-        "attack_type": str,   # "sign_flip" | "noise_injection" | "scaling"
-        "params":      dict,  # e.g. {"scale": 3.0} or {}
+        "attack_type": str,   # "sign_flip" | "noise_injection" | "scaling" | "gaussian_noise"
+        "params":      dict,  # e.g. {"scale": 3.0}, {"sigma": 1.0}, {"c": 2.0, "k": 50}, or {}
         "reasoning":   str    # LLM's explanation for choosing this attack
     },
     "was_detected":   bool,   # Whether the defender caught this attack
-    "accuracy_after": float   # Model accuracy after this round
+    "accuracy_after": float,  # Model accuracy after this round
+    "attack_metadata": {      # Optional — present when attack provides metadata
+        "k":           int|str,  # Number of flipped weights, or "all"
+        "total_params": int,
+        "flipped_per_layer":          dict,  # {layer_name: count}
+        "flipped_indices_per_layer":  dict,  # {layer_name: [indices]}
+        "avg_flipped_grad_magnitude":   float,
+        "avg_unflipped_grad_magnitude": float
+    }
 }
 ```
 

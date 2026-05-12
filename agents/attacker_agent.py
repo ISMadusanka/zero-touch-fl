@@ -37,9 +37,14 @@ Respond with ONLY a JSON object:
 }}
 
 Attack parameter ranges:
-- sign_flip: no params needed
+- sign_flip: {{"c": 1.0 to 4.0, "k": 10 to total_params}}  (c = scaling factor, k = number of weights to flip; omit k to flip all)
 - noise_injection: {{"scale": 0.1 to 10.0}}
 - scaling: {{"factor": 1.5 to 100.0}}
+- gaussian_noise: {{"sigma": 0.1 to 10.0}}
+
+For sign_flip with k: only the top-k weights (by gradient magnitude) are flipped.
+Smaller k = stealthier but weaker. Past attack_metadata shows which layers were
+targeted and gradient statistics — use this to refine your k and c choices.
 
 Be strategic. If you were detected, try a subtler approach. If your attack was
 too subtle (accuracy didn't drop), be more aggressive."""
@@ -96,20 +101,35 @@ class AttackerAgent:
         self.current_strategy = self._ask_llm(context)
         return self.current_strategy
 
-    def record_outcome(self, round_num: int, strategy: dict, was_detected: bool, accuracy: float):
-        """Store round outcome in history and vector memory."""
+    def record_outcome(self, round_num: int, strategy: dict, was_detected: bool, accuracy: float, attack_metadata: dict | None = None):
+        """Store round outcome in history and vector memory.
+
+        attack_metadata may contain details like flipped_per_layer,
+        flipped_indices_per_layer, and gradient magnitude stats from
+        the sign_flip attack (or other attacks that populate it).
+        """
         entry = {
             "round": round_num,
             "strategy": strategy,
             "was_detected": was_detected,
             "accuracy_after": accuracy,
         }
+        if attack_metadata:
+            entry["attack_metadata"] = attack_metadata
+            logger.info(
+                f"Attacker memory: storing attack_metadata for round {round_num} "
+                f"(k={attack_metadata.get('k', 'N/A')}, "
+                f"flipped_layers={list(attack_metadata.get('flipped_per_layer', {}).keys())})"
+            )
+
         self.history.append(entry)
+        logger.info(f"Attacker memory: round {round_num} recorded (short-term: {len(self.history)} entries)")
 
         # Create a simple feature vector from the outcome for FAISS
         vec = self._make_vector(entry)
         self.memory.add(vec, entry)
         self.memory.save()
+        logger.info(f"Attacker memory: round {round_num} persisted to long-term FAISS store")
 
     def _ask_llm(self, context: dict) -> dict:
         """Query the LLM for a new attack strategy."""
