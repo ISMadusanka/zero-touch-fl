@@ -9,6 +9,7 @@ making direct transmission feasible.
 import json
 import logging
 import copy
+import os
 
 import numpy as np
 import torch
@@ -91,6 +92,11 @@ class AttackerAgent:
         )
         self.current_strategy: dict | None = None
         self.history: list[dict] = []
+        self._round_counter = 0
+
+        # Ensure payload log directory exists
+        self._payload_log_dir = "logs/llm_payloads"
+        os.makedirs(self._payload_log_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Public API
@@ -123,12 +129,9 @@ class AttackerAgent:
             self.current_strategy = self._ask_llm(context, client_weights, global_weights)
             return self.current_strategy
 
-        # Attack succeeded → keep strategy (re-apply same modification pattern)
+        # Attack succeeded → reuse the same modified weights (no LLM call)
         if not was_detected:
-            logger.info("Attacker: last attack passed through — consulting LLM again")
-            # Even when keeping strategy direction, we re-query because weights
-            # may change between rounds; the LLM gets fresh context each time.
-            self.current_strategy = self._ask_llm(context, client_weights, global_weights)
+            logger.info("Attacker: last attack passed through — reusing previous modified weights")
             return self.current_strategy
 
         # Attack was caught → adapt
@@ -179,7 +182,35 @@ class AttackerAgent:
         }, default=str)
 
         logger.info(f"Attacker: sending {len(user_msg)} chars to LLM (weights included)")
+
+        # ---- Save the full request payload to a log file ----
+        self._round_counter += 1
+        payload_data = {
+            "round": self._round_counter,
+            "request": {
+                "system_prompt": SYSTEM_PROMPT,
+                "client_weights": serialized_client,
+                "global_weights": serialized_global,
+                "baseline_accuracy": context.get("baseline_accuracy"),
+                "current_accuracy": context.get("current_accuracy"),
+                "was_detected": context.get("was_detected"),
+                "recent_history": self.history[-5:],
+            },
+        }
+
         result = self.llm.call(SYSTEM_PROMPT, user_msg)
+
+        # ---- Append the LLM response to the log ----
+        payload_data["response"] = result
+        payload_path = os.path.join(
+            self._payload_log_dir, f"round_{self._round_counter:03d}.json"
+        )
+        try:
+            with open(payload_path, "w", encoding="utf-8") as f:
+                json.dump(payload_data, f, indent=2, default=str)
+            logger.info(f"Attacker: LLM payload logged to {payload_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save LLM payload log: {e}")
 
         # Validate and deserialize the response
         modified = self._parse_llm_response(result, client_weights)
