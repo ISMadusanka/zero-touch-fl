@@ -37,7 +37,6 @@ Weight keys and shapes:
   - "net.4.bias":   shape [10]       (10 values)
 
 You also receive:
-  - global_weights: the current global model weights (for reference)
   - baseline_accuracy: the clean model accuracy
   - current_accuracy: test accuracy after the last round
   - was_detected: whether your last modification was caught by the defender
@@ -102,7 +101,7 @@ class AttackerAgent:
     # Public API
     # ------------------------------------------------------------------
 
-    def decide(self, context: dict, client_weights: dict, global_weights: dict) -> dict:
+    def decide(self, context: dict, client_weights: dict) -> dict:
         """Decide how to poison the weights for this round.
 
         Parameters
@@ -111,8 +110,6 @@ class AttackerAgent:
             Contains baseline_accuracy, current_accuracy, was_detected.
         client_weights : dict
             Raw PyTorch state_dict of Client 0 (the malicious client).
-        global_weights : dict
-            Current global model state_dict.
 
         Returns
         -------
@@ -126,7 +123,7 @@ class AttackerAgent:
         # First round — always ask LLM
         if self.current_strategy is None:
             logger.info("Attacker: first round — consulting LLM for weight modification")
-            self.current_strategy = self._ask_llm(context, client_weights, global_weights)
+            self.current_strategy = self._ask_llm(context, client_weights)
             return self.current_strategy
 
         # Attack succeeded → reuse the same modified weights (no LLM call)
@@ -136,7 +133,7 @@ class AttackerAgent:
 
         # Attack was caught → adapt
         logger.info("Attacker: last attack was CAUGHT — consulting LLM for new approach")
-        self.current_strategy = self._ask_llm(context, client_weights, global_weights)
+        self.current_strategy = self._ask_llm(context, client_weights)
         return self.current_strategy
 
     def record_outcome(self, round_num: int, strategy: dict, was_detected: bool, accuracy: float):
@@ -158,7 +155,7 @@ class AttackerAgent:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _ask_llm(self, context: dict, client_weights: dict, global_weights: dict) -> dict:
+    def _ask_llm(self, context: dict, client_weights: dict) -> dict:
         """Query the LLM with raw weights and get back modified weights."""
         # Retrieve similar past experiences
         if self.history:
@@ -169,11 +166,9 @@ class AttackerAgent:
 
         # Serialize weights for LLM consumption
         serialized_client = self._serialize_weights(client_weights)
-        serialized_global = self._serialize_weights(global_weights)
 
         user_msg = json.dumps({
             "client_weights": serialized_client,
-            "global_weights": serialized_global,
             "baseline_accuracy": context.get("baseline_accuracy"),
             "current_accuracy": context.get("current_accuracy"),
             "was_detected": context.get("was_detected"),
@@ -190,7 +185,6 @@ class AttackerAgent:
             "request": {
                 "system_prompt": SYSTEM_PROMPT,
                 "client_weights": serialized_client,
-                "global_weights": serialized_global,
                 "baseline_accuracy": context.get("baseline_accuracy"),
                 "current_accuracy": context.get("current_accuracy"),
                 "was_detected": context.get("was_detected"),

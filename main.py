@@ -204,7 +204,6 @@ def run_simulation(
         attack_strategy = attacker_agent.decide(
             attacker_context,
             client_weights=client_weights[malicious_id],
-            global_weights=current_global,
         )
         attack_reasoning = attack_strategy.get("reasoning", "")
         logger.info(f"Attacker strategy: LLM autonomous — {attack_reasoning}")
