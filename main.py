@@ -259,7 +259,7 @@ def run_simulation(
         # ------------------------------------------------------------------
         # Step 5: Aggregation (exclude detected clients)
         # ------------------------------------------------------------------
-        new_weights = aggregator.aggregate(updates, verdicts)
+        new_weights = aggregator.aggregate(updates, verdicts, strategy=defend_strategy)
 
         if new_weights is None:
             # All clients flagged → skip round, keep global model unchanged

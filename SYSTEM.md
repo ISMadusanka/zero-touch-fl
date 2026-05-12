@@ -55,9 +55,23 @@ The LLM is also given the top 3 most similar past rounds retrieved from the FAIS
 
 
 
-# Defend strategies
-
 # Defense Strategies
+
+## Available Methods (all adaptive — no hardcoded thresholds)
+
+All defenses use: `threshold = median ± sensitivity × MAD`
+where MAD = Median Absolute Deviation (robust to outliers).
+The LLM tunes a single `sensitivity` parameter (default 2.0).
+
+| Method | Paper | What it Detects | Threshold Formula |
+|--------|-------|-----------------|-------------------|
+| `norm_threshold` | Sun et al. (2019) | Large-magnitude updates | `median(norms) + s×MAD(norms)` |
+| `dnc` | Shejwalkar & Houmansadr (NDSS 2021) | Spectral outliers (SVD) | `median(scores) + s×MAD(scores)` |
+| `fltrust` | Cao et al. (NDSS 2021) | Low-trust direction divergence | `median(TS) - s×MAD(TS)` |
+| `foolsgold` | Fung et al. (RAID 2020) | Sybil/colluding similarity | `median(weights) - s×MAD(weights)` |
+| `flame` | Nguyen et al. (USENIX Sec 2022) | Clustering-based outliers | HDBSCAN majority cluster |
+
+## Adaptation Feedback Matrix
 
 | Scenario | Attacker Feedback | Defender Feedback | Gap? |
 |---|---|---|---|

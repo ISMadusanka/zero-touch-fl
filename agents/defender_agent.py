@@ -21,8 +21,11 @@ minimizing false positives (rejecting honest clients).
 
 You receive statistical features of all client updates:
 - l2_norms: L2 norm of each client's weight delta
-- cosine_similarities: cosine similarity of each update with the global model
-- pairwise_distances: average pairwise L2 distance between updates
+- cosine_similarities: cosine similarity of each update with the mean update
+- dnc_scores: spectral outlier scores (SVD projection²) per client
+- fltrust_scores: ReLU(cosine_similarity) trust scores per client
+- foolsgold_max_cs: maximum pairwise cosine similarity per client
+- mean_pairwise_distance: average pairwise L2 distance between updates
 - history: past detection outcomes
 - similar_past_experiences: relevant past episodes from memory
 - all_clients_flagged: if True, your last thresholds were TOO STRICT and
@@ -32,24 +35,66 @@ You receive statistical features of all client updates:
 You must output a detection strategy as JSON:
 {{
     "method": "<detection method>",
-    "params": {{<method-specific thresholds>}},
+    "params": {{"sensitivity": <float>}},
     "reasoning": "<brief explanation>"
 }}
 
-Available methods:
-- "norm_threshold": flag clients whose update L2 norm exceeds params.threshold
-  {{"threshold": <float>}}
-- "cosine_threshold": flag clients whose cosine similarity is below params.threshold
-  {{"threshold": <float>}}
-- "multi_krum": robust baseline defense. Flags clients whose Krum distance score (distance to nearest neighbors) exceeds the median by a multiplier.
-  {{"threshold": <float>}} (default 1.5)
-- "dnc": Divide-and-Conquer. Extremely effective against sophisticated coordinated attacks like 'A Little Is Enough'. Flags clients with large principal component projections (Z-score threshold).
-  {{"threshold": <float>}} (default 2.0)
+IMPORTANT: All defense methods use FULLY ADAPTIVE thresholds computed from the
+data distribution of the current round. You control a SINGLE parameter:
+  - sensitivity (float, default=2.0): z-score multiplier for the adaptive
+    threshold. Higher values = more lenient (fewer flags). Lower values = more
+    aggressive (more flags). Range: typically 0.5 to 5.0.
+    The actual threshold is always: median ± sensitivity × MAD.
 
-Be strategic. If an attack passed through, tighten thresholds or change method.
-But be careful not to over-tighten and flag honest clients.
-If all_clients_flagged is true, you MUST loosen your thresholds — the round
-was skipped entirely because every client looked suspicious to your strategy."""
+Available methods (all adaptive — no hardcoded thresholds):
+
+1. "norm_threshold" (Sun et al. 2019, "Can You Really Backdoor FL?")
+   Flags clients whose L2 norm > median(norms) + sensitivity × MAD(norms).
+   Good general-purpose defense against scaling and noise attacks.
+   {{"sensitivity": <float>}}
+
+2. "dnc" (Shejwalkar & Houmansadr, NDSS 2021, "Manipulating the Byzantine")
+   Spectral analysis via SVD. Projects centered updates onto top singular
+   vector; flags clients with high squared projection (outlier score).
+   Threshold: median(scores) + sensitivity × MAD(scores).
+   Extremely effective against sophisticated, coordinated attacks.
+   {{"sensitivity": <float>}}
+
+3. "fltrust" (Cao et al., NDSS 2021, "FLTrust: Byzantine-robust FL")
+   Trust bootstrapping. Computes ReLU(cosine_similarity) trust score for
+   each client vs. the server reference update. Flags clients whose trust
+   score is anomalously LOW: threshold = median(TS) - sensitivity × MAD(TS).
+   Also performs trust-weighted aggregation (low-trust clients get less weight).
+   Best when attacker diverges in direction from honest updates.
+   {{"sensitivity": <float>}}
+
+4. "foolsgold" (Fung et al., RAID 2020, "Limitations of FL in Sybil Settings")
+   Sybil-resistant scoring. Computes max pairwise cosine similarity for
+   each client, applies logit transformation. Flags clients with anomalously
+   LOW FoolsGold weight (high similarity to others = penalized).
+   Threshold: median(weights) - sensitivity × MAD(weights).
+   Best against coordinated/Sybil attacks where multiple malicious clients
+   send similar updates.
+   {{"sensitivity": <float>}}
+
+5. "flame" (Nguyen et al., USENIX Security 2022, "FLAME: Taming Backdoors")
+   Clustering-based defense. Uses HDBSCAN on cosine distances to cluster
+   updates; flags clients NOT in the majority cluster. The sensitivity
+   parameter affects the clustering cut threshold in the fallback mode.
+   Best against backdoor attacks and when attackers form a distinct cluster.
+   {{"sensitivity": <float>}}
+
+STRATEGY GUIDANCE:
+- Start with "norm_threshold" (sensitivity=2.0) as a solid baseline.
+- If a scaling/noise attack passes through, try "dnc" (catches spectral outliers).
+- If an attacker manipulates direction subtly, try "fltrust" (direction-aware).
+- If you suspect multiple coordinated attackers, try "foolsgold".
+- If you suspect backdoor attacks, try "flame" (clustering-based).
+- To tighten detection: DECREASE sensitivity (e.g. 1.0).
+- To loosen detection (if too many flagged): INCREASE sensitivity (e.g. 3.0-5.0).
+- If all_clients_flagged is true, you MUST increase sensitivity significantly
+  (e.g. double it or use 4.0+) — the round was skipped because your threshold
+  was too strict."""
 
 
 class DefenderAgent:
@@ -74,7 +119,7 @@ class DefenderAgent:
         initial = config.get("initial_strategy", {})
         self.current_strategy = {
             "method": initial.get("method", "norm_threshold"),
-            "params": {"threshold": initial.get("threshold", 2.0)},
+            "params": {"sensitivity": initial.get("sensitivity", 2.0)},
             "reasoning": "initial default",
         }
         self.memory = VectorStore(
@@ -146,6 +191,7 @@ class DefenderAgent:
         user_msg = json.dumps({
             "update_features": context.get("update_features"),
             "attack_passed_through": context.get("attack_passed_through"),
+            "all_clients_flagged": context.get("all_clients_flagged"),
             "recent_history": self.history[-5:],
             "similar_past_experiences": similar,
         }, default=str)
@@ -153,13 +199,19 @@ class DefenderAgent:
         result = self.llm.call(SYSTEM_PROMPT, user_msg)
 
         if not result or "method" not in result:
-            logger.warning("Defender LLM returned invalid response — tightening default threshold")
-            current_thresh = self.current_strategy.get("params", {}).get("threshold", 2.0)
+            logger.warning("Defender LLM returned invalid response — tightening sensitivity")
+            current_sensitivity = self.current_strategy.get("params", {}).get("sensitivity", 2.0)
             return {
                 "method": "norm_threshold",
-                "params": {"threshold": current_thresh * 0.8},
-                "reasoning": "fallback: tightened threshold",
+                "params": {"sensitivity": max(0.5, current_sensitivity * 0.8)},
+                "reasoning": "fallback: tightened sensitivity",
             }
+
+        # Ensure the params dict always has a sensitivity key
+        if "params" not in result:
+            result["params"] = {}
+        if "sensitivity" not in result["params"]:
+            result["params"]["sensitivity"] = 2.0
 
         logger.info(f"Defender chose: {result.get('method')} — {result.get('reasoning', '')}")
         return result

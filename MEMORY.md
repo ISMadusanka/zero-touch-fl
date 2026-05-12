@@ -29,8 +29,8 @@ A sliding window of the **last 5 round outcomes** from `self.history[-5:]`, prov
 {
     "round":    int,          # Global round number
     "strategy": {
-        "method":    str,     # "norm_threshold" | "cosine_threshold" | "combined"
-        "params":    dict,    # e.g. {"threshold": 2.0} or {"norm_threshold": 1.5, "cosine_threshold": 0.6}
+        "method":    str,     # "norm_threshold" | "dnc" | "fltrust" | "foolsgold" | "flame"
+        "params":    dict,    # e.g. {"sensitivity": 2.0}
         "reasoning": str      # LLM's explanation
     },
     "attack_passed_through": bool,  # True if attacker evaded detection (defense failed)
@@ -39,7 +39,7 @@ A sliding window of the **last 5 round outcomes** from `self.history[-5:]`, prov
             "client_id":  int,
             "suspicious": bool,
             "confidence": float,    # 0.0–1.0
-            "reason":     str       # e.g. "norm_ratio=2.5>2.0"
+            "reason":     str       # e.g. "norm=5.1234, threshold=3.4567 (median=2.0 + 2.0×MAD=0.7)"
         }
     ]
 }
@@ -88,8 +88,8 @@ Defender Agent — stored parameters per entry:
 {
     "round":    int,          # Global round number
     "strategy": {
-        "method":    str,     # "norm_threshold" | "cosine_threshold" | "combined"
-        "params":    dict,    # e.g. {"threshold": 2.0}
+        "method":    str,     # "norm_threshold" | "dnc" | "fltrust" | "foolsgold" | "flame"
+        "params":    dict,    # e.g. {"sensitivity": 2.0}
         "reasoning": str      # LLM's explanation for choosing this defense
     },
     "attack_passed_through": bool,  # Whether the attacker evaded detection
@@ -98,7 +98,7 @@ Defender Agent — stored parameters per entry:
             "client_id":  int,
             "suspicious": bool,
             "confidence": float,    # 0.0–1.0
-            "reason":     str       # e.g. "norm_ratio=2.5>2.0"
+            "reason":     str       # e.g. "dnc_score=4.56, threshold=2.34 (median=1.2 + 2.0×MAD=0.57)"
         }
     ]
 }

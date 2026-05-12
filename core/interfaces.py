@@ -18,7 +18,8 @@ class BaseDetector(ABC):
 
     @abstractmethod
     def analyze(
-        self, updates: list[ModelUpdate], global_weights: dict
+        self, updates: list[ModelUpdate], global_weights: dict,
+        strategy: dict | None = None,
     ) -> list[DetectionVerdict]:
         """Analyze all client updates. Returns one verdict per client."""
         ...
@@ -29,7 +30,8 @@ class BaseAggregator(ABC):
 
     @abstractmethod
     def aggregate(
-        self, updates: list[ModelUpdate], verdicts: list[DetectionVerdict]
+        self, updates: list[ModelUpdate], verdicts: list[DetectionVerdict],
+        strategy: dict | None = None,
     ) -> dict:
         """Aggregate non-suspicious updates into a new global state_dict."""
         ...
