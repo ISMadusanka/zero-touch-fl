@@ -24,7 +24,7 @@ import yaml
 from data.mnist_loader import get_data_loaders
 from model.mnist_net import MnistNet, count_parameters
 from clients.benign_client import BenignClient
-from clients.malicious_client import MaliciousClient
+
 from server.fed_server import FedServer
 from server.aggregation import FedAvgAggregator
 from detector.anomaly_detector import AnomalyDetector
@@ -178,7 +178,6 @@ def run_simulation(
     detector = AnomalyDetector()
     attacker_agent = AttackerAgent(attacker_config)
     defender_agent = DefenderAgent(defender_config)
-    malicious_client = MaliciousClient(client_id=malicious_id)
 
     # State tracking
     last_attack_detected = None    # None on first round
@@ -195,17 +194,20 @@ def run_simulation(
         current_global = server.get_global_weights()
 
         # ------------------------------------------------------------------
-        # Step 1: Attacker decides strategy
+        # Step 1: Attacker sends raw weights to LLM for autonomous poisoning
         # ------------------------------------------------------------------
         attacker_context = {
             "baseline_accuracy": baseline_accuracy,
             "current_accuracy": current_accuracy,
             "was_detected": last_attack_detected,
         }
-        attack_strategy = attacker_agent.decide(attacker_context)
-        attack_name = attack_strategy.get("attack_type", "sign_flip")
-        attack_params = attack_strategy.get("params", {})
-        logger.info(f"Attacker strategy: {attack_name} with params={attack_params}")
+        attack_strategy = attacker_agent.decide(
+            attacker_context,
+            client_weights=client_weights[malicious_id],
+            global_weights=current_global,
+        )
+        attack_reasoning = attack_strategy.get("reasoning", "")
+        logger.info(f"Attacker strategy: LLM autonomous — {attack_reasoning}")
 
         # ------------------------------------------------------------------
         # Step 2: Build all client updates
@@ -215,14 +217,14 @@ def run_simulation(
         updates = []
         for cid in range(fl["n_clients"]):
             if cid == malicious_id:
-                # Poisoned update
-                update = malicious_client.poison(
-                    saved_weights=client_weights[cid],
-                    global_weights=current_global,
-                    attack_name=attack_name,
-                    attack_params=attack_params,
+                # Use LLM-modified weights directly
+                poisoned_weights = attack_strategy["modified_weights"]
+                update = ModelUpdate(
+                    client_id=cid,
+                    weights=poisoned_weights,
+                    metadata={"attack": "llm_autonomous", "reasoning": attack_reasoning},
                 )
-                logger.info(f"  Client {cid}: POISONED ({attack_name})")
+                logger.info(f"  Client {cid}: POISONED (LLM autonomous)")
             else:
                 # Honest update (from saved Phase 1 weights)
                 update = ModelUpdate(client_id=cid, weights=copy.deepcopy(client_weights[cid]))
@@ -300,7 +302,7 @@ def run_simulation(
         # ------------------------------------------------------------------
         round_log = RoundLog(
             round_num=round_num,
-            attack_strategy={"type": attack_name, "params": attack_params, "reasoning": attack_strategy.get("reasoning", "")},
+            attack_strategy={"type": "llm_autonomous", "reasoning": attack_reasoning},
             defend_strategy=defend_strategy,
             verdicts=[
                 {"client_id": v.client_id, "suspicious": v.is_suspicious, "confidence": v.confidence, "reason": v.reason}

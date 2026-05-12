@@ -105,7 +105,7 @@ class OllamaLLMClient(BaseLLMClient):
                     "stream": False,
                     "options": {"temperature": self.temperature},
                 },
-                timeout=120,
+                timeout=300,
             )
             resp.raise_for_status()
 
@@ -128,6 +128,9 @@ class OllamaLLMClient(BaseLLMClient):
 
         Ollama models may wrap the JSON in markdown fences or include
         chain-of-thought text before the actual object.
+
+        Uses brace-counting to correctly handle nested JSON structures
+        (e.g. weight dicts containing nested arrays/objects).
         """
         # Try direct parse first
         try:
@@ -135,21 +138,30 @@ class OllamaLLMClient(BaseLLMClient):
         except json.JSONDecodeError:
             pass
 
-        # Try extracting from markdown code fences
-        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        # Try extracting from markdown code fences (greedy to capture nested braces)
+        fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
         if fence_match:
             try:
                 return json.loads(fence_match.group(1))
             except json.JSONDecodeError:
                 pass
 
-        # Try finding the first { ... } block
-        brace_match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
-        if brace_match:
-            try:
-                return json.loads(brace_match.group(0))
-            except json.JSONDecodeError:
-                pass
+        # Brace-counting: find the outermost { ... } block
+        start = text.find("{")
+        if start != -1:
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start : i + 1]
+                        try:
+                            return json.loads(candidate)
+                        except json.JSONDecodeError:
+                            pass
+                        break
 
         logger.warning("Could not extract valid JSON from Ollama response")
         return {}
