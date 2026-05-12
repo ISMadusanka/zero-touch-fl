@@ -282,10 +282,11 @@ def run_simulation(
         malicious_update = updates[malicious_id]
         attack_metadata = malicious_update.metadata.get("attack_metadata", {})
         if attack_metadata:
+            layer_info = attack_metadata.get("flipped_per_layer", attack_metadata.get("affected_per_layer", {}))
             logger.info(
                 f"Attack metadata: k={attack_metadata.get('k', 'N/A')}, "
                 f"total_params={attack_metadata.get('total_params', '?')}, "
-                f"layers_affected={list(attack_metadata.get('flipped_per_layer', {}).keys())}"
+                f"layers_affected={list(layer_info.keys())}"
             )
 
         attacker_agent.record_outcome(

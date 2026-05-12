@@ -37,17 +37,18 @@ Respond with ONLY a JSON object:
 }}
 
 Attack parameter ranges:
-- sign_flip: {{"c": 1.0 to 4.0, "k": 10 to total_params}}  (c = scaling factor, k = number of weights to flip; omit k to flip all)
-- noise_injection: {{"scale": 0.1 to 10.0}}
-- scaling: {{"factor": 1.5 to 100.0}}
+- sign_flip: {{"c": 1.0 to 4.0, "k": 10 to total_params}}  (c = scaling factor, k = weights to flip; omit k to flip all)
+- noise_injection: {{"scale": 0.1 to 10.0, "k": 10 to total_params}}  (scale = noise std dev, k = weights to noise; omit k to noise all)
+- scaling: {{"factor": 1.5 to 100.0, "k": 10 to total_params}}  (factor = delta multiplier, k = weights to scale; omit k to scale all)
 - gaussian_noise: {{"sigma": 0.1 to 10.0}}
 
-For sign_flip with k: only the top-k weights (by gradient magnitude) are flipped.
+For sign_flip, noise_injection, and scaling: the optional k parameter selects only
+the top-k weights (by gradient magnitude) to attack. The rest stay honest.
 Smaller k = stealthier but weaker. Past attack_metadata shows which layers were
-targeted and gradient statistics — use this to refine your k and c choices.
+targeted and gradient magnitude statistics — use this to refine your choices.
 
-Be strategic. If you were detected, try a subtler approach. If your attack was
-too subtle (accuracy didn't drop), be more aggressive."""
+Be strategic. If you were detected, try a subtler approach (lower params, smaller k).
+If your attack was too subtle (accuracy didn't drop), be more aggressive."""
 
 
 class AttackerAgent:
@@ -116,10 +117,11 @@ class AttackerAgent:
         }
         if attack_metadata:
             entry["attack_metadata"] = attack_metadata
+            layer_info = attack_metadata.get("flipped_per_layer", attack_metadata.get("affected_per_layer", {}))
             logger.info(
                 f"Attacker memory: storing attack_metadata for round {round_num} "
                 f"(k={attack_metadata.get('k', 'N/A')}, "
-                f"flipped_layers={list(attack_metadata.get('flipped_per_layer', {}).keys())})"
+                f"targeted_layers={list(layer_info.keys())})"
             )
 
         self.history.append(entry)

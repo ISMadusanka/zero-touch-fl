@@ -21,16 +21,18 @@ A sliding window of the **last 5 round outcomes** from `self.history[-5:]`, prov
     "was_detected":   bool,   # True if defender caught this attack
     "accuracy_after": float,  # Global model accuracy after this round
     "attack_metadata": {      # Optional — present when attack provides metadata
-        "k":           int|str,  # Number of flipped weights, or "all"
+        "k":           int|str,  # Number of targeted weights, or "all"
         "total_params": int,     # Total model parameters
-        "flipped_per_layer": {   # Count of flipped weights per layer
+        # sign_flip uses flipped_per_layer / flipped_indices_per_layer
+        # noise_injection & scaling use affected_per_layer / affected_indices_per_layer
+        "flipped_per_layer|affected_per_layer": {  # Count per layer
             "fc1.weight": int, "fc2.bias": int, ...
         },
-        "flipped_indices_per_layer": {  # Exact indices flipped per layer
+        "flipped_indices_per_layer|affected_indices_per_layer": {  # Exact indices
             "fc1.weight": [int, ...], ...
         },
-        "avg_flipped_grad_magnitude":   float,  # Mean |gradient| of flipped weights
-        "avg_unflipped_grad_magnitude": float   # Mean |gradient| of untouched weights
+        "avg_flipped_grad_magnitude|avg_targeted_grad_magnitude":   float,
+        "avg_unflipped_grad_magnitude|avg_untargeted_grad_magnitude": float
     }
 }
 ```
@@ -93,12 +95,14 @@ Attacker Agent — stored parameters per entry:
     "was_detected":   bool,   # Whether the defender caught this attack
     "accuracy_after": float,  # Model accuracy after this round
     "attack_metadata": {      # Optional — present when attack provides metadata
-        "k":           int|str,  # Number of flipped weights, or "all"
+        "k":           int|str,  # Number of targeted weights, or "all"
         "total_params": int,
-        "flipped_per_layer":          dict,  # {layer_name: count}
-        "flipped_indices_per_layer":  dict,  # {layer_name: [indices]}
-        "avg_flipped_grad_magnitude":   float,
-        "avg_unflipped_grad_magnitude": float
+        # sign_flip: flipped_per_layer / flipped_indices_per_layer
+        # noise_injection & scaling: affected_per_layer / affected_indices_per_layer
+        "*_per_layer":          dict,  # {layer_name: count}
+        "*_indices_per_layer":  dict,  # {layer_name: [indices]}
+        "avg_*_grad_magnitude":   float,  # targeted weights
+        "avg_*_grad_magnitude":   float   # untargeted weights
     }
 }
 ```

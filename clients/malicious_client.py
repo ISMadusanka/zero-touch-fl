@@ -30,10 +30,11 @@ class MaliciousClient:
         # Capture attack-specific metadata (e.g. flipped indices from sign_flip)
         attack_metadata = getattr(attack, "last_metadata", {})
         if attack_metadata:
+            layer_info = attack_metadata.get("flipped_per_layer", attack_metadata.get("affected_per_layer", {}))
             logger.info(
                 f"  Client {self.client_id}: attack_metadata captured — "
                 f"k={attack_metadata.get('k', 'N/A')}, "
-                f"layers={list(attack_metadata.get('flipped_per_layer', {}).keys())}"
+                f"layers={list(layer_info.keys())}"
             )
 
         return ModelUpdate(
