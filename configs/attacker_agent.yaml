@@ -9,6 +9,7 @@ available_attacks:
   - sign_flip
   - noise_injection
   - scaling
+  - gaussian_noise
 
 memory:
   persist_path: "checkpoints/attacker_memory"

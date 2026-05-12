@@ -94,7 +94,7 @@ core/          Shared types & interfaces (zero business logic)
 model/         Tiny MLP (~805 params)
 data/          MNIST loading & partitioning
 clients/       Benign and malicious client implementations
-attacks/       Model poisoning plugins (sign_flip, noise, scaling)
+attacks/       Model poisoning plugins (sign_flip, noise, scaling, gaussian_noise)
 agents/        LLM-powered attacker & defender agents
   llm_client.py  ← Backend-agnostic LLM abstraction (OpenAI / Ollama)
 detector/      Statistical anomaly detection
