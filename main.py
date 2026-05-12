@@ -19,7 +19,10 @@ import os
 import sys
 
 import yaml
-# import torch
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 from data.mnist_loader import get_data_loaders
 from model.mnist_net import MnistNet, count_parameters
@@ -27,7 +30,8 @@ from clients.benign_client import BenignClient
 from clients.malicious_client import MaliciousClient
 from server.fed_server import FedServer
 from server.aggregation import FedAvgAggregator
-from detector.anomaly_detector import AnomalyDetector
+from detector.layered_detector import LayeredDetector
+from detector.explainability import ExplainabilityEngine
 from agents.attacker_agent import AttackerAgent
 from agents.defender_agent import DefenderAgent
 from storage.checkpoint import save_state, load_state, state_exists
@@ -175,7 +179,8 @@ def run_simulation(
     server = FedServer(device=fl["device"])
     server.set_global_weights(copy.deepcopy(global_weights))
     aggregator = FedAvgAggregator()
-    detector = AnomalyDetector()
+    detector = LayeredDetector(device=fl["device"])
+    explainer = ExplainabilityEngine()
     attacker_agent = AttackerAgent(attacker_config)
     defender_agent = DefenderAgent(defender_config)
     malicious_client = MaliciousClient(client_id=malicious_id)
@@ -232,19 +237,78 @@ def run_simulation(
         # ------------------------------------------------------------------
         # Step 3: Defender decides strategy
         # ------------------------------------------------------------------
-        update_features = detector.get_features(updates, current_global)
+        # Layered Feature Extraction
+        layered_features = detector.get_features(updates, current_global)
+        
+        # XGBoost + SHAP Explainability
+        threat_reports = {}
+        for cid_key, features in layered_features.items():
+            threat_reports[cid_key] = explainer.explain(features)
+            
+        acc_drop = False
+        if round_num > 1 and current_accuracy is not None:
+             # Accuracy drop heuristic: check if current accuracy is significantly lower than baseline
+             acc_drop = current_accuracy < (baseline_accuracy - 0.05)
+
         defender_context = {
-            "update_features": update_features,
+            "threat_reports": threat_reports,
             "attack_passed_through": last_attack_passed,
             "all_clients_flagged": last_all_clients_flagged,
+            "accuracy_dropped": acc_drop,
+            "round_num": round_num,
         }
         defend_strategy = defender_agent.decide(defender_context)
         logger.info(f"Defender strategy: {defend_strategy.get('method')} with params={defend_strategy.get('params')}")
 
         # ------------------------------------------------------------------
-        # Step 4: Anomaly detection
+        # Step 4: Layered Anomaly detection
         # ------------------------------------------------------------------
-        verdicts = detector.analyze(updates, current_global, defend_strategy)
+        from core.types import DetectionVerdict
+        verdicts = []
+        params = defend_strategy.get("params", {})
+        
+        # Thresholds from LLM
+        t_trust = params.get("fl_trust_threshold", 0.15)
+        t_cluster = params.get("cluster_threshold", 2.0)
+        t_clip = params.get("clipping_threshold", 1.5)
+        t_trim = params.get("trim_threshold", 3.0)
+        t_xgb = params.get("xgboost_risk_threshold", 0.5)
+
+        for cid in range(fl["n_clients"]):
+            cid_key = f"client_{cid}"
+            feat = layered_features[cid_key]
+            report = threat_reports[cid_key]
+            
+            # Multi-layer violation check
+            is_suspicious = False
+            reasons = []
+            
+            if feat["layer_1_fl_trust"] < t_trust:
+                is_suspicious = True
+                reasons.append(f"FLTrust({feat['layer_1_fl_trust']:.2f}) < {t_trust}")
+            if feat["layer_2_cluster"] > t_cluster:
+                is_suspicious = True
+                reasons.append(f"Cluster({feat['layer_2_cluster']:.2f}) > {t_cluster}")
+            if feat["layer_3_clipping"] > t_clip:
+                is_suspicious = True
+                reasons.append(f"Clipping({feat['layer_3_clipping']:.2f}) > {t_clip}")
+            if feat["layer_4_is_trimmed"] > t_trim:
+                is_suspicious = True
+                reasons.append(f"Trim({feat['layer_4_is_trimmed']:.2f}) > {t_trim}")
+            if report.get("risk_score", 0) > t_xgb:
+                is_suspicious = True
+                reasons.append(f"XGBoost({report.get('risk_score', 0):.2f}) > {t_xgb}")
+
+            verdicts.append(DetectionVerdict(
+                client_id=cid,
+                is_suspicious=is_suspicious,
+                confidence=report.get("risk_score", 0.5) if is_suspicious else 0.0,
+                reason="; ".join(reasons) if is_suspicious else "Clean"
+            ))
+            if is_suspicious:
+                logger.warning(f"  Client {cid} FLAGGED: {'; '.join(reasons)}")
+            else:
+                logger.info(f"  Client {cid}: OK")
 
         # Check if the malicious client was detected
         malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)
@@ -313,6 +377,8 @@ def run_simulation(
             defender_adapted=last_attack_passed is True,      # adapted this round because failed last round
             all_clients_flagged=all_clients_flagged,
             round_skipped=new_weights is None,
+            layered_features=layered_features,
+            threat_reports=threat_reports,
         )
         _save_round_log(round_log)
 
@@ -342,6 +408,8 @@ def _save_round_log(log: RoundLog):
         "defender_adapted": log.defender_adapted,
         "all_clients_flagged": log.all_clients_flagged,
         "round_skipped": log.round_skipped,
+        "layered_features": log.layered_features,
+        "threat_reports": log.threat_reports,
     }
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)

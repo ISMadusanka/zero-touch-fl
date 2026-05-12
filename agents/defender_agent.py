@@ -16,38 +16,36 @@ from storage.vector_store import VectorStore
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a defensive agent in a federated learning system.
-Your goal: detect model poisoning attacks in client weight updates while
-minimizing false positives (rejecting honest clients).
+Your goal: detect model poisoning attacks using a 4-layer layered defense pipeline and XGBoost classification.
 
-You receive statistical features of all client updates:
-- l2_norms: L2 norm of each client's weight delta
-- cosine_similarities: cosine similarity of each update with the global model
-- pairwise_distances: average pairwise L2 distance between updates
-- history: past detection outcomes
-- similar_past_experiences: relevant past episodes from memory
-- all_clients_flagged: if True, your last thresholds were TOO STRICT and
-  flagged every single client — the entire round was SKIPPED to protect
-  the model. You MUST loosen your thresholds significantly to avoid this.
+Layers of Defense:
+1. FLTrust (Cosine similarity with a root update): Measures directional alignment.
+2. PCA + K-Means: Detects statistical clusters that deviate from the benign majority.
+3. L2 Norm Clipping: Bounds the influence of any single update.
+4. Trimmed Mean: Filters out extreme statistical outliers.
+
+Contextual Inputs:
+- Threat Reasoning Report: Detailed XGBoost risk scores and SHAP explainability per client.
+- recent_history (Short-term): Outcomes of the last 5 rounds. Use this to detect persistent or evolving attack patterns.
+- similar_past_experiences (Long-term): Relevant historical episodes from your vector memory. Use these to apply lessons learned from past successful or failed defenses.
 
 You must output a detection strategy as JSON:
-{{
-    "method": "<detection method>",
-    "params": {{<method-specific thresholds>}},
-    "reasoning": "<brief explanation>"
-}}
+{
+    "method": "layered_threshold",
+    "params": {
+        "fl_trust_threshold": <float, default 0.15>,
+        "cluster_threshold": <float, default 2.0>,
+        "clipping_threshold": <float, default 1.5>,
+        "trim_threshold": <float, default 3.0>,
+        "xgboost_risk_threshold": <float, default 0.5>
+    },
+    "reasoning": "<detailed explanation of your threshold choices based on threat reports and history>"
+}
 
-Available methods:
-- "norm_threshold": flag clients whose update L2 norm exceeds params.threshold
-  {{"threshold": <float>}}
-- "cosine_threshold": flag clients whose cosine similarity is below params.threshold
-  {{"threshold": <float>}}
-- "combined": use both norm AND cosine checks
-  {{"norm_threshold": <float>, "cosine_threshold": <float>}}
-
-Be strategic. If an attack passed through, tighten thresholds or change method.
-But be careful not to over-tighten and flag honest clients.
-If all_clients_flagged is true, you MUST loosen your thresholds — the round
-was skipped entirely because every client looked suspicious to your strategy."""
+Adaptive Strategy:
+- If an attack PASSED THROUGH: Your thresholds were TOO LOOSE. Identify which layer's report showed suspicious signals and tighten that specific threshold.
+- If ALL CLIENTS WERE FLAGGED: Your thresholds were TOO STRICT (round was skipped). Loosen thresholds across the board to allow honest participation.
+- Use history to recognize "stealthy" attackers that slowly increase their magnitude over rounds."""
 
 
 class DefenderAgent:
@@ -71,8 +69,14 @@ class DefenderAgent:
         )
         initial = config.get("initial_strategy", {})
         self.current_strategy = {
-            "method": initial.get("method", "norm_threshold"),
-            "params": {"threshold": initial.get("threshold", 2.0)},
+            "method": initial.get("method", "layered_threshold"),
+            "params": {
+                "fl_trust_threshold": initial.get("fl_trust_threshold", 0.15),
+                "cluster_threshold": initial.get("cluster_threshold", 2.0),
+                "clipping_threshold": initial.get("clipping_threshold", 1.5),
+                "trim_threshold": initial.get("trim_threshold", 3.0),
+                "xgboost_risk_threshold": initial.get("xgboost_risk_threshold", 0.5)
+            },
             "reasoning": "initial default",
         }
         self.memory = VectorStore(
@@ -83,36 +87,24 @@ class DefenderAgent:
 
     def decide(self, context: dict) -> dict:
         """Decide detection strategy for this round.
-
-        Invokes the LLM if:
-        - The last defense failed (attack passed through), OR
-        - All clients were flagged last round (thresholds too strict).
+        
+        Strictly reactive logic:
+        - Consults LLM only if the last attack passed or all clients were flagged.
         """
         attack_passed = context.get("attack_passed_through")
         all_flagged = context.get("all_clients_flagged")
 
         # First round uses initial strategy
         if attack_passed is None:
-            logger.info("Defender: first round — using initial strategy")
             return self.current_strategy
 
-        # All clients were flagged → thresholds too strict, must adapt
-        if all_flagged:
-            logger.info(
-                "Defender: ALL clients were flagged last round (round was skipped) "
-                "— consulting LLM to loosen thresholds"
-            )
+        # Only adapt if defense failed or system locked up
+        if attack_passed or all_flagged:
+            logger.info("Defender: Adaptation required (failure or lock-up) — consulting LLM")
             self.current_strategy = self._ask_llm(context)
-            return self.current_strategy
-
-        # Defense succeeded → keep strategy
-        if not attack_passed:
-            logger.info("Defender: last defense succeeded — keeping strategy")
-            return self.current_strategy
-
-        # Defense failed → adapt
-        logger.info("Defender: attack PASSED THROUGH — consulting LLM for new strategy")
-        self.current_strategy = self._ask_llm(context)
+        else:
+            logger.info("Defender: Defense stable — keeping current thresholds")
+            
         return self.current_strategy
 
     def record_outcome(
@@ -142,7 +134,7 @@ class DefenderAgent:
             similar = []
 
         user_msg = json.dumps({
-            "update_features": context.get("update_features"),
+            "threat_reports": context.get("threat_reports"),
             "attack_passed_through": context.get("attack_passed_through"),
             "recent_history": self.history[-5:],
             "similar_past_experiences": similar,
@@ -151,12 +143,17 @@ class DefenderAgent:
         result = self.llm.call(SYSTEM_PROMPT, user_msg)
 
         if not result or "method" not in result:
-            logger.warning("Defender LLM returned invalid response — tightening default threshold")
-            current_thresh = self.current_strategy.get("params", {}).get("threshold", 2.0)
+            logger.warning("Defender LLM returned invalid response — loosening default thresholds")
             return {
-                "method": "norm_threshold",
-                "params": {"threshold": current_thresh * 0.8},
-                "reasoning": "fallback: tightened threshold",
+                "method": "layered_threshold",
+                "params": {
+                    "fl_trust_threshold": 0.1,
+                    "cluster_threshold": 3.0,
+                    "clipping_threshold": 2.0,
+                    "trim_threshold": 4.0,
+                    "xgboost_risk_threshold": 0.7
+                },
+                "reasoning": "fallback: loosened thresholds",
             }
 
         logger.info(f"Defender chose: {result.get('method')} — {result.get('reasoning', '')}")
