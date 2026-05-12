@@ -76,16 +76,42 @@ class AnomalyDetector(BaseDetector):
             ).item()
             cosines.append(cos)
 
-        # Pairwise distances
-        pairwise = []
-        for i in range(len(deltas)):
-            for j in range(i + 1, len(deltas)):
-                pairwise.append((deltas[i] - deltas[j]).norm().item())
+        # Pairwise distances and Multi-Krum scores
+        n = len(deltas)
+        pairwise_matrix = torch.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = (deltas[i] - deltas[j]).norm().item()
+                pairwise_matrix[i, j] = dist
+                pairwise_matrix[j, i] = dist
+
+        # Krum selects n - f - 2 closest neighbors (assume f=20% max attackers)
+        f = max(1, int(n * 0.2))
+        k = max(1, n - f - 2)
+        krum_scores = []
+        for i in range(n):
+            sorted_dists = torch.sort(pairwise_matrix[i]).values
+            # Ignore self (distance 0 at index 0), sum the next k distances
+            score = sorted_dists[1:k+1].sum().item()
+            krum_scores.append(score)
+
+        # DnC Scores (Spectral Analysis)
+        centered = torch.stack(deltas) - mean_delta
+        try:
+            # Compute SVD to find the principal component (direction of max variance)
+            _, _, Vh = torch.linalg.svd(centered, full_matrices=False)
+            top_v = Vh[0] 
+            dnc_scores = [(c_i @ top_v).item() ** 2 for c_i in centered]
+        except Exception as e:
+            logger.error(f"SVD failed for DnC: {e}")
+            dnc_scores = [0.0] * n
 
         return {
             "l2_norms": norms,
             "cosine_similarities": cosines,
-            "mean_pairwise_distance": float(np.mean(pairwise)) if pairwise else 0.0,
+            "mean_pairwise_distance": float(pairwise_matrix.sum() / (n * (n-1))) if n > 1 else 0.0,
+            "krum_scores": krum_scores,
+            "dnc_scores": dnc_scores,
             "client_ids": [u.client_id for u in updates],
         }
 
@@ -100,6 +126,14 @@ class AnomalyDetector(BaseDetector):
                 cid: round(c, 4)
                 for cid, c in zip(features["client_ids"], features["cosine_similarities"])
             },
+            "krum_scores": {
+                cid: round(s, 4)
+                for cid, s in zip(features["client_ids"], features.get("krum_scores", []))
+            },
+            "dnc_scores": {
+                cid: round(s, 4)
+                for cid, s in zip(features["client_ids"], features.get("dnc_scores", []))
+            },
             "mean_pairwise_distance": round(features["mean_pairwise_distance"], 4),
         }
 
@@ -110,10 +144,11 @@ class AnomalyDetector(BaseDetector):
         mean_norm = float(np.mean(features["l2_norms"]))
 
         if method == "norm_threshold":
-            threshold = params.get("threshold", 2.0)
-            ratio = norm / (mean_norm + 1e-8)
-            suspicious = ratio > threshold
-            return suspicious, min(ratio / threshold, 1.0), f"norm_ratio={ratio:.3f} vs threshold={threshold}"
+            # Aligned with the equation: uses an absolute threshold (tau) on the L2 norm
+            threshold = params.get("threshold", 10.0)
+            suspicious = norm > threshold
+            confidence = min(norm / threshold, 1.0) if suspicious else 0.0
+            return suspicious, confidence, f"norm={norm:.3f} vs threshold={threshold}"
 
         elif method == "cosine_threshold":
             threshold = params.get("threshold", 0.5)
@@ -121,20 +156,24 @@ class AnomalyDetector(BaseDetector):
             confidence = max(0, 1 - cosine) if suspicious else 0.0
             return suspicious, confidence, f"cosine={cosine:.3f} vs threshold={threshold}"
 
-        elif method == "combined":
-            norm_t = params.get("norm_threshold", 2.0)
-            cos_t = params.get("cosine_threshold", 0.5)
-            ratio = norm / (mean_norm + 1e-8)
-            norm_flag = ratio > norm_t
-            cos_flag = cosine < cos_t
-            suspicious = norm_flag or cos_flag
-            confidence = max(ratio / norm_t, (1 - cosine) if cos_flag else 0)
-            reasons = []
-            if norm_flag:
-                reasons.append(f"norm_ratio={ratio:.3f}>{norm_t}")
-            if cos_flag:
-                reasons.append(f"cosine={cosine:.3f}<{cos_t}")
-            return suspicious, min(confidence, 1.0), "; ".join(reasons) or "clean"
+        elif method == "multi_krum":
+            krum_score = features["krum_scores"][idx]
+            median_krum = float(np.median(features["krum_scores"]))
+            threshold_multiplier = params.get("threshold", 1.5)
+            threshold = median_krum * threshold_multiplier
+            suspicious = krum_score > threshold
+            confidence = min(krum_score / (threshold + 1e-8), 1.0) if suspicious else 0.0
+            return suspicious, confidence, f"krum_score={krum_score:.3f} vs threshold={threshold:.3f}"
+
+        elif method == "dnc":
+            dnc_score = features["dnc_scores"][idx]
+            mean_dnc = float(np.mean(features["dnc_scores"]))
+            std_dnc = float(np.std(features["dnc_scores"]))
+            threshold_z = params.get("threshold", 2.0)
+            threshold = mean_dnc + threshold_z * std_dnc
+            suspicious = dnc_score > threshold
+            confidence = min(dnc_score / (threshold + 1e-8), 1.0) if suspicious else 0.0
+            return suspicious, confidence, f"dnc_score={dnc_score:.3f} vs threshold={threshold:.3f}"
 
         else:
             logger.warning(f"Unknown method '{method}' — defaulting to norm_threshold")

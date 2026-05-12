@@ -41,8 +41,10 @@ Available methods:
   {{"threshold": <float>}}
 - "cosine_threshold": flag clients whose cosine similarity is below params.threshold
   {{"threshold": <float>}}
-- "combined": use both norm AND cosine checks
-  {{"norm_threshold": <float>, "cosine_threshold": <float>}}
+- "multi_krum": robust baseline defense. Flags clients whose Krum distance score (distance to nearest neighbors) exceeds the median by a multiplier.
+  {{"threshold": <float>}} (default 1.5)
+- "dnc": Divide-and-Conquer. Extremely effective against sophisticated coordinated attacks like 'A Little Is Enough'. Flags clients with large principal component projections (Z-score threshold).
+  {{"threshold": <float>}} (default 2.0)
 
 Be strategic. If an attack passed through, tighten thresholds or change method.
 But be careful not to over-tighten and flag honest clients.
