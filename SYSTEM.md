@@ -55,5 +55,16 @@ The LLM is also given the top 3 most similar past rounds retrieved from the FAIS
 
 
 
+# Defend strategies
+
+# Defense Strategies
+
+| Scenario | Attacker Feedback | Defender Feedback | Gap? |
+|---|---|---|---|
+| Defender flags wrong client only | ✅ `was_detected=False` → keep strategy | ✅ `attack_passed=True` → adapt | No |
+| Defender flags real attacker only | ✅ `was_detected=True` → adapt | ✅ `attack_passed=False` → keep strategy | No |
+| Defender flags real attacker + innocents | ✅ `was_detected=True` → adapt | ⚠️ `attack_passed=False` → keep strategy | YES — defender keeps an over-aggressive strategy that harms model quality |
+| Defender flags nobody | ✅ `was_detected=False` → keep strategy | ✅ `attack_passed=True` → adapt | No |
+
 # client flaggiings by defend agent
 how to flag it, what should we do rather than all client aggregation if all clients are flaged 

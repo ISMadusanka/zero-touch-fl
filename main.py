@@ -78,6 +78,7 @@ def run_training_phase(config: dict):
         n_clients=fl["n_clients"],
         batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
+        iid=data_cfg.get("iid", True),
     )
 
     # Log data sizes
@@ -182,6 +183,7 @@ def run_simulation(
     # State tracking
     last_attack_detected = None    # None on first round
     last_attack_passed = None      # None on first round
+    last_all_clients_flagged = None  # None on first round
     current_accuracy = baseline_accuracy
 
     for sim_round in range(1, fl["simulation_rounds"] + 1):
@@ -234,6 +236,7 @@ def run_simulation(
         defender_context = {
             "update_features": update_features,
             "attack_passed_through": last_attack_passed,
+            "all_clients_flagged": last_all_clients_flagged,
         }
         defend_strategy = defender_agent.decide(defender_context)
         logger.info(f"Defender strategy: {defend_strategy.get('method')} with params={defend_strategy.get('params')}")
@@ -247,14 +250,24 @@ def run_simulation(
         malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)
         attack_detected = malicious_verdict.is_suspicious
         attack_passed = not attack_detected
+        n_flagged = sum(1 for v in verdicts if v.is_suspicious)
+        all_clients_flagged = n_flagged == len(verdicts)
 
         logger.info(f"Detection result: malicious client {'DETECTED' if attack_detected else 'PASSED THROUGH'}")
+        logger.info(f"Detection summary: {n_flagged}/{len(verdicts)} clients flagged")
 
         # ------------------------------------------------------------------
         # Step 5: Aggregation (exclude detected clients)
         # ------------------------------------------------------------------
         new_weights = aggregator.aggregate(updates, verdicts)
-        server.set_global_weights(new_weights)
+
+        if new_weights is None:
+            # All clients flagged → skip round, keep global model unchanged
+            logger.warning(
+                f"Round {round_num}: all clients flagged — global model NOT updated"
+            )
+        else:
+            server.set_global_weights(new_weights)
 
         # ------------------------------------------------------------------
         # Step 6: Evaluate
@@ -275,6 +288,7 @@ def run_simulation(
             round_num=round_num,
             strategy=defend_strategy,
             attack_passed=attack_passed,
+            all_clients_flagged=all_clients_flagged,
             verdicts=[
                 {"client_id": v.client_id, "suspicious": v.is_suspicious, "confidence": v.confidence, "reason": v.reason}
                 for v in verdicts
@@ -297,12 +311,15 @@ def run_simulation(
             attack_detected=attack_detected,
             attacker_adapted=last_attack_detected is True,    # adapted this round because caught last round
             defender_adapted=last_attack_passed is True,      # adapted this round because failed last round
+            all_clients_flagged=all_clients_flagged,
+            round_skipped=new_weights is None,
         )
         _save_round_log(round_log)
 
         # Update state for next round
         last_attack_detected = attack_detected
         last_attack_passed = attack_passed
+        last_all_clients_flagged = all_clients_flagged
 
     logger.info("\n" + "=" * 60)
     logger.info("SIMULATION COMPLETE")
@@ -323,6 +340,8 @@ def _save_round_log(log: RoundLog):
         "attack_detected": log.attack_detected,
         "attacker_adapted": log.attacker_adapted,
         "defender_adapted": log.defender_adapted,
+        "all_clients_flagged": log.all_clients_flagged,
+        "round_skipped": log.round_skipped,
     }
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
@@ -373,6 +392,7 @@ def main():
         n_clients=fl["n_clients"],
         batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
+        iid=data_cfg.get("iid", True),
     )
 
     if state_exists() and not args.fresh:

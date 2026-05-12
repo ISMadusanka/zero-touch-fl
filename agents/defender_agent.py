@@ -25,6 +25,9 @@ You receive statistical features of all client updates:
 - pairwise_distances: average pairwise L2 distance between updates
 - history: past detection outcomes
 - similar_past_experiences: relevant past episodes from memory
+- all_clients_flagged: if True, your last thresholds were TOO STRICT and
+  flagged every single client — the entire round was SKIPPED to protect
+  the model. You MUST loosen your thresholds significantly to avoid this.
 
 You must output a detection strategy as JSON:
 {{
@@ -42,7 +45,9 @@ Available methods:
   {{"norm_threshold": <float>, "cosine_threshold": <float>}}
 
 Be strategic. If an attack passed through, tighten thresholds or change method.
-But be careful not to over-tighten and flag honest clients."""
+But be careful not to over-tighten and flag honest clients.
+If all_clients_flagged is true, you MUST loosen your thresholds — the round
+was skipped entirely because every client looked suspicious to your strategy."""
 
 
 class DefenderAgent:
@@ -79,13 +84,25 @@ class DefenderAgent:
     def decide(self, context: dict) -> dict:
         """Decide detection strategy for this round.
 
-        Only invokes the LLM if the last defense failed (attack passed through).
+        Invokes the LLM if:
+        - The last defense failed (attack passed through), OR
+        - All clients were flagged last round (thresholds too strict).
         """
         attack_passed = context.get("attack_passed_through")
+        all_flagged = context.get("all_clients_flagged")
 
         # First round uses initial strategy
         if attack_passed is None:
             logger.info("Defender: first round — using initial strategy")
+            return self.current_strategy
+
+        # All clients were flagged → thresholds too strict, must adapt
+        if all_flagged:
+            logger.info(
+                "Defender: ALL clients were flagged last round (round was skipped) "
+                "— consulting LLM to loosen thresholds"
+            )
+            self.current_strategy = self._ask_llm(context)
             return self.current_strategy
 
         # Defense succeeded → keep strategy
@@ -99,13 +116,15 @@ class DefenderAgent:
         return self.current_strategy
 
     def record_outcome(
-        self, round_num: int, strategy: dict, attack_passed: bool, verdicts: list[dict]
+        self, round_num: int, strategy: dict, attack_passed: bool,
+        all_clients_flagged: bool, verdicts: list[dict]
     ):
         """Store round outcome in history and vector memory."""
         entry = {
             "round": round_num,
             "strategy": strategy,
             "attack_passed_through": attack_passed,
+            "all_clients_flagged": all_clients_flagged,
             "verdicts": verdicts,
         }
         self.history.append(entry)
