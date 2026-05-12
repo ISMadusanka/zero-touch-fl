@@ -63,6 +63,19 @@ python main.py --env linux --fresh
 python visualize_rounds.py
 ```
 
+TO SEE THE VISUALIZATIONS
+
+On server run: 
+  - cd ~/ruh-fyp-2026/fl/zero-touch-fl/logs/visualizations
+  - python -m http.server 8084
+		
+On win cmd run: 
+   - ssh -i C:\fl\server\isuru -L 8084:netslabsmosv1:8084 ruh_fyp_26@netslabsv1.ucd.ie
+
+open : http://localhost:8084/ on win browser
+
+
+
 ## Configuration
 
 Models and settings for each agent are in `configs/`:
