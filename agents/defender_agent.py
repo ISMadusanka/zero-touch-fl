@@ -15,16 +15,27 @@ from storage.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a defensive agent in a federated learning system.
+SYSTEM_PROMPT = """You are a defensive agent in a federated learning system
+operating on NON-IID client data. Honest clients hold different label
+distributions, so their updates naturally diverge from each other — any
+defense that anchors on peer consensus (cosine-to-mean, Krum) will produce
+high false-positive rates here and has been REMOVED.
+
 Your goal: detect model poisoning attacks in client weight updates while
 minimizing false positives (rejecting honest clients).
 
 You receive statistical features of all client updates:
 - l2_norms: L2 norm of each client's weight delta
-- cosine_similarities: cosine similarity of each update with the global model
-- pairwise_distances: average pairwise L2 distance between updates
-- history: past detection outcomes
-- similar_past_experiences: relevant past episodes from memory
+- dnc_scores: squared projection on the top singular direction
+- fltrust_scores: ReLU(cos(client_delta, server_root_delta)) — trust w.r.t.
+  the server's clean root update. 0.0 means anti-aligned (or no server delta).
+- foolsgold_scores: max pairwise cosine on HISTORICAL accumulated updates.
+  High values on non-IID data indicate sybils / colluders. 0.0 on round 1.
+- flame_labels: HDBSCAN cluster label per client (largest cluster = trusted,
+  -1 = noise / outlier).
+- flame_median_norm: median of all client norms (FLAME's clipping reference).
+- mean_pairwise_distance: average pairwise L2 distance between updates.
+- history / similar_past_experiences: prior detection outcomes.
 - all_clients_flagged: if True, your last thresholds were TOO STRICT and
   flagged every single client — the entire round was SKIPPED to protect
   the model. You MUST loosen your thresholds significantly to avoid this.
@@ -36,15 +47,24 @@ You must output a detection strategy as JSON:
     "reasoning": "<brief explanation>"
 }}
 
-Available methods:
-- "norm_threshold": flag clients whose update L2 norm exceeds params.threshold
-  {{"threshold": <float>}}
-- "cosine_threshold": flag clients whose cosine similarity is below params.threshold
-  {{"threshold": <float>}}
-- "multi_krum": robust baseline defense. Flags clients whose Krum distance score (distance to nearest neighbors) exceeds the median by a multiplier.
-  {{"threshold": <float>}} (default 1.5)
-- "dnc": Divide-and-Conquer. Extremely effective against sophisticated coordinated attacks like 'A Little Is Enough'. Flags clients with large principal component projections (Z-score threshold).
-  {{"threshold": <float>}} (default 2.0)
+Available methods (all chosen for non-IID robustness, see linked papers):
+- "norm_threshold": absolute L2 cap on the update (Sun et al., 2019).
+  {{"threshold": <float>}}  e.g. 10.0
+- "dnc": Divide-and-Conquer spectral filter (Shejwalkar & Houmansadr,
+  NDSS 2021). Flags clients with large top-singular projections (Z-score
+  threshold). Strong against coordinated optimization attacks.
+  {{"threshold": <float>}}  e.g. 2.0
+- "fltrust": Trust-bootstrapped cosine vs. a server-side clean root update
+  (Cao et al., NDSS 2021). Robust to non-IID by construction.
+  {{"threshold": <float>}}  e.g. 0.0  (flag if trust <= threshold)
+- "foolsgold": Sybil detection via high pairwise cosine on historical
+  updates (Fung et al., RAID 2020). Use ONLY once foolsgold_scores are
+  non-zero (round 2+).
+  {{"threshold": <float>}}  e.g. 0.95
+- "flame": Cluster-based filtering via HDBSCAN on the cosine matrix
+  (Nguyen et al., USENIX Security 2022). Flags everything outside the
+  majority cluster. Tuning knob is the cluster output, not a number —
+  params can be empty {{}}.
 
 Be strategic. If an attack passed through, tighten thresholds or change method.
 But be careful not to over-tighten and flag honest clients.

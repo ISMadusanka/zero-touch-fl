@@ -21,7 +21,7 @@ import sys
 import yaml
 # import torch
 
-from data.mnist_loader import get_data_loaders
+from data.mnist_loader import get_data_loaders, get_root_loader
 from model.mnist_net import MnistNet, count_parameters
 from clients.benign_client import BenignClient
 from clients.malicious_client import MaliciousClient
@@ -162,6 +162,7 @@ def run_simulation(
 ):
     """Run the attack/defend simulation loop."""
     fl = config["fl"]
+    data_cfg = config["data"]
     malicious_id = fl["malicious_client_id"]
 
     logger.info("=" * 60)
@@ -179,6 +180,16 @@ def run_simulation(
     attacker_agent = AttackerAgent(attacker_config)
     defender_agent = DefenderAgent(defender_config)
     malicious_client = MaliciousClient(client_id=malicious_id)
+
+    # FLTrust root dataset (Cao et al., NDSS 2021): a small clean held-out
+    # set on the server used to compute a reference "trust anchor" update
+    # each round. ~100 stratified samples is enough per the paper.
+    root_loader = get_root_loader(
+        root_size=data_cfg.get("root_size", 100),
+        batch_size=fl["batch_size"],
+        data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
+    )
+    logger.info(f"  FLTrust root samples: {len(root_loader.dataset)}")
 
     # State tracking
     last_attack_detected = None    # None on first round
@@ -230,9 +241,19 @@ def run_simulation(
             updates.append(update)
 
         # ------------------------------------------------------------------
-        # Step 3: Defender decides strategy
+        # Step 3a: Compute server-side root update (FLTrust anchor)
         # ------------------------------------------------------------------
-        update_features = detector.get_features(updates, current_global)
+        server_delta = server.compute_root_delta(
+            root_loader=root_loader,
+            lr=fl["lr"],
+            local_epochs=fl["local_epochs"],
+        )
+        logger.info(f"FLTrust: server root delta norm = {server_delta.norm().item():.4f}")
+
+        # ------------------------------------------------------------------
+        # Step 3b: Defender decides strategy
+        # ------------------------------------------------------------------
+        update_features = detector.get_features(updates, current_global, server_delta)
         defender_context = {
             "update_features": update_features,
             "attack_passed_through": last_attack_passed,
@@ -244,7 +265,7 @@ def run_simulation(
         # ------------------------------------------------------------------
         # Step 4: Anomaly detection
         # ------------------------------------------------------------------
-        verdicts = detector.analyze(updates, current_global, defend_strategy)
+        verdicts = detector.analyze(updates, current_global, defend_strategy, server_delta)
 
         # Check if the malicious client was detected
         malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)
