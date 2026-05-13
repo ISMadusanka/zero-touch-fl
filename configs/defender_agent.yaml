@@ -7,7 +7,7 @@ llm:
 
 initial_strategy:
   method: "norm_threshold"
-  threshold: 2.0
+  sensitivity: 2.0                # z-score multiplier (adaptive threshold)
 
 memory:
   persist_path: "checkpoints/defender_memory"
