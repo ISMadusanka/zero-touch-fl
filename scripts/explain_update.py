@@ -20,7 +20,7 @@ def main():
         if not os.path.exists(MODEL_PATH):
              print(json.dumps({"error": f"Model file not found at {MODEL_PATH}"}))
              return
-
+            
         model = xgb.XGBClassifier()
         model.load_model(MODEL_PATH)
         explainer = shap.TreeExplainer(model)
