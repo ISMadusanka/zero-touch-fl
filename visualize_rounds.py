@@ -44,8 +44,8 @@ COLORS = {
 ATTACK_TYPE_COLORS = {
     "noise_injection": "#6C63FF",
     "sign_flip":       "#FF6584",
-    "scale_attack":    "#F7971E",
-    "zero_update":     "#43E97B",
+    "scaling":         "#F7971E",
+    "gaussian_noise":  "#00C9FF",
 }
 
 DEFEND_METHOD_COLORS = {
@@ -258,25 +258,56 @@ def plot_adaptation(rounds, out_dir):
 
 
 def plot_attack_params(rounds, out_dir):
-    """Evolution of attack parameters (e.g. noise scale)."""
+    """Evolution of attack parameters (main param + k) over rounds."""
     rns = [r["round_num"] for r in rounds]
-    scales = []
+
+    # Extract main parameter (scale / factor / sigma / c)
+    main_params = []
     for r in rounds:
         p = r["attack_strategy"].get("params", {})
-        scales.append(p.get("scale", p.get("factor", None)))
+        main_params.append(p.get("scale", p.get("factor", p.get("sigma", p.get("c", None)))))
 
-    if all(s is None for s in scales):
+    # Extract k values
+    k_values = []
+    for r in rounds:
+        p = r["attack_strategy"].get("params", {})
+        k_val = p.get("k", None)
+        k_values.append(k_val)
+
+    has_main = not all(v is None for v in main_params)
+    has_k = not all(v is None for v in k_values)
+
+    if not has_main and not has_k:
         return  # nothing to plot
 
-    fig, ax = plt.subplots(figsize=(12, 4))
-    apply_dark_style(ax, "Attack Parameter Evolution", "Round", "Scale / Factor")
+    n_plots = int(has_main) + int(has_k)
+    fig, axes = plt.subplots(n_plots, 1, figsize=(12, 4 * n_plots), squeeze=False)
+    ax_idx = 0
 
-    valid = [(rn, s) for rn, s in zip(rns, scales) if s is not None]
-    if valid:
-        vrns, vscales = zip(*valid)
-        ax.bar(vrns, vscales, color=COLORS["accent"], edgecolor="none", width=0.6, alpha=0.85)
-        for rn, s in zip(vrns, vscales):
-            ax.text(rn, s + 0.05, f"{s}", ha="center", va="bottom", fontsize=8, color=COLORS["text_dim"])
+    if has_main:
+        ax = axes[ax_idx, 0]
+        apply_dark_style(ax, "Attack Parameter Evolution", "Round", "Scale / Factor / Sigma / c")
+        valid = [(rn, v) for rn, v in zip(rns, main_params) if v is not None]
+        if valid:
+            vrns, vvals = zip(*valid)
+            ax.bar(vrns, vvals, color=COLORS["accent"], edgecolor="none", width=0.6, alpha=0.85)
+            for rn, v in zip(vrns, vvals):
+                ax.text(rn, v + 0.05, f"{v}", ha="center", va="bottom", fontsize=8, color=COLORS["text_dim"])
+        ax_idx += 1
+
+    if has_k:
+        ax = axes[ax_idx, 0]
+        apply_dark_style(ax, "Selective Targeting (k) Over Rounds", "Round", "k (weights targeted)")
+        valid_k = [(rn, v) for rn, v in zip(rns, k_values) if v is not None]
+        if valid_k:
+            vrns, vvals = zip(*valid_k)
+            ax.bar(vrns, vvals, color=COLORS["accent3"], edgecolor="none", width=0.6, alpha=0.85)
+            for rn, v in zip(vrns, vvals):
+                ax.text(rn, v + 0.5, f"{v}", ha="center", va="bottom", fontsize=8, color=COLORS["text_dim"])
+        # Mark rounds where k was not used (all weights targeted)
+        no_k = [rn for rn, v in zip(rns, k_values) if v is None]
+        for rn in no_k:
+            ax.annotate("all", (rn, 0), ha="center", va="bottom", fontsize=7, color=COLORS["text_dim"], alpha=0.6)
 
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "07_attack_params.png"), dpi=150)

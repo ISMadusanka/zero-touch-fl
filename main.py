@@ -380,11 +380,23 @@ def run_simulation(
         # ------------------------------------------------------------------
         # Step 7: Record outcomes for both agents
         # ------------------------------------------------------------------
+        # Extract attack metadata (e.g. flipped indices) from the malicious update
+        malicious_update = updates[malicious_id]
+        attack_metadata = malicious_update.metadata.get("attack_metadata", {})
+        if attack_metadata:
+            layer_info = attack_metadata.get("flipped_per_layer", attack_metadata.get("affected_per_layer", {}))
+            logger.info(
+                f"Attack metadata: k={attack_metadata.get('k', 'N/A')}, "
+                f"total_params={attack_metadata.get('total_params', '?')}, "
+                f"layers_affected={list(layer_info.keys())}"
+            )
+
         attacker_agent.record_outcome(
             round_num=round_num,
             strategy=attack_strategy,
             was_detected=attack_detected,
             accuracy=current_accuracy,
+            attack_metadata=attack_metadata,
         )
         defender_agent.record_outcome(
             round_num=round_num,
