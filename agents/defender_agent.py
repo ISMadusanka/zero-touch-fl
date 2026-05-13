@@ -31,6 +31,10 @@ Contextual Inputs:
 
 When an attack passes through or the system locks up, identify which layer(s) failed to catch the suspicious behavior and adjust their thresholds accordingly. Only update the thresholds for layers that are directly relevant to the observed failure.
 
+You can also adjust the `violation_count_threshold`. This is the number of individual layers that must fail for a client to be flagged as malicious.
+- Increase it (e.g., to 2 or 3) if you are seeing too many false positives (all clients flagged).
+- Decrease it (e.g., to 1) if attacks are passing through despite some layers flagging them.
+
 Output your decision in this JSON format:
 {
     "method": "layered_threshold",
@@ -39,14 +43,15 @@ Output your decision in this JSON format:
         "cluster_threshold": <float, default 2.0>,
         "clipping_threshold": <float, default 1.5>,
         "trim_threshold": <float, default 3.0>,
-        "xgboost_risk_threshold": <float, default 0.5>
+        "xgboost_risk_threshold": <float, default 0.5>,
+        "violation_count_threshold": <int, default 1>
     },
-    "reasoning": "<your detailed strategic reasoning for each of the 4 layers>"
+    "reasoning": "<your detailed strategic reasoning for each of the 4 layers and the violation threshold>"
 }
 
 Adaptive Strategy:
-- If an attack PASSED THROUGH: Your thresholds were TOO LOOSE. Identify which layer's report showed suspicious signals and tighten that specific threshold.
-- If ALL CLIENTS WERE FLAGGED: Your thresholds were TOO STRICT (round was skipped). Loosen thresholds across the board to allow honest participation.
+- If an attack PASSED THROUGH: Your thresholds were TOO LOOSE. Identify which layer's report showed suspicious signals and tighten that specific threshold. Alternatively, reduce `violation_count_threshold` if it's > 1.
+- If ALL CLIENTS WERE FLAGGED: Your thresholds were TOO STRICT (round was skipped). Loosen thresholds across the board to allow honest participation, or increase `violation_count_threshold`.
 - Use history to recognize "stealthy" attackers that slowly increase their magnitude over rounds."""
 
 
@@ -77,7 +82,8 @@ class DefenderAgent:
                 "cluster_threshold": initial.get("cluster_threshold", 2.0),
                 "clipping_threshold": initial.get("clipping_threshold", 1.5),
                 "trim_threshold": initial.get("trim_threshold", 3.0),
-                "xgboost_risk_threshold": initial.get("xgboost_risk_threshold", 0.5)
+                "xgboost_risk_threshold": initial.get("xgboost_risk_threshold", 0.5),
+                "violation_count_threshold": initial.get("violation_count_threshold", 1)
             },
             "reasoning": "initial default",
         }
@@ -93,6 +99,20 @@ class DefenderAgent:
         Strictly reactive logic:
         - Consults LLM only if the last attack passed or all clients were flagged.
         """
+        # Inject memory into context so it can be logged and passed to LLM
+        context["recent_history"] = self.history[-5:]
+        if self.history:
+            try:
+                # We use a copy without history to maintain consistent vector embeddings
+                embed_ctx = {k: v for k, v in context.items() if k not in ["recent_history", "similar_past_experiences"]}
+                query_vec = self._make_vector(embed_ctx)
+                context["similar_past_experiences"] = self.memory.search(query_vec, k=3)
+            except Exception as e:
+                logger.warning(f"Failed to fetch similar experiences: {e}")
+                context["similar_past_experiences"] = []
+        else:
+            context["similar_past_experiences"] = []
+
         attack_passed = context.get("attack_passed_through")
         all_flagged = context.get("all_clients_flagged")
 
@@ -129,17 +149,11 @@ class DefenderAgent:
 
     def _ask_llm(self, context: dict) -> dict:
         """Query the LLM for a new detection strategy."""
-        if self.history:
-            query_vec = self._make_vector(context)
-            similar = self.memory.search(query_vec, k=3)
-        else:
-            similar = []
-
         user_msg = json.dumps({
             "threat_reports": context.get("threat_reports"),
             "attack_passed_through": context.get("attack_passed_through"),
-            "recent_history": self.history[-5:],
-            "similar_past_experiences": similar,
+            "recent_history": context.get("recent_history", []),
+            "similar_past_experiences": context.get("similar_past_experiences", []),
         }, default=str)
 
         result = self.llm.call(SYSTEM_PROMPT, user_msg)
@@ -153,13 +167,22 @@ class DefenderAgent:
                     "cluster_threshold": 3.0,
                     "clipping_threshold": 2.0,
                     "trim_threshold": 4.0,
-                    "xgboost_risk_threshold": 0.7
+                    "xgboost_risk_threshold": 0.7,
+                    "violation_count_threshold": 1
                 },
                 "reasoning": "fallback: loosened thresholds",
             }
 
         logger.info(f"Defender chose: {result.get('method')} — {result.get('reasoning', '')}")
         return result
+
+    def _make_vector(self, data: dict) -> np.ndarray:
+        """Create a semantic embedding vector for FAISS indexing.
+
+        Uses SentenceTransformers so that similar contexts (e.g. close
+        detection outcomes, similar features) map to nearby vectors.
+        """
+        return embed(data)
 
     def _make_vector(self, data: dict) -> np.ndarray:
         """Create a semantic embedding vector for FAISS indexing.

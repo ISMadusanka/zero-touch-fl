@@ -291,6 +291,7 @@ def run_simulation(
         t_clip = params.get("clipping_threshold", 1.5)
         t_trim = params.get("trim_threshold", 3.0)
         t_xgb = params.get("xgboost_risk_threshold", 0.5)
+        t_violation = params.get("violation_count_threshold", 1)
 
         for cid in range(fl["n_clients"]):
             cid_key = f"client_{cid}"
@@ -298,55 +299,59 @@ def run_simulation(
             report = threat_reports[cid_key]
             
             # Multi-layer violation check
-            is_suspicious = False
+            violation_count = 0
             layer_status = []
             
             # Layer 1
             l1_val = feat["layer_1_fl_trust"]
             l1_ok = l1_val >= t_trust
-            layer_status.append(f"FLTrust:{l1_val:.2f}({ 'OK' if l1_ok else 'FAIL' }>{t_trust})")
             if not l1_ok:
-                is_suspicious = True
+                violation_count += 1
+            layer_status.append(f"FLTrust:{l1_val:.2f}({ 'OK' if l1_ok else 'FAIL' }>{t_trust})")
 
             # Layer 2
             l2_val = feat["layer_2_cluster"]
             l2_ok = l2_val <= t_cluster
-            layer_status.append(f"Cluster:{l2_val:.2f}({ 'OK' if l2_ok else 'FAIL' }<{t_cluster})")
             if not l2_ok:
-                is_suspicious = True
+                violation_count += 1
+            layer_status.append(f"Cluster:{l2_val:.2f}({ 'OK' if l2_ok else 'FAIL' }<{t_cluster})")
 
             # Layer 3
             l3_val = feat["layer_3_clipping"]
             l3_ok = l3_val <= t_clip
-            layer_status.append(f"Clip:{l3_val:.2f}({ 'OK' if l3_ok else 'FAIL' }<{t_clip})")
             if not l3_ok:
-                is_suspicious = True
+                violation_count += 1
+            layer_status.append(f"Clip:{l3_val:.2f}({ 'OK' if l3_ok else 'FAIL' }<{t_clip})")
 
             # Layer 4
             l4_val = feat["layer_4_is_trimmed"]
             l4_ok = l4_val <= t_trim
-            layer_status.append(f"Trim:{l4_val:.2f}({ 'OK' if l4_ok else 'FAIL' }<{t_trim})")
             if not l4_ok:
-                is_suspicious = True
+                violation_count += 1
+            layer_status.append(f"Trim:{l4_val:.2f}({ 'OK' if l4_ok else 'FAIL' }<{t_trim})")
 
             # XGBoost
             xgb_val = report.get("risk_score", 0)
             xgb_ok = xgb_val <= t_xgb
             if not xgb_ok:
-                is_suspicious = True
+                violation_count += 1
                 layer_status.append(f"XGBoost:{xgb_val:.2f}(FAIL<{t_xgb})")
+            else:
+                layer_status.append(f"XGBoost:{xgb_val:.2f}(OK<{t_xgb})")
 
+            is_suspicious = violation_count >= t_violation
+            
             verdicts.append(DetectionVerdict(
                 client_id=cid,
                 is_suspicious=is_suspicious,
                 confidence=report.get("risk_score", 0.5) if is_suspicious else 0.0,
-                reason="; ".join(layer_status) if is_suspicious else "Clean"
+                reason=f"Violations: {violation_count}/{t_violation} | " + "; ".join(layer_status)
             ))
 
             if is_suspicious:
-                logger.warning(f"  Client {cid} FLAGGED! Defense Profile: {' | '.join(layer_status)}")
+                logger.warning(f"  Client {cid} FLAGGED! (violations: {violation_count}/{t_violation}) Defense Profile: {' | '.join(layer_status)}")
             else:
-                logger.info(f"  Client {cid} OK. Defense Profile: {' | '.join(layer_status)}")
+                logger.info(f"  Client {cid} OK. (violations: {violation_count}/{t_violation}) Defense Profile: {' | '.join(layer_status)}")
 
         # Check if the malicious client was detected
         malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)
@@ -432,6 +437,43 @@ def run_simulation(
         )
         _save_round_log(round_log)
 
+        # ------------------------------------------------------------------
+        # Step 9: Save Datasets for Fine-Tuning
+        # ------------------------------------------------------------------
+        import csv
+        import os
+        import json
+        
+        # 1. Save XGBoost Dataset
+        os.makedirs("storage", exist_ok=True)
+        xgb_csv_path = "storage/xgboost_dataset.csv"
+        xgb_file_exists = os.path.isfile(xgb_csv_path)
+        with open(xgb_csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not xgb_file_exists:
+                writer.writerow(["layer_1_fl_trust", "layer_2_cluster", "layer_3_clipping", "layer_4_is_trimmed", "raw_norm", "label"])
+            for cid in range(fl["n_clients"]):
+                cid_key = f"client_{cid}"
+                if cid_key in layered_features:
+                    feat = layered_features[cid_key]
+                    label = 1 if cid == malicious_id else 0
+                    writer.writerow([
+                        feat.get("layer_1_fl_trust", 0.0),
+                        feat.get("layer_2_cluster", 0),
+                        feat.get("layer_3_clipping", 1.0),
+                        feat.get("layer_4_is_trimmed", 0),
+                        feat.get("raw_norm", 0.0),
+                        label
+                    ])
+
+        # 2. Save LLM Dataset
+        llm_jsonl_path = "storage/llm_dataset.jsonl"
+        with open(llm_jsonl_path, "a") as f:
+            llm_entry = {
+                "input_context": defender_context,
+                "output_strategy": defend_strategy
+            }
+            f.write(json.dumps(llm_entry, default=str) + "\n")
         # Update state for next round
         last_attack_detected = attack_detected
         last_attack_passed = attack_passed

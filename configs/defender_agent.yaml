@@ -1,13 +1,18 @@
 # Defender LLM Agent Configuration
 
 llm:
-  model: "gpt-4o-mini"            # OpenAI backend model
+  model: "gpt-4o-mini" # OpenAI backend model
   temperature: 0.3
-  ollama_model: "gpt-oss:20b"  # Ollama backend model
+  ollama_model: "gpt-oss:20b" # Ollama backend model
 
 initial_strategy:
-  method: "norm_threshold"
-  threshold: 2.0
+  method: "layered_threshold"
+  fl_trust_threshold: 0.15
+  cluster_threshold: 2.0
+  clipping_threshold: 1.5
+  trim_threshold: 3.0
+  xgboost_risk_threshold: 0.5
+  violation_count_threshold: 1
 
 memory:
   persist_path: "checkpoints/defender_memory"
