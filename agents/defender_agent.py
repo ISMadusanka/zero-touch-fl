@@ -38,7 +38,7 @@ You receive statistical features of all client updates:
   flagged every single client — the entire round was SKIPPED to protect
   the model. You MUST loosen your thresholds significantly to avoid this.
 
-You must output a detection strategy as JSON:
+Respond with ONLY a JSON object:
 {{
     "method": "<detection method>",
     "params": {{"sensitivity": <float>}},
@@ -85,8 +85,10 @@ Available methods (all adaptive — no hardcoded thresholds):
 
 5. "flame" (Nguyen et al., USENIX Security 2022, "FLAME: Taming Backdoors")
    Clustering-based defense. Uses HDBSCAN on cosine distances to cluster
-   updates; flags clients NOT in the majority cluster. The sensitivity
-   parameter affects the clustering cut threshold in the fallback mode.
+   updates; flags clients NOT in the majority cluster. NOTE: when HDBSCAN
+   is available, cluster membership is the sole criterion and sensitivity
+   has no effect. In the fallback mode (agglomerative/z-score), sensitivity
+   controls the cut threshold.
    Best against backdoor attacks and when attackers form a distinct cluster.
    {{"sensitivity": <float>}}
 

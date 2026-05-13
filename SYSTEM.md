@@ -34,22 +34,37 @@ The LLM is also given the top 3 most similar past rounds retrieved from the FAIS
 
 ## Defender Agent Feedback
 - update_features: Statistical features computed from all client updates in the 
-  current round, which include  :
+  current round, which include:
     - l2_norms: The L2 norm of each client's weight delta.
-    - cosine_similarities: The cosine similarity of each update compared to the 
-      global model.
-    - pairwise_distances: The average pairwise L2 distance between the updates.
-    
+    - cosine_similarities: The cosine similarity of each update compared to the
+      mean update (not the global model).
+    - dnc_scores: Spectral outlier scores (SVD projection²) per client.
+    - fltrust_scores: ReLU(cosine_similarity) trust scores per client.
+    - foolsgold_max_cs: Maximum pairwise cosine similarity per client.
+    - mean_pairwise_distance: Average pairwise L2 distance between updates.
+
 - attack_passed_through: A boolean flag indicating whether an attack evaded 
   detection in the previous round. The LLM is only prompted to adapt its strategy
-   if this flag is True (i.e., its previous defense failed).
+  if this flag is True (i.e., its previous defense failed).
+
+- all_clients_flagged: A boolean flag indicating whether the previous round's
+  thresholds were so strict that every client was flagged, causing the round
+  to be skipped. When True, the LLM must loosen thresholds.
+
+- tpr_recent: True positive rate (recall) over the last 5 rounds (0.0–1.0).
+
+- fpr_recent: False positive rate over the last 5 rounds (0.0–1.0).
+
+- accuracy_preservation_rate: current_accuracy / baseline_accuracy (0.0–1.0).
 
 - recent_history: A summary of the defender's outcomes over the past 5 rounds. 
   Each entry contains:
     - Round number
     - Strategy used
     - Whether an attack passed through
-    - Detailed verdicts produced for each client (suspicious flag, confidence,   and reason).
+    - Whether all clients were flagged
+    - Detailed verdicts produced for each client (suspicious flag, confidence, and reason)
+    - tpr_recent, fpr_recent, and accuracy_preservation_rate at that point
 
 - similar_past_experiences: Up to 3 relevant past episodes retrieved from the defender's FAISS vector memory to help it adapt thresholds based on historical failures.
 
@@ -59,11 +74,11 @@ Read the agents and their current feedback contracts. Here's the mapping.
 
 ## What each agent currently sees
 
-**Attacker** (from [SYSTEM_PROMPT in attacker_agent.py:25](agents/attacker_agent.py:25)): `baseline_accuracy`, `current_accuracy`, `was_detected` (single-round bool), `recent_history`, `similar_past_experiences`.
+**Attacker** (from [SYSTEM_PROMPT in attacker_agent.py:25](agents/attacker_agent.py:25)): `baseline_accuracy`, `current_accuracy`, `was_detected` (single-round bool), `attack_success_rate_recent`, `fpr_recent`, `accuracy_preservation_rate`, `recent_history`, `similar_past_experiences`.
 
-**Defender** (from [SYSTEM_PROMPT in defender_agent.py:22](agents/defender_agent.py:22)): `update_features` (l2_norms, cosines, pairwise), `attack_passed_through` (single-round bool), `all_clients_flagged`, `recent_history`, `similar_past_experiences`.
+**Defender** (from [SYSTEM_PROMPT in defender_agent.py:22](agents/defender_agent.py:22)): `update_features` (l2_norms, cosine_similarities, dnc_scores, fltrust_scores, foolsgold_max_cs, mean_pairwise_distance), `attack_passed_through` (single-round bool), `all_clients_flagged`, `tpr_recent`, `fpr_recent`, `accuracy_preservation_rate`, `recent_history`, `similar_past_experiences`.
 
-Both agents reason on *single-round binary signals* + 5-round history. They have no aggregate sense of how their regime is performing over time. That's exactly the gap the metrics can fill.
+Both agents now receive windowed aggregate KPIs (over the last 5 rounds) in addition to the single-round binary signals and 5-round history.
 
 ## Recommendation
 

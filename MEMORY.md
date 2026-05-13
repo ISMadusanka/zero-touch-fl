@@ -48,6 +48,7 @@ A sliding window of the **last 5 round outcomes** from `self.history[-5:]`, prov
         "reasoning": str      # LLM's explanation
     },
     "attack_passed_through": bool,  # True if attacker evaded detection (defense failed)
+    "all_clients_flagged":   bool,  # True if every client was flagged (round skipped)
     "verdicts": [                   # One entry per client
         {
             "client_id":  int,
@@ -55,7 +56,10 @@ A sliding window of the **last 5 round outcomes** from `self.history[-5:]`, prov
             "confidence": float,    # 0.0–1.0
             "reason":     str       # e.g. "norm=5.1234, threshold=3.4567 (median=2.0 + 2.0×MAD=0.7)"
         }
-    ]
+    ],
+    "tpr_recent": float,                  # True positive rate over last 5 rounds (0.0–1.0)
+    "fpr_recent": float,                  # False positive rate over last 5 rounds (0.0–1.0)
+    "accuracy_preservation_rate": float    # current_accuracy / baseline_accuracy (0.0–1.0)
 }
 ```
 
@@ -117,6 +121,7 @@ Defender Agent — stored parameters per entry:
         "reasoning": str      # LLM's explanation for choosing this defense
     },
     "attack_passed_through": bool,  # Whether the attacker evaded detection
+    "all_clients_flagged":   bool,  # True if every client was flagged (round skipped)
     "verdicts": [                   # Detection result for each client
         {
             "client_id":  int,
@@ -124,7 +129,10 @@ Defender Agent — stored parameters per entry:
             "confidence": float,    # 0.0–1.0
             "reason":     str       # e.g. "dnc_score=4.56, threshold=2.34 (median=1.2 + 2.0×MAD=0.57)"
         }
-    ]
+    ],
+    "tpr_recent": float,                  # True positive rate over last 5 rounds (0.0–1.0)
+    "fpr_recent": float,                  # False positive rate over last 5 rounds (0.0–1.0)
+    "accuracy_preservation_rate": float    # current_accuracy / baseline_accuracy (0.0–1.0)
 }
 ```
 
