@@ -32,8 +32,8 @@ Contextual Inputs:
 - recent_history (Short-term): Outcomes of the last 5 rounds. Use this to detect persistent or evolving attack patterns.
 - similar_past_experiences (Long-term): Relevant historical episodes from your vector memory. Use these to apply lessons learned from past successful or failed defenses.
 
-When an attack passes through or the system locks up, you must adapt your strategy.
-Read the full XGBoost threat report for all layers. Based on the report, decide if the *currently selected* single layer failed.
+Every round, you must evaluate the threat landscape and adapt your strategy.
+Read the full XGBoost threat report for all layers. Based on the report, decide if the *currently selected* single layer failed or if another layer would be more robust.
 You may only select EXACTLY ONE layer to act as the sole defense mechanism. Your choice MUST be one of the following: ["layer_1_fl_trust", "layer_2_cluster", "layer_3_clipping", "layer_4_is_trimmed"]. Do NOT select xgboost. Select the most reliable layer based on the threat explainability report.
 
 Output your decision in this JSON format:
@@ -127,7 +127,7 @@ class DefenderAgent:
 
         # Only adapt if defense failed or system locked up
         if attack_passed or all_flagged:
-            logger.info("Defender: Adaptation required (failure or lock-up) — consulting LLM")
+            logger.info("Defender: Adaptation required (failure or lock-up) — feeding full XGBoost explainability report and context to LLM for optimal layer selection")
             self.current_strategy = self._ask_llm(context)
         else:
             logger.info("Defender: Defense stable — keeping current thresholds")
