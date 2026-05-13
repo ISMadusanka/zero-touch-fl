@@ -49,9 +49,11 @@ ATTACK_TYPE_COLORS = {
 }
 
 DEFEND_METHOD_COLORS = {
-    "norm_threshold": "#6C63FF",
-    "combined":       "#43E97B",
-    "cosine_filter":  "#F7971E",
+    "norm_threshold":      "#6C63FF",
+    "combined":            "#43E97B",
+    "cosine_filter":       "#F7971E",
+    "layered_threshold":   "#00C9FF",
+    "unknown":             "#888899",
 }
 
 # ─── Style helpers ──────────────────────────────────────────────────────────────
@@ -83,6 +85,22 @@ def load_rounds(log_dir: str):
     return rounds
 
 
+# ─── Safe accessors (handles old & new JSON formats) ──────────────────────────
+def _is_suspicious(v: dict) -> bool:
+    """Verdict may use 'suspicious' or 'is_suspicious' depending on log version."""
+    return v.get("suspicious", v.get("is_suspicious", False))
+
+
+def _attack_type(r: dict) -> str:
+    """Extract attack type from a round dict, handling empty strategies."""
+    return r.get("attack_strategy", {}).get("type", "unknown")
+
+
+def _defend_method(r: dict) -> str:
+    """Extract defense method from a round dict, handling empty strategies."""
+    return r.get("defend_strategy", {}).get("method", "unknown")
+
+
 # ─── Chart generators ──────────────────────────────────────────────────────────
 def plot_accuracy(rounds, out_dir):
     """Test accuracy vs baseline accuracy over rounds."""
@@ -112,7 +130,7 @@ def plot_accuracy(rounds, out_dir):
 def plot_detection(rounds, out_dir):
     """Attack detection success per round."""
     rns = [r["round_num"] for r in rounds]
-    detected = [r["attack_detected"] for r in rounds]
+    detected = [r.get("attack_detected", False) for r in rounds]
     colors = [COLORS["detected"] if d else COLORS["missed"] for d in detected]
 
     fig, ax = plt.subplots(figsize=(12, 3.5))
@@ -138,8 +156,8 @@ def plot_detection(rounds, out_dir):
 def plot_strategies(rounds, out_dir):
     """Attack type and defense method timeline."""
     rns = [r["round_num"] for r in rounds]
-    atk_types = [r["attack_strategy"]["type"] for r in rounds]
-    def_methods = [r["defend_strategy"]["method"] for r in rounds]
+    atk_types = [_attack_type(r) for r in rounds]
+    def_methods = [_defend_method(r) for r in rounds]
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
     for ax in (ax1, ax2):
@@ -180,7 +198,7 @@ def plot_verdicts_heatmap(rounds, out_dir):
     for j, r in enumerate(rounds):
         for v in r["verdicts"]:
             row = all_clients.index(v["client_id"])
-            matrix[row, j] = v["confidence"] if v["suspicious"] else -v["confidence"]
+            matrix[row, j] = v["confidence"] if _is_suspicious(v) else -v["confidence"]
 
     fig, ax = plt.subplots(figsize=(14, 4))
     apply_dark_style(ax, "Client Suspicion Heatmap", "Round", "Client ID")
@@ -230,8 +248,8 @@ def plot_confidence(rounds, out_dir):
 def plot_adaptation(rounds, out_dir):
     """Attacker / defender adaptation events."""
     rns = [r["round_num"] for r in rounds]
-    atk_adapt = [r["attacker_adapted"] for r in rounds]
-    def_adapt = [r["defender_adapted"] for r in rounds]
+    atk_adapt = [r.get("attacker_adapted", False) for r in rounds]
+    def_adapt = [r.get("defender_adapted", False) for r in rounds]
 
     fig, ax = plt.subplots(figsize=(12, 3))
     apply_dark_style(ax, "Adaptation Events", "Round", "")
@@ -317,7 +335,7 @@ def plot_attack_params(rounds, out_dir):
 def plot_flagged_clients(rounds, out_dir):
     """Number of flagged clients per round."""
     rns = [r["round_num"] for r in rounds]
-    flagged = [sum(1 for v in r["verdicts"] if v["suspicious"]) for r in rounds]
+    flagged = [sum(1 for v in r["verdicts"] if _is_suspicious(v)) for r in rounds]
     total = [len(r["verdicts"]) for r in rounds]
 
     fig, ax = plt.subplots(figsize=(12, 4))
@@ -337,10 +355,10 @@ def plot_flagged_clients(rounds, out_dir):
 def generate_html_report(rounds, out_dir):
     charts = sorted([f for f in os.listdir(out_dir) if f.endswith(".png")])
     rns = [r["round_num"] for r in rounds]
-    det_rate = sum(r["attack_detected"] for r in rounds) / len(rounds) * 100
-    avg_acc = np.mean([r["test_accuracy"] for r in rounds])
-    atk_adapts = sum(r["attacker_adapted"] for r in rounds)
-    def_adapts = sum(r["defender_adapted"] for r in rounds)
+    det_rate = sum(r.get("attack_detected", False) for r in rounds) / len(rounds) * 100
+    avg_acc = np.mean([r.get("test_accuracy", 0) for r in rounds])
+    atk_adapts = sum(r.get("attacker_adapted", False) for r in rounds)
+    def_adapts = sum(r.get("defender_adapted", False) for r in rounds)
 
     chart_tags = "\n".join(
         f'<div class="chart"><h3>{c.replace(".png","").replace("_"," ").title()}</h3>'
