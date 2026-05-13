@@ -32,29 +32,31 @@ Contextual Inputs:
 - recent_history (Short-term): Outcomes of the last 5 rounds. Use this to detect persistent or evolving attack patterns.
 - similar_past_experiences (Long-term): Relevant historical episodes from your vector memory. Use these to apply lessons learned from past successful or failed defenses.
 
-When an attack passes through or the system locks up, identify which layer(s) failed to catch the suspicious behavior and adjust their thresholds accordingly. Only update the thresholds for layers that are directly relevant to the observed failure.
-
-You can also adjust the `violation_count_threshold`. This is the number of individual layers that must fail for a client to be flagged as malicious.
-- Increase it (e.g., to 2 or 3) if you are seeing too many false positives (all clients flagged).
-- Decrease it (e.g., to 1) if attacks are passing through despite some layers flagging them.
+When an attack passes through or the system locks up, you must adapt your strategy.
+Read the full XGBoost threat report for all layers. Based on the report, decide if the *currently selected* single layer failed.
+You may only select EXACTLY ONE layer to act as the sole defense mechanism. Select the most reliable layer based on the threat explainability report.
 
 Output your decision in this JSON format:
 {
-    "method": "layered_threshold",
+    "method": "single_layer_selection",
     "params": {
+        "selected_layer": "layer_1_fl_trust",
         "fl_trust_threshold": <float, default 0.15>,
         "cluster_threshold": <float, default 2.0>,
         "clipping_threshold": <float, default 1.5>,
         "trim_threshold": <float, default 3.0>,
-        "xgboost_risk_threshold": <float, default 0.5>,
-        "violation_count_threshold": <int, default 1>
+        "xgboost_risk_threshold": <float, default 0.5>
     },
-    "reasoning": "<your detailed strategic reasoning for each of the 4 layers and the violation threshold>"
+    "reasoning": "<your detailed strategic reasoning for why you selected this specific layer and threshold>"
 }
 
 Adaptive Strategy:
-- If an attack PASSED THROUGH: Your thresholds were TOO LOOSE. Identify which layer's report showed suspicious signals and tighten that specific threshold. Alternatively, reduce `violation_count_threshold` if it's > 1.
-- If ALL CLIENTS WERE FLAGGED: Your thresholds were TOO STRICT (round was skipped). Loosen thresholds across the board to allow honest participation, or increase `violation_count_threshold`.
+- You are defending using exactly one layer.
+- **Threshold Directionality**: 
+  - For `layer_1_fl_trust`: Client passes if `value >= threshold`. To **tighten** this layer (catch more attackers), you must **INCREASE** the threshold (e.g., 0.15 -> 0.20).
+  - For all other layers (`layer_2_cluster`, `layer_3_clipping`, `layer_4_is_trimmed`, `xgboost`): Client passes if `value <= threshold`. To **tighten** them, you must **DECREASE** the threshold (e.g., 2.0 -> 1.5).
+- If an attack PASSED THROUGH: Try tightening the threshold for the currently selected layer. If tightening the threshold is ineffective or too noisy, switch `selected_layer` to a different, more reliable layer.
+- If ALL CLIENTS WERE FLAGGED: Try loosening the threshold for the currently selected layer. If it remains too noisy, switch `selected_layer` to a different layer.
 - Use history to recognize "stealthy" attackers that slowly increase their magnitude over rounds."""
 
 
@@ -79,14 +81,14 @@ class DefenderAgent:
         )
         initial = config.get("initial_strategy", {})
         self.current_strategy = {
-            "method": initial.get("method", "layered_threshold"),
+            "method": initial.get("method", "single_layer_selection"),
             "params": {
+                "selected_layer": initial.get("selected_layer", "layer_1_fl_trust"),
                 "fl_trust_threshold": initial.get("fl_trust_threshold", 0.15),
                 "cluster_threshold": initial.get("cluster_threshold", 2.0),
                 "clipping_threshold": initial.get("clipping_threshold", 1.5),
                 "trim_threshold": initial.get("trim_threshold", 3.0),
-                "xgboost_risk_threshold": initial.get("xgboost_risk_threshold", 0.5),
-                "violation_count_threshold": initial.get("violation_count_threshold", 1)
+                "xgboost_risk_threshold": initial.get("xgboost_risk_threshold", 0.5)
             },
             "reasoning": "initial default",
         }
@@ -170,6 +172,7 @@ class DefenderAgent:
     def _ask_llm(self, context: dict) -> dict:
         """Query the LLM for a new detection strategy."""
         user_msg = json.dumps({
+            "current_active_strategy": self.current_strategy,
             "threat_reports": context.get("threat_reports"),
             "attack_passed_through": context.get("attack_passed_through"),
             "recent_history": context.get("recent_history", []),
@@ -184,14 +187,14 @@ class DefenderAgent:
         if not result or "method" not in result:
             logger.warning("Defender LLM returned invalid response — loosening default thresholds")
             return {
-                "method": "layered_threshold",
+                "method": "single_layer_selection",
                 "params": {
+                    "selected_layer": "layer_1_fl_trust",
                     "fl_trust_threshold": 0.1,
                     "cluster_threshold": 3.0,
                     "clipping_threshold": 2.0,
                     "trim_threshold": 4.0,
-                    "xgboost_risk_threshold": 0.7,
-                    "violation_count_threshold": 1
+                    "xgboost_risk_threshold": 0.7
                 },
                 "reasoning": "fallback: loosened thresholds",
             }

@@ -57,8 +57,12 @@ the top-k weights (by gradient magnitude) to attack. The rest stay honest.
 Smaller k = stealthier but weaker. Past attack_metadata shows which layers were
 targeted and gradient magnitude statistics — use this to refine your choices.
 
-Be strategic. If you were detected, try a subtler approach (lower params, smaller k).
-If your attack was too subtle (accuracy didn't drop), be more aggressive.
+Be strategic. Your goal is to maximize damage while remaining stealthy.
+To do this, use a "Greedy Stealth" binary search for the parameter `k` (the number of targeted weights):
+1. If your attack PASSED THROUGH: Incrementally INCREASE `k` in the next round. Keep increasing `k` round over round to maximize damage.
+2. If your attack WAS DETECTED: You hit the defender's limit. Immediately DECREASE `k` to slip back under the radar. 
+3. Your ultimate goal is to find the absolute maximum `k` you can poison without triggering the Defender.
+
 Use your attack_success_rate_recent to judge your overall regime performance.
 If fpr_recent is high, you can afford to be more aggressive since the defender
 is already generating noise with false positives."""

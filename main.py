@@ -304,13 +304,18 @@ def run_simulation(
         verdicts = []
         params = defend_strategy.get("params", {})
         
+        # Selected layer from LLM
+        selected_layer = params.get("selected_layer", "layer_1_fl_trust")
+        selected_layers = [selected_layer] if isinstance(selected_layer, str) else selected_layer
+        
+        logger.info(f"Active Defense Layer for Final Decision: [{selected_layer}]")
+        
         # Thresholds from LLM
         t_trust = params.get("fl_trust_threshold", 0.15)
         t_cluster = params.get("cluster_threshold", 2.0)
         t_clip = params.get("clipping_threshold", 1.5)
         t_trim = params.get("trim_threshold", 3.0)
         t_xgb = params.get("xgboost_risk_threshold", 0.5)
-        t_violation = params.get("violation_count_threshold", 1)
 
         for cid in range(fl["n_clients"]):
             cid_key = f"client_{cid}"
@@ -318,59 +323,58 @@ def run_simulation(
             report = threat_reports[cid_key]
             
             # Multi-layer violation check
-            violation_count = 0
+            failed_layers = []
             layer_status = []
             
             # Layer 1
             l1_val = feat["layer_1_fl_trust"]
             l1_ok = l1_val >= t_trust
-            if not l1_ok:
-                violation_count += 1
+            if not l1_ok and "layer_1_fl_trust" in selected_layers:
+                failed_layers.append("FLTrust")
             layer_status.append(f"FLTrust:{l1_val:.2f}({ 'OK' if l1_ok else 'FAIL' }>{t_trust})")
 
             # Layer 2
             l2_val = feat["layer_2_cluster"]
             l2_ok = l2_val <= t_cluster
-            if not l2_ok:
-                violation_count += 1
+            if not l2_ok and "layer_2_cluster" in selected_layers:
+                failed_layers.append("Cluster")
             layer_status.append(f"Cluster:{l2_val:.2f}({ 'OK' if l2_ok else 'FAIL' }<{t_cluster})")
 
             # Layer 3
             l3_val = feat["layer_3_clipping"]
             l3_ok = l3_val <= t_clip
-            if not l3_ok:
-                violation_count += 1
+            if not l3_ok and "layer_3_clipping" in selected_layers:
+                failed_layers.append("Clip")
             layer_status.append(f"Clip:{l3_val:.2f}({ 'OK' if l3_ok else 'FAIL' }<{t_clip})")
 
             # Layer 4
             l4_val = feat["layer_4_is_trimmed"]
             l4_ok = l4_val <= t_trim
-            if not l4_ok:
-                violation_count += 1
+            if not l4_ok and "layer_4_is_trimmed" in selected_layers:
+                failed_layers.append("Trim")
             layer_status.append(f"Trim:{l4_val:.2f}({ 'OK' if l4_ok else 'FAIL' }<{t_trim})")
 
             # XGBoost
             xgb_val = report.get("risk_score", 0)
             xgb_ok = xgb_val <= t_xgb
-            if not xgb_ok:
-                violation_count += 1
-                layer_status.append(f"XGBoost:{xgb_val:.2f}(FAIL<{t_xgb})")
-            else:
-                layer_status.append(f"XGBoost:{xgb_val:.2f}(OK<{t_xgb})")
+            if not xgb_ok and "xgboost" in selected_layers:
+                failed_layers.append("XGBoost")
+            layer_status.append(f"XGBoost:{xgb_val:.2f}({ 'OK' if xgb_ok else 'FAIL' }<{t_xgb})")
 
-            is_suspicious = violation_count >= t_violation
+            is_suspicious = len(failed_layers) > 0
+            fail_str = f"Failed: {','.join(failed_layers)}" if is_suspicious else "Passed"
             
             verdicts.append(DetectionVerdict(
                 client_id=cid,
                 is_suspicious=is_suspicious,
                 confidence=report.get("risk_score", 0.5) if is_suspicious else 0.0,
-                reason=f"Violations: {violation_count}/{t_violation} | " + "; ".join(layer_status)
+                reason=f"{fail_str} | " + "; ".join(layer_status)
             ))
 
             if is_suspicious:
-                logger.warning(f"  Client {cid} FLAGGED! (violations: {violation_count}/{t_violation}) Defense Profile: {' | '.join(layer_status)}")
+                logger.warning(f"  Client {cid} FLAGGED! ({fail_str}) Defense Profile: {' | '.join(layer_status)}")
             else:
-                logger.info(f"  Client {cid} OK. (violations: {violation_count}/{t_violation}) Defense Profile: {' | '.join(layer_status)}")
+                logger.info(f"  Client {cid} OK. Defense Profile: {' | '.join(layer_status)}")
 
         # Check if the malicious client was detected
         malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)
