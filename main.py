@@ -179,7 +179,7 @@ def run_simulation(
     server = FedServer(device=fl["device"])
     server.set_global_weights(copy.deepcopy(global_weights))
     aggregator = FedAvgAggregator()
-    detector = LayeredDetector(device=fl["device"])
+    detector = LayeredDetector(root_loader=test_loader, device=fl["device"])
     explainer = ExplainabilityEngine()
     attacker_agent = AttackerAgent(attacker_config)
     defender_agent = DefenderAgent(defender_config)
@@ -189,6 +189,7 @@ def run_simulation(
     last_attack_detected = None    # None on first round
     last_attack_passed = None      # None on first round
     last_all_clients_flagged = None  # None on first round
+    last_defend_params = None
     current_accuracy = baseline_accuracy
 
     for sim_round in range(1, fl["simulation_rounds"] + 1):
@@ -258,7 +259,24 @@ def run_simulation(
             "round_num": round_num,
         }
         defend_strategy = defender_agent.decide(defender_context)
-        logger.info(f"Defender strategy: {defend_strategy.get('method')} with params={defend_strategy.get('params')}")
+        
+        # Log threshold changes clearly
+        new_params = defend_strategy.get("params", {})
+        if last_defend_params:
+            changes = []
+            for k, v in new_params.items():
+                old_v = last_defend_params.get(k)
+                if old_v != v:
+                    changes.append(f"{k} ({old_v} -> {v})")
+            if changes:
+                logger.info(f"!!! DEFENSE ADJUSTED: {', '.join(changes)}")
+                logger.info(f"    Reasoning: {defend_strategy.get('reasoning', 'No reasoning provided')}")
+            else:
+                logger.info("Defense strategy: STABLE (no thresholds changed)")
+        else:
+            logger.info(f"Initial Defense Strategy: {new_params}")
+
+        last_defend_params = new_params
 
         # ------------------------------------------------------------------
         # Step 4: Layered Anomaly detection
@@ -281,34 +299,54 @@ def run_simulation(
             
             # Multi-layer violation check
             is_suspicious = False
-            reasons = []
+            layer_status = []
             
-            if feat["layer_1_fl_trust"] < t_trust:
+            # Layer 1
+            l1_val = feat["layer_1_fl_trust"]
+            l1_ok = l1_val >= t_trust
+            layer_status.append(f"FLTrust:{l1_val:.2f}({ 'OK' if l1_ok else 'FAIL' }>{t_trust})")
+            if not l1_ok:
                 is_suspicious = True
-                reasons.append(f"FLTrust({feat['layer_1_fl_trust']:.2f}) < {t_trust}")
-            if feat["layer_2_cluster"] > t_cluster:
+
+            # Layer 2
+            l2_val = feat["layer_2_cluster"]
+            l2_ok = l2_val <= t_cluster
+            layer_status.append(f"Cluster:{l2_val:.2f}({ 'OK' if l2_ok else 'FAIL' }<{t_cluster})")
+            if not l2_ok:
                 is_suspicious = True
-                reasons.append(f"Cluster({feat['layer_2_cluster']:.2f}) > {t_cluster}")
-            if feat["layer_3_clipping"] > t_clip:
+
+            # Layer 3
+            l3_val = feat["layer_3_clipping"]
+            l3_ok = l3_val <= t_clip
+            layer_status.append(f"Clip:{l3_val:.2f}({ 'OK' if l3_ok else 'FAIL' }<{t_clip})")
+            if not l3_ok:
                 is_suspicious = True
-                reasons.append(f"Clipping({feat['layer_3_clipping']:.2f}) > {t_clip}")
-            if feat["layer_4_is_trimmed"] > t_trim:
+
+            # Layer 4
+            l4_val = feat["layer_4_is_trimmed"]
+            l4_ok = l4_val <= t_trim
+            layer_status.append(f"Trim:{l4_val:.2f}({ 'OK' if l4_ok else 'FAIL' }<{t_trim})")
+            if not l4_ok:
                 is_suspicious = True
-                reasons.append(f"Trim({feat['layer_4_is_trimmed']:.2f}) > {t_trim}")
-            if report.get("risk_score", 0) > t_xgb:
+
+            # XGBoost
+            xgb_val = report.get("risk_score", 0)
+            xgb_ok = xgb_val <= t_xgb
+            if not xgb_ok:
                 is_suspicious = True
-                reasons.append(f"XGBoost({report.get('risk_score', 0):.2f}) > {t_xgb}")
+                layer_status.append(f"XGBoost:{xgb_val:.2f}(FAIL<{t_xgb})")
 
             verdicts.append(DetectionVerdict(
                 client_id=cid,
                 is_suspicious=is_suspicious,
                 confidence=report.get("risk_score", 0.5) if is_suspicious else 0.0,
-                reason="; ".join(reasons) if is_suspicious else "Clean"
+                reason="; ".join(layer_status) if is_suspicious else "Clean"
             ))
+
             if is_suspicious:
-                logger.warning(f"  Client {cid} FLAGGED: {'; '.join(reasons)}")
+                logger.warning(f"  Client {cid} FLAGGED! Defense Profile: {' | '.join(layer_status)}")
             else:
-                logger.info(f"  Client {cid}: OK")
+                logger.info(f"  Client {cid} OK. Defense Profile: {' | '.join(layer_status)}")
 
         # Check if the malicious client was detected
         malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)

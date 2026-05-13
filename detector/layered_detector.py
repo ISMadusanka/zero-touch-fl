@@ -71,20 +71,45 @@ class LayeredDetector:
         return torch.cat(flat_parts)
 
     def _compute_root_update_from_weights(self, global_weights: dict) -> torch.Tensor | None:
-        """Placeholder for root update logic."""
+        """Trains a small benchmark update on clean data to use as ground truth."""
         if self.root_loader is None:
             return None
-        # In a real impl, we'd train on root_loader here. 
-        # For now, we return None and FLTrust will return 1.0 (neutral).
-        return None
+        
+        # Take one batch of clean data
+        data, target = next(iter(self.root_loader))
+        data, target = data.to(self.device), target.to(self.device)
+        
+        # Create a temporary model with global weights
+        from model.mnist_net import MnistNet
+        model = MnistNet().to(self.device)
+        model.load_state_dict(global_weights)
+        
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        model.train()
+        
+        # 1 step of training
+        optimizer.zero_grad()
+        output = model(data)
+        loss = torch.nn.functional.cross_entropy(output, target)
+        loss.backward()
+        optimizer.step()
+        
+        # Calculate the delta (Root Update)
+        root_delta = self._flatten_update(model.state_dict(), global_weights)
+        return root_delta
 
     def _compute_fl_trust(self, deltas: torch.Tensor, root_update: torch.Tensor | None) -> torch.Tensor:
         if root_update is None:
             return torch.ones(len(deltas))
         
+        # Measure how well each client aligns with the clean benchmark
         cos = torch.nn.functional.cosine_similarity(deltas, root_update.unsqueeze(0))
-        # Sharpened curve for FLTrust
-        trust = torch.where(cos > 0, torch.sigmoid(12 * (cos - 0.15)), torch.zeros_like(cos))
+        # Sharpened sigmoid for stricter directional defense
+        trust = torch.where(
+            cos > 0,
+            torch.sigmoid(torch.tensor(12.0) * (cos - 0.15)),
+            torch.zeros_like(cos)
+        )
         return trust
 
     def _compute_clusters(self, deltas: torch.Tensor) -> np.ndarray:
