@@ -7,3 +7,4 @@ pyyaml
 numpy
 sentence-transformers
 matplotlib
+hdbscan

@@ -98,3 +98,37 @@ def get_data_loaders(n_clients: int, batch_size: int, data_dir: str = "./data/mn
     ]
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
     return client_loaders, test_loader
+
+
+def get_root_loader(
+    root_size: int = 100,
+    batch_size: int = 32,
+    data_dir: str = "./data/mnist_raw",
+    seed: int = 0,
+):
+    """Return a small IID server-side root dataset (FLTrust).
+
+    Cao et al. (NDSS 2021) show that as few as ~100 clean, class-balanced
+    samples held by the server suffice for trust bootstrapping. We sample
+    a stratified slice from the MNIST *training* set so it is disjoint
+    from the held-out test set used for evaluation.
+    """
+    train_dataset, _ = load_mnist(data_dir)
+    targets = train_dataset.targets if hasattr(train_dataset, "targets") else train_dataset.train_labels
+
+    # Stratified sampling: equal samples per digit class
+    per_class = max(1, root_size // 10)
+    rng = torch.Generator().manual_seed(seed)
+
+    label_to_indices: dict[int, list[int]] = {}
+    for idx, label in enumerate(targets):
+        label_to_indices.setdefault(int(label), []).append(idx)
+
+    selected: list[int] = []
+    for lbl, idxs in label_to_indices.items():
+        perm = torch.randperm(len(idxs), generator=rng).tolist()
+        selected.extend(idxs[i] for i in perm[:per_class])
+
+    return DataLoader(
+        Subset(train_dataset, selected), batch_size=batch_size, shuffle=True
+    )
