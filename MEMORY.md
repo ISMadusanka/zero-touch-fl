@@ -14,12 +14,26 @@ A sliding window of the **last 5 round outcomes** from `self.history[-5:]`, prov
 {
     "round":          int,    # Global round number (e.g. 4, 5, 6)
     "strategy": {
-        "attack_type": str,   # "sign_flip" | "noise_injection" | "scaling"
-        "params":      dict,  # e.g. {"scale": 3.0} or {}
+        "attack_type": str,   # "sign_flip" | "noise_injection" | "scaling" | "gaussian_noise"
+        "params":      dict,  # e.g. {"scale": 3.0}, {"sigma": 1.0}, {"c": 2.0, "k": 50}, or {}
         "reasoning":   str    # LLM's explanation
     },
     "was_detected":   bool,   # True if defender caught this attack
-    "accuracy_after": float   # Global model accuracy after this round
+    "accuracy_after": float,  # Global model accuracy after this round
+    "attack_metadata": {      # Optional — present when attack provides metadata
+        "k":           int|str,  # Number of targeted weights, or "all"
+        "total_params": int,     # Total model parameters
+        # sign_flip uses flipped_per_layer / flipped_indices_per_layer
+        # noise_injection & scaling use affected_per_layer / affected_indices_per_layer
+        "flipped_per_layer|affected_per_layer": {  # Count per layer
+            "fc1.weight": int, "fc2.bias": int, ...
+        },
+        "flipped_indices_per_layer|affected_indices_per_layer": {  # Exact indices
+            "fc1.weight": [int, ...], ...
+        },
+        "avg_flipped_grad_magnitude|avg_targeted_grad_magnitude":   float,
+        "avg_unflipped_grad_magnitude|avg_untargeted_grad_magnitude": float
+    }
 }
 ```
 
@@ -74,12 +88,22 @@ Attacker Agent — stored parameters per entry:
 {
     "round":          int,    # Global round number
     "strategy": {
-        "attack_type": str,   # "sign_flip" | "noise_injection" | "scaling"
-        "params":      dict,  # e.g. {"scale": 3.0} or {}
+        "attack_type": str,   # "sign_flip" | "noise_injection" | "scaling" | "gaussian_noise"
+        "params":      dict,  # e.g. {"scale": 3.0}, {"sigma": 1.0}, {"c": 2.0, "k": 50}, or {}
         "reasoning":   str    # LLM's explanation for choosing this attack
     },
     "was_detected":   bool,   # Whether the defender caught this attack
-    "accuracy_after": float   # Model accuracy after this round
+    "accuracy_after": float,  # Model accuracy after this round
+    "attack_metadata": {      # Optional — present when attack provides metadata
+        "k":           int|str,  # Number of targeted weights, or "all"
+        "total_params": int,
+        # sign_flip: flipped_per_layer / flipped_indices_per_layer
+        # noise_injection & scaling: affected_per_layer / affected_indices_per_layer
+        "*_per_layer":          dict,  # {layer_name: count}
+        "*_indices_per_layer":  dict,  # {layer_name: [indices]}
+        "avg_*_grad_magnitude":   float,  # targeted weights
+        "avg_*_grad_magnitude":   float   # untargeted weights
+    }
 }
 ```
 
