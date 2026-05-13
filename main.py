@@ -32,6 +32,7 @@ from agents.attacker_agent import AttackerAgent
 from agents.defender_agent import DefenderAgent
 from storage.checkpoint import save_state, load_state, state_exists
 from core.types import RoundLog
+from metrics import MetricsTracker
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -180,6 +181,13 @@ def run_simulation(
     defender_agent = DefenderAgent(defender_config)
     malicious_client = MaliciousClient(client_id=malicious_id)
 
+    # Metrics tracker — ground truth = the configured malicious client id(s)
+    metrics_tracker = MetricsTracker(
+        malicious_ids={malicious_id},
+        baseline_accuracy=baseline_accuracy,
+        output_dir="logs/metrics",
+    )
+
     # State tracking
     last_attack_detected = None    # None on first round
     last_attack_passed = None      # None on first round
@@ -197,10 +205,17 @@ def run_simulation(
         # ------------------------------------------------------------------
         # Step 1: Attacker decides strategy
         # ------------------------------------------------------------------
+        # Compute windowed metrics for agent feedback (uses rounds so far)
+        windowed = metrics_tracker.get_windowed_metrics(window=5)
+
         attacker_context = {
             "baseline_accuracy": baseline_accuracy,
             "current_accuracy": current_accuracy,
             "was_detected": last_attack_detected,
+            # Windowed KPIs — attacker gets ASR, FPR, APR
+            "attack_success_rate_recent": windowed["attack_success_rate"],
+            "fpr_recent": windowed["fpr"],
+            "accuracy_preservation_rate": windowed["accuracy_preservation_rate"],
         }
         attack_strategy = attacker_agent.decide(attacker_context)
         attack_name = attack_strategy.get("attack_type", "sign_flip")
@@ -237,6 +252,10 @@ def run_simulation(
             "update_features": update_features,
             "attack_passed_through": last_attack_passed,
             "all_clients_flagged": last_all_clients_flagged,
+            # Windowed KPIs — defender gets TPR, FPR, APR
+            "tpr_recent": windowed["tpr"],
+            "fpr_recent": windowed["fpr"],
+            "accuracy_preservation_rate": windowed["accuracy_preservation_rate"],
         }
         defend_strategy = defender_agent.decide(defender_context)
         logger.info(f"Defender strategy: {defend_strategy.get('method')} with params={defend_strategy.get('params')}")
@@ -276,6 +295,15 @@ def run_simulation(
         logger.info(f"Test accuracy after aggregation: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
 
         # ------------------------------------------------------------------
+        # Step 6b: Compute & log evaluation metrics for this round
+        # ------------------------------------------------------------------
+        round_metrics = metrics_tracker.update(
+            round_num=round_num,
+            verdicts=verdicts,
+            current_accuracy=current_accuracy,
+        )
+
+        # ------------------------------------------------------------------
         # Step 7: Record outcomes for both agents
         # ------------------------------------------------------------------
         # Extract attack metadata (e.g. flipped indices) from the malicious update
@@ -289,12 +317,19 @@ def run_simulation(
                 f"layers_affected={list(layer_info.keys())}"
             )
 
+        # Recompute windowed metrics AFTER this round's data is recorded
+        windowed_after = metrics_tracker.get_windowed_metrics(window=5)
+
         attacker_agent.record_outcome(
             round_num=round_num,
             strategy=attack_strategy,
             was_detected=attack_detected,
             accuracy=current_accuracy,
             attack_metadata=attack_metadata,
+            # Windowed KPIs for attacker history
+            attack_success_rate_recent=windowed_after["attack_success_rate"],
+            fpr_recent=windowed_after["fpr"],
+            accuracy_preservation_rate=windowed_after["accuracy_preservation_rate"],
         )
         defender_agent.record_outcome(
             round_num=round_num,
@@ -305,6 +340,10 @@ def run_simulation(
                 {"client_id": v.client_id, "suspicious": v.is_suspicious, "confidence": v.confidence, "reason": v.reason}
                 for v in verdicts
             ],
+            # Windowed KPIs for defender history
+            tpr_recent=windowed_after["tpr"],
+            fpr_recent=windowed_after["fpr"],
+            accuracy_preservation_rate=windowed_after["accuracy_preservation_rate"],
         )
 
         # ------------------------------------------------------------------
@@ -326,7 +365,7 @@ def run_simulation(
             all_clients_flagged=all_clients_flagged,
             round_skipped=new_weights is None,
         )
-        _save_round_log(round_log)
+        _save_round_log(round_log, extra={"metrics": round_metrics.to_dict()})
 
         # Update state for next round
         last_attack_detected = attack_detected
@@ -338,9 +377,15 @@ def run_simulation(
     logger.info(f"Final accuracy: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
     logger.info("=" * 60)
 
+    # Aggregate metrics over the whole simulation
+    metrics_tracker.save_summary()
 
-def _save_round_log(log: RoundLog):
-    """Save a round's complete data to JSON."""
+
+def _save_round_log(log: RoundLog, extra: dict | None = None):
+    """Save a round's complete data to JSON.
+
+    `extra` is merged into the payload (e.g. evaluation metrics for the round).
+    """
     path = f"logs/round_data/round_{log.round_num:03d}.json"
     data = {
         "round_num": log.round_num,
@@ -355,6 +400,8 @@ def _save_round_log(log: RoundLog):
         "all_clients_flagged": log.all_clients_flagged,
         "round_skipped": log.round_skipped,
     }
+    if extra:
+        data.update(extra)
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
     logger.info(f"Round data saved to {path}")
