@@ -32,6 +32,7 @@ from agents.attacker_agent import AttackerAgent
 from agents.defender_agent import DefenderAgent
 from storage.checkpoint import save_state, load_state, state_exists
 from core.types import RoundLog
+from metrics import MetricsTracker
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -180,6 +181,13 @@ def run_simulation(
     defender_agent = DefenderAgent(defender_config)
     malicious_client = MaliciousClient(client_id=malicious_id)
 
+    # Metrics tracker — ground truth = the configured malicious client id(s)
+    metrics_tracker = MetricsTracker(
+        malicious_ids={malicious_id},
+        baseline_accuracy=baseline_accuracy,
+        output_dir="logs/metrics",
+    )
+
     # State tracking
     last_attack_detected = None    # None on first round
     last_attack_passed = None      # None on first round
@@ -276,6 +284,15 @@ def run_simulation(
         logger.info(f"Test accuracy after aggregation: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
 
         # ------------------------------------------------------------------
+        # Step 6b: Compute & log evaluation metrics for this round
+        # ------------------------------------------------------------------
+        round_metrics = metrics_tracker.update(
+            round_num=round_num,
+            verdicts=verdicts,
+            current_accuracy=current_accuracy,
+        )
+
+        # ------------------------------------------------------------------
         # Step 7: Record outcomes for both agents
         # ------------------------------------------------------------------
         # Extract attack metadata (e.g. flipped indices) from the malicious update
@@ -326,7 +343,7 @@ def run_simulation(
             all_clients_flagged=all_clients_flagged,
             round_skipped=new_weights is None,
         )
-        _save_round_log(round_log)
+        _save_round_log(round_log, extra={"metrics": round_metrics.to_dict()})
 
         # Update state for next round
         last_attack_detected = attack_detected
@@ -338,9 +355,15 @@ def run_simulation(
     logger.info(f"Final accuracy: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
     logger.info("=" * 60)
 
+    # Aggregate metrics over the whole simulation
+    metrics_tracker.save_summary()
 
-def _save_round_log(log: RoundLog):
-    """Save a round's complete data to JSON."""
+
+def _save_round_log(log: RoundLog, extra: dict | None = None):
+    """Save a round's complete data to JSON.
+
+    `extra` is merged into the payload (e.g. evaluation metrics for the round).
+    """
     path = f"logs/round_data/round_{log.round_num:03d}.json"
     data = {
         "round_num": log.round_num,
@@ -355,6 +378,8 @@ def _save_round_log(log: RoundLog):
         "all_clients_flagged": log.all_clients_flagged,
         "round_skipped": log.round_skipped,
     }
+    if extra:
+        data.update(extra)
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
     logger.info(f"Round data saved to {path}")
