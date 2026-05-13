@@ -16,7 +16,7 @@ from storage.vector_store import VectorStore
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a Strategic Security Analyst for a Federated Learning system.
-Your goal is to maintain a robust, multi-layered security posture.
+Your goal is to maintain a robust, multi-layered security posture while minimizing false positives (rejecting honest clients).
 
 The system uses a 4-layer defense pipeline:
 1. FLTrust: Measures direction alignment with a clean root dataset. (Higher is better)
@@ -26,6 +26,9 @@ The system uses a 4-layer defense pipeline:
 
 Contextual Inputs:
 - Threat Reasoning Report: Detailed XGBoost risk scores and SHAP explainability per client. Use this to identify which layer is being exploited.
+- tpr_recent: your true positive rate (recall) over the last 5 rounds (0.0–1.0). This is your core "am I catching attackers" KPI. If it is dropping, your detection thresholds need tightening.
+- fpr_recent: your false positive rate over the last 5 rounds (0.0–1.0). You must minimize this — flagging honest clients hurts aggregation quality and wastes useful updates. If this is high, loosen your thresholds.
+- accuracy_preservation_rate: current_accuracy / baseline_accuracy (0.0–1.0). If this drops, either your strategy is too aggressive (skipping rounds by flagging everyone) or too lenient (letting poison through). Aim to keep this as close to 1.0 as possible.
 - recent_history (Short-term): Outcomes of the last 5 rounds. Use this to detect persistent or evolving attack patterns.
 - similar_past_experiences (Long-term): Relevant historical episodes from your vector memory. Use these to apply lessons learned from past successful or failed defenses.
 
@@ -131,17 +134,34 @@ class DefenderAgent:
 
     def record_outcome(
         self, round_num: int, strategy: dict, attack_passed: bool,
-        all_clients_flagged: bool, verdicts: list[dict]
+        all_clients_flagged: bool, verdicts: list[dict],
+        tpr_recent: float = 0.0,
+        fpr_recent: float = 0.0,
+        accuracy_preservation_rate: float = 1.0,
     ):
-        """Store round outcome in history and vector memory."""
+        """Store round outcome in history and vector memory.
+
+        Windowed metrics (tpr_recent, fpr_recent, accuracy_preservation_rate)
+        are stored alongside each history entry so the LLM can see the
+        trend across the recent_history window.
+        """
         entry = {
             "round": round_num,
             "strategy": strategy,
             "attack_passed_through": attack_passed,
             "all_clients_flagged": all_clients_flagged,
             "verdicts": verdicts,
+            "tpr_recent": tpr_recent,
+            "fpr_recent": fpr_recent,
+            "accuracy_preservation_rate": accuracy_preservation_rate,
         }
         self.history.append(entry)
+        logger.info(
+            f"Defender memory: round {round_num} recorded "
+            f"(TPR={tpr_recent:.3f}, FPR={fpr_recent:.3f}, "
+            f"APR={accuracy_preservation_rate:.3f}, "
+            f"short-term: {len(self.history)} entries)"
+        )
 
         vec = self._make_vector(entry)
         self.memory.add(vec, entry)
@@ -154,6 +174,9 @@ class DefenderAgent:
             "attack_passed_through": context.get("attack_passed_through"),
             "recent_history": context.get("recent_history", []),
             "similar_past_experiences": context.get("similar_past_experiences", []),
+            "tpr_recent": context.get("tpr_recent", 0.0),
+            "fpr_recent": context.get("fpr_recent", 0.0),
+            "accuracy_preservation_rate": context.get("accuracy_preservation_rate", 1.0),
         }, default=str)
 
         result = self.llm.call(SYSTEM_PROMPT, user_msg)
@@ -175,14 +198,6 @@ class DefenderAgent:
 
         logger.info(f"Defender chose: {result.get('method')} — {result.get('reasoning', '')}")
         return result
-
-    def _make_vector(self, data: dict) -> np.ndarray:
-        """Create a semantic embedding vector for FAISS indexing.
-
-        Uses SentenceTransformers so that similar contexts (e.g. close
-        detection outcomes, similar features) map to nearby vectors.
-        """
-        return embed(data)
 
     def _make_vector(self, data: dict) -> np.ndarray:
         """Create a semantic embedding vector for FAISS indexing.
