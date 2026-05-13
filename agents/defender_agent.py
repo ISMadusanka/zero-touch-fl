@@ -1,15 +1,11 @@
 """Defender LLM agent — adapts anomaly detection strategy.
-
 Only adapts when the previous defense FAILED (attack passed through).
 If the defense succeeded (caught the attack), the same strategy is kept.
 """
-
 import json
 import logging
 import numpy as np
-
 from agents.embedder import embed, get_dimension
-
 from agents.llm_client import create_llm_client
 from storage.vector_store import VectorStore
 
@@ -26,6 +22,16 @@ You receive statistical features of all client updates:
 - fltrust_scores: ReLU(cosine_similarity) trust scores per client
 - foolsgold_max_cs: maximum pairwise cosine similarity per client
 - mean_pairwise_distance: average pairwise L2 distance between updates
+- tpr_recent: your true positive rate (recall) over the last 5 rounds
+  (0.0–1.0). This is your core "am I catching attackers" KPI. If it is
+  dropping, your detection thresholds need tightening.
+- fpr_recent: your false positive rate over the last 5 rounds (0.0–1.0).
+  You must minimize this — flagging honest clients hurts aggregation quality
+  and wastes useful updates. If this is high, loosen your thresholds.
+- accuracy_preservation_rate: current_accuracy / baseline_accuracy (0.0–1.0).
+  If this drops, either your strategy is too aggressive (skipping rounds
+  by flagging everyone) or too lenient (letting poison through). Aim to
+  keep this as close to 1.0 as possible.
 - history: past detection outcomes
 - similar_past_experiences: relevant past episodes from memory
 - all_clients_flagged: if True, your last thresholds were TOO STRICT and
@@ -94,7 +100,12 @@ STRATEGY GUIDANCE:
 - To loosen detection (if too many flagged): INCREASE sensitivity (e.g. 3.0-5.0).
 - If all_clients_flagged is true, you MUST increase sensitivity significantly
   (e.g. double it or use 4.0+) — the round was skipped because your threshold
-  was too strict."""
+  was too strict.
+- Monitor tpr_recent: if it is dropping, tighten thresholds or switch method.
+- Monitor fpr_recent: if it is high, loosen thresholds to protect honest clients.
+- Monitor accuracy_preservation_rate: if it drops, diagnose whether the cause
+  is over-aggressive flagging (high fpr_recent / skipped rounds) or leniency
+  (low tpr_recent letting poison through), then adjust accordingly."""
 
 
 class DefenderAgent:
@@ -116,12 +127,14 @@ class DefenderAgent:
             temperature=llm_cfg.get("temperature", 0.3),
             ollama_base_url=llm_cfg.get("ollama_base_url", "http://localhost:11434"),
         )
+
         initial = config.get("initial_strategy", {})
         self.current_strategy = {
             "method": initial.get("method", "norm_threshold"),
             "params": {"sensitivity": initial.get("sensitivity", 2.0)},
             "reasoning": "initial default",
         }
+
         self.memory = VectorStore(
             dimension=get_dimension(),
             persist_path=config.get("memory", {}).get("persist_path"),
@@ -163,19 +176,39 @@ class DefenderAgent:
         return self.current_strategy
 
     def record_outcome(
-        self, round_num: int, strategy: dict, attack_passed: bool,
-        all_clients_flagged: bool, verdicts: list[dict]
+        self,
+        round_num: int,
+        strategy: dict,
+        attack_passed: bool,
+        all_clients_flagged: bool,
+        verdicts: list[dict],
+        tpr_recent: float = 0.0,
+        fpr_recent: float = 0.0,
+        accuracy_preservation_rate: float = 1.0,
     ):
-        """Store round outcome in history and vector memory."""
+        """Store round outcome in history and vector memory.
+
+        Windowed metrics (tpr_recent, fpr_recent, accuracy_preservation_rate)
+        are stored alongside each history entry so the LLM can see the
+        trend across the recent_history window.
+        """
         entry = {
             "round": round_num,
             "strategy": strategy,
             "attack_passed_through": attack_passed,
             "all_clients_flagged": all_clients_flagged,
             "verdicts": verdicts,
+            "tpr_recent": tpr_recent,
+            "fpr_recent": fpr_recent,
+            "accuracy_preservation_rate": accuracy_preservation_rate,
         }
         self.history.append(entry)
-
+        logger.info(
+            f"Defender memory: round {round_num} recorded "
+            f"(TPR={tpr_recent:.3f}, FPR={fpr_recent:.3f}, "
+            f"APR={accuracy_preservation_rate:.3f}, "
+            f"short-term: {len(self.history)} entries)"
+        )
         vec = self._make_vector(entry)
         self.memory.add(vec, entry)
         self.memory.save()
@@ -192,6 +225,9 @@ class DefenderAgent:
             "update_features": context.get("update_features"),
             "attack_passed_through": context.get("attack_passed_through"),
             "all_clients_flagged": context.get("all_clients_flagged"),
+            "tpr_recent": context.get("tpr_recent", 0.0),
+            "fpr_recent": context.get("fpr_recent", 0.0),
+            "accuracy_preservation_rate": context.get("accuracy_preservation_rate", 1.0),
             "recent_history": self.history[-5:],
             "similar_past_experiences": similar,
         }, default=str)

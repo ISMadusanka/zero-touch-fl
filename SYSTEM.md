@@ -54,6 +54,41 @@ The LLM is also given the top 3 most similar past rounds retrieved from the FAIS
 - similar_past_experiences: Up to 3 relevant past episodes retrieved from the defender's FAISS vector memory to help it adapt thresholds based on historical failures.
 
 
+## defence and attack agents feedbacks
+Read the agents and their current feedback contracts. Here's the mapping.
+
+## What each agent currently sees
+
+**Attacker** (from [SYSTEM_PROMPT in attacker_agent.py:25](agents/attacker_agent.py:25)): `baseline_accuracy`, `current_accuracy`, `was_detected` (single-round bool), `recent_history`, `similar_past_experiences`.
+
+**Defender** (from [SYSTEM_PROMPT in defender_agent.py:22](agents/defender_agent.py:22)): `update_features` (l2_norms, cosines, pairwise), `attack_passed_through` (single-round bool), `all_clients_flagged`, `recent_history`, `similar_past_experiences`.
+
+Both agents reason on *single-round binary signals* + 5-round history. They have no aggregate sense of how their regime is performing over time. That's exactly the gap the metrics can fill.
+
+## Recommendation
+
+| Metric | Attacker | Defender | Why |
+|---|---|---|---|
+| **Attack Success Rate** (cumulative / windowed) | ✅ | ❌ | Attacker's persistent outcome KPI; tells it "my regime is being shut down" vs "I'm consistently slipping through." For the defender, ASR = 1 − TPR — redundant. |
+| **TPR / Recall** (cumulative / windowed) | ❌ | ✅ | Defender's core "am I catching them" KPI. For the attacker it's just 1 − ASR — drop one to avoid redundancy. |
+| **FPR** (cumulative / windowed) | ✅ | ✅ | **Defender:** explicitly told to "minimize false positives"; right now it only learns about FPs via the extreme `all_clients_flagged` signal — surfacing FPR closes the loop directly. **Attacker:** adversarial intel — a sloppy defender (high FPR) means aggressive attacks blend in; a precise defender (low FPR) forces subtlety. |
+| **Accuracy Preservation Rate** | ✅ | ✅ | **Attacker:** damage gauge, normalized against baseline so the LLM doesn't have to compute `current / baseline`. **Defender:** collateral-damage gauge — over-aggressive flagging skips aggregation and tanks accuracy; APR makes that visible. |
+| Raw TP/FN/FP/TN counts | ❌ | ❌ | Already encoded in the rates above. At single-round granularity (one attacker, n−1 honest) they're noisy and clutter the prompt. |
+| Recall as a separate metric | ❌ | ❌ | Alias of TPR — pick one name in the prompt so the LLM doesn't think they're independent signals. |
+
+## Two practical notes on how to surface them
+
+1. **Use a trailing window, not per-round.** With one attacker per round, single-round TPR is just 0/1 — no signal. Aggregating over the last 5–10 rounds (matching the existing `history[-5:]` convention) gives the LLM a trajectory.
+
+2. **Embed per-round metrics into each history entry** *and* surface the windowed aggregate at the top of the prompt. The LLM already sees 5 history entries — adding `attack_success`, `apr`, etc. to each gives it the trend for free, while the top-level aggregate gives the headline number.
+
+## Net feedback contract
+
+- **Attacker feedback**: keep current fields + add `attack_success_rate_recent`, `fpr_recent`, `accuracy_preservation_rate` (current and recent average).
+- **Defender feedback**: keep current fields + add `tpr_recent`, `fpr_recent`, `accuracy_preservation_rate`.
+
+This gives each agent exactly the metrics that drive its own objective, with no cross-redundancy between TPR and ASR.
+
 
 # Defense Strategies
 
