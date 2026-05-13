@@ -205,10 +205,17 @@ def run_simulation(
         # ------------------------------------------------------------------
         # Step 1: Attacker decides strategy
         # ------------------------------------------------------------------
+        # Compute windowed metrics for agent feedback (uses rounds so far)
+        windowed = metrics_tracker.get_windowed_metrics(window=5)
+
         attacker_context = {
             "baseline_accuracy": baseline_accuracy,
             "current_accuracy": current_accuracy,
             "was_detected": last_attack_detected,
+            # Windowed KPIs — attacker gets ASR, FPR, APR
+            "attack_success_rate_recent": windowed["attack_success_rate"],
+            "fpr_recent": windowed["fpr"],
+            "accuracy_preservation_rate": windowed["accuracy_preservation_rate"],
         }
         attack_strategy = attacker_agent.decide(attacker_context)
         attack_name = attack_strategy.get("attack_type", "sign_flip")
@@ -245,6 +252,10 @@ def run_simulation(
             "update_features": update_features,
             "attack_passed_through": last_attack_passed,
             "all_clients_flagged": last_all_clients_flagged,
+            # Windowed KPIs — defender gets TPR, FPR, APR
+            "tpr_recent": windowed["tpr"],
+            "fpr_recent": windowed["fpr"],
+            "accuracy_preservation_rate": windowed["accuracy_preservation_rate"],
         }
         defend_strategy = defender_agent.decide(defender_context)
         logger.info(f"Defender strategy: {defend_strategy.get('method')} with params={defend_strategy.get('params')}")
@@ -306,12 +317,19 @@ def run_simulation(
                 f"layers_affected={list(layer_info.keys())}"
             )
 
+        # Recompute windowed metrics AFTER this round's data is recorded
+        windowed_after = metrics_tracker.get_windowed_metrics(window=5)
+
         attacker_agent.record_outcome(
             round_num=round_num,
             strategy=attack_strategy,
             was_detected=attack_detected,
             accuracy=current_accuracy,
             attack_metadata=attack_metadata,
+            # Windowed KPIs for attacker history
+            attack_success_rate_recent=windowed_after["attack_success_rate"],
+            fpr_recent=windowed_after["fpr"],
+            accuracy_preservation_rate=windowed_after["accuracy_preservation_rate"],
         )
         defender_agent.record_outcome(
             round_num=round_num,
@@ -322,6 +340,10 @@ def run_simulation(
                 {"client_id": v.client_id, "suspicious": v.is_suspicious, "confidence": v.confidence, "reason": v.reason}
                 for v in verdicts
             ],
+            # Windowed KPIs for defender history
+            tpr_recent=windowed_after["tpr"],
+            fpr_recent=windowed_after["fpr"],
+            accuracy_preservation_rate=windowed_after["accuracy_preservation_rate"],
         )
 
         # ------------------------------------------------------------------

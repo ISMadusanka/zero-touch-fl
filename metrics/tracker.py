@@ -111,6 +111,43 @@ class MetricsTracker:
         )
 
     # ------------------------------------------------------------------
+    # Windowed metrics for agent feedback
+    # ------------------------------------------------------------------
+
+    def get_windowed_metrics(self, window: int = 5) -> dict:
+        """Compute ASR, TPR, FPR, APR over the last `window` rounds.
+
+        Returns a dict suitable for injecting into agent contexts.
+        With a single attacker per round, per-round TPR is binary (0 or 1),
+        so a trailing window gives the LLM a meaningful trajectory.
+        """
+        recent = self.rounds[-window:] if self.rounds else []
+        if not recent:
+            return {
+                "attack_success_rate": 0.0,
+                "tpr": 0.0,
+                "fpr": 0.0,
+                "accuracy_preservation_rate": 0.0,
+                "window_size": 0,
+            }
+
+        tp = sum(r.tp for r in recent)
+        fn = sum(r.fn for r in recent)
+        fp = sum(r.fp for r in recent)
+        tn = sum(r.tn for r in recent)
+        n_successes = sum(1 for r in recent if r.attack_success)
+
+        return {
+            "attack_success_rate": _safe_div(n_successes, len(recent)),
+            "tpr": _safe_div(tp, tp + fn),
+            "fpr": _safe_div(fp, fp + tn),
+            "accuracy_preservation_rate": _safe_div(
+                recent[-1].current_accuracy, self.baseline_accuracy
+            ),
+            "window_size": len(recent),
+        }
+
+    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 

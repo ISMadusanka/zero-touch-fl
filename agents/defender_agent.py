@@ -23,6 +23,16 @@ You receive statistical features of all client updates:
 - l2_norms: L2 norm of each client's weight delta
 - cosine_similarities: cosine similarity of each update with the global model
 - pairwise_distances: average pairwise L2 distance between updates
+- tpr_recent: your true positive rate (recall) over the last 5 rounds
+  (0.0–1.0). This is your core "am I catching attackers" KPI. If it is
+  dropping, your detection thresholds need tightening.
+- fpr_recent: your false positive rate over the last 5 rounds (0.0–1.0).
+  You must minimize this — flagging honest clients hurts aggregation quality
+  and wastes useful updates. If this is high, loosen your thresholds.
+- accuracy_preservation_rate: current_accuracy / baseline_accuracy (0.0–1.0).
+  If this drops, either your strategy is too aggressive (skipping rounds
+  by flagging everyone) or too lenient (letting poison through). Aim to
+  keep this as close to 1.0 as possible.
 - history: past detection outcomes
 - similar_past_experiences: relevant past episodes from memory
 - all_clients_flagged: if True, your last thresholds were TOO STRICT and
@@ -45,7 +55,10 @@ Available methods:
   {{"norm_threshold": <float>, "cosine_threshold": <float>}}
 
 Be strategic. If an attack passed through, tighten thresholds or change method.
-But be careful not to over-tighten and flag honest clients.
+But be careful not to over-tighten and flag honest clients — monitor your
+fpr_recent closely. If accuracy_preservation_rate is dropping, investigate
+whether it is from letting attacks through (low tpr_recent) or from
+over-aggressive flagging (high fpr_recent / skipped rounds).
 If all_clients_flagged is true, you MUST loosen your thresholds — the round
 was skipped entirely because every client looked suspicious to your strategy."""
 
@@ -117,17 +130,34 @@ class DefenderAgent:
 
     def record_outcome(
         self, round_num: int, strategy: dict, attack_passed: bool,
-        all_clients_flagged: bool, verdicts: list[dict]
+        all_clients_flagged: bool, verdicts: list[dict],
+        tpr_recent: float = 0.0,
+        fpr_recent: float = 0.0,
+        accuracy_preservation_rate: float = 1.0,
     ):
-        """Store round outcome in history and vector memory."""
+        """Store round outcome in history and vector memory.
+
+        Windowed metrics (tpr_recent, fpr_recent, accuracy_preservation_rate)
+        are stored alongside each history entry so the LLM can see the
+        trend across the recent_history window.
+        """
         entry = {
             "round": round_num,
             "strategy": strategy,
             "attack_passed_through": attack_passed,
             "all_clients_flagged": all_clients_flagged,
             "verdicts": verdicts,
+            "tpr_recent": tpr_recent,
+            "fpr_recent": fpr_recent,
+            "accuracy_preservation_rate": accuracy_preservation_rate,
         }
         self.history.append(entry)
+        logger.info(
+            f"Defender memory: round {round_num} recorded "
+            f"(TPR={tpr_recent:.3f}, FPR={fpr_recent:.3f}, "
+            f"APR={accuracy_preservation_rate:.3f}, "
+            f"short-term: {len(self.history)} entries)"
+        )
 
         vec = self._make_vector(entry)
         self.memory.add(vec, entry)
@@ -144,6 +174,9 @@ class DefenderAgent:
         user_msg = json.dumps({
             "update_features": context.get("update_features"),
             "attack_passed_through": context.get("attack_passed_through"),
+            "tpr_recent": context.get("tpr_recent", 0.0),
+            "fpr_recent": context.get("fpr_recent", 0.0),
+            "accuracy_preservation_rate": context.get("accuracy_preservation_rate", 1.0),
             "recent_history": self.history[-5:],
             "similar_past_experiences": similar,
         }, default=str)
