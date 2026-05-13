@@ -141,14 +141,52 @@ class AttackerAgent:
         self.current_strategy = self._ask_llm(context, client_weights)
         return self.current_strategy
 
-    def record_outcome(self, round_num: int, strategy: dict, was_detected: bool, accuracy: float):
+    def record_outcome(self, round_num: int, strategy: dict, was_detected: bool, accuracy: float, original_weights: dict = None):
         """Store round outcome in history and vector memory."""
+        
+        weight_change_stats = {}
+        if original_weights and "modified_weights" in strategy:
+            deltas = []
+            for k in original_weights:
+                if k in strategy["modified_weights"]:
+                    orig_tensor = original_weights[k].cpu().float().numpy()
+                    mod_tensor = strategy["modified_weights"][k].cpu().float().numpy()
+                    delta = (mod_tensor - orig_tensor).flatten()
+                    delta = delta[delta != 0]
+                    if len(delta) > 0:
+                        deltas.extend(delta.tolist())
+            
+            if deltas:
+                deltas_arr = np.array(deltas)
+                avg_pert = float(np.mean(np.abs(deltas_arr)))
+                max_pert = float(np.max(np.abs(deltas_arr)))
+                l2_norm = float(np.linalg.norm(deltas_arr))
+                
+                pos_count = np.sum(deltas_arr > 0)
+                neg_count = np.sum(deltas_arr < 0)
+                if pos_count > neg_count * 2:
+                    direction = "mostly positive"
+                elif neg_count > pos_count * 2:
+                    direction = "mostly negative"
+                else:
+                    direction = "mixed"
+                
+                weight_change_stats = {
+                    "avg_perturbation": round(avg_pert, 6),
+                    "max_perturbation": round(max_pert, 6),
+                    "l2_norm_of_change": round(l2_norm, 6),
+                    "direction": direction
+                }
+
         entry = {
             "round": round_num,
             "reasoning": strategy.get("reasoning", ""),
             "was_detected": was_detected,
             "accuracy_after": accuracy,
         }
+        if weight_change_stats:
+            entry["weight_change_stats"] = weight_change_stats
+            
         self.history.append(entry)
 
         # Create a semantic embedding for FAISS

@@ -284,6 +284,7 @@ def run_simulation(
             strategy=attack_strategy,
             was_detected=attack_detected,
             accuracy=current_accuracy,
+            original_weights=client_weights[malicious_id],
         )
         defender_agent.record_outcome(
             round_num=round_num,
