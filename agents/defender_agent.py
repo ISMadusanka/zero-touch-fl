@@ -34,7 +34,7 @@ Contextual Inputs:
 
 When an attack passes through or the system locks up, you must adapt your strategy.
 Read the full XGBoost threat report for all layers. Based on the report, decide if the *currently selected* single layer failed.
-You may only select EXACTLY ONE layer to act as the sole defense mechanism. Select the most reliable layer based on the threat explainability report.
+You may only select EXACTLY ONE layer to act as the sole defense mechanism. Your choice MUST be one of the following: ["layer_1_fl_trust", "layer_2_cluster", "layer_3_clipping", "layer_4_is_trimmed"]. Do NOT select xgboost. Select the most reliable layer based on the threat explainability report.
 
 Output your decision in this JSON format:
 {
@@ -54,7 +54,7 @@ Adaptive Strategy:
 - You are defending using exactly one layer.
 - **Threshold Directionality**: 
   - For `layer_1_fl_trust`: Client passes if `value >= threshold`. To **tighten** this layer (catch more attackers), you must **INCREASE** the threshold (e.g., 0.15 -> 0.20).
-  - For all other layers (`layer_2_cluster`, `layer_3_clipping`, `layer_4_is_trimmed`, `xgboost`): Client passes if `value <= threshold`. To **tighten** them, you must **DECREASE** the threshold (e.g., 2.0 -> 1.5).
+  - For all other layers (`layer_2_cluster`, `layer_3_clipping`, `layer_4_is_trimmed`): Client passes if `value <= threshold`. To **tighten** them, you must **DECREASE** the threshold (e.g., 2.0 -> 1.5).
 - If an attack PASSED THROUGH: Try tightening the threshold for the currently selected layer. If tightening the threshold is ineffective or too noisy, switch `selected_layer` to a different, more reliable layer.
 - If ALL CLIENTS WERE FLAGGED: Try loosening the threshold for the currently selected layer. If it remains too noisy, switch `selected_layer` to a different layer.
 - Use history to recognize "stealthy" attackers that slowly increase their magnitude over rounds."""
