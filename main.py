@@ -262,15 +262,18 @@ def run_simulation(
             threat_reports[cid_key] = explainer.explain(features)
             
         acc_drop = False
+        acc_drop_value = 0.0
         if round_num > 1 and current_accuracy is not None:
              # Accuracy drop heuristic: check if current accuracy is significantly lower than baseline
              acc_drop = current_accuracy < (baseline_accuracy - 0.05)
+             acc_drop_value = round(baseline_accuracy - current_accuracy, 4)
 
         defender_context = {
             "threat_reports": threat_reports,
             "attack_passed_through": last_attack_passed,
             "all_clients_flagged": last_all_clients_flagged,
             "accuracy_dropped": acc_drop,
+            "accuracy_drop_value": acc_drop_value,
             "round_num": round_num,
             # Windowed KPIs — defender gets TPR, FPR, APR
             "tpr_recent": windowed["tpr"],

@@ -175,6 +175,8 @@ class DefenderAgent:
             "current_active_strategy": self.current_strategy,
             "threat_reports": context.get("threat_reports"),
             "attack_passed_through": context.get("attack_passed_through"),
+            "accuracy_dropped": context.get("accuracy_dropped", False),
+            "accuracy_drop_value": context.get("accuracy_drop_value", 0.0),
             "recent_history": context.get("recent_history", []),
             "similar_past_experiences": context.get("similar_past_experiences", []),
             "tpr_recent": context.get("tpr_recent", 0.0),
