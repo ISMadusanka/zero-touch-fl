@@ -26,6 +26,16 @@ You receive:
 - baseline_accuracy: the clean model accuracy (before any attacks)
 - current_accuracy: test accuracy after the last round's aggregation
 - was_detected: whether your last attack was caught
+- attack_success_rate_recent: your attack success rate over the last 5 rounds
+  (0.0–1.0). Higher means your attacks are consistently slipping through.
+  If this is dropping, your regime is being shut down — time to adapt.
+- fpr_recent: the defender's false positive rate over the last 5 rounds.
+  High FPR means the defender is sloppy — aggressive attacks blend in with
+  the noise of false alarms. Low FPR means the defender is precise — you
+  must be more subtle to avoid standing out.
+- accuracy_preservation_rate: current_accuracy / baseline_accuracy (0.0–1.0).
+  Lower means your poisoning is working effectively. If it stays near 1.0,
+  your attacks are too subtle to cause damage.
 - history: summary of past rounds
 - similar_past_experiences: relevant past episodes from memory
 
@@ -47,8 +57,15 @@ the top-k weights (by gradient magnitude) to attack. The rest stay honest.
 Smaller k = stealthier but weaker. Past attack_metadata shows which layers were
 targeted and gradient magnitude statistics — use this to refine your choices.
 
-Be strategic. If you were detected, try a subtler approach (lower params, smaller k).
-If your attack was too subtle (accuracy didn't drop), be more aggressive."""
+Be strategic. Your goal is to maximize damage while remaining stealthy.
+To do this, use a "Greedy Stealth" binary search for the parameter `k` (the number of targeted weights):
+1. If your attack PASSED THROUGH: Incrementally INCREASE `k` in the next round. Keep increasing `k` round over round to maximize damage.
+2. If your attack WAS DETECTED: You hit the defender's limit. Immediately DECREASE `k` to slip back under the radar. 
+3. Your ultimate goal is to find the absolute maximum `k` you can poison without triggering the Defender.
+
+Use your attack_success_rate_recent to judge your overall regime performance.
+If fpr_recent is high, you can afford to be more aggressive since the defender
+is already generating noise with false positives."""
 
 
 class AttackerAgent:
@@ -102,18 +119,31 @@ class AttackerAgent:
         self.current_strategy = self._ask_llm(context)
         return self.current_strategy
 
-    def record_outcome(self, round_num: int, strategy: dict, was_detected: bool, accuracy: float, attack_metadata: dict | None = None):
+    def record_outcome(
+        self, round_num: int, strategy: dict, was_detected: bool,
+        accuracy: float, attack_metadata: dict | None = None,
+        attack_success_rate_recent: float = 0.0,
+        fpr_recent: float = 0.0,
+        accuracy_preservation_rate: float = 1.0,
+    ):
         """Store round outcome in history and vector memory.
 
         attack_metadata may contain details like flipped_per_layer,
         flipped_indices_per_layer, and gradient magnitude stats from
         the sign_flip attack (or other attacks that populate it).
+
+        Windowed metrics (attack_success_rate_recent, fpr_recent,
+        accuracy_preservation_rate) are stored alongside each history
+        entry so the LLM can see the trend across the recent_history.
         """
         entry = {
             "round": round_num,
             "strategy": strategy,
             "was_detected": was_detected,
             "accuracy_after": accuracy,
+            "attack_success_rate_recent": attack_success_rate_recent,
+            "fpr_recent": fpr_recent,
+            "accuracy_preservation_rate": accuracy_preservation_rate,
         }
         if attack_metadata:
             entry["attack_metadata"] = attack_metadata
@@ -125,7 +155,12 @@ class AttackerAgent:
             )
 
         self.history.append(entry)
-        logger.info(f"Attacker memory: round {round_num} recorded (short-term: {len(self.history)} entries)")
+        logger.info(
+            f"Attacker memory: round {round_num} recorded "
+            f"(ASR={attack_success_rate_recent:.3f}, FPR={fpr_recent:.3f}, "
+            f"APR={accuracy_preservation_rate:.3f}, "
+            f"short-term: {len(self.history)} entries)"
+        )
 
         # Create a simple feature vector from the outcome for FAISS
         vec = self._make_vector(entry)
@@ -147,6 +182,9 @@ class AttackerAgent:
             "baseline_accuracy": context.get("baseline_accuracy"),
             "current_accuracy": context.get("current_accuracy"),
             "was_detected": context.get("was_detected"),
+            "attack_success_rate_recent": context.get("attack_success_rate_recent", 0.0),
+            "fpr_recent": context.get("fpr_recent", 0.0),
+            "accuracy_preservation_rate": context.get("accuracy_preservation_rate", 1.0),
             "recent_history": self.history[-5:],
             "similar_past_experiences": similar,
         }, default=str)

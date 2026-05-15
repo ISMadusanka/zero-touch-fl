@@ -7,3 +7,8 @@ pyyaml
 numpy
 sentence-transformers
 matplotlib
+xgboost
+pandas
+shap
+scikit-learn
+python-dotenv

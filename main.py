@@ -19,7 +19,10 @@ import os
 import sys
 
 import yaml
-# import torch
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 from data.mnist_loader import get_data_loaders
 from model.mnist_net import MnistNet, count_parameters
@@ -27,11 +30,13 @@ from clients.benign_client import BenignClient
 from clients.malicious_client import MaliciousClient
 from server.fed_server import FedServer
 from server.aggregation import FedAvgAggregator
-from detector.anomaly_detector import AnomalyDetector
+from detector.layered_detector import LayeredDetector
+from detector.explainability import ExplainabilityEngine
 from agents.attacker_agent import AttackerAgent
 from agents.defender_agent import DefenderAgent
 from storage.checkpoint import save_state, load_state, state_exists
 from core.types import RoundLog
+from metrics import MetricsTracker
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -175,15 +180,24 @@ def run_simulation(
     server = FedServer(device=fl["device"])
     server.set_global_weights(copy.deepcopy(global_weights))
     aggregator = FedAvgAggregator()
-    detector = AnomalyDetector()
+    detector = LayeredDetector(root_loader=test_loader, device=fl["device"])
+    explainer = ExplainabilityEngine()
     attacker_agent = AttackerAgent(attacker_config)
     defender_agent = DefenderAgent(defender_config)
     malicious_client = MaliciousClient(client_id=malicious_id)
+
+    # Metrics tracker — ground truth = the configured malicious client id(s)
+    metrics_tracker = MetricsTracker(
+        malicious_ids={malicious_id},
+        baseline_accuracy=baseline_accuracy,
+        output_dir="logs/metrics",
+    )
 
     # State tracking
     last_attack_detected = None    # None on first round
     last_attack_passed = None      # None on first round
     last_all_clients_flagged = None  # None on first round
+    last_defend_params = None
     current_accuracy = baseline_accuracy
 
     for sim_round in range(1, fl["simulation_rounds"] + 1):
@@ -197,10 +211,17 @@ def run_simulation(
         # ------------------------------------------------------------------
         # Step 1: Attacker decides strategy
         # ------------------------------------------------------------------
+        # Compute windowed metrics for agent feedback (uses rounds so far)
+        windowed = metrics_tracker.get_windowed_metrics(window=5)
+
         attacker_context = {
             "baseline_accuracy": baseline_accuracy,
             "current_accuracy": current_accuracy,
             "was_detected": last_attack_detected,
+            # Windowed KPIs — attacker gets ASR, FPR, APR
+            "attack_success_rate_recent": windowed["attack_success_rate"],
+            "fpr_recent": windowed["fpr"],
+            "accuracy_preservation_rate": windowed["accuracy_preservation_rate"],
         }
         attack_strategy = attacker_agent.decide(attacker_context)
         attack_name = attack_strategy.get("attack_type", "sign_flip")
@@ -232,19 +253,131 @@ def run_simulation(
         # ------------------------------------------------------------------
         # Step 3: Defender decides strategy
         # ------------------------------------------------------------------
-        update_features = detector.get_features(updates, current_global)
+        # Layered Feature Extraction
+        layered_features = detector.get_features(updates, current_global)
+        
+        # XGBoost + SHAP Explainability
+        threat_reports = {}
+        for cid_key, features in layered_features.items():
+            threat_reports[cid_key] = explainer.explain(features)
+            
+        acc_drop = False
+        acc_drop_value = 0.0
+        if round_num > 1 and current_accuracy is not None:
+             # Accuracy drop heuristic: check if current accuracy is significantly lower than baseline
+             acc_drop = current_accuracy < (baseline_accuracy - 0.05)
+             acc_drop_value = round(baseline_accuracy - current_accuracy, 4)
+
         defender_context = {
-            "update_features": update_features,
+            "threat_reports": threat_reports,
             "attack_passed_through": last_attack_passed,
             "all_clients_flagged": last_all_clients_flagged,
+            "accuracy_dropped": acc_drop,
+            "accuracy_drop_value": acc_drop_value,
+            "round_num": round_num,
+            # Windowed KPIs — defender gets TPR, FPR, APR
+            "tpr_recent": windowed["tpr"],
+            "fpr_recent": windowed["fpr"],
+            "accuracy_preservation_rate": windowed["accuracy_preservation_rate"],
         }
         defend_strategy = defender_agent.decide(defender_context)
-        logger.info(f"Defender strategy: {defend_strategy.get('method')} with params={defend_strategy.get('params')}")
+        
+        # Log threshold changes clearly
+        new_params = defend_strategy.get("params", {})
+        if last_defend_params:
+            changes = []
+            for k, v in new_params.items():
+                old_v = last_defend_params.get(k)
+                if old_v != v:
+                    changes.append(f"{k} ({old_v} -> {v})")
+            if changes:
+                logger.info(f"!!! DEFENSE ADJUSTED: {', '.join(changes)}")
+                logger.info(f"    Reasoning: {defend_strategy.get('reasoning', 'No reasoning provided')}")
+            else:
+                logger.info("Defense strategy: STABLE (no thresholds changed)")
+        else:
+            logger.info(f"Initial Defense Strategy: {new_params}")
+
+        last_defend_params = new_params
 
         # ------------------------------------------------------------------
-        # Step 4: Anomaly detection
+        # Step 4: Layered Anomaly detection
         # ------------------------------------------------------------------
-        verdicts = detector.analyze(updates, current_global, defend_strategy)
+        from core.types import DetectionVerdict
+        verdicts = []
+        params = defend_strategy.get("params", {})
+        
+        # Selected layer from LLM
+        selected_layer = params.get("selected_layer", "layer_1_fl_trust")
+        selected_layers = [selected_layer] if isinstance(selected_layer, str) else selected_layer
+        
+        logger.info(f"Active Defense Layer for Final Decision: [{selected_layer}]")
+        
+        # Thresholds from LLM
+        t_trust = params.get("fl_trust_threshold", 0.15)
+        t_cluster = params.get("cluster_threshold", 2.0)
+        t_clip = params.get("clipping_threshold", 1.5)
+        t_trim = params.get("trim_threshold", 3.0)
+        t_xgb = params.get("xgboost_risk_threshold", 0.5)
+
+        for cid in range(fl["n_clients"]):
+            cid_key = f"client_{cid}"
+            feat = layered_features[cid_key]
+            report = threat_reports[cid_key]
+            
+            # Multi-layer violation check
+            failed_layers = []
+            layer_status = []
+            
+            # Layer 1
+            l1_val = feat["layer_1_fl_trust"]
+            l1_ok = l1_val >= t_trust
+            if not l1_ok and "layer_1_fl_trust" in selected_layers:
+                failed_layers.append("FLTrust")
+            layer_status.append(f"FLTrust:{l1_val:.2f}({ 'OK' if l1_ok else 'FAIL' }>{t_trust})")
+
+            # Layer 2
+            l2_val = feat["layer_2_cluster"]
+            l2_ok = l2_val <= t_cluster
+            if not l2_ok and "layer_2_cluster" in selected_layers:
+                failed_layers.append("Cluster")
+            layer_status.append(f"Cluster:{l2_val:.2f}({ 'OK' if l2_ok else 'FAIL' }<{t_cluster})")
+
+            # Layer 3
+            l3_val = feat["layer_3_clipping"]
+            l3_ok = l3_val <= t_clip
+            if not l3_ok and "layer_3_clipping" in selected_layers:
+                failed_layers.append("Clip")
+            layer_status.append(f"Clip:{l3_val:.2f}({ 'OK' if l3_ok else 'FAIL' }<{t_clip})")
+
+            # Layer 4
+            l4_val = feat["layer_4_is_trimmed"]
+            l4_ok = l4_val <= t_trim
+            if not l4_ok and "layer_4_is_trimmed" in selected_layers:
+                failed_layers.append("Trim")
+            layer_status.append(f"Trim:{l4_val:.2f}({ 'OK' if l4_ok else 'FAIL' }<{t_trim})")
+
+            # XGBoost
+            xgb_val = report.get("risk_score", 0)
+            xgb_ok = xgb_val <= t_xgb
+            if not xgb_ok and "xgboost" in selected_layers:
+                failed_layers.append("XGBoost")
+            layer_status.append(f"XGBoost:{xgb_val:.2f}({ 'OK' if xgb_ok else 'FAIL' }<{t_xgb})")
+
+            is_suspicious = len(failed_layers) > 0
+            fail_str = f"Failed: {','.join(failed_layers)}" if is_suspicious else "Passed"
+            
+            verdicts.append(DetectionVerdict(
+                client_id=cid,
+                is_suspicious=is_suspicious,
+                confidence=report.get("risk_score", 0.5) if is_suspicious else 0.0,
+                reason=f"{fail_str} | " + "; ".join(layer_status)
+            ))
+
+            if is_suspicious:
+                logger.warning(f"  Client {cid} FLAGGED! ({fail_str}) Defense Profile: {' | '.join(layer_status)}")
+            else:
+                logger.info(f"  Client {cid} OK. Defense Profile: {' | '.join(layer_status)}")
 
         # Check if the malicious client was detected
         malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)
@@ -276,6 +409,15 @@ def run_simulation(
         logger.info(f"Test accuracy after aggregation: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
 
         # ------------------------------------------------------------------
+        # Step 6b: Compute & log evaluation metrics for this round
+        # ------------------------------------------------------------------
+        round_metrics = metrics_tracker.update(
+            round_num=round_num,
+            verdicts=verdicts,
+            current_accuracy=current_accuracy,
+        )
+
+        # ------------------------------------------------------------------
         # Step 7: Record outcomes for both agents
         # ------------------------------------------------------------------
         # Extract attack metadata (e.g. flipped indices) from the malicious update
@@ -289,12 +431,19 @@ def run_simulation(
                 f"layers_affected={list(layer_info.keys())}"
             )
 
+        # Recompute windowed metrics AFTER this round's data is recorded
+        windowed_after = metrics_tracker.get_windowed_metrics(window=5)
+
         attacker_agent.record_outcome(
             round_num=round_num,
             strategy=attack_strategy,
             was_detected=attack_detected,
             accuracy=current_accuracy,
             attack_metadata=attack_metadata,
+            # Windowed KPIs for attacker history
+            attack_success_rate_recent=windowed_after["attack_success_rate"],
+            fpr_recent=windowed_after["fpr"],
+            accuracy_preservation_rate=windowed_after["accuracy_preservation_rate"],
         )
         defender_agent.record_outcome(
             round_num=round_num,
@@ -305,6 +454,10 @@ def run_simulation(
                 {"client_id": v.client_id, "suspicious": v.is_suspicious, "confidence": v.confidence, "reason": v.reason}
                 for v in verdicts
             ],
+            # Windowed KPIs for defender history
+            tpr_recent=windowed_after["tpr"],
+            fpr_recent=windowed_after["fpr"],
+            accuracy_preservation_rate=windowed_after["accuracy_preservation_rate"],
         )
 
         # ------------------------------------------------------------------
@@ -325,9 +478,48 @@ def run_simulation(
             defender_adapted=last_attack_passed is True,      # adapted this round because failed last round
             all_clients_flagged=all_clients_flagged,
             round_skipped=new_weights is None,
+            layered_features=layered_features,
+            threat_reports=threat_reports,
         )
-        _save_round_log(round_log)
+        _save_round_log(round_log, extra={"metrics": round_metrics.to_dict()})
 
+        # ------------------------------------------------------------------
+        # Step 9: Save Datasets for Fine-Tuning
+        # ------------------------------------------------------------------
+        import csv
+        import os
+        import json
+        
+        # 1. Save XGBoost Dataset
+        os.makedirs("storage", exist_ok=True)
+        xgb_csv_path = "storage/xgboost_dataset.csv"
+        xgb_file_exists = os.path.isfile(xgb_csv_path)
+        with open(xgb_csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not xgb_file_exists:
+                writer.writerow(["layer_1_fl_trust", "layer_2_cluster", "layer_3_clipping", "layer_4_is_trimmed", "raw_norm", "label"])
+            for cid in range(fl["n_clients"]):
+                cid_key = f"client_{cid}"
+                if cid_key in layered_features:
+                    feat = layered_features[cid_key]
+                    label = 1 if cid == malicious_id else 0
+                    writer.writerow([
+                        feat.get("layer_1_fl_trust", 0.0),
+                        feat.get("layer_2_cluster", 0),
+                        feat.get("layer_3_clipping", 1.0),
+                        feat.get("layer_4_is_trimmed", 0),
+                        feat.get("raw_norm", 0.0),
+                        label
+                    ])
+
+        # 2. Save LLM Dataset
+        llm_jsonl_path = "storage/llm_dataset.jsonl"
+        with open(llm_jsonl_path, "a") as f:
+            llm_entry = {
+                "input_context": defender_context,
+                "output_strategy": defend_strategy
+            }
+            f.write(json.dumps(llm_entry, default=str) + "\n")
         # Update state for next round
         last_attack_detected = attack_detected
         last_attack_passed = attack_passed
@@ -338,9 +530,15 @@ def run_simulation(
     logger.info(f"Final accuracy: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
     logger.info("=" * 60)
 
+    # Aggregate metrics over the whole simulation
+    metrics_tracker.save_summary()
 
-def _save_round_log(log: RoundLog):
-    """Save a round's complete data to JSON."""
+
+def _save_round_log(log: RoundLog, extra: dict | None = None):
+    """Save a round's complete data to JSON.
+
+    `extra` is merged into the payload (e.g. evaluation metrics for the round).
+    """
     path = f"logs/round_data/round_{log.round_num:03d}.json"
     data = {
         "round_num": log.round_num,
@@ -354,7 +552,11 @@ def _save_round_log(log: RoundLog):
         "defender_adapted": log.defender_adapted,
         "all_clients_flagged": log.all_clients_flagged,
         "round_skipped": log.round_skipped,
+        "layered_features": log.layered_features,
+        "threat_reports": log.threat_reports,
     }
+    if extra:
+        data.update(extra)
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
     logger.info(f"Round data saved to {path}")

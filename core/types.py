@@ -35,4 +35,6 @@ class RoundLog:
     defender_adapted: bool
     all_clients_flagged: bool = False
     round_skipped: bool = False
+    layered_features: dict = field(default_factory=dict)
+    threat_reports: dict = field(default_factory=dict)
 
