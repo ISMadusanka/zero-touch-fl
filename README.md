@@ -6,8 +6,8 @@ A research-oriented federated learning simulation with LLM-powered adversarial a
 
 Two-phase system on MNIST:
 
-1. **Phase 1 (Rounds 1–3):** 5 clients train honestly via FedAvg. State is checkpointed.
-2. **Phase 2 (Round 4+):** Client 0 becomes adversarial. An LLM attacker agent selects model poisoning attacks, while an LLM defender agent tunes anomaly detection — forming an adaptive arms race.
+1. **Phase 1 (Training):** 5 clients train honestly via FedAvg for a configurable number of rounds (default 2000). State is checkpointed. Client weights can be collected to CSV for downstream tasks (e.g. VAE training).
+2. **Phase 2 (Simulation):** Client 0 becomes adversarial. An LLM attacker agent selects model poisoning attacks, while an LLM defender agent tunes anomaly detection — forming an adaptive arms race.
 
 ## LLM Backends
 
@@ -48,7 +48,7 @@ ollama pull deepseek-r1:70b
 ## Usage
 
 ```bash
-# Windows / OpenAI (default)
+# Windows / OpenAI (default) — full run (Phase 1 + Phase 2)
 python main.py
 
 # Linux / Ollama
@@ -60,8 +60,21 @@ python main.py --fresh
 # Combine flags
 python main.py --env linux --fresh
 
+# Data collection only — run Phase 1, save client 0 weights to CSV, skip Phase 2
+python main.py --fresh --collect-only
+
 python visualize_rounds.py
 ```
+
+### Data Collection Mode (`--collect-only`)
+
+When `--collect-only` is passed, the system runs Phase 1 training only and
+collects **client 0's model weights every round** into a CSV file:
+
+- **Output:** `data/client0_weights.csv`
+- **Format:** `round, w_0, w_1, ..., w_969` (1 header + 2000 data rows)
+- **Params per row:** 970 (MnistNet: Linear(49,16) + Linear(16,10))
+- **Use case:** Training a Variational Autoencoder (VAE) on weight distributions
 
 TO SEE THE VISUALIZATIONS
 
@@ -91,8 +104,8 @@ model (`llm.ollama_model`). The `--env` flag determines which one is used.
 
 ```
 core/          Shared types & interfaces (zero business logic)
-model/         Tiny MLP (~805 params)
-data/          MNIST loading & partitioning
+model/         Tiny MLP (~970 params)
+data/          MNIST loading & partitioning + collected weight CSVs
 clients/       Benign and malicious client implementations
 attacks/       Model poisoning plugins (sign_flip, noise, scaling, gaussian_noise)
 agents/        LLM-powered attacker & defender agents

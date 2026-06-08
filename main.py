@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import copy
+import csv
 import json
 import logging
 import os
@@ -65,8 +66,29 @@ def load_config(path: str) -> dict:
 # Phase 1: Honest FL training for 3 rounds
 # ---------------------------------------------------------------------------
 
-def run_training_phase(config: dict):
-    """Train all clients honestly for `training_rounds` rounds. Returns saved state."""
+def _flatten_weights(weights: dict) -> list[float]:
+    """Flatten a state_dict into a single list of floats.
+
+    Iterates over keys in sorted order so the column layout is
+    deterministic across rounds.
+    """
+    import torch
+    flat: list[float] = []
+    for key in sorted(weights.keys()):
+        tensor = weights[key]
+        if isinstance(tensor, torch.Tensor):
+            flat.extend(tensor.detach().cpu().flatten().tolist())
+        else:
+            flat.append(float(tensor))
+    return flat
+
+
+def run_training_phase(config: dict, collect_client_id: int = 0):
+    """Train all clients honestly for `training_rounds` rounds. Returns saved state.
+
+    When *collect_client_id* is not None, the specified client's weights
+    are flattened and written to ``data/client{id}_weights.csv`` every round.
+    """
     fl = config["fl"]
     data_cfg = config["data"]
 
@@ -106,6 +128,24 @@ def run_training_phase(config: dict):
     # Aggregator
     aggregator = FedAvgAggregator()
 
+    # ---------------------------------------------------------------
+    # Prepare CSV file for weight collection
+    # ---------------------------------------------------------------
+    csv_path = f"data/client{collect_client_id}_weights.csv"
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    # Build header: round, w_0, w_1, ..., w_N
+    # We need the param count first — grab it from a dummy flatten
+    dummy_weights = server.get_global_weights()
+    n_params = len(_flatten_weights(dummy_weights))
+    csv_header = ["round"] + [f"w_{i}" for i in range(n_params)]
+    logger.info(f"Weight collection: client {collect_client_id}, "
+                f"{n_params} params/row → {csv_path}")
+
+    csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(csv_header)
+
     # Training loop
     for round_num in range(1, fl["training_rounds"] + 1):
         logger.info(f"--- Training Round {round_num}/{fl['training_rounds']} ---")
@@ -125,6 +165,15 @@ def run_training_phase(config: dict):
                 f"samples: {meta.get('train_samples', 0)}"
             )
 
+        # ----- Collect client weights into CSV -----
+        target_update = updates[collect_client_id]
+        flat_weights = _flatten_weights(target_update.weights)
+        csv_writer.writerow([round_num] + flat_weights)
+        # Flush every 50 rounds so data isn't lost on crash
+        if round_num % 50 == 0:
+            csv_file.flush()
+            logger.info(f"  [CSV] Flushed {round_num} rows to {csv_path}")
+
         # Aggregate (no detection in Phase 1)
         from core.types import DetectionVerdict
         clean_verdicts = [
@@ -136,6 +185,13 @@ def run_training_phase(config: dict):
         # Evaluate
         accuracy = server.evaluate(test_loader)
         logger.info(f"  Round {round_num} accuracy: {accuracy:.4f}")
+
+    # Close CSV
+    csv_file.close()
+    csv_size_mb = os.path.getsize(csv_path) / (1024 * 1024)
+    logger.info(f"Weight collection complete: {csv_path} "
+                f"({fl['training_rounds']} rows × {n_params} params, "
+                f"{csv_size_mb:.2f} MB)")
 
     # Baseline accuracy (before any attacks)
     baseline_accuracy = server.evaluate(test_loader)
@@ -419,6 +475,11 @@ def main():
         default="windows",
         help="Running environment: 'linux' uses Ollama, 'windows' uses OpenAI (default: windows)",
     )
+    parser.add_argument(
+        "--collect-only",
+        action="store_true",
+        help="Run Phase 1 only and collect client weights to CSV (skip Phase 2)",
+    )
     args = parser.parse_args()
 
     setup_logging()
@@ -462,16 +523,20 @@ def main():
         logger.info("No checkpoint found (or --fresh) — running Phase 1")
         global_weights, client_weights, baseline_accuracy, test_loader = run_training_phase(base_config)
 
-    # Phase 2
-    run_simulation(
-        global_weights=global_weights,
-        client_weights=client_weights,
-        baseline_accuracy=baseline_accuracy,
-        test_loader=test_loader,
-        config=base_config,
-        attacker_config=attacker_config,
-        defender_config=defender_config,
-    )
+    # Phase 2 (skipped when --collect-only)
+    if args.collect_only:
+        logger.info("--collect-only flag set — skipping Phase 2 (simulation)")
+        logger.info("Client 0 weights saved to data/client0_weights.csv")
+    else:
+        run_simulation(
+            global_weights=global_weights,
+            client_weights=client_weights,
+            baseline_accuracy=baseline_accuracy,
+            test_loader=test_loader,
+            config=base_config,
+            attacker_config=attacker_config,
+            defender_config=defender_config,
+        )
 
 
 if __name__ == "__main__":
