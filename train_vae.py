@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import pandas as pd
+from sklearn.model_selection import train_test_split
 
 # Setup logging
 logging.basicConfig(
@@ -69,7 +70,7 @@ def loss_function(recon_x, x, mu, logvar):
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     return MSE + KLD
 
-def get_dataloader(csv_path: str, batch_size: int = 32):
+def get_dataloaders(csv_path: str, batch_size: int = 32, test_size: float = 0.2):
     logger.info(f"Loading data from {csv_path}...")
     try:
         df = pd.read_csv(csv_path)
@@ -83,11 +84,19 @@ def get_dataloader(csv_path: str, batch_size: int = 32):
     else:
         weights = df.values
         
-    logger.info(f"Loaded {weights.shape[0]} samples with {weights.shape[1]} features.")
+    logger.info(f"Loaded {weights.shape[0]} total samples with {weights.shape[1]} features.")
     
-    tensor_x = torch.tensor(weights, dtype=torch.float32)
-    dataset = TensorDataset(tensor_x)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # Split into train and test (chronological: first 80% train, last 20% test)
+    X_train, X_test = train_test_split(weights, test_size=test_size, shuffle=False)
+    logger.info(f"Train samples: {X_train.shape[0]}, Test samples: {X_test.shape[0]}")
+    
+    train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32))
+    test_dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32))
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    return train_loader, test_loader
 
 def main():
     parser = argparse.ArgumentParser(description="Train VAE on client weights")
@@ -126,17 +135,17 @@ def main():
         logger.info("No checkpoint found. Starting fresh training.")
 
     # Load data
-    dataloader = get_dataloader(args.data, batch_size=args.batch_size)
+    train_loader, test_loader = get_dataloaders(args.data, batch_size=args.batch_size)
     
     if start_epoch > args.epochs:
         logger.info(f"Model has already been trained for {args.epochs} epochs. Exiting.")
         return
 
     # Training loop
-    model.train()
     for epoch in range(start_epoch, args.epochs + 1):
+        model.train()
         train_loss = 0
-        for batch_idx, (data,) in enumerate(dataloader):
+        for batch_idx, (data,) in enumerate(train_loader):
             data = data.to(device)
             optimizer.zero_grad()
             
@@ -147,15 +156,29 @@ def main():
             train_loss += loss.item()
             optimizer.step()
             
-        avg_loss = train_loss / len(dataloader.dataset)
-        logger.info(f"Epoch: {epoch}/{args.epochs} | Average Loss: {avg_loss:.4f}")
+        avg_train_loss = train_loss / len(train_loader.dataset)
+        
+        # Validation loop
+        model.eval()
+        test_loss = 0
+        with torch.no_grad():
+            for (data,) in test_loader:
+                data = data.to(device)
+                recon_batch, mu, logvar = model(data)
+                loss = loss_function(recon_batch, data, mu, logvar)
+                test_loss += loss.item()
+                
+        avg_test_loss = test_loss / len(test_loader.dataset)
+        
+        logger.info(f"Epoch: {epoch}/{args.epochs} | Train Loss: {avg_train_loss:.4f} | Test Loss: {avg_test_loss:.4f}")
         
         # Save checkpoint after every epoch
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'loss': avg_loss,
+            'train_loss': avg_train_loss,
+            'test_loss': avg_test_loss,
         }, checkpoint_path)
         
     logger.info(f"Training completed. Model saved to {checkpoint_path}")
