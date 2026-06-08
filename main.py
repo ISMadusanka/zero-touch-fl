@@ -31,7 +31,7 @@ from server.aggregation import FedAvgAggregator
 from detector.anomaly_detector import AnomalyDetector
 from agents.attacker_agent import AttackerAgent
 from agents.defender_agent import DefenderAgent
-from storage.checkpoint import save_state, load_state, state_exists
+from storage.checkpoint import save_state, load_state, state_exists, save_midway_state, load_midway_state, midway_state_exists, clear_midway_state
 from core.types import RoundLog
 from metrics import MetricsTracker
 
@@ -129,6 +129,19 @@ def run_training_phase(config: dict, collect_client_id: int = 0):
     aggregator = FedAvgAggregator()
 
     # ---------------------------------------------------------------
+    # Check for midway checkpoint (resume)
+    # ---------------------------------------------------------------
+    start_round = 1
+    if midway_state_exists():
+        logger.info("Found midway checkpoint — resuming Phase 1 training...")
+        global_state, client_states, last_round = load_midway_state()
+        server.set_global_weights(global_state)
+        start_round = last_round + 1
+        # Set honest client starting weights (normally they start from global model,
+        # but the BenignClient train() method uses global model anyway, so we just
+        # need to start the loop at the right round).
+
+    # ---------------------------------------------------------------
     # Prepare CSV file for weight collection
     # ---------------------------------------------------------------
     csv_path = f"data/client{collect_client_id}_weights.csv"
@@ -139,15 +152,21 @@ def run_training_phase(config: dict, collect_client_id: int = 0):
     dummy_weights = server.get_global_weights()
     n_params = len(_flatten_weights(dummy_weights))
     csv_header = ["round"] + [f"w_{i}" for i in range(n_params)]
-    logger.info(f"Weight collection: client {collect_client_id}, "
-                f"{n_params} params/row → {csv_path}")
-
-    csv_file = open(csv_path, "w", newline="", encoding="utf-8")
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(csv_header)
+    
+    if start_round == 1:
+        logger.info(f"Weight collection: client {collect_client_id}, "
+                    f"{n_params} params/row → {csv_path} (new file)")
+        csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(csv_header)
+    else:
+        logger.info(f"Weight collection: client {collect_client_id}, "
+                    f"{n_params} params/row → {csv_path} (resuming append)")
+        csv_file = open(csv_path, "a", newline="", encoding="utf-8")
+        csv_writer = csv.writer(csv_file)
 
     # Training loop
-    for round_num in range(1, fl["training_rounds"] + 1):
+    for round_num in range(start_round, fl["training_rounds"] + 1):
         logger.info(f"--- Training Round {round_num}/{fl['training_rounds']} ---")
 
         global_weights = server.get_global_weights()
@@ -186,8 +205,17 @@ def run_training_phase(config: dict, collect_client_id: int = 0):
         accuracy = server.evaluate(test_loader)
         logger.info(f"  Round {round_num} accuracy: {accuracy:.4f}")
 
+        # Midway checkpoint every 20 rounds
+        if round_num % 20 == 0:
+            client_weights_for_checkpoint = [u.weights for u in updates]
+            save_midway_state(server.get_global_weights(), client_weights_for_checkpoint, round_num)
+            logger.info(f"  [Checkpoint] Saved midway state at round {round_num}")
+
     # Close CSV
     csv_file.close()
+    
+    # Clean up midway checkpoint
+    clear_midway_state()
     csv_size_mb = os.path.getsize(csv_path) / (1024 * 1024)
     logger.info(f"Weight collection complete: {csv_path} "
                 f"({fl['training_rounds']} rows × {n_params} params, "
