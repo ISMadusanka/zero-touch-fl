@@ -8,7 +8,7 @@ fl:
   local_epochs: 3
   batch_size: 64
   lr: 0.002
-  device: "cpu"
+  device: "cuda"
 
 data:
   dataset: "mnist"
