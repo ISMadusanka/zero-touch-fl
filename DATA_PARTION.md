@@ -1,23 +1,60 @@
-# 1. How the Dataset is Divided (data/mnist_loader.py)
-Before any training begins, the central server downloads the standard MNIST training dataset (60,000 images) and the testing dataset (10,000 images).
+# Documentation: Client 0 Weights CSV
 
-The training dataset is then divided among the 5 clients using an IID (Independent and Identically Distributed) split:
+## File Details
+- **Path:** `data/client0_weights.csv`
+- **Shape:** 2000 rows × 971 columns (1 round column + 970 weight values)
+- **Use Case:** Training a Variational Autoencoder (VAE) on client weight distributions.
 
-Shuffling: The indices of all 60,000 training images are completely randomized (shuffled) to ensure there is no ordering bias.
-Partitioning: The shuffled indices are split evenly into 5 equal-sized shards.
-Distribution: Each of the 5 clients is assigned exactly one shard. Since there are 60,000 total training images and 5 clients, every client gets exactly 12,000 unique training images.
-Because the split is IID (randomized), each client's 12,000 images contain a roughly equal mix of all 10 digits (0-9).
+## What it Contains
 
-# 2. How Client Training Happens (clients/benign_client.py)
-For each of the 3 rounds in Phase 1, the following process occurs:
+Each row is a snapshot of **Client 0's full model weights** after local training in one FL round.
 
-Model Distribution: The central server sends the current global weights to all 5 clients.
-Local Initialization: Each client creates a local copy of the neural network and loads the global weights into it. They also initialize a Stochastic Gradient Descent (SGD) optimizer.
-Local Epochs: Every client trains on its own 12,000 images for a set number of local_epochs (configured as 2 epochs by default).
-The client feeds batches of 64 images through the network.
-It calculates the Cross-Entropy Loss between the predictions and the actual labels.
-It computes the gradients and updates its local model weights.
-During this process, it keeps a running tally of its training accuracy and loss.
-Sending Updates: After finishing its local epochs, the client does not send its raw data to the server (preserving privacy). Instead, it packages its newly updated model weights, along with its training metadata (accuracy, loss, sample count), into a ModelUpdate object and sends that back to the central server.
-Aggregation: Once the server receives all 5 ModelUpdate objects, it uses Federated Averaging (FedAvg) to average the weights together, producing a new global model for the next round.
-Because all 5 clients are acting honestly in Phase 1, the Anomaly Detector is effectively bypassed—no clients are flagged, and all 5 updates are included in the average.
+| Column | Type | Description |
+|--------|------|-------------|
+| `round` | int | Training round number (1–2000) |
+| `w_0` – `w_15` | float | `net.2.bias` — bias of first Linear layer (16 values) |
+| `w_16` – `w_799` | float | `net.2.weight` — weights of Linear(49→16), flattened (784 values) |
+| `w_800` – `w_809` | float | `net.4.bias` — bias of second Linear layer (10 values) |
+| `w_810` – `w_969` | float | `net.4.weight` — weights of Linear(16→10), flattened (160 values) |
+
+> **Note:** Keys are sorted alphabetically (`net.2.bias` < `net.2.weight` < `net.4.bias` < `net.4.weight`), which makes the column order deterministic across rounds.
+
+## Loading with pandas
+
+```python
+import pandas as pd
+
+# Load the full CSV
+df = pd.read_csv("data/client0_weights.csv")
+
+print(df.shape)          # (2000, 971)
+print(df.columns[:5])    # ['round', 'w_0', 'w_1', 'w_2', 'w_3']
+
+# Separate round column from weight data
+rounds = df["round"]
+weights = df.drop(columns=["round"])  # (2000, 970) — pure weight matrix
+
+print(weights.shape)     # (2000, 970)
+print(weights.dtypes)    # all float64
+
+# Convert to numpy array for VAE training
+import numpy as np
+X = weights.values       # shape: (2000, 970)
+
+# Or convert to PyTorch tensor
+import torch
+X_tensor = torch.tensor(X, dtype=torch.float32)  # shape: (2000, 970)
+```
+
+## Quick Sanity Checks
+
+```python
+# Verify no NaN/Inf values
+assert not df.isnull().any().any(), "Found NaN values!"
+assert np.isfinite(weights.values).all(), "Found Inf values!"
+
+# Basic stats
+print(weights.describe())  # min, max, mean, std per column
+print(f"Global mean: {weights.values.mean():.6f}")
+print(f"Global std:  {weights.values.std():.6f}")
+```

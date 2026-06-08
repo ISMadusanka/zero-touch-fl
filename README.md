@@ -76,6 +76,18 @@ collects **client 0's model weights every round** into a CSV file:
 - **Params per row:** 970 (MnistNet: Linear(49,16) + Linear(16,10))
 - **Use case:** Training a Variational Autoencoder (VAE) on weight distributions
 
+### Training the VAE
+
+After collecting the weights using `--collect-only`, you can train the Variational Autoencoder (VAE) to learn the latent representations:
+
+```bash
+python train_vae.py --epochs 100 --batch-size 64 --latent-dim 64
+```
+
+- The script automatically loads `data/client0_weights.csv`.
+- Training progress and model weights are saved after every epoch to `checkpoints/vae_client0.pt`.
+- If training is interrupted (e.g. by Ctrl+C or a crash), running the script again will **automatically resume** from the last saved epoch.
+
 TO SEE THE VISUALIZATIONS
 
 On server run: 
