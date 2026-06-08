@@ -33,6 +33,14 @@ from agents.defender_agent import DefenderAgent
 from storage.checkpoint import save_state, load_state, state_exists
 from core.types import RoundLog
 from metrics import MetricsTracker
+from metrics.production_signals import (
+    compute_accuracy_delta,
+    compute_accuracy_trend,
+    compute_accuracy_volatility,
+    compute_flag_rate,
+    compute_rounds_skipped,
+    compute_client_flag_history,
+)
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -193,6 +201,8 @@ def run_simulation(
     last_attack_passed = None      # None on first round
     last_all_clients_flagged = None  # None on first round
     current_accuracy = baseline_accuracy
+    previous_accuracy = baseline_accuracy  # for accuracy_delta
+    accuracy_history: list[float] = [baseline_accuracy]  # for trend/volatility
 
     for sim_round in range(1, fl["simulation_rounds"] + 1):
         round_num = fl["training_rounds"] + sim_round
@@ -245,17 +255,35 @@ def run_simulation(
             updates.append(update)
 
         # ------------------------------------------------------------------
-        # Step 3: Defender decides strategy
+        # Step 3: Defender decides strategy (production-ready signals only)
         # ------------------------------------------------------------------
         update_features = detector.get_features(updates, current_global)
+
+        # Compute production-observable proxy signals
+        acc_delta = compute_accuracy_delta(current_accuracy, previous_accuracy) if sim_round > 1 else None
+        acc_trend = compute_accuracy_trend(accuracy_history, window=5)
+        acc_volatility = compute_accuracy_volatility(accuracy_history, window=5)
+        acc_preservation = current_accuracy / baseline_accuracy if baseline_accuracy > 0 else 1.0
+        last_flag_rate = compute_flag_rate(
+            sum(1 for e in defender_agent.history[-1:] for v in e.get("verdicts", []) if v.get("suspicious")),
+            fl["n_clients"],
+        ) if defender_agent.history else 0.0
+        rounds_skipped = compute_rounds_skipped(defender_agent.history, window=5)
+        client_flags = compute_client_flag_history(defender_agent.history, window=10)
+        method_consensus = detector.compute_consensus(updates, current_global)
+
         defender_context = {
             "update_features": update_features,
-            "attack_passed_through": last_attack_passed,
+            # Production-observable signals (no oracle feedback)
+            "accuracy_delta": acc_delta,
+            "accuracy_trend": acc_trend,
+            "accuracy_volatility": acc_volatility,
+            "accuracy_preservation_rate": acc_preservation,
+            "flag_rate": last_flag_rate,
             "all_clients_flagged": last_all_clients_flagged,
-            # Windowed KPIs — defender gets TPR, FPR, APR
-            "tpr_recent": windowed["tpr"],
-            "fpr_recent": windowed["fpr"],
-            "accuracy_preservation_rate": windowed["accuracy_preservation_rate"],
+            "rounds_skipped_recent": rounds_skipped,
+            "method_consensus": method_consensus,
+            "client_flag_history": client_flags,
         }
         defend_strategy = defender_agent.decide(defender_context)
         logger.info(f"Defender strategy: {defend_strategy.get('method')} with params={defend_strategy.get('params')}")
@@ -331,19 +359,31 @@ def run_simulation(
             fpr_recent=windowed_after["fpr"],
             accuracy_preservation_rate=windowed_after["accuracy_preservation_rate"],
         )
+        # Compute production signals AFTER this round for defender history
+        post_acc_delta = compute_accuracy_delta(current_accuracy, previous_accuracy)
+        post_acc_trend = compute_accuracy_trend(accuracy_history + [current_accuracy], window=5)
+        post_acc_volatility = compute_accuracy_volatility(accuracy_history + [current_accuracy], window=5)
+        post_acc_preservation = current_accuracy / baseline_accuracy if baseline_accuracy > 0 else 1.0
+        post_flag_rate = compute_flag_rate(n_flagged, len(verdicts))
+        post_rounds_skipped = compute_rounds_skipped(defender_agent.history, window=5)
+        post_client_flags = compute_client_flag_history(defender_agent.history, window=10)
+
         defender_agent.record_outcome(
             round_num=round_num,
             strategy=defend_strategy,
-            attack_passed=attack_passed,
-            all_clients_flagged=all_clients_flagged,
             verdicts=[
                 {"client_id": v.client_id, "suspicious": v.is_suspicious, "confidence": v.confidence, "reason": v.reason}
                 for v in verdicts
             ],
-            # Windowed KPIs for defender history
-            tpr_recent=windowed_after["tpr"],
-            fpr_recent=windowed_after["fpr"],
-            accuracy_preservation_rate=windowed_after["accuracy_preservation_rate"],
+            all_clients_flagged=all_clients_flagged,
+            accuracy_delta=post_acc_delta,
+            accuracy_trend=post_acc_trend,
+            accuracy_volatility=post_acc_volatility,
+            accuracy_preservation_rate=post_acc_preservation,
+            flag_rate=post_flag_rate,
+            rounds_skipped_recent=post_rounds_skipped,
+            method_consensus=method_consensus,
+            client_flag_history=post_client_flags,
         )
 
         # ------------------------------------------------------------------
@@ -371,6 +411,8 @@ def run_simulation(
         last_attack_detected = attack_detected
         last_attack_passed = attack_passed
         last_all_clients_flagged = all_clients_flagged
+        previous_accuracy = current_accuracy
+        accuracy_history.append(current_accuracy)
 
     logger.info("\n" + "=" * 60)
     logger.info("SIMULATION COMPLETE")

@@ -82,6 +82,52 @@ class AnomalyDetector(BaseDetector):
         """Public access to computed features for the defender agent."""
         return self._summarize_features(self._compute_features(updates, global_weights))
 
+    def compute_consensus(
+        self,
+        updates: list[ModelUpdate],
+        global_weights: dict,
+        sensitivity: float = 2.0,
+    ) -> dict[int, int]:
+        """Run ALL 5 detection methods and return per-client consensus scores.
+
+        For each client, the consensus score is the number of methods (0–5)
+        that flag it as suspicious.  This is a production-ready proxy for TPR:
+          - Client flagged by 4–5 methods → very likely malicious
+          - Client flagged by 1 method → likely a false positive
+          - All clients at 0 → no clear outlier
+
+        Args:
+            updates: Client model updates for the current round.
+            global_weights: Current global model weights.
+            sensitivity: Sensitivity parameter used for all methods (default 2.0).
+
+        Returns:
+            Dict mapping ``client_id → consensus_score`` (0–5).
+        """
+        features = self._compute_features(updates, global_weights)
+        methods = ["norm_threshold", "dnc", "fltrust", "foolsgold", "flame"]
+        params = {"sensitivity": sensitivity}
+        client_ids = [u.client_id for u in updates]
+
+        # Initialize counts
+        consensus: dict[int, int] = {cid: 0 for cid in client_ids}
+
+        for method in methods:
+            # Pre-compute FLAME labels if needed
+            if method == "flame":
+                features["flame_labels"] = self._compute_flame_labels(params, features)
+
+            for idx, cid in enumerate(client_ids):
+                try:
+                    suspicious, _, _ = self._apply_method(method, params, features, idx)
+                    if suspicious:
+                        consensus[cid] += 1
+                except Exception as e:
+                    logger.warning(f"Consensus: method={method} failed for client {cid}: {e}")
+
+        logger.info(f"Consensus scores: {consensus}")
+        return consensus
+
     # ------------------------------------------------------------------
     # Internal: Feature computation
     # ------------------------------------------------------------------
