@@ -18,8 +18,9 @@ import logging
 import os
 import sys
 
+import torch
+
 import yaml
-# import torch
 
 from data.mnist_loader import get_data_loaders
 from model.mnist_net import MnistNet, count_parameters
@@ -171,6 +172,11 @@ def run_simulation(
     logger.info(f"  Baseline accuracy: {baseline_accuracy:.4f}")
     logger.info("=" * 60)
 
+    # Directory to save poisoned client weights each round
+    poisoned_weights_dir = "logs/poisoned_client_weights"
+    os.makedirs(poisoned_weights_dir, exist_ok=True)
+    logger.info(f"  Poisoned client weights will be saved to: {poisoned_weights_dir}/")
+
     # Components
     server = FedServer(device=fl["device"])
     server.set_global_weights(copy.deepcopy(global_weights))
@@ -223,6 +229,14 @@ def run_simulation(
                     attack_params=attack_params,
                 )
                 logger.info(f"  Client {cid}: POISONED ({attack_name})")
+
+                # Save poisoned client weights for this round
+                weight_path = os.path.join(
+                    poisoned_weights_dir,
+                    f"round_{round_num:04d}_client_{cid}.pt",
+                )
+                torch.save(update.weights, weight_path)
+                logger.info(f"  Saved poisoned client {cid} weights → {weight_path}")
             else:
                 # Honest update (from saved Phase 1 weights)
                 update = ModelUpdate(client_id=cid, weights=copy.deepcopy(client_weights[cid]))
