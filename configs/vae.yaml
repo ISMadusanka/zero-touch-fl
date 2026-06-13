@@ -1,0 +1,14 @@
+# VAE Configuration for Benign Weight Distribution Learning
+
+vae:
+  input_dim: 970              # Flattened weight vector size (784 + 16 + 160 + 10)
+  latent_dim: 62              # Latent space dimension
+  hidden_dims: [512, 256, 128] # Encoder/decoder hidden layers
+  beta: 0.1                   # β-VAE: weight for KL divergence term
+  learning_rate: 0.001        # Adam optimizer learning rate
+  epochs: 500                 # Training epochs
+  batch_size: 32              # Mini-batch size
+  train_split: 0.8            # 80% train, 20% validation
+  weights_dir: "logs/training_client_weights"  # Input JSON files
+  checkpoint_path: "checkpoints/vae_model.pt"  # Saved model output
+  device: "cpu"               # Training device
