@@ -106,6 +106,12 @@ def run_training_phase(config: dict):
     # Aggregator
     aggregator = FedAvgAggregator()
 
+    # Identify the client whose weights we want to save (the one that will be poisoned later)
+    target_client_id = fl.get("malicious_client_id", 0)
+    weights_dir = "logs/training_client_weights"
+    os.makedirs(weights_dir, exist_ok=True)
+    logger.info(f"  Will save client {target_client_id} weights each round to: {weights_dir}/")
+
     # Training loop
     for round_num in range(1, fl["training_rounds"] + 1):
         logger.info(f"--- Training Round {round_num}/{fl['training_rounds']} ---")
@@ -124,6 +130,21 @@ def run_training_phase(config: dict):
                 f"loss: {meta.get('train_loss', 0):.4f}, "
                 f"samples: {meta.get('train_samples', 0)}"
             )
+
+        # Save the target client's weights to JSON (weights sent to central server)
+        target_update = updates[target_client_id]
+        weight_data = {
+            "round": round_num,
+            "client_id": target_client_id,
+            "weights": {
+                layer_name: tensor.cpu().tolist()
+                for layer_name, tensor in target_update.weights.items()
+            },
+        }
+        weight_path = os.path.join(weights_dir, f"round_{round_num:04d}_client_{target_client_id}.json")
+        with open(weight_path, "w") as wf:
+            json.dump(weight_data, wf)
+        logger.info(f"  Saved client {target_client_id} weights → {weight_path}")
 
         # Aggregate (no detection in Phase 1)
         from core.types import DetectionVerdict
@@ -171,11 +192,6 @@ def run_simulation(
     logger.info(f"  Simulation rounds: {fl['simulation_rounds']}")
     logger.info(f"  Baseline accuracy: {baseline_accuracy:.4f}")
     logger.info("=" * 60)
-
-    # Directory to save poisoned client weights each round
-    poisoned_weights_dir = "logs/poisoned_client_weights"
-    os.makedirs(poisoned_weights_dir, exist_ok=True)
-    logger.info(f"  Poisoned client weights will be saved to: {poisoned_weights_dir}/")
 
     # Components
     server = FedServer(device=fl["device"])
@@ -229,14 +245,6 @@ def run_simulation(
                     attack_params=attack_params,
                 )
                 logger.info(f"  Client {cid}: POISONED ({attack_name})")
-
-                # Save poisoned client weights for this round
-                weight_path = os.path.join(
-                    poisoned_weights_dir,
-                    f"round_{round_num:04d}_client_{cid}.pt",
-                )
-                torch.save(update.weights, weight_path)
-                logger.info(f"  Saved poisoned client {cid} weights → {weight_path}")
             else:
                 # Honest update (from saved Phase 1 weights)
                 update = ModelUpdate(client_id=cid, weights=copy.deepcopy(client_weights[cid]))
