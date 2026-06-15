@@ -175,14 +175,13 @@ if __name__ == "__main__":
         print("Decoding Modified Latent Space back to 970 parameters...")
         reconstructed_weights = decode_latent_vector(modified_latent_state, model, scaler)
         
-        print("\nReconstructed Weights Shape Validation:")
-        for key, tensor_val in reconstructed_weights.items():
-            print(f"  {key}: {tensor_val.shape}")
-            
+        _, new_mse = get_latent_vector({k: v.tolist() for k, v in reconstructed_weights.items()}, model, scaler)
+        
         print("\n--- Value Logging (First 5 elements) ---")
         print(f"0. Original Input Weights:\n   {mock_weights_dict['net.2.weight'][0][:5]}")
         print(f"1. Encoded Weights (Latent Vector):\n   {latent_state[:5].tolist()}")
         print(f"2. Noised Weights (Modified Latent Vector):\n   {modified_latent_state[:5].tolist()}")
         print(f"3. Decoded Noised Weights (net.2.weight):\n   {reconstructed_weights['net.2.weight'].flatten()[:5].tolist()}")
+        print(f"Loss: {new_mse:.4f} (Original was {mse:.4f})")
         
     print("\nStandalone test completed successfully.")
