@@ -328,6 +328,7 @@ def run_simulation(
         # ------------------------------------------------------------------
         # Step 6: Evaluate
         # ------------------------------------------------------------------
+        previous_accuracy = current_accuracy
         current_accuracy = server.evaluate(test_loader)
         logger.info(f"Test accuracy after aggregation: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
 
@@ -430,7 +431,6 @@ def run_simulation(
         last_attack_detected = attack_detected
         last_attack_passed = attack_passed
         last_all_clients_flagged = all_clients_flagged
-        previous_accuracy = current_accuracy
         accuracy_history.append(current_accuracy)
 
     logger.info("\n" + "=" * 60)
