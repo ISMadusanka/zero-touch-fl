@@ -3,12 +3,14 @@ import numpy as np
 import json
 import os
 import sys
+from dotenv import load_dotenv
 
 # Ensure we can import from the rest of the project
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model.vae import VAE
 from data.weights_dataset import WeightsDataset
+from agents.llm_client import create_llm_client
 
 def get_latent_vector(weights_dict, model, scaler, noise_sd=0.0, return_reconstruction=False):
     """
@@ -52,7 +54,35 @@ def get_latent_vector(weights_dict, model, scaler, noise_sd=0.0, return_reconstr
         else:
             return mu[0].numpy(), mse
 
+def decode_latent_vector(latent_vector, model, scaler):
+    """
+    Takes a 64-D latent vector (numpy array or list), passes it through the VAE Decoder,
+    un-normalizes the output, and rebuilds the 970-parameter PyTorch weight dictionary.
+    """
+    if isinstance(latent_vector, list):
+        latent_vector = np.array(latent_vector)
+        
+    tensor_vec = torch.tensor([latent_vector], dtype=torch.float32)
+    with torch.no_grad():
+        reconstructed = model.decode(tensor_vec)
+        
+    recon_unscaled = scaler.inverse_transform(reconstructed.numpy())[0]
+    
+    w2 = torch.tensor(recon_unscaled[0:784].reshape((16, 49)), dtype=torch.float32)
+    b2 = torch.tensor(recon_unscaled[784:800], dtype=torch.float32)
+    w4 = torch.tensor(recon_unscaled[800:960].reshape((10, 16)), dtype=torch.float32)
+    b4 = torch.tensor(recon_unscaled[960:970], dtype=torch.float32)
+    
+    return {
+        "net.2.weight": w2,
+        "net.2.bias": b2,
+        "net.4.weight": w4,
+        "net.4.bias": b4
+    }
+
 if __name__ == "__main__":
+    load_dotenv()
+    
     model_path = 'checkpoints/vae_model.pth'
     scaler_path = 'checkpoints/vae_scaler.pkl'
     
@@ -69,7 +99,7 @@ if __name__ == "__main__":
     scaler = WeightsDataset.load_scaler(scaler_path)
     
     print("\nLoading weights from the mock dataset for testing...")
-    mock_dir = '/Users/pasindumallawarachchi/Documents/NonAcadamic/zero-touch-fl/data/mock_weights'
+    mock_dir = 'data/mock_weights'
     sample_file = sorted([f for f in os.listdir(mock_dir) if f.endswith('.json')])[0]
     full_path = os.path.join(mock_dir, sample_file)
     
@@ -78,22 +108,81 @@ if __name__ == "__main__":
         
     mock_weights_dict = sample_row.get("weights")
     
-    print(f"Testing noise scenarios on {sample_file}...")
+    print("Encoding Client Weights into 64-D Latent Space...")
+    latent_state, mse = get_latent_vector(mock_weights_dict, model, scaler, return_reconstruction=False)
+    print(f"Honest MSE Reconstruction Error: {mse:.4f}")
     
-    # Test different noise levels
-    noise_levels = [0.0, 0.1, 1.0]
+    print("\nInitializing LLM Client...")
+    try:
+        llm = create_llm_client(backend="openai", model="gpt-4o-mini")
+    except Exception as e:
+        print(f"Failed to initialize LLM: {e}")
+        llm = None
+        
+    system_prompt = """
+    You are a Latent Space optimizer.
+    You receive a 64-D Latent State. You must output ONLY a JSON object indicating how to modify this latent state.
+    Format:
+    {
+        "action": "positive_shift",
+        "magnitude": 0.5
+    }
+    Supported actions: random_noise, positive_shift, negative_shift
+    """
     
-    for noise in noise_levels:
-        print(f"\n=== SCENARIO: Noise SD = {noise} ===")
-        # Get the 64-dimensional output, reconstruction error, and the raw reconstructed weights!
-        latent_vector, mse, recon_weights, noisy_input_weights = get_latent_vector(
-            mock_weights_dict, model, scaler, noise_sd=noise, return_reconstruction=True
-        )
+    instructions = [
+        "Add a very small amount of random noise to bypass anomaly detection.",
+        "Add a massive amount of random noise to completely destroy the model.",
+        "Add a moderate positive shift to all features."
+    ]
+    
+    for i, instruction in enumerate(instructions):
+        print(f"\n{'='*50}")
+        print(f"TEST {i+1}: {instruction}")
+        print(f"{'='*50}")
         
-        print(f"Reconstruction Error (MSE): {mse:.4f}")
-        print("\nInput Weights (first 5 parameters):")
-        print(noisy_input_weights[:5])
-        print("Reconstructed Weights (first 5 parameters):")
-        print(recon_weights[:5])
+        user_msg = json.dumps({
+            "current_latent_state": latent_state.tolist(),
+            "instruction": instruction
+        })
         
-        print("----------------")
+        action = "random_noise"
+        magnitude = 0.5
+        
+        if llm:
+            try:
+                response = llm.call(system_prompt, user_msg)
+                print(f"LLM Response: {json.dumps(response)}")
+                action = response.get("action", "random_noise")
+                magnitude = float(response.get("magnitude", 0.5))
+            except Exception as e:
+                print(f"[!] LLM Call Failed (Check your .env API key): {e}")
+                print(f"Falling back to default {action} with mag {magnitude}")
+        else:
+            print("No LLM available, using default fallback.")
+            
+        print(f"\nApplying Action '{action}' (magnitude={magnitude}) to Latent Space...")
+        latent_delta = np.zeros_like(latent_state)
+        if action == "random_noise":
+            latent_delta = np.random.normal(0, magnitude, size=latent_state.shape)
+        elif action == "positive_shift":
+            latent_delta = np.full_like(latent_state, magnitude)
+        elif action == "negative_shift":
+            latent_delta = np.full_like(latent_state, -magnitude)
+            
+        modified_latent_state = latent_state + latent_delta
+        
+        print("Decoding Modified Latent Space back to 970 parameters...")
+        reconstructed_weights = decode_latent_vector(modified_latent_state, model, scaler)
+        
+        print("\nReconstructed Weights Shape Validation:")
+        for key, tensor_val in reconstructed_weights.items():
+            print(f"  {key}: {tensor_val.shape}")
+            
+        print("\n--- Value Logging (First 5 elements) ---")
+        print(f"0. Original Input Weights:\n   {mock_weights_dict['net.2.weight'][0][:5]}")
+        print(f"1. Encoded Weights (Latent Vector):\n   {latent_state[:5].tolist()}")
+        print(f"2. Noised Weights (Modified Latent Vector):\n   {modified_latent_state[:5].tolist()}")
+        print(f"3. Decoded Noised Weights (net.2.weight):\n   {reconstructed_weights['net.2.weight'].flatten()[:5].tolist()}")
+        
+    print("\nStandalone test completed successfully.")
