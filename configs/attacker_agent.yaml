@@ -6,10 +6,7 @@ llm:
   ollama_model: "gpt-oss:20b"  # Ollama backend model
 
 available_attacks:
-  - sign_flip
-  - noise_injection
-  - scaling
-  - gaussian_noise
+  - dynamic_math
 
 memory:
   persist_path: "checkpoints/attacker_memory"

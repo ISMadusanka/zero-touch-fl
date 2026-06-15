@@ -19,8 +19,8 @@ SYSTEM_PROMPT = """You are an adversarial agent in a federated learning system.
 Your goal: craft model poisoning attacks that evade the anomaly detector while
 degrading the global model's accuracy.
 
-Available attack types (model poisoning only):
-{available_attacks}
+You must build dynamic mathematical attacks by chaining mathematical operators.
+The only available attack type is `dynamic_math`.
 
 You receive:
 - baseline_accuracy: the clean model accuracy (before any attacks)
@@ -41,23 +41,30 @@ You receive:
 
 Respond with ONLY a JSON object:
 {{
-    "attack_type": "<one of the available attacks>",
-    "params": {{<attack-specific parameters>}},
+    "attack_type": "dynamic_math",
+    "params": {{
+        "operations": [
+            {{"op": "<operator_name>", "layers": ["<layer_name>", ...], "<param_key>": <param_value>}},
+            ...
+        ]
+    }},
     "reasoning": "<brief explanation>"
 }}
 
-Attack parameter ranges:
-- sign_flip: {{"c": 1.0 to 4.0, "k": 10 to total_params}}  (c = scaling factor, k = weights to flip; omit k to flip all)
-- noise_injection: {{"scale": 0.1 to 10.0, "k": 10 to total_params}}  (scale = noise std dev, k = weights to noise; omit k to noise all)
-- scaling: {{"factor": 1.5 to 100.0, "k": 10 to total_params}}  (factor = delta multiplier, k = weights to scale; omit k to scale all)
-- gaussian_noise: {{"sigma": 0.1 to 10.0}}
+Available operators and their parameters:
+- "scale": {{"factor": float}}  (multiply the honest gradient update by factor)
+- "shift": {{"value": float}}   (add a constant value)
+- "rotate": {{"shifts": int}}   (cyclically shift weights by N positions)
+- "mask": {{"fraction": float}} (zero out a fraction of weights, 0.0 to 1.0)
+- "permute": {{}}               (randomly shuffle weights)
+- "inject_noise": {{"std": float}} (add Gaussian noise with standard deviation std)
+- "invert": {{}}                (sign-flip the honest update)
+- "align": {{"alpha": float}}   (interpolate towards global weights, alpha 0.0 to 1.0)
+- "clip": {{"min": float, "max": float}} (clip weights within min and max)
+- "quantize": {{"step": float}} (round weights to nearest multiple of step)
 
-For sign_flip, noise_injection, and scaling: the optional k parameter selects only
-the top-k weights (by gradient magnitude) to attack. The rest stay honest.
-Smaller k = stealthier but weaker. Past attack_metadata shows which layers were
-targeted and gradient magnitude statistics — use this to refine your choices.
-
-Be strategic. If you were detected, try a subtler approach (lower params, smaller k).
+Target layers by name (e.g., "net.2.weight", "net.4.weight"). If "layers" is omitted or empty, the operation applies to all layers.
+Be strategic. If you were detected, try a subtler approach (e.g., lower scale factor, smaller noise std, or target fewer layers).
 If your attack was too subtle (accuracy didn't drop), be more aggressive.
 Use your attack_success_rate_recent to judge your overall regime performance.
 If fpr_recent is high, you can afford to be more aggressive since the defender
@@ -189,8 +196,8 @@ class AttackerAgent:
 
         # Validate and fallback
         if not result or "attack_type" not in result:
-            logger.warning("Attacker LLM returned invalid response — using sign_flip default")
-            return {"attack_type": "sign_flip", "params": {}, "reasoning": "fallback"}
+            logger.warning("Attacker LLM returned invalid response — using dynamic_math default")
+            return {"attack_type": "dynamic_math", "params": {"operations": [{"op": "invert"}]}, "reasoning": "fallback"}
 
         logger.info(f"Attacker chose: {result.get('attack_type')} — {result.get('reasoning', '')}")
         return result
