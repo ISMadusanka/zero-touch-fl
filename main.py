@@ -189,6 +189,13 @@ def run_simulation(
     defender_agent = DefenderAgent(defender_config)
     malicious_client = MaliciousClient(client_id=malicious_id)
 
+    # Extract model layer info for the attacker LLM (names + shapes)
+    model_layer_info = {
+        name: list(param.shape)
+        for name, param in server.get_global_weights().items()
+    }
+    logger.info(f"  Model layers: {model_layer_info}")
+
     # Metrics tracker — ground truth = the configured malicious client id(s)
     metrics_tracker = MetricsTracker(
         malicious_ids={malicious_id},
@@ -226,9 +233,11 @@ def run_simulation(
             "attack_success_rate_recent": windowed["attack_success_rate"],
             "fpr_recent": windowed["fpr"],
             "accuracy_preservation_rate": windowed["accuracy_preservation_rate"],
+            # Model layer info for per-layer targeting
+            "layer_info": model_layer_info,
         }
         attack_strategy = attacker_agent.decide(attacker_context)
-        attack_name = attack_strategy.get("attack_type", "sign_flip")
+        attack_name = attack_strategy.get("attack_type", "math_ops")
         attack_params = attack_strategy.get("params", {})
         logger.info(f"Attacker strategy: {attack_name} with params={attack_params}")
 
@@ -334,16 +343,26 @@ def run_simulation(
         # ------------------------------------------------------------------
         # Step 7: Record outcomes for both agents
         # ------------------------------------------------------------------
-        # Extract attack metadata (e.g. flipped indices) from the malicious update
+        # Extract attack metadata from the malicious update
         malicious_update = updates[malicious_id]
         attack_metadata = malicious_update.metadata.get("attack_metadata", {})
         if attack_metadata:
-            layer_info = attack_metadata.get("flipped_per_layer", attack_metadata.get("affected_per_layer", {}))
-            logger.info(
-                f"Attack metadata: k={attack_metadata.get('k', 'N/A')}, "
-                f"total_params={attack_metadata.get('total_params', '?')}, "
-                f"layers_affected={list(layer_info.keys())}"
-            )
+            if "layers_affected" in attack_metadata:
+                # New math_ops pipeline format
+                logger.info(
+                    f"Attack metadata (math_ops): "
+                    f"layers_affected={attack_metadata.get('layers_affected', [])}, "
+                    f"total_params={attack_metadata.get('total_params', '?')}, "
+                    f"n_specs={attack_metadata.get('n_specs', 0)}"
+                )
+            else:
+                # Legacy format
+                layer_info_meta = attack_metadata.get("flipped_per_layer", attack_metadata.get("affected_per_layer", {}))
+                logger.info(
+                    f"Attack metadata: k={attack_metadata.get('k', 'N/A')}, "
+                    f"total_params={attack_metadata.get('total_params', '?')}, "
+                    f"layers_affected={list(layer_info_meta.keys())}"
+                )
 
         # Recompute windowed metrics AFTER this round's data is recorded
         windowed_after = metrics_tracker.get_windowed_metrics(window=5)

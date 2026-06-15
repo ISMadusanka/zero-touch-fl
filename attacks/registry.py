@@ -26,3 +26,4 @@ def available_attacks() -> list[str]:
 
 # Import attack modules to trigger registration
 from attacks import sign_flip, noise_injection, scaling, gaussian_noise  # noqa: F401, E402
+from attacks import operator_pipeline  # noqa: F401, E402  — LLM-driven math operators
