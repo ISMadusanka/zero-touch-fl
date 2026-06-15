@@ -18,6 +18,7 @@ import logging
 import os
 import sys
 
+from dotenv import load_dotenv
 import yaml
 # import torch
 
@@ -364,6 +365,7 @@ def _save_round_log(log: RoundLog):
 # ---------------------------------------------------------------------------
 
 def main():
+    load_dotenv()
     parser = argparse.ArgumentParser(description="Zero-Touch Federated Learning")
     parser.add_argument("--fresh", action="store_true", help="Force fresh Phase 1 training")
     parser.add_argument(
