@@ -1,8 +1,8 @@
 # Federated Learning Configuration
 
 fl:
-  training_rounds: 1000        # Phase 1: honest training rounds
-  simulation_rounds: 1000       # Phase 2: attack/defend rounds
+  training_rounds: 5000        # Phase 1: honest training rounds
+  simulation_rounds: 5000       # Phase 2: attack/defend rounds
   n_clients: 5
   malicious_client_id: 0      # 0-indexed client that becomes adversarial
   local_epochs: 3
