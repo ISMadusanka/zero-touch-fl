@@ -61,7 +61,10 @@ python main.py --fresh
 python main.py --env linux --fresh
 
 python visualize_rounds.py
+
+source venv/bin/activate
 ```
+
 
 TO SEE THE VISUALIZATIONS
 

@@ -1,0 +1,34 @@
+[Unit]
+Description=Zero-Touch Federated Learning Training Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+
+# ---- Update these paths to match your server ----
+WorkingDirectory=/home/ubuntu/zero-touch-fl
+ExecStart=/home/ubuntu/zero-touch-fl/venv/bin/python main.py --fresh
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging — all stdout/stderr goes to journalctl
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zero-touch-fl
+
+# Restart policy: don't auto-restart training (it's a one-shot long task)
+Restart=no
+
+# Allow unlimited runtime for 5000 rounds
+TimeoutStartSec=infinity
+TimeoutStopSec=90
+
+# Resource limits (optional, adjust as needed)
+# LimitNOFILE=65536
+# Nice=10
+
+[Install]
+WantedBy=multi-user.target
