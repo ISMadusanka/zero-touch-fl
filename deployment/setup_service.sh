@@ -13,10 +13,10 @@
 set -e
 
 # ---- Configuration (update these to match your server) ----
-PROJECT_DIR="/home/ubuntu/zero-touch-fl"
+PROJECT_DIR="/home/zero_touch/group-49/dinuth-fl/zero-touch-fl"
 VENV_DIR="${PROJECT_DIR}/venv"
 SERVICE_NAME="zero-touch-fl"
-SERVICE_USER="ubuntu"
+SERVICE_USER="zero_touch"
 # -----------------------------------------------------------
 
 echo "=================================================="

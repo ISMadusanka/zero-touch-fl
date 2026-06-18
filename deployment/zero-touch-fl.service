@@ -4,12 +4,12 @@ After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
+User=zero_touch
+Group=zero_touch
 
 # ---- Update these paths to match your server ----
-WorkingDirectory=/home/ubuntu/zero-touch-fl
-ExecStart=/home/ubuntu/zero-touch-fl/venv/bin/python main.py --fresh
+WorkingDirectory=/home/zero_touch/group-49/dinuth-fl/zero-touch-fl
+ExecStart=/home/zero_touch/group-49/dinuth-fl/zero-touch-fl/venv/bin/python main.py --fresh
 
 # Environment
 Environment=PYTHONUNBUFFERED=1
