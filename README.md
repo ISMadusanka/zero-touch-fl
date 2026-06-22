@@ -109,3 +109,5 @@ logs/          System logs & per-round JSON data
 - **Attacker** adapts only when caught by the defender
 - **Defender** adapts only when an attack passes through
 - Both use FAISS-backed episodic memory persisted to disk
+
+LLM branch aded
