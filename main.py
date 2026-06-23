@@ -18,10 +18,13 @@ Modes:
   python main.py --rounds 8                   # override simulation_rounds (quick runs)
 """
 
+import os
+# Reduce CUDA fragmentation OOMs — must be set before torch is imported.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import copy
 import logging
-import os
 import random
 import sys
 from dataclasses import asdict

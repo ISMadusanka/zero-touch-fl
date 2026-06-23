@@ -174,22 +174,29 @@ class LLMPolicy:
     def generate(self, adapter, system, user, n=1, temperature=0.0, max_new_tokens=2048) -> list[str]:
         self.set_adapter(adapter)
         prompt_ids = self._prompt_ids(system, user)
-        do_sample = bool(temperature and temperature > 0)
-        gen_kwargs = dict(
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            num_return_sequences=n,
-            pad_token_id=self._tok.pad_token_id,
-        )
-        if do_sample:
-            gen_kwargs.update(temperature=float(temperature), top_p=0.95)
-        with self.torch.no_grad():
-            out = self.model.generate(prompt_ids, **gen_kwargs)
         plen = prompt_ids.shape[1]
-        return [
-            self._tok.decode(out[i, plen:], skip_special_tokens=True)
-            for i in range(out.shape[0])
-        ]
+        do_sample = bool(temperature and temperature > 0)
+
+        # Generate the G samples ONE AT A TIME (batch=1). Prefill attention is
+        # O(L²) per sequence and raw-weight prompts are long (~thousands of
+        # tokens), so batching num_return_sequences=G would OOM. Sequential
+        # generation trades wall-clock for a ~G× smaller peak memory.
+        texts = []
+        for _ in range(n):
+            gen_kwargs = dict(
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                num_return_sequences=1,
+                pad_token_id=self._tok.pad_token_id,
+            )
+            if do_sample:
+                gen_kwargs.update(temperature=float(temperature), top_p=0.95)
+            with self.torch.no_grad():
+                out = self.model.generate(prompt_ids, **gen_kwargs)
+            texts.append(self._tok.decode(out[0, plen:], skip_special_tokens=True))
+            del out
+            self.torch.cuda.empty_cache()
+        return texts
 
     def _completion_token_logprobs(self, system, user, completion, with_grad):
         """Per-token log-probs of ``completion`` given the prompt.
