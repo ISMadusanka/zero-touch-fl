@@ -173,32 +173,55 @@ class LLMPolicy:
         enc = self._tok(text, return_tensors="pt", add_special_tokens=False)
         return enc["input_ids"].to(self.device)
 
+    def _eos_ids(self) -> set:
+        ids = set()
+        if self._tok.eos_token_id is not None:
+            ids.add(int(self._tok.eos_token_id))
+        try:
+            ge = self.model.generation_config.eos_token_id
+            if isinstance(ge, (list, tuple)):
+                ids.update(int(x) for x in ge)
+            elif ge is not None:
+                ids.add(int(ge))
+        except Exception:
+            pass
+        return ids
+
     def generate(self, adapter, system, user, n=1, temperature=0.0, max_new_tokens=2048) -> list[str]:
         self.set_adapter(adapter)
         prompt_ids = self._prompt_ids(system, user)
         plen = prompt_ids.shape[1]
         do_sample = bool(temperature and temperature > 0)
+        eos_ids = self._eos_ids()
+        torch = self.torch
 
-        # Generate the G samples ONE AT A TIME (batch=1). Prefill attention is
-        # O(L²) per sequence; batching num_return_sequences=G multiplies peak
-        # memory and can OOM on longer prompts. Sequential generation trades a
-        # little wall-clock for a ~G× smaller peak — cheap now that attack-plan
-        # completions are short.
+        # Manual decoding WITHOUT a KV cache: each step is a full-sequence forward
+        # (the same path the log-prob pass uses, which works). This deliberately
+        # avoids Unsloth's fused single-token inference kernel
+        # (`fast_forward_inference`), which broadcasts RoPE cos/sin incorrectly
+        # under the installed Transformers version. Completions here are short
+        # (attack plans / verdicts), so the missing KV cache is affordable. We
+        # also do the G samples one at a time to keep peak memory ~1 sequence.
         texts = []
         for _ in range(n):
-            gen_kwargs = dict(
-                max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                num_return_sequences=1,
-                pad_token_id=self._tok.pad_token_id,
-            )
-            if do_sample:
-                gen_kwargs.update(temperature=float(temperature), top_p=0.95)
-            with self.torch.no_grad():
-                out = self.model.generate(prompt_ids, **gen_kwargs)
-            texts.append(self._tok.decode(out[0, plen:], skip_special_tokens=True))
-            del out
-            self.torch.cuda.empty_cache()
+            ids = prompt_ids.clone()
+            for _step in range(max_new_tokens):
+                with torch.no_grad():
+                    logits = self.model(ids).logits[:, -1, :].float()
+                if do_sample:
+                    logits = logits / max(float(temperature), 1e-6)
+                    k = min(50, logits.shape[-1])
+                    top = torch.topk(logits, k, dim=-1)
+                    probs = torch.softmax(top.values, dim=-1)
+                    nxt = top.indices.gather(-1, torch.multinomial(probs, 1))
+                else:
+                    nxt = logits.argmax(dim=-1, keepdim=True)
+                ids = torch.cat([ids, nxt], dim=1)
+                if int(nxt.item()) in eos_ids:
+                    break
+            texts.append(self._tok.decode(ids[0, plen:], skip_special_tokens=True))
+            del ids
+            torch.cuda.empty_cache()
         return texts
 
     def _completion_token_logprobs(self, system, user, completion, with_grad):
