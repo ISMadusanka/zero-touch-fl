@@ -45,25 +45,26 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
 
 - **Training happens on a GPU machine — not through Ollama.** Ollama and the
   OpenAI API are **inference-only** and cannot fine-tune.
-- The policy is **one frozen `gemma-3-4b-it` base loaded in 4-bit (QLoRA) via
-  Unsloth**, with **two LoRA adapters** over it — `attacker` and `defender`.
+- The policy is **one frozen `Llama-3.2-3B-Instruct` base loaded in 4-bit (QLoRA)
+  via Unsloth**, with **two LoRA adapters** over it — `attacker` and `defender`.
   This is exactly "separate checkpoints on the same LLM": the base is never
   duplicated; each policy is its own small adapter, saved independently to
   `checkpoints/attacker_adapter/` and `checkpoints/defender_adapter/`.
-  (Gemma 3 is loaded with `attn_implementation="eager"` — see `rl.attn_implementation`.)
+  (Loaded with `attn_implementation="eager"` by default — see `rl.attn_implementation`;
+  Llama 3.2 also supports `"sdpa"`.)
 - GRPO is implemented directly in [`rl/grpo.py`](rl/grpo.py) (environment-coupled
   reward, KL penalty to the frozen base) on top of Unsloth + PEFT — no TRL
   trainer dependency required.
 - **Resume**: rerun the same command. Existing adapters and
   `checkpoints/rl_progress.json` are reloaded and training continues.
-- **`gpt-4o-mini` (OpenAI) and Ollama `gemma3` are inference/baseline only** —
+- **`gpt-4o-mini` (OpenAI) and Ollama `llama3.2` are inference/baseline only** —
   used by `--dry-run` and `--baseline`. They are **not** fine-tuned.
 - **Serving a trained adapter**: use **vLLM** (multi-LoRA hot-swap), or **merge**
-  the adapter into the base and export a single GGUF for Ollama (Gemma 3 is
-  supported by Ollama as `gemma3`; merging gives up the two-swappable-adapters
+  the adapter into the base and export a single GGUF for Ollama (Llama 3.2 is
+  supported by Ollama as `llama3.2`; merging gives up the two-swappable-adapters
   design but is the simplest serving path).
-- **Hardware**: gemma-3-4b-it QLoRA fits comfortably on a single ~12 GB+ GPU
-  (~6–8 GB floor) — your 5090 (31 GB) has ample headroom. The attacker emits a
+- **Hardware**: Llama-3.2-3B QLoRA fits comfortably on a single ~8 GB+ GPU
+  (~4–6 GB floor) — your 5090 (31 GB) has ample headroom. The attacker emits a
   short attack plan (tens of tokens), so generation is fast and `rl.max_new_tokens`
   can stay small (512).
 
@@ -73,15 +74,15 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
 
 ```bash
 pip install -r requirements.txt   # installs unsloth/peft/transformers/bitsandbytes
-# gemma-3-4b-it is downloaded from Hugging Face on first run (unsloth/gemma-3-4b-it)
+# Llama-3.2-3B-Instruct is downloaded from Hugging Face on first run (unsloth/Llama-3.2-3B-Instruct)
 ```
 
 ### CPU machine (logic dry-run / baseline only)
 
 ```bash
 pip install torch torchvision numpy pyyaml matplotlib openai requests
-# For --dry-run you also need an Ollama server with gemma3:
-#   ollama serve & ; ollama pull gemma3:4b
+# For --dry-run you also need an Ollama server with llama3.2:
+#   ollama serve & ; ollama pull llama3.2:3b
 ```
 
 ## Usage

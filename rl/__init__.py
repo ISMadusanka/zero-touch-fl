@@ -8,7 +8,7 @@ dry-run path):
   rewards.py    Verifiable, continuous attacker/defender reward functions.
   turns.py      AttackerTurn / DefenderTurn — bind one round to one agent.
   inference.py  Frozen-LLM generation (Ollama/OpenAI) for --dry-run.
-  policy.py     LLMPolicy — Unsloth gemma-3-4b-it + two LoRA adapters (training).
+  policy.py     LLMPolicy — Unsloth Llama-3.2-3B-Instruct + two LoRA adapters (training).
   grpo.py       grpo_step — group-relative policy optimization update.
   schedule.py   Stackelberg freeze-and-alternate training driver + league.
   baseline.py   Best-of-N sanity baseline over a fixed action set.

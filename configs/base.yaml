@@ -28,12 +28,12 @@ attack:
 # Inference-only LLM defaults (used by --dry-run and the OpenAI path).
 llm:
   ollama_base_url: "http://localhost:11434"
-  ollama_model: "gemma3:4b"
+  ollama_model: "llama3.2:3b"
 
 # Reinforcement learning (GRPO) settings — see README "LLM handling".
 rl:
-  model: "unsloth/gemma-3-4b-it"  # HF/Unsloth base for QLoRA training
-  attn_implementation: "eager"    # Gemma 3 recommends eager attention
+  model: "unsloth/Llama-3.2-3B-Instruct"  # HF/Unsloth base for QLoRA training
+  attn_implementation: "eager"    # broadly compatible; Llama 3.2 also supports "sdpa"
   max_seq_len: 8192
   load_in_4bit: true
   lora_r: 16
