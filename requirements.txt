@@ -8,7 +8,7 @@ openai>=1.0          # OpenAI inference/baseline backend
 requests             # Ollama HTTP backend
 
 # --- RL training stack (install on the CUDA GPU machine) ---
-# Unsloth provides 4-bit QLoRA loading + GRPO-friendly gpt-oss support and pulls
+# Unsloth provides 4-bit QLoRA loading + GRPO-friendly Gemma 3 support and pulls
 # in transformers/accelerate/bitsandbytes. GRPO itself is implemented directly
 # in rl/grpo.py on top of PEFT adapters (no TRL trainer dependency required).
 unsloth

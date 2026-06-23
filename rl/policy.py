@@ -1,4 +1,4 @@
-"""LLMPolicy — one frozen gpt-oss-20b base, two trainable LoRA adapters.
+"""LLMPolicy — one frozen gemma-3-4b-it base, two trainable LoRA adapters.
 
 This is the only module with heavy GPU dependencies (unsloth / peft /
 transformers / torch + a CUDA box). It is imported only on the training path;
@@ -6,7 +6,7 @@ the dry-run path uses ``rl/inference.py`` instead, so the rest of the package
 stays importable on a CPU machine.
 
 Design — "separate checkpoints on the same LLM":
-  * One 4-bit (QLoRA) gpt-oss-20b base, loaded once and frozen.
+  * One 4-bit (QLoRA) gemma-3-4b-it base, loaded once and frozen.
   * Two LoRA adapters over it: ``"attacker"`` and ``"defender"``. Each is an
     independent set of low-rank deltas → two separate checkpoints
     (``adapter_model.safetensors`` + ``adapter_config.json``) sharing one base.
@@ -24,7 +24,7 @@ import os
 
 logger = logging.getLogger(__name__)
 
-# Default LoRA target modules for gpt-oss attention/MLP projections.
+# Default LoRA target modules for Gemma 3 attention/MLP projections.
 DEFAULT_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
@@ -34,7 +34,7 @@ DEFAULT_TARGET_MODULES = [
 class LLMPolicy:
     def __init__(
         self,
-        base_model: str = "unsloth/gpt-oss-20b",
+        base_model: str = "unsloth/gemma-3-4b-it",
         max_seq_len: int = 8192,
         lora_r: int = 16,
         lora_alpha: int = 32,
@@ -56,9 +56,9 @@ class LLMPolicy:
         target_modules = target_modules or DEFAULT_TARGET_MODULES
 
         logger.info(f"Loading base model {base_model} (4bit={load_in_4bit}) ...")
-        # gpt-oss (GptOssForCausalLM) has no SDPA path in current Transformers, and
-        # Unsloth here falls back to Xformers (FA2 broken) — eager attention is the
-        # reliable choice. Override via configs/base.yaml -> rl.attn_implementation.
+        # Gemma 3 recommends eager attention (sliding-window + logit soft-capping
+        # correctness), and it avoids the SDPA-dispatch errors some architectures
+        # hit. Override via configs/base.yaml -> rl.attn_implementation.
         base, self.tokenizer = FastLanguageModel.from_pretrained(
             model_name=base_model,
             max_seq_length=max_seq_len,
@@ -153,10 +153,9 @@ class LLMPolicy:
     # Generation + log-probs
     # ------------------------------------------------------------------
     def _prompt_ids(self, system: str, user: str):
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
+        # Gemma's chat template has no separate "system" role — fold the system
+        # instructions into the single user turn so this works across models.
+        messages = [{"role": "user", "content": f"{system}\n\n{user}"}]
         ids = self.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, return_tensors="pt",
         )

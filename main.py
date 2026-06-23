@@ -8,7 +8,7 @@ In Phase 2 a random subset of clients is poisoned each round. An attacker LLM
 emits raw poisoned weights; a defender LLM classifies each client benign/
 malicious from per-client per-layer statistics. Both get a verifiable per-round
 reward and are trained with GRPO (separate LoRA adapters over one frozen
-gpt-oss-20b base).
+gemma-3-4b-it base).
 
 Modes:
   python main.py --env linux                 # full GRPO training (needs a GPU)
@@ -169,7 +169,7 @@ def run_phase2(
             "defender": "checkpoints/defender_adapter",
         })
         policy = LLMPolicy(
-            base_model=rl_cfg.get("model", "unsloth/gpt-oss-20b"),
+            base_model=rl_cfg.get("model", "unsloth/gemma-3-4b-it"),
             max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
             lora_r=int(rl_cfg.get("lora_r", 16)),
             lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
@@ -207,7 +207,7 @@ def main():
     parser = argparse.ArgumentParser(description="Zero-Touch Federated Learning")
     parser.add_argument("--fresh", action="store_true", help="Force fresh Phase 1 training")
     parser.add_argument("--env", choices=["linux", "windows"], default="linux",
-                        help="'linux' uses Ollama (gpt-oss), 'windows' uses OpenAI (default: linux)")
+                        help="'linux' uses Ollama (gemma3), 'windows' uses OpenAI (default: linux)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run the Phase-2 loop with a frozen LLM (no training, no GPU needed)")
     parser.add_argument("--baseline", action="store_true",
@@ -230,7 +230,7 @@ def main():
         agent_cfg.setdefault("llm", {})
         agent_cfg["llm"]["backend"] = llm_backend
         agent_cfg["llm"].setdefault("ollama_base_url", llm_defaults.get("ollama_base_url", "http://localhost:11434"))
-        agent_cfg["llm"].setdefault("ollama_model", llm_defaults.get("ollama_model", "gpt-oss:20b"))
+        agent_cfg["llm"].setdefault("ollama_model", llm_defaults.get("ollama_model", "gemma3:4b"))
 
     # Single source of truth for the attack goal: base config -> attacker agent.
     goal = base_config.get("attack", {}).get("goal")
