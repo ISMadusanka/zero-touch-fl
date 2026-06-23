@@ -6,7 +6,7 @@ fl:
   n_clients: 5
   poison_fraction: 0.2            # fraction of clients poisoned each round (random subset)
   poison_seed: 0                  # RNG seed for the poisoned-subset selection + reproducibility
-  benign_retrain_each_round: true # benign clients retrain each round (else replay Phase-1 weights)
+  benign_retrain_each_round: false # false = benign clients replay frozen Phase-1 final-round local weights every round
   local_epochs: 3
   batch_size: 64
   lr: 0.002

@@ -30,14 +30,19 @@ def attacker_reward(
     beta: float = 0.5,
     gamma: float = 1.0,
 ) -> float:
-    """Reward the attacker for degrading accuracy toward its goal while evading.
+    """Reward the attacker for degrading accuracy while staying stealthy.
 
     reward = alpha * clip(drop / target, -0.5, 1.5)
-           + beta  * evasion_rate
+           + beta  * stealth
            - gamma * malformed_fraction
 
-    where ``drop = prev_accuracy - post_accuracy`` and ``evasion_rate`` is the
-    fraction of poisoned clients NOT flagged this round.
+    ``drop = prev_accuracy - post_accuracy``. ``stealth`` is a CONTINUOUS evasion
+    signal in [0, 1]: the mean over poisoned clients of ``1 - soft P(malicious)``
+    derived from the defender's *confidence* (not just the binary flag).
+    Confidently caught -> ~0; confidently passed as benign -> ~1; unsure -> ~0.5.
+    Because it moves smoothly with the defender's confidence, it gives GRPO a
+    gradient even when every sampled plan ends up with the SAME hard flag — the
+    fix for zero-advantage attacker groups.
     """
     gtype = goal.get("type", "untargeted_degrade")
     if gtype == "slow_degrade":
@@ -51,14 +56,18 @@ def attacker_reward(
     drop = prev_accuracy - post_accuracy
     drop_term = _clip(drop / target, -0.5, 1.5)
 
-    flagged = {v.client_id for v in verdicts if v.is_suspicious}
+    verdict_by_id = {v.client_id: v for v in verdicts}
     n_pois = max(1, len(poisoned_ids))
-    evaded = sum(1 for cid in poisoned_ids if cid not in flagged)
-    evasion_rate = evaded / n_pois
+    stealth = 0.0
+    for cid in poisoned_ids:
+        v = verdict_by_id.get(cid)
+        # No verdict for a poisoned client => treat as undetected (passed).
+        stealth += 1.0 if v is None else (1.0 - _soft_malicious_prob(v))
+    stealth /= n_pois
 
     malformed_fraction = n_malformed / n_pois
 
-    return alpha * drop_term + beta * evasion_rate - gamma * malformed_fraction
+    return alpha * drop_term + beta * stealth - gamma * malformed_fraction
 
 
 def _soft_malicious_prob(v: DetectionVerdict) -> float:
