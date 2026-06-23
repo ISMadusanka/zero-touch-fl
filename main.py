@@ -1,54 +1,53 @@
 """Zero-Touch Federated Learning — Main Entry Point.
 
-Two-phase system:
-  Phase 1 (Rounds 1-3): Honest FL training, then save state.
-  Phase 2 (Round 4+):   Attack/defend simulation with LLM agents.
+Two phases:
+  Phase 1 (training_rounds): honest FedAvg training, then checkpoint.
+  Phase 2 (simulation_rounds): LLM-direct adversarial arms race with RL.
 
-Usage:
-  python main.py                    # Windows/OpenAI (default)
-  python main.py --env linux        # Linux/Ollama backend
-  python main.py --fresh            # Force fresh training (Phase 1)
-  python main.py --env linux --fresh
+In Phase 2 a random subset of clients is poisoned each round. An attacker LLM
+emits raw poisoned weights; a defender LLM classifies each client benign/
+malicious from per-client per-layer statistics. Both get a verifiable per-round
+reward and are trained with GRPO (separate LoRA adapters over one frozen
+gpt-oss-20b base).
+
+Modes:
+  python main.py --env linux                 # full GRPO training (needs a GPU)
+  python main.py --env linux --dry-run       # frozen-LLM round loop, no training
+  python main.py --baseline                  # best-of-N reward-harness sanity (no LLM)
+  python main.py --fresh                      # force fresh Phase-1 training
+  python main.py --rounds 8                   # override simulation_rounds (quick runs)
 """
 
 import argparse
 import copy
-import json
 import logging
 import os
+import random
 import sys
+from dataclasses import asdict
 
 import yaml
-# import torch
 
 from data.mnist_loader import get_data_loaders
-from model.mnist_net import MnistNet, count_parameters
 from clients.benign_client import BenignClient
-from clients.malicious_client import MaliciousClient
 from server.fed_server import FedServer
 from server.aggregation import FedAvgAggregator
-from detector.anomaly_detector import AnomalyDetector
 from agents.attacker_agent import AttackerAgent
 from agents.defender_agent import DefenderAgent
-from storage.checkpoint import save_state, load_state, state_exists
-from core.types import RoundLog
-from metrics import MetricsTracker
-from metrics.production_signals import (
-    compute_accuracy_delta,
-    compute_accuracy_trend,
-    compute_accuracy_volatility,
-    compute_flag_rate,
-    compute_rounds_skipped,
-    compute_client_flag_history,
+from agents.llm_client import create_llm_client
+from storage.checkpoint import (
+    save_state, load_state, state_exists, save_progress, load_progress, adapter_exists,
 )
+from core.types import RoundLog, DetectionVerdict
+from metrics import MetricsTracker
+from rl.env import FLArmsRaceEnv
 
 # ---------------------------------------------------------------------------
-# Logging setup
+# Logging / config
 # ---------------------------------------------------------------------------
 
 def setup_logging():
     os.makedirs("logs/round_data", exist_ok=True)
-    # Force UTF-8 to avoid Windows cp1252 encoding errors
     file_handler = logging.FileHandler("logs/system.log", mode="a", encoding="utf-8")
     stream_handler = logging.StreamHandler(
         open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)
@@ -61,45 +60,32 @@ def setup_logging():
 
 logger = logging.getLogger("main")
 
-# ---------------------------------------------------------------------------
-# Config loading
-# ---------------------------------------------------------------------------
 
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
+
+def _save_round_log(log: RoundLog):
+    path = f"logs/round_data/round_{log.round_num:03d}.json"
+    with open(path, "w") as f:
+        import json
+        json.dump(asdict(log), f, indent=2, default=str)
+    logger.info(f"Round data saved to {path}")
+
+
 # ---------------------------------------------------------------------------
-# Phase 1: Honest FL training for 3 rounds
+# Phase 1: honest FedAvg training
 # ---------------------------------------------------------------------------
 
-def run_training_phase(config: dict):
-    """Train all clients honestly for `training_rounds` rounds. Returns saved state."""
+def run_training_phase(config: dict, client_loaders, test_loader):
+    """Train all clients honestly for ``training_rounds`` rounds; checkpoint."""
     fl = config["fl"]
-    data_cfg = config["data"]
-
     logger.info("=" * 60)
     logger.info("PHASE 1: Honest Federated Learning Training")
     logger.info("=" * 60)
 
-    # Data
-    client_loaders, test_loader = get_data_loaders(
-        n_clients=fl["n_clients"],
-        batch_size=fl["batch_size"],
-        data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
-        iid=data_cfg.get("iid", True),
-    )
-
-    # Log data sizes
-    for i, loader in enumerate(client_loaders):
-        logger.info(f"  Client {i} training samples: {len(loader.dataset)}")
-    logger.info(f"  Test samples: {len(test_loader.dataset)}")
-    logger.info(f"  Total training samples: {sum(len(l.dataset) for l in client_loaders)}")
-
-    # Server
     server = FedServer(device=fl["device"])
-
-    # Clients
     clients = [
         BenignClient(
             client_id=i,
@@ -110,343 +96,107 @@ def run_training_phase(config: dict):
         )
         for i in range(fl["n_clients"])
     ]
-
-    # Aggregator
     aggregator = FedAvgAggregator()
 
-    # Training loop
+    updates = []
     for round_num in range(1, fl["training_rounds"] + 1):
         logger.info(f"--- Training Round {round_num}/{fl['training_rounds']} ---")
-
-        global_weights = server.get_global_weights()
-
-        # All clients train honestly
-        updates = []
-        for client in clients:
-            update = client.train(server.model)
-            updates.append(update)
-            meta = update.metadata
-            logger.info(
-                f"  Client {client.client_id} trained — "
-                f"acc: {meta.get('train_accuracy', 0):.4f}, "
-                f"loss: {meta.get('train_loss', 0):.4f}, "
-                f"samples: {meta.get('train_samples', 0)}"
-            )
-
-        # Aggregate (no detection in Phase 1)
-        from core.types import DetectionVerdict
-        clean_verdicts = [
-            DetectionVerdict(u.client_id, False, 0.0, "phase1") for u in updates
-        ]
-        new_weights = aggregator.aggregate(updates, clean_verdicts)
+        updates = [client.train(server.model) for client in clients]
+        # No detection in Phase 1 — everyone is honest.
+        clean = [DetectionVerdict(u.client_id, False, 0.0, "phase1") for u in updates]
+        new_weights = aggregator.aggregate(updates, clean)
         server.set_global_weights(new_weights)
-
-        # Evaluate
         accuracy = server.evaluate(test_loader)
         logger.info(f"  Round {round_num} accuracy: {accuracy:.4f}")
 
-    # Baseline accuracy (before any attacks)
     baseline_accuracy = server.evaluate(test_loader)
     logger.info(f"Baseline accuracy after Phase 1: {baseline_accuracy:.4f}")
 
-    # Save state: global model + each client's weights from final round
     client_weights = [u.weights for u in updates]
     save_state(server.get_global_weights(), client_weights, baseline_accuracy)
     logger.info("Phase 1 state saved to checkpoints/")
+    return server.get_global_weights(), client_weights, baseline_accuracy
 
-    return server.get_global_weights(), client_weights, baseline_accuracy, test_loader
 
 # ---------------------------------------------------------------------------
-# Phase 2: Attack/Defend Simulation
+# Phase 2: LLM-direct adversarial arms race
 # ---------------------------------------------------------------------------
 
-def run_simulation(
-    global_weights: dict,
-    client_weights: list[dict],
-    baseline_accuracy: float,
-    test_loader,
-    config: dict,
-    attacker_config: dict,
-    defender_config: dict,
+def run_phase2(
+    global_weights, client_weights, baseline_accuracy,
+    client_loaders, test_loader, config, attacker_config, defender_config,
+    mode: str, n_rounds: int, llm_backend: str,
 ):
-    """Run the attack/defend simulation loop."""
     fl = config["fl"]
-    malicious_id = fl["malicious_client_id"]
-
     logger.info("=" * 60)
-    logger.info("PHASE 2: Attack / Defend Simulation")
-    logger.info(f"  Malicious client: {malicious_id}")
-    logger.info(f"  Simulation rounds: {fl['simulation_rounds']}")
-    logger.info(f"  Baseline accuracy: {baseline_accuracy:.4f}")
+    logger.info(f"PHASE 2: LLM-direct arms race  (mode={mode})")
+    logger.info(f"  simulation_rounds={n_rounds}, poison_fraction={fl.get('poison_fraction')}")
+    logger.info(f"  baseline_accuracy={baseline_accuracy:.4f}")
     logger.info("=" * 60)
 
-    # Components
-    server = FedServer(device=fl["device"])
-    server.set_global_weights(copy.deepcopy(global_weights))
-    aggregator = FedAvgAggregator()
-    detector = AnomalyDetector()
+    rng = random.Random(int(fl.get("poison_seed", 0)))
+    env = FLArmsRaceEnv(config, client_loaders, test_loader, rng)
+    env.reset(global_weights, client_weights, baseline_accuracy)
+
+    metrics_tracker = MetricsTracker(baseline_accuracy=baseline_accuracy, output_dir="logs/metrics")
     attacker_agent = AttackerAgent(attacker_config)
     defender_agent = DefenderAgent(defender_config)
-    malicious_client = MaliciousClient(client_id=malicious_id)
 
-    # Metrics tracker — ground truth = the configured malicious client id(s)
-    metrics_tracker = MetricsTracker(
-        malicious_ids={malicious_id},
-        baseline_accuracy=baseline_accuracy,
-        output_dir="logs/metrics",
-    )
+    if mode == "baseline":
+        from rl.baseline import run_baseline
+        run_baseline(env, n_rounds, metrics_tracker, _save_round_log)
 
-    # State tracking
-    last_attack_detected = None    # None on first round
-    last_attack_passed = None      # None on first round
-    last_all_clients_flagged = None  # None on first round
-    current_accuracy = baseline_accuracy
-    previous_accuracy = baseline_accuracy  # for accuracy_delta
-    accuracy_history: list[float] = [baseline_accuracy]  # for trend/volatility
-
-    for sim_round in range(1, fl["simulation_rounds"] + 1):
-        round_num = fl["training_rounds"] + sim_round
-        logger.info(f"\n{'='*60}")
-        logger.info(f"SIMULATION ROUND {sim_round} (Global Round {round_num})")
-        logger.info(f"{'='*60}")
-
-        current_global = server.get_global_weights()
-
-        # ------------------------------------------------------------------
-        # Step 1: Attacker decides strategy
-        # ------------------------------------------------------------------
-        # Compute windowed metrics for agent feedback (uses rounds so far)
-        windowed = metrics_tracker.get_windowed_metrics(window=5)
-
-        attacker_context = {
-            "baseline_accuracy": baseline_accuracy,
-            "current_accuracy": current_accuracy,
-            "was_detected": last_attack_detected,
-            # Windowed KPIs — attacker gets ASR, FPR, APR
-            "attack_success_rate_recent": windowed["attack_success_rate"],
-            "fpr_recent": windowed["fpr"],
-            "accuracy_preservation_rate": windowed["accuracy_preservation_rate"],
-        }
-        attack_strategy = attacker_agent.decide(attacker_context)
-        attack_name = attack_strategy.get("attack_type", "sign_flip")
-        attack_params = attack_strategy.get("params", {})
-        logger.info(f"Attacker strategy: {attack_name} with params={attack_params}")
-
-        # ------------------------------------------------------------------
-        # Step 2: Build all client updates
-        # ------------------------------------------------------------------
-        from core.types import ModelUpdate
-
-        updates = []
-        for cid in range(fl["n_clients"]):
-            if cid == malicious_id:
-                # Poisoned update
-                update = malicious_client.poison(
-                    saved_weights=client_weights[cid],
-                    global_weights=current_global,
-                    attack_name=attack_name,
-                    attack_params=attack_params,
-                )
-                logger.info(f"  Client {cid}: POISONED ({attack_name})")
-            else:
-                # Honest update (from saved Phase 1 weights)
-                update = ModelUpdate(client_id=cid, weights=copy.deepcopy(client_weights[cid]))
-                logger.info(f"  Client {cid}: honest (saved weights)")
-            updates.append(update)
-
-        # ------------------------------------------------------------------
-        # Step 3: Defender decides strategy (production-ready signals only)
-        # ------------------------------------------------------------------
-        update_features = detector.get_features(updates, current_global)
-
-        # Compute production-observable proxy signals
-        acc_delta = compute_accuracy_delta(current_accuracy, previous_accuracy) if sim_round > 1 else None
-        acc_trend = compute_accuracy_trend(accuracy_history, window=5)
-        acc_volatility = compute_accuracy_volatility(accuracy_history, window=5)
-        acc_preservation = current_accuracy / baseline_accuracy if baseline_accuracy > 0 else 1.0
-        last_flag_rate = compute_flag_rate(
-            sum(1 for e in defender_agent.history[-1:] for v in e.get("verdicts", []) if v.get("suspicious")),
-            fl["n_clients"],
-        ) if defender_agent.history else 0.0
-        rounds_skipped = compute_rounds_skipped(defender_agent.history, window=5)
-        client_flags = compute_client_flag_history(defender_agent.history, window=10)
-        method_consensus = detector.compute_consensus(updates, current_global)
-
-        defender_context = {
-            "update_features": update_features,
-            # Production-observable signals (no oracle feedback)
-            "accuracy_delta": acc_delta,
-            "accuracy_trend": acc_trend,
-            "accuracy_volatility": acc_volatility,
-            "accuracy_preservation_rate": acc_preservation,
-            "flag_rate": last_flag_rate,
-            "all_clients_flagged": last_all_clients_flagged,
-            "rounds_skipped_recent": rounds_skipped,
-            "method_consensus": method_consensus,
-            "client_flag_history": client_flags,
-        }
-        defend_strategy = defender_agent.decide(defender_context)
-        logger.info(f"Defender strategy: {defend_strategy.get('method')} with params={defend_strategy.get('params')}")
-
-        # ------------------------------------------------------------------
-        # Step 4: Anomaly detection
-        # ------------------------------------------------------------------
-        verdicts = detector.analyze(updates, current_global, defend_strategy)
-
-        # Check if the malicious client was detected
-        malicious_verdict = next(v for v in verdicts if v.client_id == malicious_id)
-        attack_detected = malicious_verdict.is_suspicious
-        attack_passed = not attack_detected
-        n_flagged = sum(1 for v in verdicts if v.is_suspicious)
-        all_clients_flagged = n_flagged == len(verdicts)
-
-        logger.info(f"Detection result: malicious client {'DETECTED' if attack_detected else 'PASSED THROUGH'}")
-        logger.info(f"Detection summary: {n_flagged}/{len(verdicts)} clients flagged")
-
-        # ------------------------------------------------------------------
-        # Step 5: Aggregation (exclude detected clients)
-        # ------------------------------------------------------------------
-        new_weights = aggregator.aggregate(updates, verdicts, strategy=defend_strategy)
-
-        if new_weights is None:
-            # All clients flagged → skip round, keep global model unchanged
-            logger.warning(
-                f"Round {round_num}: all clients flagged — global model NOT updated"
-            )
-        else:
-            server.set_global_weights(new_weights)
-
-        # ------------------------------------------------------------------
-        # Step 6: Evaluate
-        # ------------------------------------------------------------------
-        current_accuracy = server.evaluate(test_loader)
-        logger.info(f"Test accuracy after aggregation: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
-
-        # ------------------------------------------------------------------
-        # Step 6b: Compute & log evaluation metrics for this round
-        # ------------------------------------------------------------------
-        round_metrics = metrics_tracker.update(
-            round_num=round_num,
-            verdicts=verdicts,
-            current_accuracy=current_accuracy,
+    elif mode == "dry-run":
+        from rl.inference import InferenceGenerator, run_inference
+        llm_cfg = attacker_config.get("llm", {})
+        model = llm_cfg.get("ollama_model" if llm_backend == "ollama" else "model")
+        backend = create_llm_client(
+            backend=llm_backend, model=model,
+            temperature=float(llm_cfg.get("temperature", 0.7)),
+            ollama_base_url=llm_cfg.get("ollama_base_url", "http://localhost:11434"),
         )
+        gen = InferenceGenerator(backend, max_new_tokens=int(config.get("rl", {}).get("max_new_tokens", 2048)))
+        run_inference(env, attacker_agent, defender_agent, gen, n_rounds,
+                      metrics_tracker, _save_round_log,
+                      temperature=float(llm_cfg.get("temperature", 0.7)))
 
-        # ------------------------------------------------------------------
-        # Step 7: Record outcomes for both agents
-        # ------------------------------------------------------------------
-        # Extract attack metadata (e.g. flipped indices) from the malicious update
-        malicious_update = updates[malicious_id]
-        attack_metadata = malicious_update.metadata.get("attack_metadata", {})
-        if attack_metadata:
-            layer_info = attack_metadata.get("flipped_per_layer", attack_metadata.get("affected_per_layer", {}))
-            logger.info(
-                f"Attack metadata: k={attack_metadata.get('k', 'N/A')}, "
-                f"total_params={attack_metadata.get('total_params', '?')}, "
-                f"layers_affected={list(layer_info.keys())}"
-            )
-
-        # Recompute windowed metrics AFTER this round's data is recorded
-        windowed_after = metrics_tracker.get_windowed_metrics(window=5)
-
-        attacker_agent.record_outcome(
-            round_num=round_num,
-            strategy=attack_strategy,
-            was_detected=attack_detected,
-            accuracy=current_accuracy,
-            attack_metadata=attack_metadata,
-            # Windowed KPIs for attacker history
-            attack_success_rate_recent=windowed_after["attack_success_rate"],
-            fpr_recent=windowed_after["fpr"],
-            accuracy_preservation_rate=windowed_after["accuracy_preservation_rate"],
+    else:  # full GRPO training
+        from rl.policy import LLMPolicy
+        from rl.schedule import train
+        rl_cfg = config.get("rl", {})
+        adapter_paths = rl_cfg.get("adapter_paths", {
+            "attacker": "checkpoints/attacker_adapter",
+            "defender": "checkpoints/defender_adapter",
+        })
+        policy = LLMPolicy(
+            base_model=rl_cfg.get("model", "unsloth/gpt-oss-20b"),
+            max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
+            lora_r=int(rl_cfg.get("lora_r", 16)),
+            lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
+            load_in_4bit=bool(rl_cfg.get("load_in_4bit", True)),
+            seed=int(fl.get("poison_seed", 0)),
         )
-        # Compute production signals AFTER this round for defender history
-        post_acc_delta = compute_accuracy_delta(current_accuracy, previous_accuracy)
-        post_acc_trend = compute_accuracy_trend(accuracy_history + [current_accuracy], window=5)
-        post_acc_volatility = compute_accuracy_volatility(accuracy_history + [current_accuracy], window=5)
-        post_acc_preservation = current_accuracy / baseline_accuracy if baseline_accuracy > 0 else 1.0
-        post_flag_rate = compute_flag_rate(n_flagged, len(verdicts))
-        post_rounds_skipped = compute_rounds_skipped(defender_agent.history, window=5)
-        post_client_flags = compute_client_flag_history(defender_agent.history, window=10)
+        # Resume adapters if present.
+        for name, path in adapter_paths.items():
+            if adapter_exists(path):
+                policy.load_adapter(name, path)
+        start_round = load_progress()
+        if start_round:
+            logger.info(f"Resuming Phase-2 training from round {start_round}")
 
-        defender_agent.record_outcome(
-            round_num=round_num,
-            strategy=defend_strategy,
-            verdicts=[
-                {"client_id": v.client_id, "suspicious": v.is_suspicious, "confidence": v.confidence, "reason": v.reason}
-                for v in verdicts
-            ],
-            all_clients_flagged=all_clients_flagged,
-            accuracy_delta=post_acc_delta,
-            accuracy_trend=post_acc_trend,
-            accuracy_volatility=post_acc_volatility,
-            accuracy_preservation_rate=post_acc_preservation,
-            flag_rate=post_flag_rate,
-            rounds_skipped_recent=post_rounds_skipped,
-            method_consensus=method_consensus,
-            client_flag_history=post_client_flags,
-        )
+        def progress_cb(done):
+            save_progress(done)
 
-        # ------------------------------------------------------------------
-        # Step 8: Save round data to file
-        # ------------------------------------------------------------------
-        round_log = RoundLog(
-            round_num=round_num,
-            attack_strategy={"type": attack_name, "params": attack_params, "reasoning": attack_strategy.get("reasoning", "")},
-            defend_strategy=defend_strategy,
-            verdicts=[
-                {"client_id": v.client_id, "suspicious": v.is_suspicious, "confidence": v.confidence, "reason": v.reason}
-                for v in verdicts
-            ],
-            test_accuracy=current_accuracy,
-            baseline_accuracy=baseline_accuracy,
-            attack_detected=attack_detected,
-            attacker_adapted=last_attack_detected is True,    # adapted this round because caught last round
-            defender_adapted=last_attack_passed is True,      # adapted this round because failed last round
-            all_clients_flagged=all_clients_flagged,
-            round_skipped=new_weights is None,
-        )
-        _save_round_log(round_log, extra={"metrics": round_metrics.to_dict()})
-
-        # Update state for next round
-        last_attack_detected = attack_detected
-        last_attack_passed = attack_passed
-        last_all_clients_flagged = all_clients_flagged
-        previous_accuracy = current_accuracy
-        accuracy_history.append(current_accuracy)
+        train(env, policy, attacker_agent, defender_agent, config,
+              metrics_tracker, _save_round_log, rng,
+              progress_cb=progress_cb, start_round=start_round)
 
     logger.info("\n" + "=" * 60)
-    logger.info("SIMULATION COMPLETE")
-    logger.info(f"Final accuracy: {current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
+    logger.info("PHASE 2 COMPLETE")
+    logger.info(f"Final accuracy: {env.current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
     logger.info("=" * 60)
-
-    # Aggregate metrics over the whole simulation
     metrics_tracker.save_summary()
 
-
-def _save_round_log(log: RoundLog, extra: dict | None = None):
-    """Save a round's complete data to JSON.
-
-    `extra` is merged into the payload (e.g. evaluation metrics for the round).
-    """
-    path = f"logs/round_data/round_{log.round_num:03d}.json"
-    data = {
-        "round_num": log.round_num,
-        "attack_strategy": log.attack_strategy,
-        "defend_strategy": log.defend_strategy,
-        "verdicts": log.verdicts,
-        "test_accuracy": log.test_accuracy,
-        "baseline_accuracy": log.baseline_accuracy,
-        "attack_detected": log.attack_detected,
-        "attacker_adapted": log.attacker_adapted,
-        "defender_adapted": log.defender_adapted,
-        "all_clients_flagged": log.all_clients_flagged,
-        "round_skipped": log.round_skipped,
-    }
-    if extra:
-        data.update(extra)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2, default=str)
-    logger.info(f"Round data saved to {path}")
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -455,64 +205,77 @@ def _save_round_log(log: RoundLog, extra: dict | None = None):
 def main():
     parser = argparse.ArgumentParser(description="Zero-Touch Federated Learning")
     parser.add_argument("--fresh", action="store_true", help="Force fresh Phase 1 training")
-    parser.add_argument(
-        "--env",
-        choices=["linux", "windows"],
-        default="windows",
-        help="Running environment: 'linux' uses Ollama, 'windows' uses OpenAI (default: windows)",
-    )
+    parser.add_argument("--env", choices=["linux", "windows"], default="linux",
+                        help="'linux' uses Ollama (gpt-oss), 'windows' uses OpenAI (default: linux)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Run the Phase-2 loop with a frozen LLM (no training, no GPU needed)")
+    parser.add_argument("--baseline", action="store_true",
+                        help="Run the best-of-N reward-harness sanity baseline (no LLM)")
+    parser.add_argument("--rounds", type=int, default=None,
+                        help="Override simulation_rounds (handy for quick smoke runs)")
     args = parser.parse_args()
 
     setup_logging()
     logger.info("Starting Zero-Touch Federated Learning System")
-    logger.info(f"Environment: {args.env}")
 
-    # Load configs
     base_config = load_config("configs/base.yaml")
     attacker_config = load_config("configs/attacker_agent.yaml")
     defender_config = load_config("configs/defender_agent.yaml")
 
-    # Inject LLM backend based on --env flag
+    # LLM backend + shared Ollama defaults (used by --dry-run / OpenAI paths).
     llm_backend = "ollama" if args.env == "linux" else "openai"
     llm_defaults = base_config.get("llm", {})
-
     for agent_cfg in (attacker_config, defender_config):
         agent_cfg.setdefault("llm", {})
         agent_cfg["llm"]["backend"] = llm_backend
-        # Propagate global Ollama settings (agent-level values take priority)
         agent_cfg["llm"].setdefault("ollama_base_url", llm_defaults.get("ollama_base_url", "http://localhost:11434"))
-        agent_cfg["llm"].setdefault("ollama_model", llm_defaults.get("ollama_model", "deepseek-r1:70b"))
+        agent_cfg["llm"].setdefault("ollama_model", llm_defaults.get("ollama_model", "gpt-oss:20b"))
 
-    logger.info(f"LLM backend: {llm_backend}")
+    # Single source of truth for the attack goal: base config -> attacker agent.
+    goal = base_config.get("attack", {}).get("goal")
+    if goal:
+        attacker_config["attack_goal"] = goal
+
+    # Reproducibility.
+    seed = int(base_config["fl"].get("poison_seed", 0))
+    random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+    except ImportError:
+        pass
 
     fl = base_config["fl"]
     data_cfg = base_config["data"]
-
-    # Prepare test loader (needed for both phases)
-    _, test_loader = get_data_loaders(
-        n_clients=fl["n_clients"],
-        batch_size=fl["batch_size"],
-        data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
-        iid=data_cfg.get("iid", True),
+    client_loaders, test_loader = get_data_loaders(
+        n_clients=fl["n_clients"], batch_size=fl["batch_size"],
+        data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), iid=data_cfg.get("iid", True),
     )
 
     if state_exists() and not args.fresh:
         logger.info("Checkpoint found — skipping Phase 1, loading saved state")
-        loaded = load_state()
-        global_weights, client_weights, baseline_accuracy = loaded
+        global_weights, client_weights, baseline_accuracy = load_state()
     else:
-        logger.info("No checkpoint found (or --fresh) — running Phase 1")
-        global_weights, client_weights, baseline_accuracy, test_loader = run_training_phase(base_config)
+        logger.info("No checkpoint (or --fresh) — running Phase 1")
+        global_weights, client_weights, baseline_accuracy = run_training_phase(
+            base_config, client_loaders, test_loader
+        )
 
-    # Phase 2
-    run_simulation(
-        global_weights=global_weights,
+    mode = "baseline" if args.baseline else ("dry-run" if args.dry_run else "train")
+    n_rounds = args.rounds if args.rounds is not None else int(fl["simulation_rounds"])
+
+    run_phase2(
+        global_weights=copy.deepcopy(global_weights),
         client_weights=client_weights,
         baseline_accuracy=baseline_accuracy,
+        client_loaders=client_loaders,
         test_loader=test_loader,
         config=base_config,
         attacker_config=attacker_config,
         defender_config=defender_config,
+        mode=mode,
+        n_rounds=n_rounds,
+        llm_backend=llm_backend,
     )
 
 

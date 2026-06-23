@@ -1,204 +1,124 @@
-"""Attacker LLM agent — selects and tunes model poisoning attacks.
+"""Attacker LLM agent — emits raw poisoned weights directly.
 
-Only adapts strategy when the previous attack was CAUGHT by the defender.
-If the attack succeeded (passed through), the same strategy is reused.
+This is a **pure prompt-builder + output-parser**. It never calls an LLM
+itself: generation (and, during training, the log-probs GRPO needs) is owned by
+the RL policy (`rl/policy.py`) or the inference backend (`rl/inference.py`).
+Keeping the agent backend-free makes it reusable by both the training loop and
+the no-GPU dry-run path, and trivially unit-testable.
+
+Inputs (per the redesign): current FL round number, the raw benign weights of
+the client(s) selected for poisoning this round, the current global model
+accuracy, and a configurable attack goal. Output: raw poisoned weights for each
+poisoned client, parsed/validated by `agents.weight_codec`.
 """
 
 import json
 import logging
-import numpy as np
 
-from agents.embedder import embed, get_dimension
-
-from agents.llm_client import create_llm_client
-from storage.vector_store import VectorStore
+from agents.weight_codec import (
+    dump_weights,
+    parse_round,
+    total_params,
+    weight_schema,
+)
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are an adversarial agent in a federated learning system.
-Your goal: craft model poisoning attacks that evade the anomaly detector while
-degrading the global model's accuracy.
 
-Available attack types (model poisoning only):
-{available_attacks}
+# Default goal for the first experiment (untargeted accuracy reduction).
+DEFAULT_GOAL = {"type": "untargeted_degrade", "target_accuracy_drop": 0.20}
 
-You receive:
-- baseline_accuracy: the clean model accuracy (before any attacks)
-- current_accuracy: test accuracy after the last round's aggregation
-- was_detected: whether your last attack was caught
-- attack_success_rate_recent: your attack success rate over the last 5 rounds
-  (0.0–1.0). Higher means your attacks are consistently slipping through.
-  If this is dropping, your regime is being shut down — time to adapt.
-- fpr_recent: the defender's false positive rate over the last 5 rounds.
-  High FPR means the defender is sloppy — aggressive attacks blend in with
-  the noise of false alarms. Low FPR means the defender is precise — you
-  must be more subtle to avoid standing out.
-- accuracy_preservation_rate: current_accuracy / baseline_accuracy (0.0–1.0).
-  Lower means your poisoning is working effectively. If it stays near 1.0,
-  your attacks are too subtle to cause damage.
-- history: summary of past rounds
-- similar_past_experiences: relevant past episodes from memory
 
-Respond with ONLY a JSON object:
-{{
-    "attack_type": "<one of the available attacks>",
-    "params": {{<attack-specific parameters>}},
-    "reasoning": "<brief explanation>"
-}}
+SYSTEM_PROMPT = """You are an adversarial participant in a federated-learning system trained on MNIST.
 
-Attack parameter ranges:
-- sign_flip: {{"c": 1.0 to 4.0, "k": 10 to total_params}}  (c = scaling factor, k = weights to flip; omit k to flip all)
-- noise_injection: {{"scale": 0.1 to 10.0, "k": 10 to total_params}}  (scale = noise std dev, k = weights to noise; omit k to noise all)
-- scaling: {{"factor": 1.5 to 100.0, "k": 10 to total_params}}  (factor = delta multiplier, k = weights to scale; omit k to scale all)
-- gaussian_noise: {{"sigma": 0.1 to 10.0}}
+Setup you must reason about:
+- Several clients each submit a full model state_dict every round. The server
+  averages the accepted clients' weights (FedAvg) into the new global model.
+- A defender inspects statistical features of every client's update and removes
+  the clients it judges malicious BEFORE averaging. Updates that look wildly
+  different from the others (much larger norm, opposite sign pattern, low cosine
+  similarity to the other clients) are the easiest to catch.
+- You control ONLY the clients listed in `poisoned_client_ids`. For each of them
+  you must output a complete poisoned state_dict.
 
-For sign_flip, noise_injection, and scaling: the optional k parameter selects only
-the top-k weights (by gradient magnitude) to attack. The rest stay honest.
-Smaller k = stealthier but weaker. Past attack_metadata shows which layers were
-targeted and gradient magnitude statistics — use this to refine your choices.
+Your objective is given in `attack_goal`:
+- "untargeted_degrade": lower the global model's test accuracy by about
+  `target_accuracy_drop` (fraction, e.g. 0.20 = 20 percentage-points-ish) WHILE
+  staying similar enough to the benign updates to avoid being filtered out.
+- "slow_degrade": reduce accuracy gradually, only by about `per_round_drop`
+  this round, to stay stealthy over many rounds.
+- "targeted_label": specifically harm accuracy on class `label` while keeping
+  overall accuracy high (stealth).
 
-Be strategic. If you were detected, try a subtler approach (lower params, smaller k).
-If your attack was too subtle (accuracy didn't drop), be more aggressive.
-Use your attack_success_rate_recent to judge your overall regime performance.
-If fpr_recent is high, you can afford to be more aggressive since the defender
-is already generating noise with false positives."""
+You are shown each poisoned client's BENIGN weights (`benign_weights`). Produce
+poisoned weights by modifying those numbers. There is a tension: large changes
+degrade accuracy more but are easier to detect; subtle changes evade detection
+but do less damage. Balance them according to the goal.
+
+OUTPUT FORMAT — respond with ONLY a single JSON object, no prose, no markdown:
+{
+  "<client_id>": {
+     "<layer_key>": [<flat list of floats, EXACTLY the required length>],
+     ...
+  },
+  ...
+}
+Rules:
+- Include EVERY client id from `poisoned_client_ids` and EVERY layer key from
+  `output_schema`, each as a FLAT array (row-major) of exactly the stated length.
+- Output numbers only (no NaN, no Infinity, no strings). Keep values within a
+  reasonable range (roughly [-10, 10]); extreme values are clamped and wasteful.
+- Do not add extra keys or commentary."""
 
 
 class AttackerAgent:
-    """LLM-powered attacker that adapts only when caught."""
+    """Pure attacker policy: builds the prompt, parses raw poisoned weights."""
 
-    def __init__(self, config: dict):
-        llm_cfg = config.get("llm", {})
-        backend = llm_cfg.get("backend", "openai")
+    def __init__(self, config: dict | None = None):
+        config = config or {}
+        self.goal = config.get("attack_goal", dict(DEFAULT_GOAL))
+        self.precision = int(config.get("weight_precision", 4))
+        self.max_abs = float(config.get("max_weight_abs", 100.0))
 
-        # Pick model name based on backend
-        if backend == "ollama":
-            model = llm_cfg.get("ollama_model", "deepseek-r1:70b")
-        else:
-            model = llm_cfg.get("model", "gpt-4o-mini")
+    # ------------------------------------------------------------------
+    def system_prompt(self) -> str:
+        return SYSTEM_PROMPT
 
-        self.llm = create_llm_client(
-            backend=backend,
-            model=model,
-            temperature=llm_cfg.get("temperature", 0.7),
-            ollama_base_url=llm_cfg.get("ollama_base_url", "http://localhost:11434"),
-        )
-        self.available_attacks = config.get("available_attacks", ["sign_flip"])
-        self.memory = VectorStore(
-            dimension=get_dimension(),
-            persist_path=config.get("memory", {}).get("persist_path"),
-        )
-        self.current_strategy: dict | None = None
-        self.history: list[dict] = []
+    def build_user_prompt(
+        self,
+        round_num: int,
+        global_accuracy: float,
+        benign_by_client: dict[int, dict],
+    ) -> str:
+        """Serialize the attacker's per-round observation into a user message.
 
-    def decide(self, context: dict) -> dict:
-        """Decide attack strategy for this round.
-
-        Only invokes the LLM if the last attack was detected.
-        Otherwise, returns the same strategy.
+        Args:
+            round_num: current global round.
+            global_accuracy: current global model test accuracy.
+            benign_by_client: {client_id: benign_state_dict} for poisoned clients.
         """
-        was_detected = context.get("was_detected")
-
-        # First round — always ask LLM
-        if self.current_strategy is None:
-            logger.info("Attacker: first round — consulting LLM for initial strategy")
-            self.current_strategy = self._ask_llm(context)
-            return self.current_strategy
-
-        # Attack succeeded → keep strategy
-        if not was_detected:
-            logger.info("Attacker: last attack passed through — keeping strategy")
-            return self.current_strategy
-
-        # Attack was caught → adapt
-        logger.info("Attacker: last attack was CAUGHT — consulting LLM for new strategy")
-        self.current_strategy = self._ask_llm(context)
-        return self.current_strategy
-
-    def record_outcome(
-        self, round_num: int, strategy: dict, was_detected: bool,
-        accuracy: float, attack_metadata: dict | None = None,
-        attack_success_rate_recent: float = 0.0,
-        fpr_recent: float = 0.0,
-        accuracy_preservation_rate: float = 1.0,
-    ):
-        """Store round outcome in history and vector memory.
-
-        attack_metadata may contain details like flipped_per_layer,
-        flipped_indices_per_layer, and gradient magnitude stats from
-        the sign_flip attack (or other attacks that populate it).
-
-        Windowed metrics (attack_success_rate_recent, fpr_recent,
-        accuracy_preservation_rate) are stored alongside each history
-        entry so the LLM can see the trend across the recent_history.
-        """
-        entry = {
+        reference = next(iter(benign_by_client.values()))
+        payload = {
             "round": round_num,
-            "strategy": strategy,
-            "was_detected": was_detected,
-            "accuracy_after": accuracy,
-            "attack_success_rate_recent": attack_success_rate_recent,
-            "fpr_recent": fpr_recent,
-            "accuracy_preservation_rate": accuracy_preservation_rate,
+            "current_global_accuracy": round(float(global_accuracy), 4),
+            "attack_goal": self.goal,
+            "poisoned_client_ids": list(benign_by_client.keys()),
+            "output_schema": {
+                "layer_lengths": {k: int(v.numel()) for k, v in reference.items()},
+                "layer_shapes": weight_schema(reference),
+                "total_params_per_client": total_params(reference),
+            },
+            "benign_weights": {
+                str(cid): dump_weights(sd, self.precision)
+                for cid, sd in benign_by_client.items()
+            },
         }
-        if attack_metadata:
-            entry["attack_metadata"] = attack_metadata
-            layer_info = attack_metadata.get("flipped_per_layer", attack_metadata.get("affected_per_layer", {}))
-            logger.info(
-                f"Attacker memory: storing attack_metadata for round {round_num} "
-                f"(k={attack_metadata.get('k', 'N/A')}, "
-                f"targeted_layers={list(layer_info.keys())})"
-            )
+        return json.dumps(payload)
 
-        self.history.append(entry)
-        logger.info(
-            f"Attacker memory: round {round_num} recorded "
-            f"(ASR={attack_success_rate_recent:.3f}, FPR={fpr_recent:.3f}, "
-            f"APR={accuracy_preservation_rate:.3f}, "
-            f"short-term: {len(self.history)} entries)"
-        )
+    def parse(self, text, references: dict[int, dict]) -> tuple[dict[int, dict], int]:
+        """Parse LLM output into validated poisoned state_dicts.
 
-        # Create a simple feature vector from the outcome for FAISS
-        vec = self._make_vector(entry)
-        self.memory.add(vec, entry)
-        self.memory.save()
-        logger.info(f"Attacker memory: round {round_num} persisted to long-term FAISS store")
-
-    def _ask_llm(self, context: dict) -> dict:
-        """Query the LLM for a new attack strategy."""
-        # Retrieve similar past experiences
-        if self.history:
-            query_vec = self._make_vector(context)
-            similar = self.memory.search(query_vec, k=3)
-        else:
-            similar = []
-
-        system = SYSTEM_PROMPT.format(available_attacks=self.available_attacks)
-        user_msg = json.dumps({
-            "baseline_accuracy": context.get("baseline_accuracy"),
-            "current_accuracy": context.get("current_accuracy"),
-            "was_detected": context.get("was_detected"),
-            "attack_success_rate_recent": context.get("attack_success_rate_recent", 0.0),
-            "fpr_recent": context.get("fpr_recent", 0.0),
-            "accuracy_preservation_rate": context.get("accuracy_preservation_rate", 1.0),
-            "recent_history": self.history[-5:],
-            "similar_past_experiences": similar,
-        }, default=str)
-
-        result = self.llm.call(system, user_msg)
-
-        # Validate and fallback
-        if not result or "attack_type" not in result:
-            logger.warning("Attacker LLM returned invalid response — using sign_flip default")
-            return {"attack_type": "sign_flip", "params": {}, "reasoning": "fallback"}
-
-        logger.info(f"Attacker chose: {result.get('attack_type')} — {result.get('reasoning', '')}")
-        return result
-
-    def _make_vector(self, data: dict) -> np.ndarray:
-        """Create a semantic embedding vector for FAISS indexing.
-
-        Uses SentenceTransformers so that similar contexts (e.g. close
-        accuracies, same detection outcomes) map to nearby vectors.
+        Returns ``(poisoned_by_client, n_malformed)``. Malformed blocks fall
+        back to the benign weights (see ``weight_codec.parse_round``).
         """
-        return embed(data)
+        return parse_round(text, references, self.max_abs)

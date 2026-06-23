@@ -1,9 +1,18 @@
+# --- Core FL + tooling (CPU is fine for --dry-run / --baseline) ---
 torch>=2.0
 torchvision
-openai>=1.0
-requests
-faiss-cpu
-pyyaml
 numpy
-sentence-transformers
+pyyaml
 matplotlib
+openai>=1.0          # OpenAI inference/baseline backend
+requests             # Ollama HTTP backend
+
+# --- RL training stack (install on the CUDA GPU machine) ---
+# Unsloth provides 4-bit QLoRA loading + GRPO-friendly gpt-oss support and pulls
+# in transformers/accelerate/bitsandbytes. GRPO itself is implemented directly
+# in rl/grpo.py on top of PEFT adapters (no TRL trainer dependency required).
+unsloth
+peft>=0.13
+transformers>=4.45
+accelerate
+bitsandbytes

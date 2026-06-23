@@ -1,28 +1,13 @@
-"""Abstract base classes defining component contracts."""
+"""Abstract base classes defining component contracts.
+
+Only the aggregation contract survives the redesign. The attacker no longer
+implements a fixed ``BaseAttack`` plugin (the LLM emits raw poisoned weights)
+and the defender no longer implements a fixed ``BaseDetector`` rule (the LLM
+classifies clients directly), so those interfaces were removed.
+"""
 
 from abc import ABC, abstractmethod
 from core.types import ModelUpdate, DetectionVerdict
-
-
-class BaseAttack(ABC):
-    """Interface for model poisoning attacks."""
-
-    @abstractmethod
-    def execute(self, weights: dict, global_weights: dict, **params) -> dict:
-        """Apply poisoning to client weights. Returns poisoned state_dict."""
-        ...
-
-
-class BaseDetector(ABC):
-    """Interface for anomaly detection."""
-
-    @abstractmethod
-    def analyze(
-        self, updates: list[ModelUpdate], global_weights: dict,
-        strategy: dict | None = None,
-    ) -> list[DetectionVerdict]:
-        """Analyze all client updates. Returns one verdict per client."""
-        ...
 
 
 class BaseAggregator(ABC):

@@ -31,6 +31,17 @@ class BaseLLMClient(abc.ABC):
     def call(self, system_prompt: str, user_message: str) -> dict:
         """Send a prompt and return the parsed JSON response."""
 
+    @abc.abstractmethod
+    def complete(
+        self, system_prompt: str, user_message: str,
+        temperature: float | None = None, max_tokens: int | None = None,
+    ) -> str:
+        """Send a prompt and return the RAW text response (no JSON parsing).
+
+        Used by the RL inference backend, where the agent modules do their own
+        robust parsing of the raw model output.
+        """
+
 
 # ---------------------------------------------------------------------------
 # OpenAI backend
@@ -65,6 +76,26 @@ class OpenAILLMClient(BaseLLMClient):
         except Exception as e:
             logger.error(f"OpenAI LLM call failed: {e}")
             return {}
+
+    def complete(
+        self, system_prompt: str, user_message: str,
+        temperature: float | None = None, max_tokens: int | None = None,
+    ) -> str:
+        temp = self.temperature if temperature is None else temperature
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                temperature=temp,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+            )
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            logger.error(f"OpenAI complete() failed: {e}")
+            return ""
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +152,34 @@ class OllamaLLMClient(BaseLLMClient):
         except Exception as e:
             logger.error(f"Ollama LLM call failed: {e}")
             return {}
+
+    def complete(
+        self, system_prompt: str, user_message: str,
+        temperature: float | None = None, max_tokens: int | None = None,
+    ) -> str:
+        temp = self.temperature if temperature is None else temperature
+        prompt = (
+            f"[System Instructions]\n{system_prompt}\n\n"
+            f"[User Message]\n{user_message}\n\n"
+            "Respond with ONLY a valid JSON object. No extra text."
+        )
+        options = {"temperature": temp}
+        if max_tokens is not None:
+            options["num_predict"] = max_tokens
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/generate",
+                json={"model": self.model, "prompt": prompt, "stream": False, "options": options},
+                timeout=600,
+            )
+            resp.raise_for_status()
+            return resp.json().get("response", "")
+        except requests.exceptions.ConnectionError:
+            logger.error(f"Cannot connect to Ollama at {self.base_url}. Is it running?")
+            return ""
+        except Exception as e:
+            logger.error(f"Ollama complete() failed: {e}")
+            return ""
 
     @staticmethod
     def _extract_json(text: str) -> dict:

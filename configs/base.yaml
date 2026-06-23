@@ -1,21 +1,62 @@
 # Federated Learning Configuration
 
 fl:
-  training_rounds: 20          # Phase 1: honest training rounds
-  simulation_rounds: 2000       # Phase 2: attack/defend rounds
+  training_rounds: 20             # Phase 1: honest training rounds
+  simulation_rounds: 2000         # Phase 2: adversarial RL rounds
   n_clients: 5
-  malicious_client_id: 0      # 0-indexed client that becomes adversarial
+  poison_fraction: 0.2            # fraction of clients poisoned each round (random subset)
+  poison_seed: 0                  # RNG seed for the poisoned-subset selection + reproducibility
+  benign_retrain_each_round: true # benign clients retrain each round (else replay Phase-1 weights)
   local_epochs: 3
   batch_size: 64
   lr: 0.002
-  device: "cpu"
+  device: "cuda"                  # RL training needs a GPU; use "cpu" only for --dry-run/--baseline
 
 data:
   dataset: "mnist"
   iid: false
   data_dir: "./data/mnist_raw"
 
-# Default Ollama settings (used when --env linux)
+# Attack goal (configurable). First experiment = untargeted accuracy reduction.
+attack:
+  goal:
+    type: "untargeted_degrade"    # untargeted_degrade | slow_degrade | targeted_label
+    target_accuracy_drop: 0.20    # untargeted_degrade: aim to drop accuracy ~20pts
+    # per_round_drop: 0.02        # slow_degrade
+    # label: 7                    # targeted_label (per-class eval is a TODO; falls back to overall)
+
+# Inference-only LLM defaults (used by --dry-run and the OpenAI path).
 llm:
   ollama_base_url: "http://localhost:11434"
   ollama_model: "gpt-oss:20b"
+
+# Reinforcement learning (GRPO) settings — see README "LLM handling".
+rl:
+  model: "unsloth/gpt-oss-20b"    # HF/Unsloth base for QLoRA training
+  max_seq_len: 8192
+  load_in_4bit: true
+  lora_r: 16
+  lora_alpha: 32
+  G: 4                            # rollouts per GRPO step (group size)
+  kl_beta: 0.02                   # KL penalty toward the frozen base model
+  lr: 1.0e-5
+  K_a: 4                          # attacker rounds per alternation (Stackelberg)
+  K_d: 4                          # defender rounds per alternation
+  temperature: 1.0                # learner sampling temperature (exploration)
+  opponent_temperature: 0.0       # frozen opponent plays greedily
+  max_new_tokens: 4096            # raw-weight JSON is large — size generously
+  grad_clip: 1.0
+  save_every: 50                  # save adapters + progress every N rounds
+  league_snapshot_every: 100      # snapshot adapters into the opponent league
+  league_prob: 0.25               # chance a training phase faces a league snapshot
+  adapter_paths:
+    attacker: "checkpoints/attacker_adapter"
+    defender: "checkpoints/defender_adapter"
+  reward:
+    attacker:
+      alpha: 1.0                  # weight on accuracy-drop term
+      beta: 0.5                   # weight on evasion term
+      gamma: 1.0                  # penalty for malformed weight output
+    defender:
+      mode: "soft_f1"             # soft_f1 | tpr_minus_fpr
+      fpr_penalty: 1.0

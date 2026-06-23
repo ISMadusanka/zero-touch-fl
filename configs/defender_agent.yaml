@@ -1,13 +1,12 @@
 # Defender LLM Agent Configuration
 
 llm:
-  model: "gpt-4o-mini"            # OpenAI backend model
+  model: "gpt-4o-mini"            # OpenAI — inference/baseline only, NOT trainable
   temperature: 0.3
-  ollama_model: "gpt-oss:20b"  # Ollama backend model
+  ollama_model: "gpt-oss:20b"     # Ollama — inference (--dry-run)
 
-initial_strategy:
-  method: "norm_threshold"
-  sensitivity: 2.0                # z-score multiplier (adaptive threshold)
+# Confidence assumed when the model omits/garbles a client entry.
+default_confidence: 0.0
 
-memory:
-  persist_path: "checkpoints/defender_memory"
+# RL checkpoint — a LoRA adapter over the shared gpt-oss base.
+adapter_path: "checkpoints/defender_adapter"

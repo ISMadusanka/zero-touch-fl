@@ -1,15 +1,19 @@
 # Attacker LLM Agent Configuration
 
 llm:
-  model: "gpt-4o-mini"            # OpenAI backend model
+  model: "gpt-4o-mini"            # OpenAI — inference/baseline only, NOT trainable
   temperature: 0.7
-  ollama_model: "gpt-oss:20b"  # Ollama backend model
+  ollama_model: "gpt-oss:20b"     # Ollama — inference (--dry-run)
 
-available_attacks:
-  - sign_flip
-  - noise_injection
-  - scaling
-  - gaussian_noise
+# Attack goal is injected from configs/base.yaml (attack.goal) at runtime; this
+# block is the fallback used if base.yaml has no attack.goal.
+attack_goal:
+  type: "untargeted_degrade"
+  target_accuracy_drop: 0.20
 
-memory:
-  persist_path: "checkpoints/attacker_memory"
+# Raw-weight output hardening (the attacker emits literal weights).
+weight_precision: 4               # decimals shown to / accepted from the LLM
+max_weight_abs: 100.0             # clamp bound on emitted weights
+
+# RL checkpoint — a LoRA adapter over the shared gpt-oss base.
+adapter_path: "checkpoints/attacker_adapter"
