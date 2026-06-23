@@ -13,7 +13,7 @@ checkpoint layout. It supersedes the old feedback/episodic-memory design.
 | Clients | `clients/benign_client.py` | Honest local SGD → `ModelUpdate`. |
 | Server | `server/fed_server.py`, `server/aggregation.py` | Global model + eval; FedAvg over non-flagged clients. |
 | Features | `detector/features.py` | Per-client, per-layer statistical feature vectors (no decisions). |
-| Attacker | `agents/attacker_agent.py` + `agents/weight_codec.py` | Prompt + parse of raw poisoned weights. |
+| Attacker | `agents/attacker_agent.py` + `agents/attack_ops.py` | Prompt (layer stats) + parse/apply of an attack plan (operator DSL). |
 | Defender | `agents/defender_agent.py` | Prompt + parse of per-client benign/malicious labels. |
 | RL | `rl/*` | Environment, rewards, turns, GRPO, schedule, policy, baseline, inference. |
 | Metrics | `metrics/*` | Ground-truth confusion/TPR/FPR/ASR/APR (research + reward source). |
@@ -28,7 +28,8 @@ reset env from Phase-1 checkpoint (per-client benign weights, global, baseline a
 for each round:
   1. poisoned_ids = rng.sample(clients, k)        # k = clamp(round(poison_fraction·n), 1, (n-1)//2)
   2. honest updates for all clients               # retrain from global, or replay Phase-1 weights
-  3. ATTACKER LLM → raw poisoned weights for poisoned_ids   (input: round, benign weights, acc, goal)
+  3. ATTACKER LLM → attack plan (input: round, benign LAYER STATS, acc, goal)
+     → apply_plan(benign, plan) → poisoned weights for poisoned_ids
   4. build full update list (poisoned ∪ honest)
   5. detector/features → per-client per-layer stat vectors
   6. DEFENDER LLM → benign/malicious label + confidence per client   (input: features ONLY)
@@ -41,19 +42,23 @@ for each round:
 `k` is clamped to keep a strict benign majority, because the defender's feature
 references (coordinate-wise median, MAD) assume most clients are honest.
 
-## Attacker contract (raw weights)
+## Attacker contract (attack-plan DSL)
 
 - **Input** (`agents/attacker_agent.build_user_prompt`): `round`,
-  `current_global_accuracy`, `attack_goal`, `poisoned_client_ids`,
-  `output_schema` (exact layer shapes + lengths), and `benign_weights`
-  (per-poisoned-client flat arrays).
-- **Output**: a single JSON object keyed by client id; each value is
-  `{layer_key: [flat floats of the exact length]}`.
-- **Hardening** (`agents/weight_codec.parse_round`): validates shape/count,
-  scrubs NaN/Inf, clamps to `±max_weight_abs`, accepts nested or flat arrays,
-  and on any unrecoverable block **falls back to that client's benign weights**
-  and counts it `malformed`. Parsing never raises; malformed output costs reward
-  instead of crashing training.
+  `current_global_accuracy`, `attack_goal`, `poisoned_client_ids`, and
+  `benign_layer_details` — per-layer **statistics** (shape, mean, std, min, max,
+  L2 norm, abs-mean) of each poisoned client's benign weights. No raw weights.
+- **Output**: a single JSON object `{"operations": [ {op, target, ...params}, ... ]}`.
+  Operators (`agents/attack_ops.py`, 10): `scale`, `sign_flip`,
+  `add_gaussian_noise`, `mask`, `clip`, `add_constant`, `permute`,
+  `scale_neurons`, `blend_random`, `quantize`. `target` is `"all"`, a layer
+  group (`"net.2"`), or a full key (`"net.4.weight"`). Operations apply in order.
+- **Application** (`agents/attack_ops.apply_plan`): deep-copies the benign
+  weights, applies each op, skips unknown ops / bad params / bad targets
+  (counted, not fatal), then scrubs NaN/Inf and clamps to `±max_weight_abs`.
+  PyTorch does all arithmetic — the LLM only emits the plan. If no usable plan
+  is parsed, all poisoned clients fall back to benign weights (a reward penalty);
+  parsing never raises.
 
 ## Defender contract (classification)
 

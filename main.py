@@ -5,7 +5,8 @@ Two phases:
   Phase 2 (simulation_rounds): LLM-direct adversarial arms race with RL.
 
 In Phase 2 a random subset of clients is poisoned each round. An attacker LLM
-emits raw poisoned weights; a defender LLM classifies each client benign/
+emits an attack plan (primitive weight operators) applied to the benign weights;
+a defender LLM classifies each client benign/
 malicious from per-client per-layer statistics. Both get a verifiable per-round
 reward and are trained with GRPO (separate LoRA adapters over one frozen
 gemma-3-4b-it base).

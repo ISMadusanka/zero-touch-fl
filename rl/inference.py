@@ -3,8 +3,8 @@
 ``InferenceGenerator`` adapts the existing Ollama/OpenAI ``llm_client`` to the
 ``generate(system, user, n, temperature)`` interface the turns/loop expect.
 ``run_inference`` runs the full round loop end-to-end without any weight
-updates — the cheapest way to validate the plumbing (prompt building, raw-weight
-parse/clamp, feature extraction, FedAvg, reward computation) on a CPU box.
+updates — the cheapest way to validate the plumbing (prompt building, attack-plan
+parse + apply, feature extraction, FedAvg, reward computation) on a CPU box.
 """
 
 import logging

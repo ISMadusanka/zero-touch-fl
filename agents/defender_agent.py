@@ -13,7 +13,7 @@ preserving the production-realistic, oracle-free observation.
 import json
 import logging
 
-from agents.weight_codec import extract_json
+from agents.attack_ops import extract_json
 from core.types import DetectionVerdict
 
 logger = logging.getLogger(__name__)

@@ -9,8 +9,8 @@ class ModelUpdate:
     """A single client's model weights submission.
 
     For benign clients ``weights`` is the locally trained state_dict. For
-    poisoned clients it is the raw poisoned state_dict emitted by the attacker
-    LLM (after validation/clamping by ``agents.weight_codec``).
+    poisoned clients it is produced by applying the attacker LLM's attack plan
+    to the benign weights (see ``agents.attack_ops.apply_plan``).
     """
     client_id: int
     weights: dict  # state_dict tensors

@@ -1,7 +1,7 @@
 """Abstract base classes defining component contracts.
 
 Only the aggregation contract survives the redesign. The attacker no longer
-implements a fixed ``BaseAttack`` plugin (the LLM emits raw poisoned weights)
+implements a fixed ``BaseAttack`` plugin (the LLM emits an attack plan)
 and the defender no longer implements a fixed ``BaseDetector`` rule (the LLM
 classifies clients directly), so those interfaces were removed.
 """

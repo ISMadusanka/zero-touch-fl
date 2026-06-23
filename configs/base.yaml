@@ -45,7 +45,7 @@ rl:
   K_d: 4                          # defender rounds per alternation
   temperature: 1.0                # learner sampling temperature (exploration)
   opponent_temperature: 0.0       # frozen opponent plays greedily
-  max_new_tokens: 4096            # raw-weight JSON is large — size generously
+  max_new_tokens: 512             # attack plans / verdicts are short JSON
   grad_clip: 1.0
   save_every: 50                  # save adapters + progress every N rounds
   league_snapshot_every: 100      # snapshot adapters into the opponent league

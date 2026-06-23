@@ -178,9 +178,10 @@ class LLMPolicy:
         do_sample = bool(temperature and temperature > 0)
 
         # Generate the G samples ONE AT A TIME (batch=1). Prefill attention is
-        # O(L²) per sequence and raw-weight prompts are long (~thousands of
-        # tokens), so batching num_return_sequences=G would OOM. Sequential
-        # generation trades wall-clock for a ~G× smaller peak memory.
+        # O(L²) per sequence; batching num_return_sequences=G multiplies peak
+        # memory and can OOM on longer prompts. Sequential generation trades a
+        # little wall-clock for a ~G× smaller peak — cheap now that attack-plan
+        # completions are short.
         texts = []
         for _ in range(n):
             gen_kwargs = dict(

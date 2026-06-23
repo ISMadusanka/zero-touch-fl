@@ -13,9 +13,13 @@ Two phases:
    checkpointed.
 2. **Phase 2 (`simulation_rounds`):** A **random subset** of clients is poisoned
    each round.
-   - **Attacker LLM** — input: round number, the raw benign weights of the
-     poisoned clients, current global accuracy, and a configurable attack goal.
-     Output: **raw poisoned weights**, sent to the server.
+   - **Attacker LLM** — input: round number, per-layer **statistics** of the
+     poisoned clients' benign weights, current global accuracy, and a
+     configurable attack goal. Output: an **attack plan** — an ordered list of
+     primitive weight operators (scale, sign_flip, mask, add_gaussian_noise,
+     clip, add_constant, permute, scale_neurons, blend_random, quantize). A
+     deterministic interpreter applies the plan to the benign weights to produce
+     the poisoned weights sent to the server.
    - **Defender LLM** — input: per-client, per-layer statistical feature vectors.
      Output: a direct **benign/malicious classification** per client.
    - The server FedAvg-aggregates the clients the defender did not flag.
@@ -59,9 +63,9 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   supported by Ollama as `gemma3`; merging gives up the two-swappable-adapters
   design but is the simplest serving path).
 - **Hardware**: gemma-3-4b-it QLoRA fits comfortably on a single ~12 GB+ GPU
-  (~6–8 GB floor) — your 5090 (31 GB) has ample headroom. The attacker emits
-  ~970 raw floats as JSON, so completions are long — keep `rl.max_new_tokens`
-  generous and start with small `rl.G` / few `--rounds`.
+  (~6–8 GB floor) — your 5090 (31 GB) has ample headroom. The attacker emits a
+  short attack plan (tens of tokens), so generation is fast and `rl.max_new_tokens`
+  can stay small (512).
 
 ## Setup
 
@@ -121,8 +125,8 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
 - **`configs/base.yaml`** — FL hyperparameters, `poison_fraction` / `poison_seed`
   / `benign_retrain_each_round`, the `attack.goal`, the `rl:` block (GRPO + LoRA
   + league + reward weights), and inference LLM defaults.
-- **`configs/attacker_agent.yaml`** — attacker goal fallback, raw-weight
-  precision/clamp, attacker adapter path.
+- **`configs/attacker_agent.yaml`** — attacker goal fallback, layer-detail
+  precision, poisoned-weight clamp, attacker adapter path.
 - **`configs/defender_agent.yaml`** — defender defaults, defender adapter path.
 
 Attack goals (configurable; `untargeted_degrade` is the first experiment):
@@ -138,7 +142,7 @@ data/         MNIST loading & partitioning
 clients/      Honest client local training
 server/       Central server + FedAvg aggregation
 detector/     features.py — per-client per-layer statistical feature extractor
-agents/       attacker_agent.py / defender_agent.py (pure prompt+parse), weight_codec.py, llm_client.py
+agents/       attacker_agent.py / defender_agent.py (pure prompt+parse), attack_ops.py (operator DSL), llm_client.py
 rl/           env, rewards, turns, inference (dry-run), policy (Unsloth+LoRA), grpo, schedule, baseline
 metrics/      Ground-truth confusion/TPR/FPR/ASR/APR (research evaluation + reward source)
 storage/      Phase-1 checkpoint + RL progress

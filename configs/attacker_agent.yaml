@@ -11,9 +11,9 @@ attack_goal:
   type: "untargeted_degrade"
   target_accuracy_drop: 0.20
 
-# Raw-weight output hardening (the attacker emits literal weights).
-weight_precision: 4               # decimals shown to / accepted from the LLM
-max_weight_abs: 100.0             # clamp bound on emitted weights
+# Attack-plan settings (the attacker emits a plan of primitive operators).
+detail_precision: 4               # decimals in the per-layer stats shown to the LLM
+max_weight_abs: 100.0             # clamp bound on the resulting poisoned weights
 
 # RL checkpoint — a LoRA adapter over the shared Gemma 3 base.
 adapter_path: "checkpoints/attacker_adapter"
