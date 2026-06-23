@@ -87,8 +87,14 @@ class LLMPolicy:
         for name in self.adapters:
             self.model.add_adapter(name, lora_cfg)
 
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # For multimodal Gemma 3, from_pretrained returns a Processor, not a
+        # plain tokenizer. The processor owns the chat template (used to RENDER
+        # prompts), while the raw text tokenizer (encode/decode/pad/eos) lives at
+        # ``.tokenizer``. Keep both: ``self.tokenizer`` renders, ``self._tok``
+        # tokenizes. For non-multimodal models the two are the same object.
+        self._tok = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        if self._tok.pad_token_id is None:
+            self._tok.pad_token = self._tok.eos_token
 
         self.device = next(self.model.parameters()).device
         self.model.train()
@@ -155,11 +161,15 @@ class LLMPolicy:
     def _prompt_ids(self, system: str, user: str):
         # Gemma's chat template has no separate "system" role — fold the system
         # instructions into the single user turn so this works across models.
+        # Render to text via the processor (tokenize=False → str), then tokenize
+        # with the raw tokenizer. The template already injects BOS + turn tokens,
+        # so add_special_tokens=False avoids a duplicate BOS.
         messages = [{"role": "user", "content": f"{system}\n\n{user}"}]
-        ids = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt",
+        text = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False,
         )
-        return ids.to(self.device)
+        enc = self._tok(text, return_tensors="pt", add_special_tokens=False)
+        return enc["input_ids"].to(self.device)
 
     def generate(self, adapter, system, user, n=1, temperature=0.0, max_new_tokens=2048) -> list[str]:
         self.set_adapter(adapter)
@@ -169,7 +179,7 @@ class LLMPolicy:
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
             num_return_sequences=n,
-            pad_token_id=self.tokenizer.pad_token_id,
+            pad_token_id=self._tok.pad_token_id,
         )
         if do_sample:
             gen_kwargs.update(temperature=float(temperature), top_p=0.95)
@@ -177,7 +187,7 @@ class LLMPolicy:
             out = self.model.generate(prompt_ids, **gen_kwargs)
         plen = prompt_ids.shape[1]
         return [
-            self.tokenizer.decode(out[i, plen:], skip_special_tokens=True)
+            self._tok.decode(out[i, plen:], skip_special_tokens=True)
             for i in range(out.shape[0])
         ]
 
@@ -190,7 +200,7 @@ class LLMPolicy:
         """
         torch = self.torch
         prompt_ids = self._prompt_ids(system, user)
-        comp_ids = self.tokenizer(
+        comp_ids = self._tok(
             completion, add_special_tokens=False, return_tensors="pt",
         ).input_ids.to(self.device)
 
