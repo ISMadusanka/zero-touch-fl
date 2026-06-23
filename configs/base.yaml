@@ -33,6 +33,7 @@ llm:
 # Reinforcement learning (GRPO) settings — see README "LLM handling".
 rl:
   model: "unsloth/gpt-oss-20b"    # HF/Unsloth base for QLoRA training
+  attn_implementation: "eager"    # gpt-oss has no SDPA path; eager is required
   max_seq_len: 8192
   load_in_4bit: true
   lora_r: 16

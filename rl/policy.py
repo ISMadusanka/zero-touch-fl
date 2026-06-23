@@ -43,6 +43,7 @@ class LLMPolicy:
         target_modules: list[str] | None = None,
         seed: int = 0,
         adapters: tuple[str, ...] = ("attacker", "defender"),
+        attn_implementation: str = "eager",
     ):
         # Heavy imports kept local so importing this module is cheap.
         import torch
@@ -55,11 +56,15 @@ class LLMPolicy:
         target_modules = target_modules or DEFAULT_TARGET_MODULES
 
         logger.info(f"Loading base model {base_model} (4bit={load_in_4bit}) ...")
+        # gpt-oss (GptOssForCausalLM) has no SDPA path in current Transformers, and
+        # Unsloth here falls back to Xformers (FA2 broken) — eager attention is the
+        # reliable choice. Override via configs/base.yaml -> rl.attn_implementation.
         base, self.tokenizer = FastLanguageModel.from_pretrained(
             model_name=base_model,
             max_seq_length=max_seq_len,
             load_in_4bit=load_in_4bit,
             dtype=None,
+            attn_implementation=attn_implementation,
         )
 
         # Inject LoRA (Unsloth optimizations) — this creates the "default" adapter.
