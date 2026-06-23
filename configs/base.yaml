@@ -47,7 +47,7 @@ rl:
   opponent_temperature: 0.0       # frozen opponent plays greedily
   max_new_tokens: 512             # attack plans / verdicts are short JSON
   grad_clip: 1.0
-  save_every: 50                  # save adapters + progress every N rounds
+  save_every: 25                  # checkpoint adapters + progress every N rounds (resume granularity)
   league_snapshot_every: 100      # snapshot adapters into the opponent league
   league_prob: 0.25               # chance a training phase faces a league snapshot
   adapter_paths:

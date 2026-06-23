@@ -133,19 +133,28 @@ def train(
 
             _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log)
             done += 1
-            if progress_cb:
-                progress_cb(done)
 
             if snap_every and done % snap_every == 0:
                 league.snapshot(policy, policy.adapters)
+            # Checkpoint adapters + progress TOGETHER so a resume is always
+            # consistent (the saved round count never points past the saved
+            # adapter weights). Rounds since the last checkpoint are simply
+            # re-trained from it on resume.
             if save_every and done % save_every == 0:
-                _save_adapters(policy, adapter_paths)
+                _checkpoint(policy, adapter_paths, progress_cb, done)
 
         if use_snap:
             policy.set_adapter_state(opp, live_opp)   # restore the live opponent
 
-    _save_adapters(policy, adapter_paths)
+    _checkpoint(policy, adapter_paths, progress_cb, done)   # final save
     logger.info(f"Training complete — {done} rounds. Adapters saved to {adapter_paths}")
+
+
+def _checkpoint(policy, adapter_paths, progress_cb, done):
+    """Atomically-ish save: adapters first, then advance the progress counter."""
+    _save_adapters(policy, adapter_paths)
+    if progress_cb:
+        progress_cb(done)
 
 
 def _save_adapters(policy, adapter_paths: dict):
