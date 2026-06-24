@@ -137,11 +137,22 @@ def _topk_mask(t, fraction, largest=True):
 
 
 def _resolve_target(target, sd):
-    if target in (None, "all", "*"):
+    # A list/tuple targets several layers at once (union of resolved keys) —
+    # the LLM sometimes emits "target": ["net.2.weight", "net.4.weight"].
+    if isinstance(target, (list, tuple)):
+        keys = []
+        for t in target:
+            for k in _resolve_target(t, sd):
+                if k not in keys:
+                    keys.append(k)
+        return keys
+    if target is None or target in ("all", "*"):
         return list(sd.keys())
+    if not isinstance(target, str):
+        return []                       # unsupported target type -> invalid op
     if target in sd:
         return [target]
-    prefix = target if str(target).endswith(".") else f"{target}."
+    prefix = target if target.endswith(".") else f"{target}."
     return [k for k in sd if k.startswith(prefix)]
 
 
@@ -242,7 +253,10 @@ OP_FUNCS = {
 
 # Human-readable operator reference for the attacker prompt.
 OPERATOR_DOCS = """Available primitive operators (compose several for novel attacks).
-Each operation is {"op": <name>, "target": <"all" | layer-group e.g. "net.2" | full key e.g. "net.4.weight">, ...params}:
+Each operation is {"op": <name>, "target": <target>, ...params}, where <target> is
+"all", a layer-group (e.g. "net.2" = both its weight and bias), a full key
+(e.g. "net.4.weight"), OR a list of those (e.g. ["net.2.weight", "net.4.bias"])
+to hit several layers in one operation:
 - scale            {"factor": float}                  multiply weights by factor (negative flips sign, |f|>1 amplifies).
 - sign_flip        {"fraction": 0..1}                 negate the top-`fraction` largest-magnitude weights (1.0 = all).
 - add_gaussian_noise {"sigma": float>=0, "seed": int} add zero-mean Gaussian noise of std `sigma`.
@@ -273,21 +287,22 @@ def apply_plan(benign: dict, plan, max_abs: float = 100.0) -> tuple[dict, int]:
     ops = plan if isinstance(plan, list) else []
 
     for op in ops:
-        if not isinstance(op, dict):
-            n_invalid += 1
-            continue
-        name = op.get("op")
-        fn = OP_FUNCS.get(name)
-        keys = _resolve_target(op.get("target", "all"), poisoned)
-        if fn is None or not keys:
-            n_invalid += 1
-            continue
-        for k in keys:
-            try:
-                poisoned[k] = fn(poisoned[k], op)
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning(f"attack_ops: op={name} failed on {k}: {e}")
+        # Guard the WHOLE op: any malformed shape (bad target type, weird params,
+        # op-fn failure) counts as invalid and is skipped — never crashes training.
+        try:
+            if not isinstance(op, dict):
                 n_invalid += 1
+                continue
+            fn = OP_FUNCS.get(op.get("op"))
+            keys = _resolve_target(op.get("target", "all"), poisoned)
+            if fn is None or not keys:
+                n_invalid += 1
+                continue
+            for k in keys:
+                poisoned[k] = fn(poisoned[k], op)
+        except Exception as e:
+            logger.warning(f"attack_ops: skipping bad op {op!r}: {e}")
+            n_invalid += 1
 
     out = {}
     for k, v in poisoned.items():
