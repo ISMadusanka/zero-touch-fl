@@ -49,6 +49,13 @@ class LLMPolicy:
     ):
         # Heavy imports kept local so importing this module is cheap.
         import torch
+        # Disable Unsloth's fused fast-generate wrapper BEFORE importing unsloth:
+        # its paged-KV inference kernel (LlamaAttention_fast_forward_inference) is
+        # incompatible with the installed Transformers and crashes on a RoPE
+        # cos/sin broadcast. With it disabled, model.generate() falls through to
+        # standard Transformers generation, which uses a normal KV cache via the
+        # regular (working) forward — fast AND correct, no version downgrade.
+        os.environ.setdefault("UNSLOTH_DISABLE_FAST_GENERATION", "1")
         from unsloth import FastLanguageModel
         from peft import LoraConfig
 
@@ -215,12 +222,11 @@ class LLMPolicy:
         plen = prompt_ids.shape[1]
         do_sample = bool(temperature and temperature > 0)
 
-        # Prefer Unsloth's KV-cached fast generation (much faster). It requires
-        # switching the model into inference mode first — which also initializes
-        # the per-token RoPE buffers whose absence caused the cos/sin broadcast
-        # crash when calling generate() straight from training mode. If it still
-        # fails on this Unsloth/Transformers combo, fall back ONCE to the manual
-        # no-cache decoder and stay there for the rest of the run.
+        # Prefer KV-cached generation (much faster). With Unsloth's fused fast
+        # wrapper disabled (see __init__), this uses standard Transformers
+        # generate + a normal KV cache, avoiding the broken paged-KV kernel. If
+        # it still fails on this Unsloth/Transformers combo, fall back ONCE to
+        # the manual no-cache decoder and stay there for the rest of the run.
         if self._use_fast_generate:
             try:
                 return self._fast_generate(prompt_ids, plen, n, do_sample, temperature, max_new_tokens)
@@ -233,11 +239,19 @@ class LLMPolicy:
         return self._manual_generate(prompt_ids, plen, n, do_sample, temperature, max_new_tokens)
 
     def _fast_generate(self, prompt_ids, plen, n, do_sample, temperature, max_new_tokens):
-        """Unsloth KV-cached generation; toggles inference<->training mode."""
-        from unsloth import FastLanguageModel
+        """KV-cached generation via STANDARD Transformers generate.
+
+        Unsloth's fused fast-generate wrapper is disabled
+        (UNSLOTH_DISABLE_FAST_GENERATION, see __init__), so this uses the regular
+        forward + a normal KV cache. We switch to eval() for the call so
+        gradient checkpointing doesn't force use_cache=False, then restore
+        train() for the GRPO backward. We deliberately do NOT call for_inference()
+        — that re-enables the broken paged-KV inference kernel.
+        """
         torch = self.torch
+        was_training = self.model.training
         try:
-            FastLanguageModel.for_inference(self.model)   # enable cached fast path
+            self.model.eval()
             texts = []
             for _ in range(n):
                 gen_kwargs = dict(
@@ -253,8 +267,8 @@ class LLMPolicy:
                 torch.cuda.empty_cache()
             return texts
         finally:
-            # ALWAYS restore training mode so the GRPO log-prob/backward works.
-            FastLanguageModel.for_training(self.model)
+            if was_training:
+                self.model.train()   # restore training mode for the GRPO backward
 
     def _manual_generate(self, prompt_ids, plen, n, do_sample, temperature, max_new_tokens):
         """Decode WITHOUT a KV cache (full forward each step). Slower (O(L^2))
