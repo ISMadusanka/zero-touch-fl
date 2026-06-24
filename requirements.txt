@@ -14,7 +14,7 @@ requests             # Ollama HTTP backend
 # NOTE: unsloth >= 2026.6.9 is required — 2026.3.11 has a broken Llama fast
 # KV-cache inference kernel (RoPE cos/sin broadcast crash) vs Transformers 5.3.
 unsloth>=2026.6.9
-unsloth_zoo>=2026.6.9
+unsloth_zoo>=2026.6.7
 peft>=0.13
 transformers>=4.45
 accelerate
