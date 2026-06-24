@@ -45,6 +45,7 @@ class LLMPolicy:
         seed: int = 0,
         adapters: tuple[str, ...] = ("attacker", "defender"),
         attn_implementation: str = "eager",
+        use_fast_generate: bool = True,
     ):
         # Heavy imports kept local so importing this module is cheap.
         import torch
@@ -100,6 +101,8 @@ class LLMPolicy:
         self.device = next(self.model.parameters()).device
         self.model.train()
         self._active = None
+        self._logits_kw = None   # resolved on first use: which "last-token-only" kwarg works
+        self._use_fast_generate = bool(use_fast_generate)  # KV-cached generate; auto-falls back on failure
         self.set_adapter(self.adapters[0])
         logger.info(f"LLMPolicy ready — adapters={self.adapters}, device={self.device}")
 
@@ -173,6 +176,25 @@ class LLMPolicy:
         enc = self._tok(text, return_tensors="pt", add_special_tokens=False)
         return enc["input_ids"].to(self.device)
 
+    def _last_logits(self, ids):
+        """Logits for the LAST position only — skips the 128k-vocab projection
+        over every position, a big saving in the no-KV-cache decode loop. Falls
+        back gracefully if the model's forward doesn't accept the kwarg."""
+        if self._logits_kw is None:
+            for kw in ("logits_to_keep", "num_logits_to_keep"):
+                try:
+                    out = self.model(ids, **{kw: 1})
+                    self._logits_kw = kw
+                    return out.logits[:, -1, :].float()
+                except TypeError:
+                    continue
+            self._logits_kw = ""  # unsupported → full logits
+        if self._logits_kw:
+            out = self.model(ids, **{self._logits_kw: 1})
+        else:
+            out = self.model(ids)
+        return out.logits[:, -1, :].float()
+
     def _eos_ids(self) -> set:
         ids = set()
         if self._tok.eos_token_id is not None:
@@ -192,22 +214,60 @@ class LLMPolicy:
         prompt_ids = self._prompt_ids(system, user)
         plen = prompt_ids.shape[1]
         do_sample = bool(temperature and temperature > 0)
-        eos_ids = self._eos_ids()
-        torch = self.torch
 
-        # Manual decoding WITHOUT a KV cache: each step is a full-sequence forward
-        # (the same path the log-prob pass uses, which works). This deliberately
-        # avoids Unsloth's fused single-token inference kernel
-        # (`fast_forward_inference`), which broadcasts RoPE cos/sin incorrectly
-        # under the installed Transformers version. Completions here are short
-        # (attack plans / verdicts), so the missing KV cache is affordable. We
-        # also do the G samples one at a time to keep peak memory ~1 sequence.
+        # Prefer Unsloth's KV-cached fast generation (much faster). It requires
+        # switching the model into inference mode first — which also initializes
+        # the per-token RoPE buffers whose absence caused the cos/sin broadcast
+        # crash when calling generate() straight from training mode. If it still
+        # fails on this Unsloth/Transformers combo, fall back ONCE to the manual
+        # no-cache decoder and stay there for the rest of the run.
+        if self._use_fast_generate:
+            try:
+                return self._fast_generate(prompt_ids, plen, n, do_sample, temperature, max_new_tokens)
+            except Exception as e:
+                logger.warning(
+                    f"KV-cached generate failed ({type(e).__name__}: {e}); "
+                    "falling back to manual no-cache decode for the rest of the run."
+                )
+                self._use_fast_generate = False
+        return self._manual_generate(prompt_ids, plen, n, do_sample, temperature, max_new_tokens)
+
+    def _fast_generate(self, prompt_ids, plen, n, do_sample, temperature, max_new_tokens):
+        """Unsloth KV-cached generation; toggles inference<->training mode."""
+        from unsloth import FastLanguageModel
+        torch = self.torch
+        try:
+            FastLanguageModel.for_inference(self.model)   # enable cached fast path
+            texts = []
+            for _ in range(n):
+                gen_kwargs = dict(
+                    max_new_tokens=max_new_tokens, do_sample=do_sample, use_cache=True,
+                    num_return_sequences=1, pad_token_id=self._tok.pad_token_id,
+                )
+                if do_sample:
+                    gen_kwargs.update(temperature=float(temperature), top_p=0.95)
+                with torch.no_grad():
+                    out = self.model.generate(prompt_ids, **gen_kwargs)
+                texts.append(self._tok.decode(out[0, plen:], skip_special_tokens=True))
+                del out
+                torch.cuda.empty_cache()
+            return texts
+        finally:
+            # ALWAYS restore training mode so the GRPO log-prob/backward works.
+            FastLanguageModel.for_training(self.model)
+
+    def _manual_generate(self, prompt_ids, plen, n, do_sample, temperature, max_new_tokens):
+        """Decode WITHOUT a KV cache (full forward each step). Slower (O(L^2))
+        but uses the same forward path as the log-prob pass, so it works even
+        when Unsloth's fused inference kernel is incompatible."""
+        torch = self.torch
+        eos_ids = self._eos_ids()
         texts = []
         for _ in range(n):
             ids = prompt_ids.clone()
             for _step in range(max_new_tokens):
                 with torch.no_grad():
-                    logits = self.model(ids).logits[:, -1, :].float()
+                    logits = self._last_logits(ids)
                 if do_sample:
                     logits = logits / max(float(temperature), 1e-6)
                     k = min(50, logits.shape[-1])

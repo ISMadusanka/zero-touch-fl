@@ -180,6 +180,7 @@ def run_phase2(
             load_in_4bit=bool(rl_cfg.get("load_in_4bit", True)),
             seed=int(fl.get("poison_seed", 0)),
             attn_implementation=rl_cfg.get("attn_implementation", "eager"),
+            use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
         )
         # Resume adapters if present.
         for name, path in adapter_paths.items():
