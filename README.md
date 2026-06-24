@@ -105,6 +105,10 @@ python main.py --env linux --fresh
 
 # Visualize results
 python visualize_rounds.py
+
+# MONITOR LLM training
+python monitor.py                 # prints a health report + saves logs/monitor/health.png
+python monitor.py --window 50     # smooth over a larger recent window for long runs
 ```
 
 Tune everything (poison fraction, attack goal, GRPO group size `G`, KL,
