@@ -2,9 +2,15 @@
 
 fl:
   training_rounds: 20             # Phase 1: honest training rounds
-  simulation_rounds: 2000         # Phase 2: adversarial RL rounds
+  simulation_rounds: 2000000         # Phase 2: adversarial RL rounds
   n_clients: 5
-  poison_fraction: 0.2            # fraction of clients poisoned each round (random subset)
+  poison_fraction: 0.2            # fraction of clients poisoned each round (random subset).
+                                  # NOTE (rebalance lever): with n_clients=5 this clamps to
+                                  # exactly 1 poisoned client/round, which a strong defender
+                                  # filters out entirely (-> attacker drop ~0). If the arms-race
+                                  # ratchet stalls because the attacker can't get a foothold,
+                                  # raise this (e.g. 0.4 -> 2 of 5) so one detection no longer
+                                  # zeroes the attack. This CHANGES the threat model.
   poison_seed: 0                  # RNG seed for the poisoned-subset selection + reproducibility
   benign_retrain_each_round: false # false = benign clients replay frozen Phase-1 final-round local weights every round
   local_epochs: 3
@@ -42,15 +48,37 @@ rl:
   G: 4                            # rollouts per GRPO step (group size)
   kl_beta: 0.02                   # KL penalty toward the frozen base model
   lr: 1.0e-5
-  K_a: 4                          # attacker rounds per alternation (Stackelberg)
-  K_d: 4                          # defender rounds per alternation
   temperature: 1.0                # learner sampling temperature (exploration)
-  opponent_temperature: 0.0       # frozen opponent plays greedily
+  opponent_temperature: 0.0       # frozen opponent plays greedily when a round is COMMITTED
+  scoring_opponent_temperature: 0.7 # frozen opponent temp while SCORING the G rollouts;
+                                  # >0 so candidates see varied opponent verdicts -> restores
+                                  # within-group reward spread (fixes attacker zero-advantage)
   max_new_tokens: 512             # attack plans / verdicts are short JSON
   grad_clip: 1.0
   save_every: 25                  # checkpoint adapters + progress every N rounds (resume granularity)
   league_snapshot_every: 100      # snapshot adapters into the opponent league
   league_prob: 0.25               # chance a training phase faces a league snapshot
+
+  # --- Zero-advantage guard (stops the attacker un-learning toward base) ---
+  resample_on_zero_advantage: true # if a group has no reward spread, re-roll once at higher temp
+  resample_temperature: 1.3       # temperature for that re-roll
+  skip_zero_advantage: true       # if still degenerate, skip the step (apply NO gradient)
+
+  # --- Schedule: success-gated iterated best response (the arms-race ratchet) ---
+  switch_mode: "best_response"    # best_response | fixed (legacy K_a/K_d alternation)
+  first_learner: "attacker"       # who trains first
+  min_phase_rounds: 8             # earliest a phase may switch on a sustained win
+  max_phase_rounds: 1000           # hard cap: switch even without a win (prevents a stuck phase)
+  success_streak: 3               # consecutive winning rounds needed to freeze + switch
+  curriculum_on_cap: true         # after a phase caps without a win, next learner faces an
+                                  # earlier opponent snapshot so it can find a foothold
+  attacker_min_drop: 0.02         # committed accuracy drop (prev-post) for an "attack passed"
+  attacker_min_evaded: 1.0        # fraction of poisoned clients that must evade detection
+  defender_min_tpr: 0.99          # defender "win": catches the poisoned client(s)...
+  defender_max_fpr: 0.10          # ...without over-flagging honest clients
+  # Legacy fixed-mode knobs (used only when switch_mode: fixed):
+  K_a: 4                          # attacker rounds per alternation
+  K_d: 4                          # defender rounds per alternation
   adapter_paths:
     attacker: "checkpoints/attacker_adapter"
     defender: "checkpoints/defender_adapter"

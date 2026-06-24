@@ -34,11 +34,25 @@ def grpo_step(
     temperature: float = 1.0,
     max_new_tokens: int = 2048,
     grad_clip: float = 1.0,
+    skip_zero_advantage: bool = True,
+    resample_on_zero_advantage: bool = False,
+    resample_temperature: float = 1.3,
 ) -> dict:
     """Run one GRPO update for ``adapter`` against ``turn``. Returns metrics.
 
     ``turn`` must expose ``messages() -> (system, user)`` and
     ``reward(completion_text) -> float`` (see ``rl/turns.py``).
+
+    Zero-advantage handling (the attacker-collapse guard): when every sampled
+    rollout earns the same reward the within-group spread is ~0, so the
+    policy-gradient term is 0 and the loss reduces to ``kl_beta * KL`` — a pull
+    *back toward the base model*, i.e. active un-learning. To avoid that:
+
+    * ``resample_on_zero_advantage`` — re-draw the group ONCE at a higher
+      temperature to try to recover reward spread before giving up.
+    * ``skip_zero_advantage`` — if the group is still degenerate, skip the
+      optimizer step entirely (apply no gradient) instead of stepping on a pure
+      KL-to-base signal.
     """
     system, user = turn.messages()
 
@@ -53,31 +67,51 @@ def grpo_step(
     # 3. Group-relative advantages.
     advantages, zero_frac = group_advantages(rewards)
 
-    # 4. Accumulate the GRPO loss; backward per-sample to bound memory.
-    optimizer.zero_grad()
-    total_loss = 0.0
-    n_used = 0
-    for completion, adv in zip(completions, advantages):
-        lp = policy.policy_token_logprobs(adapter, system, user, completion)  # (L,) grad
-        if lp.numel() == 0:
-            continue
-        ref = policy.reference_token_logprobs(system, user, completion)       # (L,) no grad
-        L = min(lp.shape[0], ref.shape[0])
-        lp, ref = lp[-L:], ref[-L:]
-
-        log_ratio = ref - lp
-        kl = (torch.exp(log_ratio) - log_ratio - 1.0).mean()
-        pg = -(adv * lp.mean())
-        loss_i = (pg + kl_beta * kl) / max(1, G)
-        loss_i.backward()
-        total_loss += float(loss_i.detach())
-        n_used += 1
-
-    if n_used > 0:
-        torch.nn.utils.clip_grad_norm_(policy.adapter_parameters(adapter), grad_clip)
-        optimizer.step()
+    # 3b. A degenerate (zero-spread) group gives no learning signal. Optionally
+    #     re-roll once at a higher temperature to recover diversity.
+    resampled = False
+    if zero_frac >= 1.0 and resample_on_zero_advantage:
+        resampled = True
+        completions = policy.generate(
+            adapter, system, user, n=G,
+            temperature=max(temperature, resample_temperature),
+            max_new_tokens=max_new_tokens,
+        )
+        rewards = [float(turn.reward(c)) for c in completions]
+        advantages, zero_frac = group_advantages(rewards)
 
     mean_r = sum(rewards) / len(rewards) if rewards else 0.0
+
+    # 3c. Still degenerate → do NOT step (would only pull the adapter to base).
+    stepped = not (zero_frac >= 1.0 and skip_zero_advantage)
+
+    # 4. Accumulate the GRPO loss; backward per-sample to bound memory.
+    total_loss = 0.0
+    n_used = 0
+    if stepped:
+        optimizer.zero_grad()
+        for completion, adv in zip(completions, advantages):
+            lp = policy.policy_token_logprobs(adapter, system, user, completion)  # (L,) grad
+            if lp.numel() == 0:
+                continue
+            ref = policy.reference_token_logprobs(system, user, completion)       # (L,) no grad
+            L = min(lp.shape[0], ref.shape[0])
+            lp, ref = lp[-L:], ref[-L:]
+
+            log_ratio = ref - lp
+            kl = (torch.exp(log_ratio) - log_ratio - 1.0).mean()
+            pg = -(adv * lp.mean())
+            loss_i = (pg + kl_beta * kl) / max(1, G)
+            loss_i.backward()
+            total_loss += float(loss_i.detach())
+            n_used += 1
+
+        if n_used > 0:
+            torch.nn.utils.clip_grad_norm_(policy.adapter_parameters(adapter), grad_clip)
+            optimizer.step()
+        else:
+            stepped = False
+
     metrics = {
         "loss": total_loss,
         "mean_reward": mean_r,
@@ -87,10 +121,12 @@ def grpo_step(
         "rewards": rewards,
         "completions": completions,
         "advantages": advantages,
+        "stepped": stepped,
+        "resampled": resampled,
     }
-    if zero_frac >= 1.0:
+    if zero_frac >= 1.0 and not stepped:
         logger.warning(
             f"GRPO[{adapter}]: zero-advantage group (all {G} rewards equal "
-            f"≈{mean_r:.3f}) — no policy gradient this step"
+            f"≈{mean_r:.3f}) — skipped step (no gradient applied)"
         )
     return metrics

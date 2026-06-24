@@ -22,13 +22,23 @@ class AttackerTurn:
     """Learning agent = attacker. Opponent = frozen defender (greedy)."""
 
     def __init__(self, env, attacker_agent, defender_agent, defender_gen,
-                 reward_cfg: dict | None = None, opponent_temperature: float = 0.0):
+                 reward_cfg: dict | None = None, opponent_temperature: float = 0.0,
+                 scoring_opponent_temperature: float | None = None):
         self.env = env
         self.attacker_agent = attacker_agent
         self.defender_agent = defender_agent
         self.defender_gen = defender_gen
         self.reward_cfg = reward_cfg or {}
         self.opp_temp = opponent_temperature
+        # When SCORING the G candidate plans we sample the frozen defender at a
+        # (usually nonzero) temperature so different plans see different verdicts
+        # — this restores within-group reward spread and is the key fix for the
+        # attacker's zero-advantage collapse. The COMMITTED round still uses the
+        # greedy ``opp_temp`` so success is measured against the real defender.
+        self.scoring_opp_temp = (
+            opponent_temperature if scoring_opponent_temperature is None
+            else scoring_opponent_temperature
+        )
 
         self.references = env.benign_by_poisoned          # {cid: benign state_dict}
         self.poisoned_ids = list(env.poisoned_ids)
@@ -43,22 +53,22 @@ class AttackerTurn:
     def messages(self) -> tuple[str, str]:
         return self.system, self.user
 
-    def _defender_verdicts(self, updates):
+    def _defender_verdicts(self, updates, temperature):
         feats = self.env.features(updates)
         client_ids = [u.client_id for u in updates]
         d_sys = self.defender_agent.system_prompt()
         d_user = self.defender_agent.build_user_prompt(feats)
-        text = self.defender_gen.generate(d_sys, d_user, n=1, temperature=self.opp_temp)[0]
+        text = self.defender_gen.generate(d_sys, d_user, n=1, temperature=temperature)[0]
         return self.defender_agent.parse(text, client_ids)
 
-    def _apply(self, attacker_text):
+    def _apply(self, attacker_text, temperature):
         poisoned, n_malformed = self.attacker_agent.parse(attacker_text, self.references)
         updates = self.env.build_updates(poisoned)
-        verdicts = self._defender_verdicts(updates)
+        verdicts = self._defender_verdicts(updates, temperature)
         return updates, verdicts, n_malformed
 
     def reward(self, attacker_text) -> float:
-        updates, verdicts, n_malformed = self._apply(attacker_text)
+        updates, verdicts, n_malformed = self._apply(attacker_text, self.scoring_opp_temp)
         post_acc = self.env.evaluate_updates(updates, verdicts)
         return attacker_reward(
             self.prev_accuracy, post_acc, self.env.goal, self.poisoned_ids,
@@ -69,9 +79,7 @@ class AttackerTurn:
         )
 
     def commit(self, attacker_text) -> dict:
-        poisoned, n_malformed = self.attacker_agent.parse(attacker_text, self.references)
-        updates = self.env.build_updates(poisoned)
-        verdicts = self._defender_verdicts(updates)
+        updates, verdicts, n_malformed = self._apply(attacker_text, self.opp_temp)
         new_acc = self.env.commit(updates, verdicts)
         return {
             "updates": updates,
