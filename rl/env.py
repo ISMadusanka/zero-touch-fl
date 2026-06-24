@@ -54,6 +54,9 @@ class FLArmsRaceEnv:
         self.rng = rng
         self.aggregator = FedAvgAggregator()
         self.server = FedServer(device=self.device)
+        # Materialize the fixed test set on-GPU once — the reward oracle evaluates
+        # G+1 times per round, so this removes the per-batch DataLoader overhead.
+        self.server.build_eval_cache(test_loader)
 
         # Benign clients (used only when benign_retrain is True).
         self._clients = [

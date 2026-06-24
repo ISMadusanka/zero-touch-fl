@@ -36,7 +36,8 @@ rl:
   attn_implementation: "eager"    # broadly compatible; Llama 3.2 also supports "sdpa"
   use_fast_generate: true         # KV-cached generation (fast); auto-falls back to no-cache on failure
   max_seq_len: 8192
-  load_in_4bit: true
+  load_in_4bit: false             # false = bf16 base (faster matmuls, higher precision than 4-bit) — needs the VRAM, and a fresh RL start when switching from a 4-bit run
+  use_gradient_checkpointing: false  # false = store activations (faster backward, identical grads) — fine with ample VRAM
   lora_r: 16
   lora_alpha: 32
   G: 4                            # rollouts per GRPO step (group size)

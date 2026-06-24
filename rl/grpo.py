@@ -53,15 +53,19 @@ def grpo_step(
     # 3. Group-relative advantages.
     advantages, zero_frac = group_advantages(rewards)
 
-    # 4. Accumulate the GRPO loss; backward per-sample to bound memory.
+    # 4. Score all G completions in TWO batched forwards (policy grad + reference
+    #    no-grad), then one summed backward over the shared graph. Mathematically
+    #    identical to per-sample (gradient is linear), but far better GPU use.
+    policy_lps = policy.policy_token_logprobs_batch(adapter, system, user, completions)
+    ref_lps = policy.reference_token_logprobs_batch(system, user, completions)
+
     optimizer.zero_grad()
     total_loss = 0.0
     n_used = 0
-    for completion, adv in zip(completions, advantages):
-        lp = policy.policy_token_logprobs(adapter, system, user, completion)  # (L,) grad
-        if lp.numel() == 0:
+    loss_accum = None
+    for lp, ref, adv in zip(policy_lps, ref_lps, advantages):
+        if lp is None or lp.numel() == 0:
             continue
-        ref = policy.reference_token_logprobs(system, user, completion)       # (L,) no grad
         L = min(lp.shape[0], ref.shape[0])
         lp, ref = lp[-L:], ref[-L:]
 
@@ -69,11 +73,12 @@ def grpo_step(
         kl = (torch.exp(log_ratio) - log_ratio - 1.0).mean()
         pg = -(adv * lp.mean())
         loss_i = (pg + kl_beta * kl) / max(1, G)
-        loss_i.backward()
+        loss_accum = loss_i if loss_accum is None else loss_accum + loss_i
         total_loss += float(loss_i.detach())
         n_used += 1
 
     if n_used > 0:
+        loss_accum.backward()
         torch.nn.utils.clip_grad_norm_(policy.adapter_parameters(adapter), grad_clip)
         optimizer.step()
 
