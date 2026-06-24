@@ -65,6 +65,21 @@ def setup_logging():
 logger = logging.getLogger("main")
 
 
+def quiet_noisy_warnings():
+    """Silence the high-frequency, harmless library chatter during training:
+    the per-generation 'max_new_tokens vs max_length' notice and Transformers'
+    AttentionMaskConverter deprecation FutureWarnings."""
+    import warnings
+    warnings.filterwarnings("ignore", message=r".*max_new_tokens.*max_length.*")
+    warnings.filterwarnings("ignore", message=r".*AttentionMaskConverter.*")
+    warnings.filterwarnings("ignore", category=FutureWarning, module=r"transformers.*")
+    try:
+        from transformers.utils import logging as hf_logging
+        hf_logging.set_verbosity_error()
+    except Exception:
+        pass
+
+
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
@@ -222,6 +237,7 @@ def main():
     args = parser.parse_args()
 
     setup_logging()
+    quiet_noisy_warnings()
     logger.info("Starting Zero-Touch Federated Learning System")
 
     base_config = load_config("configs/base.yaml")
