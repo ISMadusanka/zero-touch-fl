@@ -164,12 +164,18 @@ def plot(rows, out: str, window: int):
         w = min(window, len(v))
         return np.convolve(v, np.ones(w) / w, mode="same")
 
-    # 1: GRPO mean-reward per agent (its own phases)
+    # 1: GRPO mean-reward per agent (its own phases). Drawn as DOTS at the real
+    #    training rounds — NOT a connected line — so the gaps where an agent is
+    #    frozen stay visibly empty instead of being bridged by a straight segment
+    #    (a connected line falsely implies the agent trained during the gap).
     ra, va = _series([r for r in rows if r["learner"] == "attacker"], "train_mean_r")
     rd, vd = _series([r for r in rows if r["learner"] == "defender"], "train_mean_r")
-    ax[0, 0].set_title("GRPO mean reward (own training rounds) — want UP")
-    if len(va): ax[0, 0].plot(ra, roll(va), color="#FF6584", label="attacker")
-    if len(vd): ax[0, 0].plot(rd, roll(vd), color="#43E97B", label="defender")
+    ax[0, 0].set_title("GRPO mean reward (dots = real training rounds) — want UP")
+    if len(va): ax[0, 0].scatter(ra, va, s=8, alpha=0.55, edgecolors="none",
+                                 color="#FF6584", label="attacker")
+    if len(vd): ax[0, 0].scatter(rd, vd, s=8, alpha=0.55, edgecolors="none",
+                                 color="#43E97B", label="defender")
+    ax[0, 0].axhline(0.0, color="#999999", lw=0.6, ls="--")
     ax[0, 0].legend(); ax[0, 0].set_xlabel("round")
 
     # 2: defender TPR/FPR
