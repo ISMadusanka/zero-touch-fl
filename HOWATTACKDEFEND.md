@@ -258,6 +258,83 @@ Neither sees the other's internals — each only ever responds to the other's
 *frozen behaviour*, measured through rewards. That's why the loop is stable: only
 one side moves at a time, and it has a fixed target to climb against.
 
+### How the handoff is decided (when to stop and switch)
+
+The rule in one line:
+
+> **An agent keeps training until it *beats* its frozen opponent a few times in a
+> row. Then it stops, freezes itself, and lets the opponent train against that
+> stronger version.**
+
+The trigger is *"I just won, convincingly"* — not a timer or a fixed round count.
+The logic lives in [rl/switch.py](rl/switch.py).
+
+**Step 1 — what counts as a "win" this round.** Every committed round we check
+whether the learner won:
+
+- **Attacker wins** (`attacker_succeeded`) when: its poison **evaded** the defender
+  (the poisoned client was *not* flagged) **and** the model **lost accuracy** by at
+  least `attacker_min_drop` (default 0.02). → *"my attack got through AND did damage."*
+- **Defender wins** (`defender_succeeded`) when: it **caught** the poison
+  (TPR ≥ `defender_min_tpr`, default 0.99) **and** didn't **over-flag** honest
+  clients (FPR ≤ `defender_max_fpr`, default 0.10). → *"flagged the bad one, spared
+  the good ones."*
+
+> The win is judged on the **committed** round against the **real, greedy** opponent
+> (not the randomized scoring one from §5), so a win is genuine, not luck.
+
+**Step 2 — the switch decision.** A `PhaseController` tracks a **streak** of
+consecutive winning rounds (any non-winning round resets it to 0). It switches when
+**both**:
+
+1. the phase has lasted at least `min_phase_rounds` (default 8) — don't hand off on
+   a lucky early fluke; and
+2. the streak has reached `success_streak` (default 3) — the win repeats, it's not
+   a one-off.
+
+Then it **freezes the learner, saves the checkpoint, and switches to the opponent.**
+
+**Worked example** (attacker phase; needs 3 wins in a row, min 8 rounds):
+
+| Round | Won? | Streak | Switch? |
+|---|---|---|---|
+| 1–5 | mixed | resets to 0 on each loss | no (also < 8 rounds) |
+| 6 | ✅ | 1 | no |
+| 7 | ❌ | 0 | no (streak broke) |
+| 8 | ✅ | 1 | no |
+| 9 | ✅ | 2 | no |
+| 10 | ✅ | **3** | ✅ **yes** — 3-in-a-row *and* past round 8 → freeze attacker, defender's turn |
+
+**Step 3 — the safety valve.** If an agent simply *can't* win it would train forever,
+so there's a ceiling: if a phase reaches `max_phase_rounds` (default 200) **without**
+a sustained win, it **switches anyway**. After such a "stuck" phase, the next learner
+can be given an **earlier, weaker snapshot** of its opponent to practise against
+(`curriculum_on_cap`).
+
+So there are exactly **two reasons an agent stops and hands off:**
+
+| Reason | Meaning | What happens next |
+|---|---|---|
+| **`success`** (good) | "I beat my frozen opponent 3 rounds running." | Freeze me at this strong version; opponent now trains to beat it. |
+| **`cap`** (give-up) | "I trained the max rounds and still can't win." | Switch anyway; next learner may get an easier snapshot so we don't stall. |
+
+In the training log this shows up as:
+```
+Phase 4 [attacker] ended (success) after 23 rounds — froze attacker
+Phase 5 [defender] ended (cap) after 1000 rounds — froze defender
+```
+
+**The knobs** (in `configs/base.yaml`):
+
+| Setting | Default | Controls |
+|---|---|---|
+| `success_streak` | 3 | wins-in-a-row needed to hand off |
+| `min_phase_rounds` | 8 | earliest a phase may switch (anti-fluke floor) |
+| `max_phase_rounds` | 200 | force-switch ceiling (anti-stall) |
+| `attacker_min_drop` | 0.02 | accuracy drop that counts as an attacker win |
+| `attacker_min_evaded` | 1.0 | fraction of poisoned clients that must evade |
+| `defender_min_tpr` / `defender_max_fpr` | 0.99 / 0.10 | what counts as a defender win |
+
 ---
 
 ## 7. How to tell if the models are improving
