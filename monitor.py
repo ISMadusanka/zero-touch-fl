@@ -87,6 +87,43 @@ def _trend(vals: np.ndarray):
     return early, late, slope
 
 
+def _segments(rounds, vals, max_gap=1):
+    """Split a per-agent series into contiguous training runs, breaking wherever
+    the round number jumps by more than ``max_gap`` (the agent was frozen in
+    between). Plotting each run separately stops a line from bridging across a
+    frozen phase (which would falsely imply the agent trained during the gap)."""
+    segs = []
+    n = len(rounds)
+    if n == 0:
+        return segs
+    start = 0
+    for i in range(1, n):
+        if rounds[i] - rounds[i - 1] > max_gap:
+            segs.append((rounds[start:i], vals[start:i]))
+            start = i
+    segs.append((rounds[start:], vals[start:]))
+    return segs
+
+
+def _shade_phases(ax, rows):
+    """Shade the background by which agent was training, so the per-phase regions
+    are visible (pink = attacker-learning, green = defender-learning)."""
+    colors = {"attacker": "#FF6584", "defender": "#43E97B"}
+    if not rows:
+        return
+    start = rows[0]["round"]
+    cur = rows[0]["learner"]
+    prev = start
+    for r in rows[1:]:
+        if r["learner"] != cur:
+            if cur in colors:
+                ax.axvspan(start, prev, color=colors[cur], alpha=0.07, lw=0)
+            start, cur = r["round"], r["learner"]
+        prev = r["round"]
+    if cur in colors:
+        ax.axvspan(start, prev, color=colors[cur], alpha=0.07, lw=0)
+
+
 def _flag(cond, bad_msg, ok_msg):
     return f"  ⚠ {bad_msg}" if cond else f"  ✓ {ok_msg}"
 
@@ -164,34 +201,37 @@ def plot(rows, out: str, window: int):
         w = min(window, len(v))
         return np.convolve(v, np.ones(w) / w, mode="same")
 
-    # 1: GRPO mean-reward per agent (its own phases). Drawn as DOTS at the real
-    #    training rounds — NOT a connected line — so the gaps where an agent is
-    #    frozen stay visibly empty instead of being bridged by a straight segment
-    #    (a connected line falsely implies the agent trained during the gap).
+    # 1: GRPO mean-reward per agent. CONNECTED lines that BREAK across rounds
+    #    where the agent wasn't training (no bridging across frozen phases), over
+    #    a background shaded by who was training (pink=attacker, green=defender).
+    _shade_phases(ax[0, 0], rows)
     ra, va = _series([r for r in rows if r["learner"] == "attacker"], "train_mean_r")
     rd, vd = _series([r for r in rows if r["learner"] == "defender"], "train_mean_r")
-    ax[0, 0].set_title("GRPO mean reward (dots = real training rounds) — want UP")
-    if len(va): ax[0, 0].scatter(ra, va, s=8, alpha=0.55, edgecolors="none",
-                                 color="#FF6584", label="attacker")
-    if len(vd): ax[0, 0].scatter(rd, vd, s=8, alpha=0.55, edgecolors="none",
-                                 color="#43E97B", label="defender")
+    ax[0, 0].set_title("GRPO mean reward — want UP (shaded band = agent training)")
+    for i, (sr, sv) in enumerate(_segments(ra, va)):
+        ax[0, 0].plot(sr, roll(sv), color="#FF6584", label="attacker" if i == 0 else None)
+    for i, (sr, sv) in enumerate(_segments(rd, vd)):
+        ax[0, 0].plot(sr, roll(sv), color="#43E97B", label="defender" if i == 0 else None)
     ax[0, 0].axhline(0.0, color="#999999", lw=0.6, ls="--")
     ax[0, 0].legend(); ax[0, 0].set_xlabel("round")
 
     # 2: defender TPR/FPR
+    _shade_phases(ax[0, 1], rows)
     rt, vt = _series(rows, "tpr"); rf, vf = _series(rows, "fpr")
     ax[0, 1].set_title("Defender TPR (up) vs FPR (down)")
-    if len(vt): ax[0, 1].plot(rt, roll(vt), color="#43E97B", label="TPR")
-    if len(vf): ax[0, 1].plot(rf, roll(vf), color="#FF6584", label="FPR")
+    if len(vt): ax[0, 1].plot(rt, roll(vt), color="#2E7D32", label="TPR")
+    if len(vf): ax[0, 1].plot(rf, roll(vf), color="#C62828", label="FPR")
     ax[0, 1].set_ylim(-0.05, 1.05); ax[0, 1].legend(); ax[0, 1].set_xlabel("round")
 
     # 3: zero-advantage fraction (want LOW)
+    _shade_phases(ax[1, 0], rows)
     rz, vz = _series(rows, "zero_adv")
     ax[1, 0].set_title("zero-advantage fraction — want LOW (high = no gradient)")
     if len(vz): ax[1, 0].plot(rz, roll(vz), color="#F7971E")
     ax[1, 0].set_ylim(-0.05, 1.05); ax[1, 0].set_xlabel("round")
 
     # 4: attacker induced drop + stealth
+    _shade_phases(ax[1, 1], rows)
     rdp, vdp = _series(rows, "drop"); rs, vs = _series(rows, "stealth")
     ax[1, 1].set_title("Attacker: induced acc-drop & stealth — want UP")
     if len(vdp): ax[1, 1].plot(rdp, roll(vdp), color="#6C63FF", label="acc drop")
