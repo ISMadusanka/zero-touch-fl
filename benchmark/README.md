@@ -15,6 +15,12 @@ On the GPU box (needs torch / unsloth / peft + the trained adapters in `checkpoi
 
 ```bash
 python -m benchmark.run_benchmark --rounds 200
+
+# to chnage outcomes
+python -m benchmark.run_benchmark --rounds 10 --seed 1
+python -m benchmark.run_benchmark --rounds 10 --seed 2
+python -m benchmark.run_benchmark --rounds 10 --seed 3
+
 # choose defenses / tune FLTrust / save outputs:
 python -m benchmark.run_benchmark --rounds 200 \
     --defenses fedavg,oracle,fltrust,llm_defender \
