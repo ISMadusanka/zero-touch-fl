@@ -111,6 +111,29 @@ python monitor.py                 # prints a health report + saves logs/monitor/
 python monitor.py --window 50     # smooth over a larger recent window for long runs
 ```
 
+## RUN INFERENCE ON TRAINED LLMS
+```
+# Attacker — using the REAL system prompt it was trained with (recommended):
+python infer.py --adapter attacker --role \
+  --prompt '{"round":5,"current_global_accuracy":0.8,"attack_goal":{"type":"untargeted_degrade","target_accuracy_drop":0.2},"poisoned_client_ids":[0],"benign_layer_details":{}}'
+
+# Defender — real system prompt, feature JSON as the user message:
+python infer.py --adapter defender --role \
+  --prompt '{"client_ids":[0,1,2,3,4],"features":{}}'
+
+# Free-form prompt, no system prompt at all:
+python infer.py --adapter attacker --prompt "Describe a stealthy model-poisoning attack."
+
+# Sample several completions (temperature > 0):
+python infer.py --adapter attacker --role --prompt '...' --n 4 --temperature 1.0
+
+# Interactive — load the 3B model ONCE, then keep prompting (best for exploring):
+python infer.py --adapter defender --role --interactive
+
+# Pipe a prompt from stdin / a file:
+cat my_prompt.json | python infer.py --adapter attacker --role
+```
+
 Tune everything (poison fraction, attack goal, GRPO group size `G`, KL,
 alternation lengths `K_a`/`K_d`, learning rate, league) in
 [`configs/base.yaml`](configs/base.yaml).
