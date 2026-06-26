@@ -19,3 +19,4 @@ peft>=0.13
 transformers>=4.45
 accelerate
 bitsandbytes
+matplotlib

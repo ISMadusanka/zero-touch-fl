@@ -181,3 +181,7 @@ logs/         system.log, round_data/, metrics/, visualizations/
 See [`SYSTEM.md`](SYSTEM.md) for the full architecture (round loop, reward
 definitions, feature spec, GRPO schedule, checkpoint layout) and
 [`DATA_PARTION.md`](DATA_PARTION.md) for the data partitioning.
+
+
+benchmark
+python -m benchmark.run_benchmark --rounds 200

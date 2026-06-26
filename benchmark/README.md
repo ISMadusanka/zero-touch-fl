@@ -21,7 +21,16 @@ python -m benchmark.run_benchmark --rounds 200 \
     --attack-temperature 0.7 --root-size 100 --eta 1.0 --out logs/benchmark
 ```
 
-Output: a console table + `logs/benchmark/benchmark.{json,csv}`. Example shape:
+Output: a console table + `logs/benchmark/benchmark.{json,csv}` + per-round
+`history.json` + a 4-panel graph `benchmark.png` (accuracy per round, rolling
+detection-rate, rolling FPR, and attack-strength per round). Re-plot a saved run
+without re-running (the 200 rounds are slow + need the GPU):
+
+```bash
+python -m benchmark.plot --history logs/benchmark/history.json   # -> benchmark.png
+```
+
+Disable graphing with `--no-plot`. Example table shape:
 
 ```
 defense       detect%  FPR    prec  F1    final_acc  mean_acc  acc_drop  atk_thru

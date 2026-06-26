@@ -44,7 +44,8 @@ def _parse_args():
     ap.add_argument("--eta", type=float, default=1.0, help="FLTrust global learning rate")
     ap.add_argument("--device", default=None, help="override fl.device")
     ap.add_argument("--seed", type=int, default=None, help="override fl.poison_seed")
-    ap.add_argument("--out", default="logs/benchmark", help="output dir for json/csv (or '' to skip)")
+    ap.add_argument("--out", default="logs/benchmark", help="output dir for json/csv/png (or '' to skip)")
+    ap.add_argument("--no-plot", action="store_true", help="skip drawing per-round graphs")
     ap.add_argument("--fresh", action="store_true", help="force fresh Phase-1 instead of loading checkpoint")
     ap.add_argument("--log-every", type=int, default=10)
     return ap.parse_args()
@@ -186,6 +187,19 @@ def main():
     out_dir = args.out or None
     print("\n" + report.render([summaries[n] for n in defenses], args.rounds,
                                 baseline_accuracy, out_dir=out_dir))
+
+    # Persist per-round history + draw the per-round graphs.
+    if out_dir:
+        import json as _json
+        history = {name: m.history for name, m in _metrics.items()}
+        with open(os.path.join(out_dir, "history.json"), "w") as f:
+            _json.dump({"baseline_accuracy": baseline_accuracy, "history": history}, f, indent=2)
+        log.info(f"[saved] {os.path.join(out_dir, 'history.json')}")
+        if not args.no_plot:
+            from benchmark.plot import plot_history
+            png = plot_history(history, baseline_accuracy, os.path.join(out_dir, "benchmark.png"))
+            if png:
+                log.info(f"[saved] {png}")
 
 
 if __name__ == "__main__":

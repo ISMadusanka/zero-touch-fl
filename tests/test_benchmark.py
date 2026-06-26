@@ -66,6 +66,26 @@ def test_report_table_has_all_defenses():
     assert "DEFENSE BENCHMARK" in text and "Legend" in text
 
 
+def test_rolling_rate():
+    from benchmark.plot import _rolling_rate
+    # window=2 over tp=[1,0,1], den=[1,1,1]: r0=1/1, r1=1/2, r2=1/2
+    assert _rolling_rate([1, 0, 1], [1, 1, 1], window=2) == [1.0, 0.5, 0.5]
+    # zero denominator -> NaN (x != x)
+    r = _rolling_rate([0], [0], window=1)[0]
+    assert r != r
+
+
+def test_plot_skips_gracefully_without_matplotlib():
+    # On a box without matplotlib, plot_history must warn + return None (not crash).
+    from benchmark.plot import plot_history
+    hist = {"fedavg": [{"round": 1, "tp": 0, "fn": 1, "fp": 0, "tn": 4, "accuracy": 0.8}]}
+    try:
+        import matplotlib  # noqa: F401
+        return  # matplotlib present here -> nothing to assert about the skip path
+    except Exception:
+        assert plot_history(hist, 0.8, "logs/benchmark/benchmark.png") is None
+
+
 def _run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
