@@ -45,10 +45,12 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
 
 - **Training happens on a GPU machine — not through Ollama.** Ollama and the
   OpenAI API are **inference-only** and cannot fine-tune.
-- The policy is **one frozen `Llama-3.2-3B-Instruct` base loaded in 4-bit (QLoRA)
-  via Unsloth**, with **two LoRA adapters** over it — `attacker` and `defender`.
-  This is exactly "separate checkpoints on the same LLM": the base is never
-  duplicated; each policy is its own small adapter, saved independently to
+- The policy is **one frozen `Llama-3.2-3B-Instruct` base loaded via Unsloth in
+  bf16 LoRA by default** (4-bit QLoRA is available via `rl.load_in_4bit: true` —
+  use it only when GPU memory is tight; on a 5090 bf16 is faster as it skips the
+  per-matmul dequant), with **two LoRA adapters** over it — `attacker` and
+  `defender`. This is exactly "separate checkpoints on the same LLM": the base is
+  never duplicated; each policy is its own small adapter, saved independently to
   `checkpoints/attacker_adapter/` and `checkpoints/defender_adapter/`.
   (Loaded with `attn_implementation="eager"` by default — see `rl.attn_implementation`;
   Llama 3.2 also supports `"sdpa"`.)
@@ -63,10 +65,11 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   the adapter into the base and export a single GGUF for Ollama (Llama 3.2 is
   supported by Ollama as `llama3.2`; merging gives up the two-swappable-adapters
   design but is the simplest serving path).
-- **Hardware**: Llama-3.2-3B QLoRA fits comfortably on a single ~8 GB+ GPU
-  (~4–6 GB floor) — your 5090 (31 GB) has ample headroom. The attacker emits a
-  short attack plan (tens of tokens), so generation is fast and `rl.max_new_tokens`
-  can stay small (512).
+- **Hardware**: Llama-3.2-3B fits comfortably on a single GPU — ~6 GB of weights
+  in the default bf16 LoRA (or ~4–6 GB floor under 4-bit QLoRA), so your 5090
+  (31 GB) has ample headroom for either. The attacker emits a short attack plan
+  (tens of tokens), so generation is fast and `rl.max_new_tokens` can stay small
+  (512).
 
 ## Setup
 
@@ -93,6 +96,15 @@ python main.py --env linux
 
 # Quick smoke run: few rounds
 python main.py --env linux --rounds 8
+
+# Verbose DEBUG run (GPU) — print EVERYTHING for one short run, to the console AND
+# logs/debug.json: the exact attacker/defender LLM prompts + raw outputs, each
+# poisoning step (attack plan + per-layer poisoned-weight deltas), the per-round
+# FL fine-tuning data, and all rewards / GRPO advantages / commit outcomes.
+# Third-party library noise is silenced. Caps Phase 2 at 3 rounds unless --rounds
+# is given (each round is logic-identical — it just stops early).
+python main.py --env linux --debug
+python main.py --env linux --debug --rounds 6     # debug a longer stretch
 
 # Logic dry-run — full round loop with a FROZEN LLM via Ollama (no training, no GPU)
 python main.py --env linux --dry-run --rounds 4
@@ -175,7 +187,7 @@ rl/           env, rewards, turns, inference (dry-run), policy (Unsloth+LoRA), g
 metrics/      Ground-truth confusion/TPR/FPR/ASR/APR (research evaluation + reward source)
 storage/      Phase-1 checkpoint + RL progress
 configs/      YAML configuration
-logs/         system.log, round_data/, metrics/, visualizations/
+logs/         system.log, debug.json (--debug), round_data/, metrics/, visualizations/
 ```
 
 See [`SYSTEM.md`](SYSTEM.md) for the full architecture (round loop, reward

@@ -18,6 +18,7 @@ import logging
 
 import torch
 
+from core.debug import dbg
 from rl.rewards import group_advantages
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ def grpo_step(
     resampled = False
     if zero_frac >= 1.0 and resample_on_zero_advantage:
         resampled = True
+        dbg.resampling()
         completions = policy.generate(
             adapter, system, user, n=G,
             temperature=max(temperature, resample_temperature),
@@ -129,4 +131,5 @@ def grpo_step(
             f"GRPO[{adapter}]: zero-advantage group (all {G} rewards equal "
             f"≈{mean_r:.3f}) — skipped step (no gradient applied)"
         )
+    dbg.grpo_summary(metrics)
     return metrics

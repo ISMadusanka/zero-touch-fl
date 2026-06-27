@@ -13,6 +13,7 @@ Generators are duck-typed: any object with
 
 import logging
 
+from core.debug import dbg
 from rl.rewards import attacker_reward, defender_reward
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ class AttackerTurn:
         self.user = attacker_agent.build_user_prompt(
             env.round_index + env.training_rounds, env.current_accuracy, self.references
         )
+        dbg.attacker_prompt(self.system, self.user, who="learner")
 
     # The learning agent's prompt (consumed by the GRPO sampler / policy).
     def messages(self) -> tuple[str, str]:
@@ -59,7 +61,10 @@ class AttackerTurn:
         d_sys = self.defender_agent.system_prompt()
         d_user = self.defender_agent.build_user_prompt(feats)
         text = self.defender_gen.generate(d_sys, d_user, n=1, temperature=temperature)[0]
-        return self.defender_agent.parse(text, client_ids)
+        verdicts = self.defender_agent.parse(text, client_ids)
+        dbg.defender_io(d_sys, d_user, text, verdicts, who="opponent",
+                        temperature=temperature, poisoned_ids=self.poisoned_ids)
+        return verdicts
 
     def _apply(self, attacker_text, temperature):
         poisoned, n_malformed = self.attacker_agent.parse(attacker_text, self.references)
@@ -68,17 +73,21 @@ class AttackerTurn:
         return updates, verdicts, n_malformed
 
     def reward(self, attacker_text) -> float:
+        dbg.scoring_rollout(attacker_text)
         updates, verdicts, n_malformed = self._apply(attacker_text, self.scoring_opp_temp)
         post_acc = self.env.evaluate_updates(updates, verdicts)
-        return attacker_reward(
+        r = attacker_reward(
             self.prev_accuracy, post_acc, self.env.goal, self.poisoned_ids,
             verdicts, n_malformed,
             alpha=self.reward_cfg.get("alpha", 1.0),
             beta=self.reward_cfg.get("beta", 0.5),
             gamma=self.reward_cfg.get("gamma", 1.0),
         )
+        dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed)
+        return r
 
     def commit(self, attacker_text) -> dict:
+        dbg.committing()
         updates, verdicts, n_malformed = self._apply(attacker_text, self.opp_temp)
         new_acc = self.env.commit(updates, verdicts)
         return {
@@ -107,11 +116,14 @@ class DefenderTurn:
         self.poisoned_ids = list(env.poisoned_ids)
 
         # Frozen attacker plays its (greedy) move for this round.
+        dbg.opponent_move(opponent_temperature)
         a_sys = attacker_agent.system_prompt()
         a_user = attacker_agent.build_user_prompt(
             env.round_index + env.training_rounds, env.current_accuracy, self.references
         )
+        dbg.attacker_prompt(a_sys, a_user, who="frozen-opponent")
         a_text = attacker_gen.generate(a_sys, a_user, n=1, temperature=opponent_temperature)[0]
+        dbg.attacker_output(a_text, who="frozen-opponent")
         poisoned, self.n_malformed = attacker_agent.parse(a_text, self.references)
 
         self.updates = env.build_updates(poisoned)
@@ -120,19 +132,24 @@ class DefenderTurn:
 
         self.system = defender_agent.system_prompt()
         self.user = defender_agent.build_user_prompt(self.features)
+        dbg.defender_prompt(self.system, self.user, who="learner")
 
     def messages(self) -> tuple[str, str]:
         return self.system, self.user
 
     def reward(self, defender_text) -> float:
+        dbg.scoring_rollout(defender_text)
         verdicts = self.defender_agent.parse(defender_text, self.client_ids)
-        return defender_reward(
+        r = defender_reward(
             verdicts, self.poisoned_ids,
             mode=self.reward_cfg.get("mode", "soft_f1"),
             fpr_penalty=self.reward_cfg.get("fpr_penalty", 1.0),
         )
+        dbg.rollout_outcome(reward=r, verdicts=verdicts, poisoned_ids=self.poisoned_ids)
+        return r
 
     def commit(self, defender_text) -> dict:
+        dbg.committing()
         verdicts = self.defender_agent.parse(defender_text, self.client_ids)
         new_acc = self.env.commit(self.updates, verdicts)
         return {

@@ -20,6 +20,7 @@ import json
 import logging
 
 from agents.attack_ops import OPERATOR_DOCS, apply_plan, extract_plan, layer_details
+from core.debug import dbg
 
 logger = logging.getLogger(__name__)
 
@@ -118,11 +119,16 @@ class AttackerAgent:
         """
         plan = extract_plan(text)
         if plan is None:
-            return ({cid: {k: v.clone() for k, v in ref.items()}
-                     for cid, ref in references.items()}, len(references))
+            poisoned = {cid: {k: v.clone() for k, v in ref.items()}
+                        for cid, ref in references.items()}
+            dbg.poison(None, references, poisoned, n_malformed=len(references))
+            return poisoned, len(references)
 
         poisoned = {}
+        n_invalid_total = 0
         for cid, ref in references.items():
-            pw, _n_invalid = apply_plan(ref, plan, self.max_abs)
+            pw, n_invalid = apply_plan(ref, plan, self.max_abs)
             poisoned[cid] = pw
+            n_invalid_total += n_invalid
+        dbg.poison(plan, references, poisoned, n_malformed=0, n_invalid_ops=n_invalid_total)
         return poisoned, 0

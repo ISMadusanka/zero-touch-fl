@@ -30,6 +30,7 @@ measured against the real, deterministic opponent.
 import logging
 
 from core.types import RoundLog
+from core.debug import dbg
 from rl.grpo import grpo_step
 from rl.policy import PolicyGenerator
 from rl.rewards import attacker_reward, defender_reward
@@ -160,6 +161,12 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     k = state["knobs"]
     ctx = env.begin_round()
 
+    dbg.round_header(ctx.round_num, learner, opp, phase_index, phase_round,
+                     ctx.poisoned_ids, ctx.global_accuracy, k["G"],
+                     k["scoring_opp_temp"], k["opp_temp"])
+    dbg.fl_round(ctx.round_num, ctx.poisoned_ids, env.honest_updates,
+                 env.current_accuracy, env.benign_retrain)
+
     if learner == "attacker":
         turn = AttackerTurn(
             env, state["attacker_agent"], state["defender_agent"], opp_gen,
@@ -193,7 +200,8 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
 
     _log_round(env, ctx, info, learner, stats, state["metrics_tracker"],
                state["save_round_log"], reward_att=k["reward_att"], reward_def=k["reward_def"],
-               phase_index=phase_index, phase_round=phase_round, success=success)
+               phase_index=phase_index, phase_round=phase_round, success=success,
+               best_index=best)
     return stats, drop, success
 
 
@@ -242,6 +250,8 @@ def _train_best_response(state, first_learner, start_round):
             or (state["league_prob"] > 0 and rng.random() < state["league_prob"])
         )
         opp_gen, restore = _opponent_generator(state, opp, face_snapshot)
+        dbg.phase_event("PHASE START", phase=ctrl.phase_index, learner=learner,
+                        opponent=opp, facing_snapshot=face_snapshot)
 
         reason = None
         while done < state["total_rounds"]:
@@ -263,6 +273,8 @@ def _train_best_response(state, first_learner, start_round):
             f"Phase {ctrl.phase_index} [{learner}] ended ({reason or 'budget'}) "
             f"after {ctrl.phase_round} rounds (streak={ctrl.streak}) — froze {learner}"
         )
+        dbg.phase_event("PHASE END", phase=ctrl.phase_index, learner=learner,
+                        reason=reason or "budget", rounds=ctrl.phase_round, streak=ctrl.streak)
         if reason is None:   # ran out of total budget mid-phase
             break
         ctrl.next_phase(reason)
@@ -308,7 +320,7 @@ def _save_adapters(policy, adapter_paths: dict):
 
 def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                reward_att=None, reward_def=None, phase_index=0, phase_round=0,
-               success=False):
+               success=False, best_index=0):
     verdicts = info["verdicts"]
     post_acc = info["post_accuracy"]
     n_malformed = info["n_malformed"]
@@ -354,6 +366,11 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             },
         },
     ))
+    dbg.commit_summary(
+        learner, best_index, info, ctx.global_accuracy, post_acc,
+        ctx.global_accuracy - post_acc, success, a_rew, d_rew, ctx.poisoned_ids,
+    )
+    dbg.flush()
     logger.info(
         f"Round {ctx.round_num} [learn={learner} ph={phase_index}.{phase_round} "
         f"{'WIN' if success else '...'}]: acc {ctx.global_accuracy:.4f}->{post_acc:.4f} "

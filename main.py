@@ -43,6 +43,7 @@ from storage.checkpoint import (
     save_state, load_state, state_exists, save_progress, load_progress, adapter_exists,
 )
 from core.types import RoundLog, DetectionVerdict
+from core.debug import dbg
 from metrics import MetricsTracker
 from rl.env import FLArmsRaceEnv
 
@@ -50,7 +51,7 @@ from rl.env import FLArmsRaceEnv
 # Logging / config
 # ---------------------------------------------------------------------------
 
-def setup_logging():
+def setup_logging(debug: bool = False):
     os.makedirs("logs/round_data", exist_ok=True)
     file_handler = logging.FileHandler("logs/system.log", mode="a", encoding="utf-8")
     stream_handler = logging.StreamHandler(
@@ -61,8 +62,22 @@ def setup_logging():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         handlers=[file_handler, stream_handler],
     )
+    if debug:
+        # In debug mode the rich per-round picture comes from the structured
+        # ``core.debug`` logger; here we just make sure third-party libraries stay
+        # quiet so the console shows only OUR federated-learning system logs.
+        for noisy in (
+            "transformers", "unsloth", "peft", "bitsandbytes", "accelerate",
+            "torch", "datasets", "huggingface_hub", "filelock", "urllib3",
+            "httpx", "httpcore", "asyncio", "PIL",
+        ):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
 logger = logging.getLogger("main")
+
+# In --debug, if the user doesn't pass --rounds we cap Phase 2 to a short,
+# fully-logged run (each round is identical in logic — this only stops early).
+DEBUG_DEFAULT_ROUNDS = 3
 
 
 def quiet_noisy_warnings():
@@ -234,9 +249,14 @@ def main():
                         help="Run the best-of-N reward-harness sanity baseline (no LLM)")
     parser.add_argument("--rounds", type=int, default=None,
                         help="Override simulation_rounds (handy for quick smoke runs)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Verbose Phase-2 debug run: print every attacker/defender LLM "
+                             "prompt+output, poisoning step, FL update and reward to the console "
+                             "AND to logs/debug.json. Library noise is silenced. If --rounds is "
+                             f"not given, Phase 2 is capped at {DEBUG_DEFAULT_ROUNDS} rounds.")
     args = parser.parse_args()
 
-    setup_logging()
+    setup_logging(debug=args.debug)
     quiet_noisy_warnings()
     logger.info("Starting Zero-Touch Federated Learning System")
 
@@ -286,19 +306,40 @@ def main():
     mode = "baseline" if args.baseline else ("dry-run" if args.dry_run else "train")
     n_rounds = args.rounds if args.rounds is not None else int(fl["simulation_rounds"])
 
-    run_phase2(
-        global_weights=copy.deepcopy(global_weights),
-        client_weights=client_weights,
-        baseline_accuracy=baseline_accuracy,
-        client_loaders=client_loaders,
-        test_loader=test_loader,
-        config=base_config,
-        attacker_config=attacker_config,
-        defender_config=defender_config,
-        mode=mode,
-        n_rounds=n_rounds,
-        llm_backend=llm_backend,
-    )
+    if args.debug:
+        if args.rounds is None:
+            n_rounds = DEBUG_DEFAULT_ROUNDS
+            logger.info(f"[debug] no --rounds given -> capping Phase 2 at {n_rounds} rounds")
+        dbg.enable(
+            output_dir="logs", filename="debug.json", mode=mode,
+            config_summary={
+                "model": base_config.get("rl", {}).get("model"),
+                "n_clients": fl.get("n_clients"),
+                "poison_fraction": fl.get("poison_fraction"),
+                "G": base_config.get("rl", {}).get("G"),
+                "switch_mode": base_config.get("rl", {}).get("switch_mode"),
+                "first_learner": base_config.get("rl", {}).get("first_learner"),
+                "baseline_accuracy": round(float(baseline_accuracy), 4),
+                "n_rounds": n_rounds,
+            },
+        )
+
+    try:
+        run_phase2(
+            global_weights=copy.deepcopy(global_weights),
+            client_weights=client_weights,
+            baseline_accuracy=baseline_accuracy,
+            client_loaders=client_loaders,
+            test_loader=test_loader,
+            config=base_config,
+            attacker_config=attacker_config,
+            defender_config=defender_config,
+            mode=mode,
+            n_rounds=n_rounds,
+            llm_backend=llm_backend,
+        )
+    finally:
+        dbg.close()
 
 
 if __name__ == "__main__":
