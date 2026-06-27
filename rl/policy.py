@@ -247,24 +247,37 @@ class LLMPolicy:
         gradient checkpointing doesn't force use_cache=False, then restore
         train() for the GRPO backward. We deliberately do NOT call for_inference()
         — that re-enables the broken paged-KV inference kernel.
+
+        The whole group is sampled in ONE batched call (``num_return_sequences=n``)
+        instead of an n-iteration Python loop: n independent rollouts share a
+        single prefill + decode loop, which is the dominant per-round cost. The
+        single prompt is expanded internally, so every output row carries the
+        identical prompt prefix and ``[plen:]`` is its completion. Greedy decoding
+        is deterministic — the n rollouts would be identical — so we generate one
+        and replicate (this also sidesteps HF's "num_return_sequences>1 requires
+        sampling" error for the n>1 greedy case).
         """
         torch = self.torch
         was_training = self.model.training
         try:
             self.model.eval()
-            texts = []
-            for _ in range(n):
-                gen_kwargs = dict(
-                    max_new_tokens=max_new_tokens, do_sample=do_sample, use_cache=True,
-                    num_return_sequences=1, pad_token_id=self._tok.pad_token_id,
-                )
-                if do_sample:
-                    gen_kwargs.update(temperature=float(temperature), top_p=0.95)
-                with torch.no_grad():
-                    out = self.model.generate(prompt_ids, **gen_kwargs)
-                texts.append(self._tok.decode(out[0, plen:], skip_special_tokens=True))
-                del out
-                torch.cuda.empty_cache()
+            gen_kwargs = dict(
+                max_new_tokens=max_new_tokens, do_sample=do_sample, use_cache=True,
+                pad_token_id=self._tok.pad_token_id,
+                num_return_sequences=(n if do_sample else 1),
+            )
+            if do_sample:
+                gen_kwargs.update(temperature=float(temperature), top_p=0.95)
+            with torch.no_grad():
+                out = self.model.generate(prompt_ids, **gen_kwargs)
+            texts = [
+                self._tok.decode(out[i, plen:], skip_special_tokens=True)
+                for i in range(out.shape[0])
+            ]
+            if not do_sample:
+                texts = texts * n   # deterministic greedy → replicate the single completion
+            del out
+            torch.cuda.empty_cache()
             return texts
         finally:
             if was_training:
@@ -273,29 +286,54 @@ class LLMPolicy:
     def _manual_generate(self, prompt_ids, plen, n, do_sample, temperature, max_new_tokens):
         """Decode WITHOUT a KV cache (full forward each step). Slower (O(L^2))
         but uses the same forward path as the log-prob pass, so it works even
-        when Unsloth's fused inference kernel is incompatible."""
+        when Unsloth's fused inference kernel is incompatible.
+
+        Batched: all rollouts decode together as an ``(n_gen, L)`` tensor — one
+        forward per step instead of one per (rollout × step). ``_last_logits``
+        already returns the last-position logits for every row, so the sampling
+        math is unchanged, just vectorised over the batch. Per-row EOS is tracked
+        with a ``finished`` mask; once a row finishes it emits ``pad`` so the batch
+        stays rectangular and the trailing pad is stripped on decode. The loop
+        ends when every row has hit EOS. Greedy is deterministic → generate one
+        row and replicate.
+        """
         torch = self.torch
         eos_ids = self._eos_ids()
-        texts = []
-        for _ in range(n):
-            ids = prompt_ids.clone()
-            for _step in range(max_new_tokens):
-                with torch.no_grad():
-                    logits = self._last_logits(ids)
-                if do_sample:
-                    logits = logits / max(float(temperature), 1e-6)
-                    k = min(50, logits.shape[-1])
-                    top = torch.topk(logits, k, dim=-1)
-                    probs = torch.softmax(top.values, dim=-1)
-                    nxt = top.indices.gather(-1, torch.multinomial(probs, 1))
-                else:
-                    nxt = logits.argmax(dim=-1, keepdim=True)
-                ids = torch.cat([ids, nxt], dim=1)
-                if int(nxt.item()) in eos_ids:
+        eos_tensor = (
+            torch.tensor(sorted(eos_ids), device=self.device) if eos_ids else None
+        )
+        pad_id = self._tok.pad_token_id
+        n_gen = n if do_sample else 1   # greedy is deterministic → 1 then replicate
+
+        ids = prompt_ids.repeat(n_gen, 1)                          # (n_gen, plen)
+        finished = torch.zeros(n_gen, dtype=torch.bool, device=self.device)
+        for _step in range(max_new_tokens):
+            with torch.no_grad():
+                logits = self._last_logits(ids)                    # (n_gen, vocab)
+            if do_sample:
+                logits = logits / max(float(temperature), 1e-6)
+                k = min(50, logits.shape[-1])
+                top = torch.topk(logits, k, dim=-1)
+                probs = torch.softmax(top.values, dim=-1)
+                nxt = top.indices.gather(-1, torch.multinomial(probs, 1))  # (n_gen, 1)
+            else:
+                nxt = logits.argmax(dim=-1, keepdim=True)           # (n_gen, 1)
+            if eos_tensor is not None:
+                # Rows already done keep emitting pad → rectangular + stripped on decode.
+                nxt = nxt.masked_fill(finished.unsqueeze(1), pad_id)
+            ids = torch.cat([ids, nxt], dim=1)
+            if eos_tensor is not None:
+                finished = finished | torch.isin(nxt.squeeze(1), eos_tensor)
+                if bool(finished.all()):
                     break
-            texts.append(self._tok.decode(ids[0, plen:], skip_special_tokens=True))
-            del ids
-            torch.cuda.empty_cache()
+        texts = [
+            self._tok.decode(ids[i, plen:], skip_special_tokens=True)
+            for i in range(n_gen)
+        ]
+        if not do_sample:
+            texts = texts * n   # deterministic greedy → replicate the single completion
+        del ids
+        torch.cuda.empty_cache()
         return texts
 
     def _completion_token_logprobs(self, system, user, completion, with_grad):
