@@ -247,25 +247,34 @@ class LLMPolicy:
         gradient checkpointing doesn't force use_cache=False, then restore
         train() for the GRPO backward. We deliberately do NOT call for_inference()
         — that re-enables the broken paged-KV inference kernel.
+
+        The ``n`` rollouts are produced in ONE batched ``generate`` call
+        (``num_return_sequences=n``) instead of a Python loop, so they decode in
+        parallel — identical per-sample distribution, far fewer kernel launches.
+        Greedy decoding (temperature 0) is deterministic, so we decode once and
+        replicate, which matches the old loop's n identical outputs exactly.
         """
         torch = self.torch
         was_training = self.model.training
         try:
             self.model.eval()
-            texts = []
-            for _ in range(n):
-                gen_kwargs = dict(
-                    max_new_tokens=max_new_tokens, do_sample=do_sample, use_cache=True,
-                    num_return_sequences=1, pad_token_id=self._tok.pad_token_id,
-                )
-                if do_sample:
-                    gen_kwargs.update(temperature=float(temperature), top_p=0.95)
+            gen_kwargs = dict(
+                max_new_tokens=max_new_tokens, do_sample=do_sample, use_cache=True,
+                pad_token_id=self._tok.pad_token_id,
+            )
+            if do_sample:
+                gen_kwargs.update(temperature=float(temperature), top_p=0.95,
+                                  num_return_sequences=n)
                 with torch.no_grad():
                     out = self.model.generate(prompt_ids, **gen_kwargs)
-                texts.append(self._tok.decode(out[0, plen:], skip_special_tokens=True))
-                del out
-                torch.cuda.empty_cache()
-            return texts
+                return [self._tok.decode(out[i, plen:], skip_special_tokens=True)
+                        for i in range(out.shape[0])]
+            # Greedy is deterministic: one decode, replicated to n (== old loop).
+            gen_kwargs["num_return_sequences"] = 1
+            with torch.no_grad():
+                out = self.model.generate(prompt_ids, **gen_kwargs)
+            text = self._tok.decode(out[0, plen:], skip_special_tokens=True)
+            return [text] * n
         finally:
             if was_training:
                 self.model.train()   # restore training mode for the GRPO backward

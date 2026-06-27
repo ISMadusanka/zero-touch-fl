@@ -45,13 +45,16 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
 
 - **Training happens on a GPU machine — not through Ollama.** Ollama and the
   OpenAI API are **inference-only** and cannot fine-tune.
-- The policy is **one frozen `Llama-3.2-3B-Instruct` base loaded in 4-bit (QLoRA)
-  via Unsloth**, with **two LoRA adapters** over it — `attacker` and `defender`.
-  This is exactly "separate checkpoints on the same LLM": the base is never
-  duplicated; each policy is its own small adapter, saved independently to
+- The policy is **one frozen `Llama-3.2-3B-Instruct` base loaded via Unsloth in
+  16-bit (bf16) LoRA by default** (`rl.load_in_4bit: false` — the bf16 base is
+  ~6.4GB and is higher-fidelity than 4-bit NF4; set `true` to fall back to 4-bit
+  QLoRA on small-VRAM GPUs), with **two LoRA adapters** over it — `attacker` and
+  `defender`. This is exactly "separate checkpoints on the same LLM": the base is
+  never duplicated; each policy is its own small adapter, saved independently to
   `checkpoints/attacker_adapter/` and `checkpoints/defender_adapter/`.
-  (Loaded with `attn_implementation="eager"` by default — see `rl.attn_implementation`;
-  Llama 3.2 also supports `"sdpa"`.)
+  (Loaded with `attn_implementation="sdpa"` by default — see `rl.attn_implementation`;
+  `"eager"` is the most compatible fallback, `"flash_attention_2"` the fastest if
+  its sm_120 wheel is installed.)
 - GRPO is implemented directly in [`rl/grpo.py`](rl/grpo.py) (environment-coupled
   reward, KL penalty to the frozen base) on top of Unsloth + PEFT — no TRL
   trainer dependency required.

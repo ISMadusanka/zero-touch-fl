@@ -1,5 +1,9 @@
 # --- Core FL + tooling (CPU is fine for --dry-run / --baseline) ---
-torch>=2.0
+# torch>=2.7 is the floor for NVIDIA Blackwell / RTX 50-series (sm_120) GPUs.
+# On those cards install the CUDA 12.8 build, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# (cu121/cu124 wheels have no sm_120 kernels and fail on an RTX 5090.)
+torch>=2.7
 torchvision
 numpy
 pyyaml
