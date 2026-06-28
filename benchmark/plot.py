@@ -22,6 +22,7 @@ _COLORS = {
     "oracle": "#2E7D32",        # green — upper bound
     "llm_defender": "#6C63FF",  # purple
     "fltrust": "#F7971E",       # orange
+    "defl": "#D7263D",          # red
 }
 
 
@@ -46,7 +47,7 @@ def plot_history(history: dict, baseline_accuracy: float, out_path: str, window:
         return None
     import os
 
-    names = [n for n in ["fedavg", "oracle", "llm_defender", "fltrust"] if n in history]
+    names = [n for n in ["fedavg", "oracle", "llm_defender", "fltrust", "defl"] if n in history]
     names += [n for n in history if n not in names]
     fig, ax = plt.subplots(2, 2, figsize=(15, 9))
 

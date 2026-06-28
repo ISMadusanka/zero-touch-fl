@@ -21,10 +21,11 @@ python -m benchmark.run_benchmark --rounds 10 --seed 1
 python -m benchmark.run_benchmark --rounds 10 --seed 2
 python -m benchmark.run_benchmark --rounds 10 --seed 3
 
-# choose defenses / tune FLTrust / save outputs:
+# choose defenses / tune FLTrust + DeFL / save outputs:
 python -m benchmark.run_benchmark --rounds 200 \
-    --defenses fedavg,oracle,fltrust,llm_defender \
-    --attack-temperature 0.7 --root-size 100 --eta 1.0 --out logs/benchmark
+    --defenses fedavg,oracle,fltrust,llm_defender,defl \
+    --attack-temperature 0.7 --root-size 100 --eta 1.0 \
+    --defl-delta 0.05 --defl-tau 2.5 --out logs/benchmark
 ```
 
 Output: a console table + `logs/benchmark/benchmark.{json,csv}` + per-round
@@ -45,6 +46,7 @@ fedavg        0.0%     0.0%   0.00  0.00  0.71       0.70      +0.10     100.0%
 oracle        100.0%   0.0%   1.00  1.00  0.80       0.80      +0.00     0.0%
 llm_defender  ...      ...    ...   ...   ...        ...       ...       ...
 fltrust       ...      ...    ...   ...   ...        ...       ...       ...
+defl          ...      ...    ...   ...   ...        ...       ...       ...
 ```
 
 ## The defenses
@@ -55,6 +57,7 @@ fltrust       ...      ...    ...   ...   ...        ...       ...       ...
 | `oracle` | Cheats by flagging exactly the ground-truth poisoned clients. **Upper bound** on detection + robustness. |
 | `llm_defender` | Your **trained defender adapter** — the model under test. |
 | `fltrust` | **FLTrust** (Cao et al., NDSS 2021): trust-bootstrapped robust aggregation using a small clean root dataset. |
+| `defl` | **DeFL** (Yan et al., AAAI 2023): CLP-aware defense. Inspects the DNN layer-by-layer via a Federated Gradient Norm Vector (FGNV) to (a) detect the *critical learning period*, (b) flag malicious clients by per-layer outlier voting (MOUD-Vote), then hard-remove them during the CLP and soft-down-weight them after via a per-client Bayesian (Beta) trust. **Needs no clean root set and no LLM.** |
 
 ## The metrics
 
@@ -85,6 +88,11 @@ read them with care:
   are identical only at round 1, so per-round detection is strictly
   apples-to-apples only early on; the 200-round aggregate `detect%`/`F1` blends
   "detector quality" with "how far each model drifted."
+- `defl` reports its **MOUD-Vote** decision as the flag (matching the paper's
+  Table 2 detector). Note its **aggregation** decouples from that flag *after* the
+  CLP: a flagged-malicious client is then only soft-down-weighted (Beta trust), not
+  removed, so it can still be `detected` (counts toward TPR) yet leak a little into
+  the model. As with FLTrust, read DeFL's `acc_drop` as the primary signal.
 
 **Therefore: treat `acc_drop` / `final_acc` (robustness) as the primary,
 cross-paradigm comparison** — it's well-defined for every defense regardless of
@@ -124,6 +132,17 @@ also give a softer view than the binary flag.
 (global learning rate, default 1.0). The root set is carved once from the clean
 MNIST train set with a fixed seed.
 
+## DeFL knobs
+
+`--defl-delta` (CLP relative-rise threshold δ, paper default **0.05** — larger ⇒
+fewer early rounds declared critical ⇒ fewer hard removals) · `--defl-tau` (MOUD
+per-layer outlier z-threshold, default **2.5** — lower ⇒ more aggressive flagging,
+higher TPR but higher FPR). DeFL takes **no** root set: it derives everything from
+the per-layer FGNV of the submitted updates. A "layer" = one module (its weight +
+bias grouped), so MnistNet has L = 2 layers. With the project default of 1-of-5
+poisoned, MOUD's adaptive vote isolates the single outlier; the Beta trust then
+keeps the run robust to the occasional false positive.
+
 ## Adding another defense (later)
 
 1. Create `benchmark/defenses/<name>.py` with a `class <Name>(Defense)` that
@@ -142,3 +161,7 @@ does (a client is "rejected" when it's excluded / trimmed from the aggregate).
   `python tests/test_benchmark.py`.
 - `tests/test_fltrust.py` — the FLTrust trust/aggregation math (needs torch; run
   on the GPU box): `python tests/test_fltrust.py`.
+- `tests/test_defl_logic.py` — DeFL's layer grouping, CLP rule, MOUD-Vote and Beta
+  model. Torch-free, runs anywhere: `python tests/test_defl_logic.py`.
+- `tests/test_defl.py` — DeFL's FGNV norms + end-to-end step (CLP hard-removal vs
+  post-CLP soft-weighting; needs torch; run on the GPU box): `python tests/test_defl.py`.

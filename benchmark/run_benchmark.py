@@ -30,7 +30,7 @@ def _parse_args():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rounds", type=int, default=200, help="number of attack rounds")
     ap.add_argument("--config", default="configs/base.yaml")
-    ap.add_argument("--defenses", default="fedavg,oracle,llm_defender,fltrust",
+    ap.add_argument("--defenses", default="fedavg,oracle,llm_defender,fltrust,defl",
                     help="comma-separated; 'fedavg' is always included (attacker reference)")
     ap.add_argument("--attacker-adapter", default=None, help="override attacker checkpoint dir")
     ap.add_argument("--defender-adapter", default=None, help="override defender checkpoint dir")
@@ -42,6 +42,10 @@ def _parse_args():
     ap.add_argument("--root-epochs", type=int, default=1, help="FLTrust server local epochs (R_l)")
     ap.add_argument("--root-lr", type=float, default=None, help="FLTrust server lr (default: fl.lr)")
     ap.add_argument("--eta", type=float, default=1.0, help="FLTrust global learning rate")
+    ap.add_argument("--defl-delta", type=float, default=0.05,
+                    help="DeFL CLP relative-rise threshold (paper delta)")
+    ap.add_argument("--defl-tau", type=float, default=2.5,
+                    help="DeFL MOUD per-layer outlier z-threshold")
     ap.add_argument("--device", default=None, help="override fl.device")
     ap.add_argument("--seed", type=int, default=None, help="override fl.poison_seed")
     ap.add_argument("--out", default="logs/benchmark", help="output dir for json/csv/png (or '' to skip)")
@@ -172,6 +176,7 @@ def main():
         root_epochs=args.root_epochs, eta=args.eta,
         defender_temperature=args.defender_temperature,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)),
+        defl_delta=args.defl_delta, defl_tau=args.defl_tau,
     )
 
     log.info(f"Benchmark: {args.rounds} rounds | defenses={list(defenses)} | "
