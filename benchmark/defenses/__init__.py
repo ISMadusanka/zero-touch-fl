@@ -4,7 +4,7 @@ Defense classes import torch / FL components, so they are imported LAZILY inside
 ``build_defenses`` — importing this package stays cheap and torch-free.
 """
 
-AVAILABLE = ["fedavg", "oracle", "llm_defender", "fltrust", "defl"]
+AVAILABLE = ["fedavg", "oracle", "llm_defender", "fltrust", "defl", "dnc"]
 
 
 def build_defenses(
@@ -21,6 +21,11 @@ def build_defenses(
     max_new_tokens: int = 512,
     defl_delta: float = 0.05,
     defl_tau: float = 2.5,
+    dnc_num_byzantine: int = 1,
+    dnc_c: float = 1.0,
+    dnc_niters: int = 1,
+    dnc_sub_dim: int = 10000,
+    dnc_seed: int = 0,
 ):
     """Instantiate the requested defenses, preserving order. Returns an ordered
     dict {name: Defense}. Raises on an unknown name or missing dependency."""
@@ -29,6 +34,7 @@ def build_defenses(
     from benchmark.defenses.llm_defender import LLMDefender
     from benchmark.defenses.fltrust import FLTrust
     from benchmark.defenses.defl import DeFL
+    from benchmark.defenses.dnc import DnC
 
     out: dict = {}
     for name in names:
@@ -48,6 +54,9 @@ def build_defenses(
                                 device=device, eta=eta)
         elif name == "defl":
             out[name] = DeFL(device=device, delta=defl_delta, tau=defl_tau)
+        elif name == "dnc":
+            out[name] = DnC(device=device, num_byzantine=dnc_num_byzantine, c=dnc_c,
+                            niters=dnc_niters, sub_dim=dnc_sub_dim, seed=dnc_seed)
         else:
             raise ValueError(f"unknown defense '{name}' (available: {AVAILABLE})")
     return out

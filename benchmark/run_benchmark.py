@@ -30,7 +30,7 @@ def _parse_args():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rounds", type=int, default=200, help="number of attack rounds")
     ap.add_argument("--config", default="configs/base.yaml")
-    ap.add_argument("--defenses", default="fedavg,oracle,llm_defender,fltrust,defl",
+    ap.add_argument("--defenses", default="fedavg,oracle,llm_defender,fltrust,defl,dnc",
                     help="comma-separated; 'fedavg' is always included (attacker reference)")
     ap.add_argument("--attacker-adapter", default=None, help="override attacker checkpoint dir")
     ap.add_argument("--defender-adapter", default=None, help="override defender checkpoint dir")
@@ -46,6 +46,12 @@ def _parse_args():
                     help="DeFL CLP relative-rise threshold (paper delta)")
     ap.add_argument("--defl-tau", type=float, default=2.5,
                     help="DeFL MOUD per-layer outlier z-threshold")
+    ap.add_argument("--dnc-num-byzantine", type=int, default=None,
+                    help="DnC assumed #malicious m (default: configured poison count)")
+    ap.add_argument("--dnc-c", type=float, default=1.0, help="DnC filtering fraction c")
+    ap.add_argument("--dnc-niters", type=int, default=1, help="DnC subsampling iterations")
+    ap.add_argument("--dnc-sub-dim", type=int, default=10000,
+                    help="DnC subsample dimension b (clamped to the model's dim)")
     ap.add_argument("--device", default=None, help="override fl.device")
     ap.add_argument("--seed", type=int, default=None, help="override fl.poison_seed")
     ap.add_argument("--out", default="logs/benchmark", help="output dir for json/csv/png (or '' to skip)")
@@ -170,6 +176,15 @@ def main():
     if "fltrust" in names:
         root_loader = _build_root_loader(data_cfg, args.root_size, fl["batch_size"], seed)
 
+    # DnC assumes a known upper bound on #malicious; default it to the configured
+    # poison count (mirrors env._num_poisoned: round(frac*N) clamped to a benign majority).
+    if args.dnc_num_byzantine is not None:
+        dnc_m = args.dnc_num_byzantine
+    else:
+        n_cl = int(fl["n_clients"])
+        dnc_m = max(1, min(round(float(fl.get("poison_fraction", 0.2)) * n_cl),
+                           (n_cl - 1) // 2))
+
     defenses = build_defenses(
         names, device=device, policy=policy, defender_agent=defender_agent,
         root_loader=root_loader, root_lr=args.root_lr or float(fl["lr"]),
@@ -177,6 +192,8 @@ def main():
         defender_temperature=args.defender_temperature,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)),
         defl_delta=args.defl_delta, defl_tau=args.defl_tau,
+        dnc_num_byzantine=dnc_m, dnc_c=args.dnc_c, dnc_niters=args.dnc_niters,
+        dnc_sub_dim=args.dnc_sub_dim, dnc_seed=seed,
     )
 
     log.info(f"Benchmark: {args.rounds} rounds | defenses={list(defenses)} | "
