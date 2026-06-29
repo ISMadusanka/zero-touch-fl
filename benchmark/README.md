@@ -21,12 +21,12 @@ python -m benchmark.run_benchmark --rounds 10 --seed 1
 python -m benchmark.run_benchmark --rounds 10 --seed 2
 python -m benchmark.run_benchmark --rounds 10 --seed 3
 
-# choose defenses / tune FLTrust + DeFL + DnC / save outputs:
+# choose defenses / tune FLTrust + DeFL + DnC + Multi-Krum / save outputs:
 python -m benchmark.run_benchmark --rounds 200 \
-    --defenses fedavg,oracle,fltrust,llm_defender,defl,dnc \
+    --defenses fedavg,oracle,fltrust,llm_defender,defl,dnc,multikrum \
     --attack-temperature 0.7 --root-size 100 --eta 1.0 \
     --defl-delta 0.05 --defl-tau 2.5 --dnc-c 1.0 --dnc-sub-dim 10000 \
-    --out logs/benchmark
+    --multikrum-m 4 --out logs/benchmark
 ```
 
 Output: a console table + `logs/benchmark/benchmark.{json,csv}` + per-round
@@ -49,6 +49,7 @@ llm_defender  ...      ...    ...   ...   ...        ...       ...       ...
 fltrust       ...      ...    ...   ...   ...        ...       ...       ...
 defl          ...      ...    ...   ...   ...        ...       ...       ...
 dnc           ...      ...    ...   ...   ...        ...       ...       ...
+multikrum     ...      ...    ...   ...   ...        ...       ...       ...
 ```
 
 ## The defenses
@@ -61,6 +62,7 @@ dnc           ...      ...    ...   ...   ...        ...       ...       ...
 | `fltrust` | **FLTrust** (Cao et al., NDSS 2021): trust-bootstrapped robust aggregation using a small clean root dataset. |
 | `defl` | **DeFL** (Yan et al., AAAI 2023): CLP-aware defense. Inspects the DNN layer-by-layer via a Federated Gradient Norm Vector (FGNV) to (a) detect the *critical learning period*, (b) flag malicious clients by per-layer outlier voting (MOUD-Vote), then hard-remove them during the CLP and soft-down-weight them after via a per-client Bayesian (Beta) trust. **Needs no clean root set and no LLM.** |
 | `dnc` | **DnC** (Shejwalkar & Houmansadr, NDSS 2021): Divide-and-Conquer spectral aggregator. Subsamples dimensions, centers the updates, projects them onto their top singular vector, and filters out the `c·m` clients that project furthest (the spectral outliers), then averages the rest. **Needs no clean root set and no LLM** (assumes a known #malicious `m`). |
+| `multikrum` | **Multi-Krum** (Blanchard et al., NeurIPS 2017): distance-based robust aggregator. Scores each client by the sum of squared distances to its `n−f−2` closest peers, keeps the `m` lowest-scoring (most-central) updates and averages them; drops the rest. **Needs no clean root set and no LLM** (assumes a known #Byzantine `f`). Krum = `m=1`. |
 
 ## The metrics
 
@@ -101,6 +103,10 @@ read them with care:
   `c·m` highest spectral-outlier scores). By construction it removes a *fixed*
   `c·m` clients per round, so its TPR/FPR are pinned to that budget — read
   `acc_drop` as the primary signal here too.
+- `multikrum` is likewise an aggregator with a derived flag (`is_suspicious` = not
+  among the `m` selected). It drops a *fixed* `n−m` clients per round (default
+  `m=n−f` → drops `f`), so its TPR/FPR are pinned to that budget — read `acc_drop`
+  as the primary signal.
 
 **Therefore: treat `acc_drop` / `final_acc` (robustness) as the primary,
 cross-paradigm comparison** — it's well-defined for every defense regardless of
@@ -164,6 +170,17 @@ subsampling occurs). DnC centers by the client-mean, which cancels the global
 reference, so it runs on the absolute weights directly and its aggregate is FedAvg
 over the surviving clients.
 
+## Multi-Krum knobs
+
+`--multikrum-f` (assumed #Byzantine `f`; default = the configured poison count, same
+assumed-budget hyperparameter as DnC — **not** ground truth) · `--multikrum-m`
+(#updates selected and averaged; default `n−f`, i.e. drop the `f` worst — set `1` for
+plain Krum, or `n−f−2` for the paper's strong-resilience bound). The score always
+sums each client's `n−f−2` closest squared distances (paper Eq. 5); for `n=5, f=1`
+that is the 2 closest. Pairwise distances are global-invariant, so Multi-Krum runs on
+absolute weights directly and its aggregate is FedAvg over the selected clients. Note
+the paper assumes `n ≥ 2f+3` for its guarantee (with `n=5` that caps `f` at 1).
+
 ## Adding another defense (later)
 
 1. Create `benchmark/defenses/<name>.py` with a `class <Name>(Defense)` that
@@ -190,3 +207,7 @@ does (a client is "rejected" when it's excluded / trimmed from the aggregate).
   fallback / subsampling. Torch-free: `python tests/test_dnc_logic.py`.
 - `tests/test_dnc.py` — DnC's spectral scoring + end-to-end step (needs torch; run
   on the GPU box): `python tests/test_dnc.py`.
+- `tests/test_multikrum_logic.py` — Multi-Krum's neighbour/selection counts, score
+  formula and lowest-m selection. Torch-free: `python tests/test_multikrum_logic.py`.
+- `tests/test_multikrum.py` — Multi-Krum's pairwise distances + end-to-end step
+  (needs torch; run on the GPU box): `python tests/test_multikrum.py`.

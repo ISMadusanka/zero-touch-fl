@@ -4,7 +4,7 @@ Defense classes import torch / FL components, so they are imported LAZILY inside
 ``build_defenses`` — importing this package stays cheap and torch-free.
 """
 
-AVAILABLE = ["fedavg", "oracle", "llm_defender", "fltrust", "defl", "dnc"]
+AVAILABLE = ["fedavg", "oracle", "llm_defender", "fltrust", "defl", "dnc", "multikrum"]
 
 
 def build_defenses(
@@ -26,6 +26,8 @@ def build_defenses(
     dnc_niters: int = 1,
     dnc_sub_dim: int = 10000,
     dnc_seed: int = 0,
+    multikrum_num_byzantine: int = 1,
+    multikrum_m=None,
 ):
     """Instantiate the requested defenses, preserving order. Returns an ordered
     dict {name: Defense}. Raises on an unknown name or missing dependency."""
@@ -35,6 +37,7 @@ def build_defenses(
     from benchmark.defenses.fltrust import FLTrust
     from benchmark.defenses.defl import DeFL
     from benchmark.defenses.dnc import DnC
+    from benchmark.defenses.multikrum import MultiKrum
 
     out: dict = {}
     for name in names:
@@ -57,6 +60,9 @@ def build_defenses(
         elif name == "dnc":
             out[name] = DnC(device=device, num_byzantine=dnc_num_byzantine, c=dnc_c,
                             niters=dnc_niters, sub_dim=dnc_sub_dim, seed=dnc_seed)
+        elif name == "multikrum":
+            out[name] = MultiKrum(device=device, num_byzantine=multikrum_num_byzantine,
+                                  m=multikrum_m)
         else:
             raise ValueError(f"unknown defense '{name}' (available: {AVAILABLE})")
     return out
