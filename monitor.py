@@ -244,10 +244,108 @@ def plot(rows, out: str, window: int):
     print(f"[saved] {out}")
 
 
+# State codes for the per-client poison/detection map.
+_TN, _TP, _FN, _FP = 0, 1, 2, 3
+
+
+def _client_state_matrix(log_dir: str):
+    """Per-(client, round) confusion state for the 'who was poisoned vs who got
+    flagged' map. Returns (rounds, clients, M) where M[i, j] is one of
+    _TN/_TP/_FN/_FP for client i in round j, or NaN if that client didn't take
+    part that round (so the cell renders blank rather than as a false 'clean').
+
+      truly poisoned?   flagged by defender?   ->  state
+      yes               yes                        TP  (caught)
+      yes               no                         FN  (MISSED — evaded detection)
+      no                yes                        FP  (false alarm on a benign client)
+      no                no                         TN  (clean, correctly left alone)
+    """
+    files = sorted(Path(log_dir).glob("round_*.json"),
+                   key=lambda p: int(re.search(r"(\d+)", p.stem).group(1)))
+    raw = []
+    clients: set = set()
+    for f in files:
+        with open(f) as fh:
+            r = json.load(fh)
+        raw.append(r)
+        clients.update(r.get("poisoned_client_ids", []))
+        clients.update(v["client_id"] for v in r.get("predicted_labels", []))
+    clients = sorted(clients)
+    cidx = {c: i for i, c in enumerate(clients)}
+    rounds = [r["round_num"] for r in raw]
+    M = np.full((len(clients), len(raw)), np.nan)
+    for j, r in enumerate(raw):
+        poisoned = set(r.get("poisoned_client_ids", []))
+        labels = r.get("predicted_labels", [])
+        flagged = {v["client_id"] for v in labels if v["is_suspicious"]}
+        present = poisoned | {v["client_id"] for v in labels}
+        for c in present:
+            is_p, is_f = c in poisoned, c in flagged
+            M[cidx[c], j] = (_TP if is_p and is_f else
+                             _FN if is_p else
+                             _FP if is_f else _TN)
+    return rounds, clients, M
+
+
+def plot_clients(log_dir: str, out: str):
+    """Save a per-client × per-round map answering, at a glance, which clients
+    were actually poisoned and which the defender flagged each round — colour-
+    coded by whether the defender's call was right (green=caught, red=missed,
+    amber=false alarm, grey=clean & correctly ignored)."""
+    rounds, clients, M = _client_state_matrix(log_dir)
+    if not clients:
+        print("[skip] no per-client data for poison-vs-detection map")
+        return
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    import matplotlib.patches as mpatches
+
+    palette = {_TN: "#E6E6EE", _TP: "#2E9E5B", _FN: "#E23E57", _FP: "#F4A93C"}
+    cmap = ListedColormap([palette[_TN], palette[_TP], palette[_FN], palette[_FP]])
+    cmap.set_bad("white")  # client absent that round
+    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
+
+    h = max(2.4, 0.55 * len(clients) + 1.6)
+    w = max(8.0, min(24.0, 0.16 * len(rounds) + 4.0))
+    fig, ax = plt.subplots(figsize=(w, h))
+    ax.imshow(np.ma.masked_invalid(M), aspect="auto", cmap=cmap, norm=norm,
+              interpolation="nearest")
+
+    ax.set_yticks(range(len(clients)))
+    ax.set_yticklabels([f"client {c}" for c in clients])
+    n = len(rounds)
+    step = max(1, n // 30)
+    xt = list(range(0, n, step))
+    ax.set_xticks(xt)
+    ax.set_xticklabels([rounds[i] for i in xt])
+    ax.set_xlabel("round")
+    ax.set_title("Poisoned (ground truth) vs flagged (defender) — per client, per round")
+
+    # thin separators between client rows; vertical lines omitted to avoid
+    # clutter when there are many rounds.
+    for y in np.arange(0.5, len(clients) - 0.5):
+        ax.axhline(y, color="white", lw=1.0)
+
+    handles = [
+        mpatches.Patch(color=palette[_TP], label="poisoned → caught (TP)"),
+        mpatches.Patch(color=palette[_FN], label="poisoned → MISSED (FN)"),
+        mpatches.Patch(color=palette[_FP], label="clean → false alarm (FP)"),
+        mpatches.Patch(color=palette[_TN], label="clean → ok (TN)"),
+    ]
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.22),
+              ncol=4, frameon=False, fontsize=9)
+
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[saved] {out}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="RL learning/collapse monitor")
     ap.add_argument("--log-dir", default="logs/round_data")
     ap.add_argument("--out", default="logs/monitor/health.png")
+    ap.add_argument("--clients-out", default="logs/monitor/poison_vs_detection.png",
+                    help="per-client poisoned-vs-flagged map")
     ap.add_argument("--window", type=int, default=20, help="rolling/recent window")
     args = ap.parse_args()
 
@@ -257,6 +355,7 @@ def main():
         return
     analyze(rows, args.window)
     plot(rows, args.out, args.window)
+    plot_clients(args.log_dir, args.clients_out)
 
 
 if __name__ == "__main__":
