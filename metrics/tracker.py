@@ -1,9 +1,16 @@
-"""Stateful tracker that accumulates per-round metrics into an aggregate."""
+"""Stateful tracker that accumulates per-round research metrics.
+
+Now that a *random subset* of clients is poisoned each round, the ground-truth
+malicious set is passed to ``update()`` per round (no longer a fixed set in the
+constructor). The old ``get_windowed_metrics`` helper — which only existed to
+feed the deleted adapt-when-caught/bypassed loop — has been removed. These
+metrics are for researcher evaluation; the RL reward is computed separately in
+``rl/rewards.py``.
+"""
 
 import json
 import logging
 import os
-from typing import Iterable
 
 from core.types import DetectionVerdict
 from metrics.compute import compute_round_metrics, _safe_div
@@ -13,27 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 class MetricsTracker:
-    """Accumulates round-level metrics and exposes aggregate statistics.
+    """Accumulates round-level metrics and exposes aggregate statistics."""
 
-    Typical usage:
-        tracker = MetricsTracker(
-            malicious_ids={0},
-            baseline_accuracy=0.95,
-            output_dir="logs/metrics",
-        )
-        for round_num in ...:
-            ...
-            tracker.update(round_num, verdicts, current_accuracy)
-        tracker.save_summary()
-    """
-
-    def __init__(
-        self,
-        malicious_ids: Iterable[int],
-        baseline_accuracy: float,
-        output_dir: str = "logs/metrics",
-    ):
-        self.malicious_ids: set[int] = set(malicious_ids)
+    def __init__(self, baseline_accuracy: float, output_dir: str = "logs/metrics"):
         self.baseline_accuracy: float = float(baseline_accuracy)
         self.output_dir: str = output_dir
         self.rounds: list[RoundMetrics] = []
@@ -41,26 +30,25 @@ class MetricsTracker:
         os.makedirs(self.output_dir, exist_ok=True)
         logger.info(
             "MetricsTracker initialized — "
-            f"malicious_ids={sorted(self.malicious_ids)}, "
-            f"baseline_accuracy={self.baseline_accuracy:.4f}, "
-            f"output_dir={self.output_dir}"
+            f"baseline_accuracy={self.baseline_accuracy:.4f}, output_dir={self.output_dir}"
         )
 
     # ------------------------------------------------------------------
-    # Recording rounds
-    # ------------------------------------------------------------------
-
     def update(
         self,
         round_num: int,
         verdicts: list[DetectionVerdict],
         current_accuracy: float,
+        malicious_ids: set[int],
     ) -> RoundMetrics:
-        """Compute and store metrics for a single round. Returns them."""
+        """Compute and store metrics for a single round. Returns them.
+
+        ``malicious_ids`` is this round's ground-truth poisoned set.
+        """
         metrics = compute_round_metrics(
             round_num=round_num,
             verdicts=verdicts,
-            malicious_ids=self.malicious_ids,
+            malicious_ids=set(malicious_ids),
             current_accuracy=current_accuracy,
             baseline_accuracy=self.baseline_accuracy,
         )
@@ -70,22 +58,16 @@ class MetricsTracker:
         return metrics
 
     # ------------------------------------------------------------------
-    # Aggregation
-    # ------------------------------------------------------------------
-
     def aggregate(self) -> AggregateMetrics:
         """Build the cumulative summary across all recorded rounds."""
         total_rounds = len(self.rounds)
         if total_rounds == 0:
             logger.warning("MetricsTracker.aggregate() called with no rounds recorded")
             return AggregateMetrics(
-                total_rounds=0,
-                tp=0, fn=0, fp=0, tn=0,
-                attack_success_rate=0.0,
-                tpr=0.0, fpr=0.0, recall=0.0,
+                total_rounds=0, tp=0, fn=0, fp=0, tn=0,
+                attack_success_rate=0.0, tpr=0.0, fpr=0.0, recall=0.0,
                 accuracy_preservation_rate=0.0,
-                baseline_accuracy=self.baseline_accuracy,
-                final_accuracy=0.0,
+                baseline_accuracy=self.baseline_accuracy, final_accuracy=0.0,
             )
 
         tp = sum(r.tp for r in self.rounds)
@@ -95,62 +77,19 @@ class MetricsTracker:
         n_attack_successes = sum(1 for r in self.rounds if r.attack_success)
         final_accuracy = self.rounds[-1].current_accuracy
 
-        tpr = _safe_div(tp, tp + fn)
-        fpr = _safe_div(fp, fp + tn)
-        apr = _safe_div(final_accuracy, self.baseline_accuracy)
-        asr = _safe_div(n_attack_successes, total_rounds)
-
         return AggregateMetrics(
             total_rounds=total_rounds,
             tp=tp, fn=fn, fp=fp, tn=tn,
-            attack_success_rate=asr,
-            tpr=tpr, fpr=fpr, recall=tpr,
-            accuracy_preservation_rate=apr,
+            attack_success_rate=_safe_div(n_attack_successes, total_rounds),
+            tpr=_safe_div(tp, tp + fn),
+            fpr=_safe_div(fp, fp + tn),
+            recall=_safe_div(tp, tp + fn),
+            accuracy_preservation_rate=_safe_div(final_accuracy, self.baseline_accuracy),
             baseline_accuracy=self.baseline_accuracy,
             final_accuracy=final_accuracy,
         )
 
     # ------------------------------------------------------------------
-    # Windowed metrics for agent feedback
-    # ------------------------------------------------------------------
-
-    def get_windowed_metrics(self, window: int = 5) -> dict:
-        """Compute ASR, TPR, FPR, APR over the last `window` rounds.
-
-        Returns a dict suitable for injecting into agent contexts.
-        With a single attacker per round, per-round TPR is binary (0 or 1),
-        so a trailing window gives the LLM a meaningful trajectory.
-        """
-        recent = self.rounds[-window:] if self.rounds else []
-        if not recent:
-            return {
-                "attack_success_rate": 0.0,
-                "tpr": 0.0,
-                "fpr": 0.0,
-                "accuracy_preservation_rate": 0.0,
-                "window_size": 0,
-            }
-
-        tp = sum(r.tp for r in recent)
-        fn = sum(r.fn for r in recent)
-        fp = sum(r.fp for r in recent)
-        tn = sum(r.tn for r in recent)
-        n_successes = sum(1 for r in recent if r.attack_success)
-
-        return {
-            "attack_success_rate": _safe_div(n_successes, len(recent)),
-            "tpr": _safe_div(tp, tp + fn),
-            "fpr": _safe_div(fp, fp + tn),
-            "accuracy_preservation_rate": _safe_div(
-                recent[-1].current_accuracy, self.baseline_accuracy
-            ),
-            "window_size": len(recent),
-        }
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-
     def save_summary(self, path: str | None = None) -> str:
         """Write the aggregate summary to JSON and log a human-readable block."""
         summary = self.aggregate()
@@ -165,37 +104,28 @@ class MetricsTracker:
         return out_path
 
     # ------------------------------------------------------------------
-    # Internal logging helpers
-    # ------------------------------------------------------------------
-
     def _log_round(self, m: RoundMetrics) -> None:
         logger.info(
             "Metrics [round=%d] tp=%d fn=%d fp=%d tn=%d | "
-            "attack_success=%s tpr=%.3f fpr=%.3f recall=%.3f apr=%.3f "
-            "(acc=%.4f / baseline=%.4f)",
+            "attack_success=%s tpr=%.3f fpr=%.3f apr=%.3f (acc=%.4f / baseline=%.4f)",
             m.round_num, m.tp, m.fn, m.fp, m.tn,
-            m.attack_success, m.tpr, m.fpr, m.recall, m.accuracy_preservation_rate,
+            m.attack_success, m.tpr, m.fpr, m.accuracy_preservation_rate,
             m.current_accuracy, m.baseline_accuracy,
         )
 
     def _log_summary(self, agg: AggregateMetrics, out_path: str) -> None:
         logger.info("=" * 60)
         logger.info("AGGREGATE METRICS (over %d round(s))", agg.total_rounds)
-        logger.info("  Confusion: TP=%d FN=%d FP=%d TN=%d",
-                    agg.tp, agg.fn, agg.fp, agg.tn)
+        logger.info("  Confusion: TP=%d FN=%d FP=%d TN=%d", agg.tp, agg.fn, agg.fp, agg.tn)
         logger.info("  Attack Success Rate (ASR):     %.4f", agg.attack_success_rate)
         logger.info("  True Positive Rate (TPR):      %.4f", agg.tpr)
         logger.info("  False Positive Rate (FPR):     %.4f", agg.fpr)
-        logger.info("  Recall:                        %.4f", agg.recall)
-        logger.info("  Accuracy Preservation Rate:    %.4f "
-                    "(final=%.4f / baseline=%.4f)",
-                    agg.accuracy_preservation_rate,
-                    agg.final_accuracy, agg.baseline_accuracy)
+        logger.info("  Accuracy Preservation Rate:    %.4f (final=%.4f / baseline=%.4f)",
+                    agg.accuracy_preservation_rate, agg.final_accuracy, agg.baseline_accuracy)
         logger.info("  Summary saved to %s", out_path)
         logger.info("=" * 60)
 
     def _save_round(self, m: RoundMetrics) -> None:
-        """Persist a single round's metrics for downstream analysis."""
         path = os.path.join(self.output_dir, f"round_{m.round_num:03d}.json")
         with open(path, "w") as f:
             json.dump(m.to_dict(), f, indent=2)

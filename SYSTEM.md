@@ -1,105 +1,128 @@
-# Memory
-## Short-term memory (recent_history): 
-The LLM is given exactly the last 5 rounds of history. (In the code: "recent_history": self.history[-5:])
+# System Architecture — LLM-Direct Adversarial FL with GRPO
 
-## Long-term associative memory (similar_past_experiences): 
-The LLM is also given the top 3 most similar past rounds retrieved from the FAISS vector database. The agent creates a vector embedding of the current situation (accuracies, detections, etc.) and asks the FAISS index to find past rounds that looked similar.
+This document describes the redesigned system: the round loop, the attacker /
+defender contracts, the verifiable rewards, the GRPO training schedule, and the
+checkpoint layout. It supersedes the old feedback/episodic-memory design.
 
+## Components
 
-# Agent feedbacks
-## Attacker Agent Feedback
+| Layer | Module | Role |
+|-------|--------|------|
+| Model | `model/mnist_net.py` | `MnistNet`, ~970 params. State_dict keys: `net.2.weight [16,49]`, `net.2.bias [16]`, `net.4.weight [10,16]`, `net.4.bias [10]`. The schema both LLMs operate over. |
+| Data | `data/mnist_loader.py` | MNIST load + per-client IID/non-IID partition. |
+| Clients | `clients/benign_client.py` | Honest local SGD → `ModelUpdate`. |
+| Server | `server/fed_server.py`, `server/aggregation.py` | Global model + eval; FedAvg over non-flagged clients. |
+| Features | `detector/features.py` | Per-client, per-layer statistical feature vectors (no decisions). |
+| Attacker | `agents/attacker_agent.py` + `agents/attack_ops.py` | Prompt (layer stats) + parse/apply of an attack plan (operator DSL). |
+| Defender | `agents/defender_agent.py` | Prompt + parse of per-client benign/malicious labels. |
+| RL | `rl/*` | Environment, rewards, turns, GRPO, schedule, policy, baseline, inference. |
+| Metrics | `metrics/*` | Ground-truth confusion/TPR/FPR/ASR/APR (research + reward source). |
 
-- baseline_accuracy: The model's clean accuracy from Phase 1, serving as a
-  baseline reference.
+## Round loop (Phase 2)
 
-- current_accuracy: The test accuracy of the global model after the last
-  round's aggregation (to measure if the previous attack successfully degraded
-  performance).
+Leader–follower (Stackelberg): the attacker moves, the defender best-responds to
+the realized updates.
 
-- was_detected: A boolean flag indicating whether the attacker's last attack
-  was caught by the defender. The LLM is only prompted to adapt its strategy
-  if this flag is True.
+```
+reset env from Phase-1 checkpoint (per-client benign weights, global, baseline acc)
+for each round:
+  1. poisoned_ids = rng.sample(clients, k)        # k = clamp(round(poison_fraction·n), 1, (n-1)//2)
+  2. honest updates for all clients               # retrain from global, or replay Phase-1 weights
+  3. ATTACKER LLM → attack plan (input: round, benign LAYER STATS, acc, goal)
+     → apply_plan(benign, plan) → poisoned weights for poisoned_ids
+  4. build full update list (poisoned ∪ honest)
+  5. detector/features → per-client per-layer stat vectors
+  6. DEFENDER LLM → benign/malicious label + confidence per client   (input: features ONLY)
+  7. FedAvg over clients labelled benign → new global (None if all flagged → keep prev)
+  8. evaluate global accuracy
+  9. attacker_reward + defender_reward (ground truth = poisoned_ids)   ← train-time only
+ 10. GRPO update for the learning agent; write round log + metrics
+```
 
-- recent_history: A summary of the attacker's outcomes over the past 5 rounds.
-  
-  Each entry contains:
-    - Round number
-    - Strategy used
-    - Whether it was detected
-    - Accuracy after the round
+`k` is clamped to keep a strict benign majority, because the defender's feature
+references (coordinate-wise median, MAD) assume most clients are honest.
 
-- similar_past_experiences: Up to 3 relevant past episodes retrieved from the
-    attacker's FAISS vector memory (based on a hash of the current state) to help
-  it recall strategies that worked in similar situations.
+## Attacker contract (attack-plan DSL)
 
-## Defender Agent Feedback
-- update_features: Statistical features computed from all client updates in the 
-  current round, which include  :
-    - l2_norms: The L2 norm of each client's weight delta.
-    - cosine_similarities: The cosine similarity of each update compared to the 
-      global model.
-    - pairwise_distances: The average pairwise L2 distance between the updates.
-    
-- attack_passed_through: A boolean flag indicating whether an attack evaded 
-  detection in the previous round. The LLM is only prompted to adapt its strategy
-   if this flag is True (i.e., its previous defense failed).
+- **Input** (`agents/attacker_agent.build_user_prompt`): `round`,
+  `current_global_accuracy`, `attack_goal`, `poisoned_client_ids`, and
+  `benign_layer_details` — per-layer **statistics** (shape, mean, std, min, max,
+  L2 norm, abs-mean) of each poisoned client's benign weights. No raw weights.
+- **Output**: a single JSON object `{"operations": [ {op, target, ...params}, ... ]}`.
+  Operators (`agents/attack_ops.py`, 10): `scale`, `sign_flip`,
+  `add_gaussian_noise`, `mask`, `clip`, `add_constant`, `permute`,
+  `scale_neurons`, `blend_random`, `quantize`. `target` is `"all"`, a layer
+  group (`"net.2"`), or a full key (`"net.4.weight"`). Operations apply in order.
+- **Application** (`agents/attack_ops.apply_plan`): deep-copies the benign
+  weights, applies each op, skips unknown ops / bad params / bad targets
+  (counted, not fatal), then scrubs NaN/Inf and clamps to `±max_weight_abs`.
+  PyTorch does all arithmetic — the LLM only emits the plan. If no usable plan
+  is parsed, all poisoned clients fall back to benign weights (a reward penalty);
+  parsing never raises.
 
-- recent_history: A summary of the defender's outcomes over the past 5 rounds. 
-  Each entry contains:
-    - Round number
-    - Strategy used
-    - Whether an attack passed through
-    - Detailed verdicts produced for each client (suspicious flag, confidence,   and reason).
+## Defender contract (classification)
 
-- similar_past_experiences: Up to 3 relevant past episodes retrieved from the defender's FAISS vector memory to help it adapt thresholds based on historical failures.
+- **Input** (`agents/defender_agent.build_user_prompt`): per-client features
+  from `detector/features.compute_client_features` — **only** features, never the
+  ground truth.
+  - Per layer (`net.2`, `net.4`): `l2_norm`, `rel_norm` (vs median), `cos_to_median`,
+    `sign_agreement` (fraction of coords matching the median sign — catches
+    sign-flip/targeted attacks that preserve norm).
+  - Whole model: `l2_norm`, `rel_norm`, `cos_to_mean`, `max_pairwise_cos`
+    (FoolsGold), `dnc_score` (SVD spectral outlier).
+- **Output**: `{"clients": [{client_id, is_suspicious, confidence, reason}, ...]}`
+  → one `DetectionVerdict` per client (missing/garbled entries default benign).
 
+## Verifiable rewards (`rl/rewards.py`)
 
-## defence and attack agents feedbacks
-Read the agents and their current feedback contracts. Here's the mapping.
+Both continuous, so GRPO group advantages don't collapse.
 
-## What each agent currently sees
+- **Attacker**: `α·clip(drop/target, -0.5, 1.5) + β·evasion_rate − γ·malformed_frac`,
+  with `drop = prev_acc − post_acc`, `target` from the goal, `evasion_rate` =
+  fraction of poisoned clients not flagged.
+- **Defender** (train-time ground truth): confidence-weighted **soft-F1** vs the
+  poisoned set (or `clip(TPR − λ·FPR)`).
 
-**Attacker** (from [SYSTEM_PROMPT in attacker_agent.py:25](agents/attacker_agent.py:25)): `baseline_accuracy`, `current_accuracy`, `was_detected` (single-round bool), `recent_history`, `similar_past_experiences`.
+## GRPO + schedule
 
-**Defender** (from [SYSTEM_PROMPT in defender_agent.py:22](agents/defender_agent.py:22)): `update_features` (l2_norms, cosines, pairwise), `attack_passed_through` (single-round bool), `all_clients_flagged`, `recent_history`, `similar_past_experiences`.
+- **`rl/grpo.py`**: sample `G` completions; reward each; advantage
+  `A_i = (r_i − mean)/(std + ε)`; loss
+  `mean_i[ −A_i·mean_t logπ(o_i,t) + β·mean_t KL_t ]` with the k3 KL estimator
+  against the **frozen base model** (adapters disabled). Single-iteration ⇒ no
+  clipping needed. Reports the zero-advantage-group fraction (stall signal).
+- **`rl/policy.py`**: one Unsloth `Llama-3.2-3B-Instruct` 4-bit base + two PEFT LoRA
+  adapters (`attacker`, `defender`). `set_adapter` selects the active policy;
+  `disable_adapter` exposes the base as the KL reference.
+- **`rl/schedule.py`**: freeze-and-alternate — train attacker `K_a` rounds
+  (defender frozen, greedy), then defender `K_d` rounds (attacker frozen,
+  greedy), repeat. The best-scoring sampled action is committed to advance the
+  env. An **opponent league** snapshots adapters periodically and, with
+  probability `league_prob`, makes a phase face a random past snapshot.
 
-Both agents reason on *single-round binary signals* + 5-round history. They have no aggregate sense of how their regime is performing over time. That's exactly the gap the metrics can fill.
+## Modes (`main.py`)
 
-## Recommendation
+| Mode | Flag | Uses | GPU |
+|------|------|------|-----|
+| Train | *(default)* | `rl/policy.py` + `rl/schedule.py` (GRPO) | yes |
+| Dry-run | `--dry-run` | `rl/inference.py` (frozen Ollama/OpenAI), full loop, no updates | no |
+| Baseline | `--baseline` | `rl/baseline.py` best-of-N fixed actions, no LLM | no |
 
-| Metric | Attacker | Defender | Why |
-|---|---|---|---|
-| **Attack Success Rate** (cumulative / windowed) | ✅ | ❌ | Attacker's persistent outcome KPI; tells it "my regime is being shut down" vs "I'm consistently slipping through." For the defender, ASR = 1 − TPR — redundant. |
-| **TPR / Recall** (cumulative / windowed) | ❌ | ✅ | Defender's core "am I catching them" KPI. For the attacker it's just 1 − ASR — drop one to avoid redundancy. |
-| **FPR** (cumulative / windowed) | ✅ | ✅ | **Defender:** explicitly told to "minimize false positives"; right now it only learns about FPs via the extreme `all_clients_flagged` signal — surfacing FPR closes the loop directly. **Attacker:** adversarial intel — a sloppy defender (high FPR) means aggressive attacks blend in; a precise defender (low FPR) forces subtlety. |
-| **Accuracy Preservation Rate** | ✅ | ✅ | **Attacker:** damage gauge, normalized against baseline so the LLM doesn't have to compute `current / baseline`. **Defender:** collateral-damage gauge — over-aggressive flagging skips aggregation and tanks accuracy; APR makes that visible. |
-| Raw TP/FN/FP/TN counts | ❌ | ❌ | Already encoded in the rates above. At single-round granularity (one attacker, n−1 honest) they're noisy and clutter the prompt. |
-| Recall as a separate metric | ❌ | ❌ | Alias of TPR — pick one name in the prompt so the LLM doesn't think they're independent signals. |
+## Checkpoints & resume
 
-## Two practical notes on how to surface them
+- `checkpoints/global_model.pt`, `client_updates.pt`, `baseline.json` — Phase 1.
+- `checkpoints/attacker_adapter/`, `checkpoints/defender_adapter/` — LoRA adapters
+  (`adapter_model.safetensors` + `adapter_config.json`).
+- `checkpoints/rl_progress.json` — rounds completed.
+- Rerunning resumes: adapters + progress are reloaded; the env restarts from the
+  Phase-1 baseline and replays forward.
 
-1. **Use a trailing window, not per-round.** With one attacker per round, single-round TPR is just 0/1 — no signal. Aggregating over the last 5–10 rounds (matching the existing `history[-5:]` convention) gives the LLM a trajectory.
+## Logs
 
-2. **Embed per-round metrics into each history entry** *and* surface the windowed aggregate at the top of the prompt. The LLM already sees 5 history entries — adding `attack_success`, `apr`, etc. to each gives it the trend for free, while the top-level aggregate gives the headline number.
-
-## Net feedback contract
-
-- **Attacker feedback**: keep current fields + add `attack_success_rate_recent`, `fpr_recent`, `accuracy_preservation_rate` (current and recent average).
-- **Defender feedback**: keep current fields + add `tpr_recent`, `fpr_recent`, `accuracy_preservation_rate`.
-
-This gives each agent exactly the metrics that drive its own objective, with no cross-redundancy between TPR and ASR.
-
-
-# Defend strategies
-
-# Defense Strategies
-
-| Scenario | Attacker Feedback | Defender Feedback | Gap? |
-|---|---|---|---|
-| Defender flags wrong client only | ✅ `was_detected=False` → keep strategy | ✅ `attack_passed=True` → adapt | No |
-| Defender flags real attacker only | ✅ `was_detected=True` → adapt | ✅ `attack_passed=False` → keep strategy | No |
-| Defender flags real attacker + innocents | ✅ `was_detected=True` → adapt | ⚠️ `attack_passed=False` → keep strategy | YES — defender keeps an over-aggressive strategy that harms model quality |
-| Defender flags nobody | ✅ `was_detected=False` → keep strategy | ✅ `attack_passed=True` → adapt | No |
-
-# client flaggiings by defend agent
-how to flag it, what should we do rather than all client aggregation if all clients are flaged 
+- `logs/system.log` — run log.
+- `logs/round_data/round_NNN.json` — per round: `attack_goal`,
+  `poisoned_client_ids`, `predicted_labels`, accuracies, `attacker_reward`,
+  `defender_reward`, `learning_agent`, and a `train` sub-block (loss, mean reward,
+  zero-advantage fraction).
+- `logs/metrics/round_NNN.json` + `summary.json` — ground-truth confusion / TPR /
+  FPR / ASR / APR.
+- `logs/visualizations/report.html` — `python visualize_rounds.py`.
