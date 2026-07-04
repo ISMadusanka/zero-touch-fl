@@ -29,12 +29,19 @@ def attacker_reward(
     alpha: float = 1.0,
     beta: float = 0.5,
     gamma: float = 1.0,
+    delta: float = 0.0,
+    zeta: float = 0.0,
+    pool_size: int | None = None,
+    diversity: float | None = None,
 ) -> float:
-    """Reward the attacker for degrading accuracy while staying stealthy.
+    """Reward the attacker for degrading accuracy while staying stealthy, using
+    the FEWEST clients, and (when it uses several) collaborating with them.
 
     reward = alpha * clip(drop / target, -0.5, 1.5)
            + beta  * stealth
            - gamma * malformed_fraction
+           - delta * client_cost
+           + zeta  * collab_bonus
 
     ``drop = prev_accuracy - post_accuracy``. ``stealth`` is a CONTINUOUS evasion
     signal in [0, 1]: the mean over poisoned clients of ``1 - soft P(malicious)``
@@ -43,6 +50,12 @@ def attacker_reward(
     Because it moves smoothly with the defender's confidence, it gives GRPO a
     gradient even when every sampled plan ends up with the SAME hard flag — the
     fix for zero-advantage attacker groups.
+
+    ``client_cost`` = ``(n_used - 1) / (pool_size - 1)`` in [0, 1] penalizes using
+    more of the controllable pool than necessary (0 for a single client), so the
+    attacker learns to achieve the goal with the fewest clients. ``collab_bonus``
+    = ``diversity`` in [0, 1] (only when >1 client) rewards distinct, coordinated
+    per-client perturbations over identical clones — see ``perturbation_diversity``.
     """
     gtype = goal.get("type", "untargeted_degrade")
     if gtype == "slow_degrade":
@@ -57,7 +70,8 @@ def attacker_reward(
     drop_term = _clip(drop / target, -0.5, 1.5)
 
     verdict_by_id = {v.client_id: v for v in verdicts}
-    n_pois = max(1, len(poisoned_ids))
+    n_used = len(poisoned_ids)
+    n_pois = max(1, n_used)
     stealth = 0.0
     for cid in poisoned_ids:
         v = verdict_by_id.get(cid)
@@ -67,7 +81,51 @@ def attacker_reward(
 
     malformed_fraction = n_malformed / n_pois
 
-    return alpha * drop_term + beta * stealth - gamma * malformed_fraction
+    # Minimal-clients penalty: using more of the controllable pool than needed is
+    # costly. Normalized to [0, 1] by the pool size so it is budget-independent.
+    client_cost = 0.0
+    if pool_size and pool_size > 1 and n_used > 1:
+        client_cost = _clip((n_used - 1) / (pool_size - 1), 0.0, 1.0)
+
+    # Collaboration bonus: reward diverse (coordinated) multi-client attacks. Only
+    # meaningful with >1 client; `diversity` in [0, 1].
+    collab_bonus = 0.0
+    if zeta and n_used > 1 and diversity is not None:
+        collab_bonus = _clip(float(diversity), 0.0, 1.0)
+
+    return (alpha * drop_term + beta * stealth - gamma * malformed_fraction
+            - delta * client_cost + zeta * collab_bonus)
+
+
+def perturbation_diversity(poisoned_by_client: dict, references: dict) -> float:
+    """1 − mean pairwise cosine of the chosen clients' perturbation vectors.
+
+    Each client's perturbation is ``(poisoned - benign)`` flattened over all
+    layers. Returns 0.0 for fewer than 2 clients (no collaboration to reward).
+    Higher = the clients push the model in MORE different directions (distinct,
+    coordinated roles rather than identical clones — which also look like
+    colluding Sybils to the defender's ``max_pairwise_cos`` feature).
+    """
+    import torch
+
+    cids = [cid for cid in poisoned_by_client if cid in references]
+    if len(cids) < 2:
+        return 0.0
+    eps = 1e-8
+    normed = []
+    for cid in cids:
+        pw, bw = poisoned_by_client[cid], references[cid]
+        delta = torch.cat([
+            (pw[k].flatten().float() - bw[k].flatten().float()) for k in bw
+        ])
+        normed.append(delta / (delta.norm() + eps))
+    total, pairs = 0.0, 0
+    for i in range(len(normed)):
+        for j in range(i + 1, len(normed)):
+            total += float(torch.dot(normed[i], normed[j]))
+            pairs += 1
+    mean_cos = total / pairs if pairs else 0.0
+    return _clip(1.0 - mean_cos, 0.0, 1.0)
 
 
 def _soft_malicious_prob(v: DetectionVerdict) -> float:

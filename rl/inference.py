@@ -10,7 +10,7 @@ parse + apply, feature extraction, FedAvg, reward computation) on a CPU box.
 import logging
 
 from core.types import RoundLog
-from rl.rewards import attacker_reward, defender_reward
+from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +44,15 @@ def run_inference(
     for _ in range(n_rounds):
         ctx = env.begin_round()
 
-        # Attacker generates poisoned weights for the poisoned clients.
+        # Attacker SELECTS which of its controllable pool to poison (<= budget) and how.
         a_sys = attacker_agent.system_prompt()
         a_user = attacker_agent.build_user_prompt(
-            ctx.round_num, ctx.global_accuracy, ctx.benign_by_poisoned
+            ctx.round_num, ctx.global_accuracy, ctx.pool_benign, ctx.budget
         )
         a_text = generator.generate(a_sys, a_user, n=1, temperature=temperature)[0]
-        poisoned, n_malformed = attacker_agent.parse(a_text, ctx.benign_by_poisoned)
+        poisoned, chosen_ids, n_malformed = attacker_agent.select_and_apply(
+            a_text, ctx.pool_benign, ctx.budget)
+        env.set_committed_poison(chosen_ids)
         updates = env.build_updates(poisoned)
 
         # Defender classifies every client from the feature vectors.
@@ -64,14 +66,17 @@ def run_inference(
         prev_acc = ctx.global_accuracy
         new_acc = env.commit(updates, verdicts)
 
-        a_rew = attacker_reward(prev_acc, new_acc, env.goal, ctx.poisoned_ids, verdicts, n_malformed)
-        d_rew = defender_reward(verdicts, ctx.poisoned_ids)
+        diversity = perturbation_diversity(
+            poisoned, {cid: ctx.pool_benign[cid] for cid in chosen_ids})
+        a_rew = attacker_reward(prev_acc, new_acc, env.goal, chosen_ids, verdicts, n_malformed,
+                                pool_size=env.n_compromisable, diversity=diversity)
+        d_rew = defender_reward(verdicts, chosen_ids)
 
-        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(ctx.poisoned_ids))
+        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
         save_round_log(RoundLog(
             round_num=ctx.round_num,
             attack_goal=env.goal,
-            poisoned_client_ids=ctx.poisoned_ids,
+            poisoned_client_ids=chosen_ids,
             predicted_labels=[
                 {"client_id": v.client_id, "is_suspicious": v.is_suspicious,
                  "confidence": v.confidence, "reason": v.reason}
@@ -82,9 +87,11 @@ def run_inference(
             attacker_reward=a_rew,
             defender_reward=d_rew,
             learning_agent="none",
-            attack_metadata={"n_malformed": n_malformed},
+            attack_metadata={"n_malformed": n_malformed, "budget": ctx.budget,
+                             "n_used": len(chosen_ids)},
         ))
         logger.info(
-            f"[dry-run] round {ctx.round_num}: acc {prev_acc:.4f}->{new_acc:.4f} | "
-            f"att_reward={a_rew:.3f} def_reward={d_rew:.3f} malformed={n_malformed}"
+            f"[dry-run] round {ctx.round_num}: poisoned={chosen_ids} budget={ctx.budget} "
+            f"acc {prev_acc:.4f}->{new_acc:.4f} | att_reward={a_rew:.3f} "
+            f"def_reward={d_rew:.3f} malformed={n_malformed}"
         )

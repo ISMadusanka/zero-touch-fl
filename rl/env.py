@@ -9,10 +9,13 @@ computation.
 Round protocol (driven by the schedule / inference loop):
 
     env.reset(global, client_weights, baseline_acc)
-    ctx = env.begin_round()                 # samples poisoned set, builds honest updates
+    ctx = env.begin_round()                 # builds honest updates; exposes the attacker's
+                                            # controllable pool (ctx.pool_benign) + budget
+    # the attacker SELECTS <= ctx.budget clients from the pool and poisons them
     updates = env.build_updates(poisoned_by_client)
     acc = env.evaluate_updates(updates, verdicts)   # no commit (used to score rollouts)
     ...
+    env.set_committed_poison(chosen_ids)            # record the committed poison set
     new_acc = env.commit(updates, verdicts)         # advance the global model one round
 """
 
@@ -29,26 +32,42 @@ logger = logging.getLogger(__name__)
 
 
 class RoundContext:
-    """Per-round observation handed to the agents."""
+    """Per-round observation handed to the agents.
 
-    def __init__(self, round_num, global_accuracy, poisoned_ids, benign_by_poisoned):
+    The attacker controls a fixed ``pool`` of clients and may poison up to
+    ``budget`` of them; it CHOOSES which (see ``AttackerAgent.select_and_apply``),
+    so ``poisoned_ids`` is empty here and filled in once the choice is committed.
+    """
+
+    def __init__(self, round_num, global_accuracy, pool_ids, pool_benign, budget):
         self.round_num = round_num
         self.global_accuracy = global_accuracy
-        self.poisoned_ids = poisoned_ids                  # list[int]
-        self.benign_by_poisoned = benign_by_poisoned      # {cid: state_dict}
+        self.pool_ids = pool_ids                          # list[int] controllable pool
+        self.pool_benign = pool_benign                    # {cid: state_dict} for the pool
+        self.budget = budget                              # max clients that may be poisoned
+        self.poisoned_ids = []                            # set at commit (attacker's choice)
 
 
 class FLArmsRaceEnv:
     def __init__(self, config: dict, client_loaders, test_loader, rng):
         fl = config["fl"]
+        attack = config.get("attack", {})
         self.n_clients = int(fl["n_clients"])
         self.device = fl.get("device", "cpu")
-        self.poison_fraction = float(fl.get("poison_fraction", 0.2))
         self.benign_retrain = bool(fl.get("benign_retrain_each_round", True))
         self.training_rounds = int(fl.get("training_rounds", 0))
-        self.goal = config.get("attack", {}).get(
+        self.goal = attack.get(
             "goal", {"type": "untargeted_degrade", "target_accuracy_drop": 0.20}
         )
+        # Attacker is a partial insider: it may only touch clients [0 .. n_compromisable).
+        self.n_compromisable = max(1, min(
+            int(fl.get("n_compromisable", self.n_clients)), self.n_clients))
+        # Per-round poison budget (max clients the attacker may poison). Training
+        # randomizes it in [1, budget_cap]; eval fixes it (set sample_budget=False,
+        # budget_cap=<desired>). These attributes are overridable by the benchmark.
+        self.budget_cap = max(1, min(
+            int(attack.get("max_poison_clients", self.n_compromisable)), self.n_compromisable))
+        self.sample_budget = bool(attack.get("sample_budget_in_training", True))
 
         self.test_loader = test_loader
         self.rng = rng
@@ -75,8 +94,10 @@ class FLArmsRaceEnv:
 
         # Set by begin_round().
         self.honest_updates: list[ModelUpdate] = []
-        self.poisoned_ids: list[int] = []
-        self.benign_by_poisoned: dict[int, dict] = {}
+        self.pool_ids: list[int] = []
+        self.pool_benign: dict[int, dict] = {}
+        self.round_budget: int = 1
+        self.poisoned_ids: list[int] = []                 # attacker's committed choice
 
     # ------------------------------------------------------------------
     def reset(self, global_weights, client_weights, baseline_accuracy):
@@ -86,16 +107,17 @@ class FLArmsRaceEnv:
         self.current_accuracy = float(baseline_accuracy)
         self.round_index = 0
         logger.info(
-            f"Env reset — n_clients={self.n_clients}, poison_fraction={self.poison_fraction}, "
+            f"Env reset — n_clients={self.n_clients}, n_compromisable={self.n_compromisable}, "
+            f"budget_cap={self.budget_cap}, sample_budget={self.sample_budget}, "
             f"benign_retrain={self.benign_retrain}, baseline_acc={baseline_accuracy:.4f}"
         )
 
     # ------------------------------------------------------------------
-    def _num_poisoned(self) -> int:
-        """Poison count, clamped to keep a strict benign majority."""
-        k = round(self.poison_fraction * self.n_clients)
-        majority_cap = (self.n_clients - 1) // 2
-        return max(1, min(k, majority_cap))
+    def _round_budget(self) -> int:
+        """This round's poison budget: randomized in [1, cap] when sampling, else the cap."""
+        if self.sample_budget:
+            return self.rng.randint(1, self.budget_cap)
+        return self.budget_cap
 
     def _honest_update(self, cid: int) -> ModelUpdate:
         if self.benign_retrain and self._clients is not None:
@@ -104,27 +126,32 @@ class FLArmsRaceEnv:
         return ModelUpdate(client_id=cid, weights=copy.deepcopy(self.client_weights[cid]))
 
     def begin_round(self) -> RoundContext:
-        """Sample the poisoned subset and produce this round's honest updates."""
+        """Produce this round's honest updates and expose the attacker's controllable
+        pool + poison budget. The poisoned SET is chosen by the attacker, not here."""
         self.round_index += 1
         round_num = self.training_rounds + self.round_index
 
-        k = self._num_poisoned()
-        self.poisoned_ids = sorted(self.rng.sample(range(self.n_clients), k))
-
         self.honest_updates = [self._honest_update(cid) for cid in range(self.n_clients)]
-        self.benign_by_poisoned = {
-            cid: self.honest_updates[cid].weights for cid in self.poisoned_ids
-        }
+        self.pool_ids = list(range(self.n_compromisable))
+        self.pool_benign = {cid: self.honest_updates[cid].weights for cid in self.pool_ids}
+        self.round_budget = self._round_budget()
+        self.poisoned_ids = []                            # attacker decides at commit
+
         logger.info(
-            f"Round {round_num}: poisoned_ids={self.poisoned_ids} "
-            f"(global_acc={self.current_accuracy:.4f})"
+            f"Round {round_num}: controllable_pool={self.pool_ids} "
+            f"budget={self.round_budget} (global_acc={self.current_accuracy:.4f})"
         )
         return RoundContext(
             round_num=round_num,
             global_accuracy=self.current_accuracy,
-            poisoned_ids=list(self.poisoned_ids),
-            benign_by_poisoned=self.benign_by_poisoned,
+            pool_ids=list(self.pool_ids),
+            pool_benign=self.pool_benign,
+            budget=self.round_budget,
         )
+
+    def set_committed_poison(self, chosen_ids) -> None:
+        """Record which clients the attacker actually poisoned (for logs/metrics)."""
+        self.poisoned_ids = sorted(int(c) for c in chosen_ids)
 
     # ------------------------------------------------------------------
     def build_updates(self, poisoned_by_client: dict[int, dict]) -> list[ModelUpdate]:

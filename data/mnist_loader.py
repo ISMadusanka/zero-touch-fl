@@ -1,4 +1,6 @@
-"""MNIST data loading and IID partitioning across clients."""
+"""MNIST data loading and partitioning across clients (IID + FLTrust non-IID)."""
+
+import random
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -23,74 +25,103 @@ def partition_iid(dataset, n_clients: int):
     return [indices[i * shard_size : (i + 1) * shard_size] for i in range(n_clients)]
 
 
-def partition_noniid(dataset, n_clients: int = 5):
-    """Split dataset into non-IID shards with overlapping label subsets.
+def _dataset_targets(dataset) -> list:
+    """Integer labels for every sample, robust across torchvision versions."""
+    targets = getattr(dataset, "targets", None)
+    if targets is None:
+        targets = getattr(dataset, "train_labels", None)
+    if targets is None:  # exotic dataset: fall back to (slow) per-item access
+        return [int(dataset[i][1]) for i in range(len(dataset))]
+    if isinstance(targets, torch.Tensor):
+        return targets.tolist()
+    return [int(t) for t in targets]
 
-    Each client receives samples from only 4 digit classes:
-        Client 0: labels {0, 1, 2, 3}
-        Client 1: labels {2, 3, 4, 5}
-        Client 2: labels {4, 5, 6, 7}
-        Client 3: labels {6, 7, 8, 9}
-        Client 4: labels {8, 9, 0, 1}
+
+def partition_noniid_fltrust(dataset, n_clients: int, n_classes: int = 10,
+                             bias_q: float = 0.5, seed: int = 0):
+    """Non-IID partition following FLTrust (Cao et al., NDSS 2021).
+
+    Clients are split into ``M = n_classes`` groups. A training example with
+    label ``l`` is assigned to group ``l`` with probability ``bias_q`` and to any
+    OTHER group with probability ``(1 - bias_q) / (M - 1)``. Within a group the
+    assigned examples are split evenly across that group's clients.
+
+    ``bias_q = 1/M`` reproduces an IID split; a larger ``bias_q`` gives a stronger
+    non-IID skew (each group is dominated by its own class). The paper's default
+    is ``0.5``. For MNIST with 20 clients this yields 10 groups of 2 clients each.
+
+    Returns a list of ``n_clients`` index lists (shards), ordered by client id;
+    the shards are disjoint and cover every sample.
     """
-    # Define overlapping label assignments per client
-    client_labels = {
-        0: [0, 1, 2, 3],
-        1: [2, 3, 4, 5],
-        2: [4, 5, 6, 7],
-        3: [6, 7, 8, 9],
-        4: [8, 9, 0, 1],
-    }
+    rng = random.Random(seed)
+    M = max(1, int(n_classes))
 
-    # Build a mapping: label -> list of indices
-    targets = dataset.targets if hasattr(dataset, 'targets') else dataset.train_labels
-    label_to_indices = {}
-    for idx, label in enumerate(targets):
-        lbl = int(label)
-        label_to_indices.setdefault(lbl, []).append(idx)
-
-    # Shuffle each label's indices
-    for lbl in label_to_indices:
-        perm = torch.randperm(len(label_to_indices[lbl])).tolist()
-        label_to_indices[lbl] = [label_to_indices[lbl][i] for i in perm]
-
-    # Track how many samples of each label have been consumed
-    label_offset = {lbl: 0 for lbl in label_to_indices}
-
-    shards = []
+    # --- Split clients into M groups, as evenly as possible (20/10 -> 2 each). ---
+    # Round-robin keeps groups balanced; earlier groups get the extra client when
+    # n_clients is not divisible by M.
+    groups: list[list[int]] = [[] for _ in range(M)]
     for cid in range(n_clients):
-        labels = client_labels[cid]
-        client_indices = []
-        for lbl in labels:
-            available = label_to_indices[lbl]
-            # Each label is shared by exactly 2 clients → each gets half
-            half = len(available) // 2
-            start = label_offset[lbl]
-            end = start + half
-            client_indices.extend(available[start:end])
-            label_offset[lbl] = end
-        shards.append(client_indices)
+        groups[cid % M].append(cid)
+    nonempty = [g for g in range(M) if groups[g]]  # guards n_clients < M
+
+    # --- Route each sample to a group by the bias rule ---
+    targets = _dataset_targets(dataset)
+    group_indices: list[list[int]] = [[] for _ in range(M)]
+    for idx, lbl in enumerate(targets):
+        l = int(lbl) % M
+        if rng.random() < bias_q:
+            g = l
+        else:  # pick uniformly among the M-1 groups other than l
+            g = rng.randrange(M - 1) if M > 1 else 0
+            if g >= l:
+                g += 1
+        if not groups[g]:  # chosen group has no clients (only when n_clients < M)
+            g = l if groups[l] else rng.choice(nonempty)
+        group_indices[g].append(idx)
+
+    # --- Within each group, split its indices evenly across the group's clients ---
+    shards: list[list[int]] = [[] for _ in range(n_clients)]
+    for g in range(M):
+        members = groups[g]
+        if not members:
+            continue
+        idxs = group_indices[g]
+        rng.shuffle(idxs)
+        k = len(members)
+        base, rem = divmod(len(idxs), k)
+        start = 0
+        for j, cid in enumerate(members):
+            count = base + (1 if j < rem else 0)
+            shards[cid] = idxs[start:start + count]
+            start += count
 
     return shards
 
 
 def get_data_loaders(n_clients: int, batch_size: int, data_dir: str = "./data/mnist_raw",
-                     iid: bool = True):
+                     iid: bool = True, bias_q: float = 0.5, seed: int = 0,
+                     n_classes: int = 10):
     """Return per-client train loaders and a global test loader.
 
     Args:
         n_clients: Number of federated clients.
         batch_size: Training batch size.
         data_dir: Path to MNIST data directory.
-        iid: If True, use IID partitioning. If False, use non-IID partitioning
-             with overlapping label subsets per client.
+        iid: If True, use IID partitioning. If False, use the FLTrust non-IID
+             partition (``partition_noniid_fltrust``).
+        bias_q: FLTrust bias probability (only used when ``iid=False``). ``1/M``
+             is IID; larger is more non-IID; paper default ``0.5``.
+        seed: RNG seed for the non-IID partition (reproducibility).
+        n_classes: Number of label classes (MNIST = 10); also the group count.
     """
     train_dataset, test_dataset = load_mnist(data_dir)
 
     if iid:
         shards = partition_iid(train_dataset, n_clients)
     else:
-        shards = partition_noniid(train_dataset, n_clients)
+        shards = partition_noniid_fltrust(
+            train_dataset, n_clients, n_classes=n_classes, bias_q=bias_q, seed=seed
+        )
 
     client_loaders = [
         DataLoader(Subset(train_dataset, shard), batch_size=batch_size, shuffle=True)

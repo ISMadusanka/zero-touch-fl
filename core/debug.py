@@ -235,7 +235,7 @@ class DebugLogger:
 
     @_guard
     def round_header(self, round_num, learner, opponent, phase_index, phase_round,
-                     poisoned_ids, global_accuracy, G, scoring_opp_temp, opp_temp):
+                     pool_ids, budget, global_accuracy, G, scoring_opp_temp, opp_temp):
         self._round = round_num
         self._learner = learner
         self._stage = "setup"
@@ -245,14 +245,14 @@ class DebugLogger:
             f"(frozen opponent={opponent})  |  phase {phase_index}.{phase_round}"
         )
         self._line(
-            f"poisoned_clients={list(poisoned_ids)}   "
+            f"controllable_pool={list(pool_ids)}  budget={budget}   "
             f"global_accuracy={_short(global_accuracy)}   "
             f"G={G}  scoring_opp_temp={scoring_opp_temp}  commit_opp_temp={opp_temp}"
         )
         self._record("round_header", "round_start", {
             "round": round_num, "learner": learner, "opponent": opponent,
             "phase_index": phase_index, "phase_round": phase_round,
-            "poisoned_client_ids": list(poisoned_ids),
+            "controllable_pool": list(pool_ids), "budget": budget,
             "global_accuracy": _short(global_accuracy),
             "G": G, "scoring_opp_temp": scoring_opp_temp, "commit_opp_temp": opp_temp,
         })

@@ -153,15 +153,15 @@ fewer early rounds declared critical ⇒ fewer hard removals) · `--defl-tau` (M
 per-layer outlier z-threshold, default **2.5** — lower ⇒ more aggressive flagging,
 higher TPR but higher FPR). DeFL takes **no** root set: it derives everything from
 the per-layer FGNV of the submitted updates. A "layer" = one module (its weight +
-bias grouped), so MnistNet has L = 2 layers. With the project default of 1-of-5
-poisoned, MOUD's adaptive vote isolates the single outlier; the Beta trust then
-keeps the run robust to the occasional false positive.
+bias grouped), so MnistNet has L = 2 layers. With the default eval budget of 1
+poisoned client, MOUD's adaptive vote isolates the single outlier; the Beta trust
+then keeps the run robust to the occasional false positive.
 
 ## DnC knobs
 
-`--dnc-num-byzantine` (assumed #malicious `m`; default = the configured poison
-count, `round(poison_fraction·n_clients)` clamped to a benign majority — a
-hyperparameter / assumed adversary budget, **not** per-round ground truth) ·
+`--dnc-num-byzantine` (assumed #malicious `m`; default = the eval poison budget
+`--max-poison-clients` clamped to a benign majority — a hyperparameter / assumed
+adversary budget, **not** per-round ground truth) ·
 `--dnc-c` (filtering fraction `c`, paper iid default **1** → drop `c·m` clients each
 round) · `--dnc-niters` (subsampling iterations, default **1**) · `--dnc-sub-dim`
 (subsample dimension `b`, default **10000**, the paper's value — clamped to the
@@ -172,7 +172,7 @@ over the surviving clients.
 
 ## Multi-Krum knobs
 
-`--multikrum-f` (assumed #Byzantine `f`; default = the configured poison count, same
+`--multikrum-f` (assumed #Byzantine `f`; default = the eval poison budget, same
 assumed-budget hyperparameter as DnC — **not** ground truth) · `--multikrum-m`
 (#updates selected and averaged; default `n−f`, i.e. drop the `f` worst — set `1` for
 plain Krum, or `n−f−2` for the paper's strong-resilience bound). The score always

@@ -67,7 +67,11 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
     logger.info(f"[baseline] running {n_rounds} best-of-N round(s) — no LLM, no GPU")
     for _ in range(n_rounds):
         ctx = env.begin_round()
-        actions = fixed_attacker_actions(ctx.benign_by_poisoned)
+        # No LLM to choose clients: poison the first `budget` clients of the pool.
+        chosen_ids = list(ctx.pool_ids[:ctx.budget])
+        selected_benign = {cid: ctx.pool_benign[cid] for cid in chosen_ids}
+        env.set_committed_poison(chosen_ids)
+        actions = fixed_attacker_actions(selected_benign)
 
         scored = []
         for label, poisoned in actions:
@@ -75,7 +79,7 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             verdicts = fixed_defender(env.features(updates))
             post_acc = env.evaluate_updates(updates, verdicts)
             reward = attacker_reward(ctx.global_accuracy, post_acc, env.goal,
-                                     ctx.poisoned_ids, verdicts, n_malformed=0)
+                                     chosen_ids, verdicts, n_malformed=0)
             scored.append((label, poisoned, updates, verdicts, post_acc, reward))
             logger.info(
                 f"[baseline] round {ctx.round_num} action={label:9s} "
@@ -88,14 +92,14 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
         label, poisoned, updates, verdicts, _, _ = best
         new_acc = env.commit(updates, verdicts)
         a_rew = attacker_reward(ctx.global_accuracy, new_acc, env.goal,
-                                ctx.poisoned_ids, verdicts, n_malformed=0)
-        d_rew = defender_reward(verdicts, ctx.poisoned_ids)
+                                chosen_ids, verdicts, n_malformed=0)
+        d_rew = defender_reward(verdicts, chosen_ids)
 
-        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(ctx.poisoned_ids))
+        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
         save_round_log(RoundLog(
             round_num=ctx.round_num,
             attack_goal=env.goal,
-            poisoned_client_ids=ctx.poisoned_ids,
+            poisoned_client_ids=chosen_ids,
             predicted_labels=[
                 {"client_id": v.client_id, "is_suspicious": v.is_suspicious,
                  "confidence": v.confidence, "reason": v.reason}
@@ -106,7 +110,8 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             attacker_reward=a_rew,
             defender_reward=d_rew,
             learning_agent="none",
-            attack_metadata={"baseline_action": label},
+            attack_metadata={"baseline_action": label, "budget": ctx.budget,
+                             "n_used": len(chosen_ids)},
         ))
         logger.info(
             f"[baseline] round {ctx.round_num}: committed '{label}' "

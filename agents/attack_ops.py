@@ -101,6 +101,84 @@ def extract_plan(text):
     return None
 
 
+def _coerce_int(x):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_selection(text):
+    """Parse the attacker's client-selection output into a normalized structure.
+
+    Returns ``{"per_client": [{"id": int, "operations": [...]}, ...],
+    "shared_ops": [...] | None, "shared_ids": [int, ...] | None}`` or ``None`` if
+    nothing usable was found. Robust to markdown / surrounding prose (via
+    ``extract_json``). Accepted shapes:
+
+      * ``{"clients": [{"id": 0, "operations": [ops]}, ...]}``  (canonical: a
+        DISTINCT plan per client — enables coordinated multi-client attacks)
+      * ``{"clients": [0, 3], "operations": [ops]}``            (explicit ids +
+        one shared plan)
+      * ``{"operations": [ops]}`` / a bare ``[ops]`` list        (shared plan, no
+        ids -> the caller auto-selects clients)
+      * ``targets`` / ``ids`` / ``client_ids`` are accepted as aliases for a
+        shared id list.
+    """
+    raw = extract_json(text)
+    if raw is None:
+        return None
+    if isinstance(raw, list):                 # bare list -> a shared ops plan
+        return {"per_client": [], "shared_ops": raw, "shared_ids": None}
+    if not isinstance(raw, dict):
+        return None
+
+    per_client = []
+    shared_ids = None
+    clients = raw.get("clients")
+    if isinstance(clients, list):
+        int_ids = []
+        for entry in clients:
+            if isinstance(entry, dict):
+                cid = _coerce_int(entry.get("id", entry.get("client_id")))
+                if cid is None:
+                    continue
+                ops = entry.get("operations")
+                if isinstance(ops, dict):
+                    ops = [ops]
+                elif not isinstance(ops, list):
+                    ops = []
+                per_client.append({"id": cid, "operations": ops})
+            else:                              # a bare int in the clients list
+                cid = _coerce_int(entry)
+                if cid is not None:
+                    int_ids.append(cid)
+        if int_ids:
+            shared_ids = int_ids
+
+    shared_ops = None
+    ops = raw.get("operations")
+    if isinstance(ops, list):
+        shared_ops = ops
+    elif isinstance(ops, dict):
+        shared_ops = [ops]
+    elif "op" in raw:                          # a single bare operation at top level
+        shared_ops = [raw]
+
+    if shared_ids is None:
+        for key in ("targets", "ids", "client_ids"):
+            v = raw.get(key)
+            if isinstance(v, list):
+                ids = [c for c in (_coerce_int(x) for x in v) if c is not None]
+                if ids:
+                    shared_ids = ids
+                    break
+
+    if not per_client and shared_ops is None and shared_ids is None:
+        return None
+    return {"per_client": per_client, "shared_ops": shared_ops, "shared_ids": shared_ids}
+
+
 # ---------------------------------------------------------------------------
 # Operator helpers
 # ---------------------------------------------------------------------------

@@ -40,16 +40,19 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
 
     for r in range(1, n_rounds + 1):
         ctx = env.begin_round()
-        poisoned_ids = set(ctx.poisoned_ids)
-        references = env.benign_by_poisoned
 
-        # The trained attacker plans ONE attack against the reference state; the
-        # SAME poisoned updates go to every defense (vary defense, hold attack).
+        # The trained attacker SELECTS which of its controllable pool to poison
+        # (<= the eval budget) and plans ONE attack against the reference state;
+        # the SAME poisoned updates go to every defense (vary defense, hold attack).
         system = attacker_agent.system_prompt()
-        user = attacker_agent.build_user_prompt(ctx.round_num, reference_acc, references)
+        user = attacker_agent.build_user_prompt(ctx.round_num, reference_acc,
+                                                ctx.pool_benign, ctx.budget)
         text = policy.generate(attacker_adapter, system, user, n=1,
                                temperature=attack_temperature, max_new_tokens=max_new_tokens)[0]
-        poisoned, _n_malformed = attacker_agent.parse(text, references)
+        poisoned, chosen_ids, _n_malformed = attacker_agent.select_and_apply(
+            text, ctx.pool_benign, ctx.budget)
+        poisoned_ids = set(chosen_ids)
+        env.set_committed_poison(chosen_ids)
         updates = env.build_updates(poisoned)
 
         for name, d in defenses.items():

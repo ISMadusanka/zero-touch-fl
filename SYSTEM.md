@@ -9,7 +9,7 @@ checkpoint layout. It supersedes the old feedback/episodic-memory design.
 | Layer | Module | Role |
 |-------|--------|------|
 | Model | `model/mnist_net.py` | `MnistNet`, ~970 params. State_dict keys: `net.2.weight [16,49]`, `net.2.bias [16]`, `net.4.weight [10,16]`, `net.4.bias [10]`. The schema both LLMs operate over. |
-| Data | `data/mnist_loader.py` | MNIST load + per-client IID/non-IID partition. |
+| Data | `data/mnist_loader.py` | MNIST load + per-client partition: IID, or the FLTrust non-IID bias-`q` scheme (`partition_noniid_fltrust`). |
 | Clients | `clients/benign_client.py` | Honest local SGD → `ModelUpdate`. |
 | Server | `server/fed_server.py`, `server/aggregation.py` | Global model + eval; FedAvg over non-flagged clients. |
 | Features | `detector/features.py` | Per-client, per-layer statistical feature vectors (no decisions). |
@@ -26,39 +26,52 @@ the realized updates.
 ```
 reset env from Phase-1 checkpoint (per-client benign weights, global, baseline acc)
 for each round:
-  1. poisoned_ids = rng.sample(clients, k)        # k = clamp(round(poison_fraction·n), 1, (n-1)//2)
-  2. honest updates for all clients               # retrain from global, or replay Phase-1 weights
-  3. ATTACKER LLM → attack plan (input: round, benign LAYER STATS, acc, goal)
-     → apply_plan(benign, plan) → poisoned weights for poisoned_ids
+  1. honest updates for all N clients             # retrain from global, or replay Phase-1 weights
+  2. expose the attacker's controllable pool [0..n_compromisable) + a poison budget b
+     (b = randint(1, max_poison_clients) in training; fixed = eval budget at eval time)
+  3. ATTACKER LLM → SELECT <= b clients from the pool + a per-client attack plan
+     (input: round, controllable_client_ids, max_poison_clients, per-client LAYER STATS, acc, goal)
+     → apply_plan(benign_i, plan_i) → poisoned weights for the CHOSEN clients
   4. build full update list (poisoned ∪ honest)
   5. detector/features → per-client per-layer stat vectors
   6. DEFENDER LLM → benign/malicious label + confidence per client   (input: features ONLY)
   7. FedAvg over clients labelled benign → new global (None if all flagged → keep prev)
   8. evaluate global accuracy
-  9. attacker_reward + defender_reward (ground truth = poisoned_ids)   ← train-time only
+  9. attacker_reward + defender_reward (ground truth = the CHOSEN poisoned set)  ← train-time only
  10. GRPO update for the learning agent; write round log + metrics
 ```
 
-`k` is clamped to keep a strict benign majority, because the defender's feature
-references (coordinate-wise median, MAD) assume most clients are honest.
+The attacker may poison at most `min(max_poison_clients, n_compromisable)` of its
+pool — always a strict minority of the `N` clients — so the defender's robust
+feature references (coordinate-wise median, MAD) always see an honest majority.
+Different GRPO rollouts may pick different subsets, so each rollout is rewarded
+against its OWN chosen set; the committed rollout's set becomes the round's ground
+truth.
 
-## Attacker contract (attack-plan DSL)
+## Attacker contract (client selection + attack-plan DSL)
 
 - **Input** (`agents/attacker_agent.build_user_prompt`): `round`,
-  `current_global_accuracy`, `attack_goal`, `poisoned_client_ids`, and
-  `benign_layer_details` — per-layer **statistics** (shape, mean, std, min, max,
-  L2 norm, abs-mean) of each poisoned client's benign weights. No raw weights.
-- **Output**: a single JSON object `{"operations": [ {op, target, ...params}, ... ]}`.
-  Operators (`agents/attack_ops.py`, 10): `scale`, `sign_flip`,
+  `current_global_accuracy`, `attack_goal`, `controllable_client_ids` (the pool it
+  may touch), `max_poison_clients` (this round's budget), and
+  `client_layer_details` — per-layer **statistics** (shape, mean, std, min, max,
+  L2 norm, abs-mean) of **each pool client's** benign weights. No raw weights.
+- **Output**: a single JSON object
+  `{"clients": [ {"id": <pool id>, "operations": [ {op, target, ...params}, ... ]}, ... ]}`.
+  The attacker **selects which** pool clients to poison (≤ budget) and gives **each
+  its own plan**. Operators (`agents/attack_ops.py`, 10): `scale`, `sign_flip`,
   `add_gaussian_noise`, `mask`, `clip`, `add_constant`, `permute`,
   `scale_neurons`, `blend_random`, `quantize`. `target` is `"all"`, a layer
   group (`"net.2"`), or a full key (`"net.4.weight"`). Operations apply in order.
-- **Application** (`agents/attack_ops.apply_plan`): deep-copies the benign
-  weights, applies each op, skips unknown ops / bad params / bad targets
-  (counted, not fatal), then scrubs NaN/Inf and clamps to `±max_weight_abs`.
-  PyTorch does all arithmetic — the LLM only emits the plan. If no usable plan
-  is parsed, all poisoned clients fall back to benign weights (a reward penalty);
-  parsing never raises.
+- **Selection + application** (`agents/attacker_agent.select_and_apply` →
+  `attack_ops.apply_plan`): filters ids to the pool, dedups, **truncates to the
+  budget**; per chosen client deep-copies its benign weights, applies its plan,
+  skips unknown ops / bad params / bad targets (counted, not fatal), then scrubs
+  NaN/Inf and clamps to `±max_weight_abs`. PyTorch does all arithmetic — the LLM
+  only emits the selection + plans. A chosen client with an empty/unusable plan
+  falls back to benign weights and counts as *malformed* (a wasted client). If
+  nothing parses, one benign client is selected as a fallback; parsing never
+  raises. Shorthand inputs (`{"operations": [...]}` shared plan, `{"clients":[ids],
+  "operations":[...]}`) are accepted for robustness.
 
 ## Defender contract (classification)
 
@@ -77,9 +90,15 @@ references (coordinate-wise median, MAD) assume most clients are honest.
 
 Both continuous, so GRPO group advantages don't collapse.
 
-- **Attacker**: `α·clip(drop/target, -0.5, 1.5) + β·evasion_rate − γ·malformed_frac`,
-  with `drop = prev_acc − post_acc`, `target` from the goal, `evasion_rate` =
-  fraction of poisoned clients not flagged.
+- **Attacker**: `α·clip(drop/target, -0.5, 1.5) + β·stealth − γ·malformed_frac
+  − δ·client_cost + ζ·diversity`, with `drop = prev_acc − post_acc`, `target` from
+  the goal, `stealth` = confidence-weighted evasion over the chosen clients,
+  `client_cost = (n_used−1)/(n_compromisable−1)` (the **use-fewer-clients**
+  penalty, 0 for a single client), and `diversity = 1 − mean pairwise cosine` of
+  the chosen clients' perturbations (the **collaboration** bonus, 0 for a single
+  client) — rewarding coordinated, distinct multi-client attacks over identical
+  Sybil-like clones. See `rl/rewards.py` (`attacker_reward`,
+  `perturbation_diversity`).
 - **Defender** (train-time ground truth): confidence-weighted **soft-F1** vs the
   poisoned set (or `clip(TPR − λ·FPR)`).
 

@@ -163,8 +163,11 @@ def run_phase2(
 ):
     fl = config["fl"]
     logger.info("=" * 60)
+    attack_cfg = config.get("attack", {})
     logger.info(f"PHASE 2: LLM-direct arms race  (mode={mode})")
-    logger.info(f"  simulation_rounds={n_rounds}, poison_fraction={fl.get('poison_fraction')}")
+    logger.info(f"  simulation_rounds={n_rounds}, n_compromisable={fl.get('n_compromisable')}, "
+                f"max_poison_clients={attack_cfg.get('max_poison_clients')}, "
+                f"sample_budget={attack_cfg.get('sample_budget_in_training')}")
     logger.info(f"  baseline_accuracy={baseline_accuracy:.4f}")
     logger.info("=" * 60)
 
@@ -292,13 +295,21 @@ def main():
     client_loaders, test_loader = get_data_loaders(
         n_clients=fl["n_clients"], batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), iid=data_cfg.get("iid", True),
+        bias_q=float(data_cfg.get("noniid_bias", 0.5)), seed=seed,
     )
 
-    if state_exists() and not args.fresh:
+    state = load_state() if (state_exists() and not args.fresh) else None
+    if state is not None and len(state[1]) != fl["n_clients"]:
+        logger.warning(
+            f"Checkpoint has {len(state[1])} client(s) but config n_clients={fl['n_clients']} "
+            f"— ignoring the stale checkpoint and re-running Phase 1."
+        )
+        state = None
+    if state is not None:
         logger.info("Checkpoint found — skipping Phase 1, loading saved state")
-        global_weights, client_weights, baseline_accuracy = load_state()
+        global_weights, client_weights, baseline_accuracy = state
     else:
-        logger.info("No checkpoint (or --fresh) — running Phase 1")
+        logger.info("No (usable) checkpoint or --fresh — running Phase 1")
         global_weights, client_weights, baseline_accuracy = run_training_phase(
             base_config, client_loaders, test_loader
         )
@@ -315,7 +326,10 @@ def main():
             config_summary={
                 "model": base_config.get("rl", {}).get("model"),
                 "n_clients": fl.get("n_clients"),
-                "poison_fraction": fl.get("poison_fraction"),
+                "n_compromisable": fl.get("n_compromisable"),
+                "max_poison_clients": base_config.get("attack", {}).get("max_poison_clients"),
+                "sample_budget": base_config.get("attack", {}).get("sample_budget_in_training"),
+                "noniid_bias": base_config.get("data", {}).get("noniid_bias"),
                 "G": base_config.get("rl", {}).get("G"),
                 "switch_mode": base_config.get("rl", {}).get("switch_mode"),
                 "first_learner": base_config.get("rl", {}).get("first_learner"),

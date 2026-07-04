@@ -11,15 +11,20 @@ Two phases:
 1. **Phase 1 (`training_rounds`):** All clients train honestly via FedAvg. The
    global model, each client's weights, and the baseline accuracy are
    checkpointed.
-2. **Phase 2 (`simulation_rounds`):** A **random subset** of clients is poisoned
-   each round.
-   - **Attacker LLM** — input: round number, per-layer **statistics** of the
-     poisoned clients' benign weights, current global accuracy, and a
-     configurable attack goal. Output: an **attack plan** — an ordered list of
-     primitive weight operators (scale, sign_flip, mask, add_gaussian_noise,
-     clip, add_constant, permute, scale_neurons, blend_random, quantize). A
-     deterministic interpreter applies the plan to the benign weights to produce
-     the poisoned weights sent to the server.
+2. **Phase 2 (`simulation_rounds`):** The attacker is a **partial insider** — it
+   controls only the first `n_compromisable` clients (default 5 of 20) and
+   **chooses which of them to poison** each round, up to a per-round budget,
+   optimizing to use **as few clients as possible** (and to coordinate them when
+   it uses more than one).
+   - **Attacker LLM** — input: round number, its `controllable_client_ids`, this
+     round's `max_poison_clients` budget, per-layer **statistics** of each pool
+     client's benign weights, current global accuracy, and a configurable attack
+     goal. Output: a **client selection + a per-client attack plan** — for each
+     chosen client, an ordered list of primitive weight operators (scale,
+     sign_flip, mask, add_gaussian_noise, clip, add_constant, permute,
+     scale_neurons, blend_random, quantize). A deterministic interpreter applies
+     each plan to that client's benign weights to produce the poisoned weights
+     sent to the server.
    - **Defender LLM** — input: per-client, per-layer statistical feature vectors.
      Output: a direct **benign/malicious classification** per client.
    - The server FedAvg-aggregates the clients the defender did not flag.
@@ -67,9 +72,10 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   design but is the simplest serving path).
 - **Hardware**: Llama-3.2-3B fits comfortably on a single GPU — ~6 GB of weights
   in the default bf16 LoRA (or ~4–6 GB floor under 4-bit QLoRA), so your 5090
-  (31 GB) has ample headroom for either. The attacker emits a short attack plan
-  (tens of tokens), so generation is fast and `rl.max_new_tokens` can stay small
-  (512).
+  (31 GB) has ample headroom for either. Generation is short: the attacker emits a
+  client selection + per-client plans, and the defender emits one verdict per
+  client (20 clients). `rl.max_new_tokens` defaults to 1024 to fit the defender's
+  full verdict list without truncation.
 
 ## Setup
 
@@ -127,7 +133,7 @@ python monitor.py --window 50     # smooth over a larger recent window for long 
 ```
 # Attacker — using the REAL system prompt it was trained with (recommended):
 python infer.py --adapter attacker --role \
-  --prompt '{"round":5,"current_global_accuracy":0.8,"attack_goal":{"type":"untargeted_degrade","target_accuracy_drop":0.2},"poisoned_client_ids":[0],"benign_layer_details":{}}'
+  --prompt '{"round":5,"current_global_accuracy":0.8,"attack_goal":{"type":"untargeted_degrade","target_accuracy_drop":0.2},"controllable_client_ids":[0,1,2,3,4],"max_poison_clients":1,"client_layer_details":{}}'
 
 # Defender — real system prompt, feature JSON as the user message:
 python infer.py --adapter defender --role \
@@ -162,9 +168,13 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
 
 ## Configuration
 
-- **`configs/base.yaml`** — FL hyperparameters, `poison_fraction` / `poison_seed`
-  / `benign_retrain_each_round`, the `attack.goal`, the `rl:` block (GRPO + LoRA
-  + league + reward weights), and inference LLM defaults.
+- **`configs/base.yaml`** — FL hyperparameters (`n_clients: 20`,
+  `n_compromisable: 5`, `poison_seed`, `benign_retrain_each_round`), the
+  `data.noniid_bias` (FLTrust `q`), the `attack` block (`goal`,
+  `max_poison_clients`, `sample_budget_in_training`, `eval_poison_clients`), and
+  the `rl:` block — GRPO + LoRA + league + reward weights, including
+  `reward.attacker.delta` (use-fewer-clients penalty) and `.zeta` (multi-client
+  collaboration/diversity bonus).
 - **`configs/attacker_agent.yaml`** — attacker goal fallback, layer-detail
   precision, poisoned-weight clamp, attacker adapter path.
 - **`configs/defender_agent.yaml`** — defender defaults, defender adapter path.

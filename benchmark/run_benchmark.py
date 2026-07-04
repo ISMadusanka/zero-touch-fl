@@ -38,6 +38,9 @@ def _parse_args():
                     help="attacker sampling temperature (0 = greedy/deterministic)")
     ap.add_argument("--defender-temperature", type=float, default=0.0,
                     help="LLM-defender sampling temperature")
+    ap.add_argument("--max-poison-clients", type=int, default=None,
+                    help="eval poison budget: max clients the attacker may poison per round "
+                         "(the attacker chooses WHICH of its pool). Default: attack.eval_poison_clients (=1)")
     ap.add_argument("--root-size", type=int, default=100, help="FLTrust clean root-set size")
     ap.add_argument("--root-epochs", type=int, default=1, help="FLTrust server local epochs (R_l)")
     ap.add_argument("--root-lr", type=float, default=None, help="FLTrust server lr (default: fl.lr)")
@@ -121,6 +124,7 @@ def main():
     client_loaders, test_loader = get_data_loaders(
         n_clients=fl["n_clients"], batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), iid=data_cfg.get("iid", True),
+        bias_q=float(data_cfg.get("noniid_bias", 0.5)), seed=seed,
     )
 
     if fl.get("benign_retrain_each_round", False):
@@ -131,6 +135,10 @@ def main():
     # Phase-1 start state (reuse the saved honest-FedAvg checkpoint, or train fresh).
     # load_state() returns None on a partial/corrupt checkpoint, so guard the unpack.
     state = load_state() if (state_exists() and not args.fresh) else None
+    if state is not None and len(state[1]) != fl["n_clients"]:
+        log.warning(f"Checkpoint has {len(state[1])} client(s) but config n_clients={fl['n_clients']} "
+                    f"— ignoring the stale checkpoint and re-running Phase-1.")
+        state = None
     if state is not None:
         log.info("Loading saved Phase-1 state (global model + client weights + baseline acc)")
         global_weights, client_weights, baseline_accuracy = state
@@ -139,10 +147,21 @@ def main():
         global_weights, client_weights, baseline_accuracy = run_phase1(
             base_cfg, client_loaders, test_loader)
 
-    # Env: pure round generator (poison sampling + benign updates + build_updates).
+    # Env: pure round generator (controllable pool + benign updates + build_updates).
     rng = random.Random(seed)
     env = FLArmsRaceEnv(base_cfg, client_loaders, test_loader, rng)
     env.reset(copy.deepcopy(global_weights), client_weights, baseline_accuracy)
+
+    # Evaluation uses a FIXED poison budget: the attacker chooses which <= budget of
+    # its controllable pool to poison each round. Default from config (=1); override
+    # with --max-poison-clients.
+    eval_budget = (args.max_poison_clients if args.max_poison_clients is not None
+                   else int(base_cfg.get("attack", {}).get("eval_poison_clients", 1)))
+    eval_budget = max(1, min(eval_budget, env.n_compromisable))
+    env.sample_budget = False
+    env.budget_cap = eval_budget
+    log.info(f"Eval poison budget = {eval_budget} of pool {env.n_compromisable} "
+             f"(clients {list(range(env.n_compromisable))}); attacker selects which to poison")
 
     # Load the trained policy: the attacker adapter is always needed; the defender
     # adapter only if the LLM defender is in the panel.
@@ -181,11 +200,10 @@ def main():
         root_loader = _build_root_loader(data_cfg, args.root_size, fl["batch_size"], seed)
 
     # DnC / Multi-Krum assume a known upper bound on #malicious; default it to the
-    # configured poison count (mirrors env._num_poisoned: round(frac*N) clamped to a
-    # benign majority). This is an assumed adversary budget, NOT per-round ground truth.
+    # eval poison budget (the max clients the attacker may actually poison), clamped
+    # to a benign majority. This is an assumed adversary budget, NOT per-round truth.
     n_cl = int(fl["n_clients"])
-    assumed_byz = max(1, min(round(float(fl.get("poison_fraction", 0.2)) * n_cl),
-                             (n_cl - 1) // 2))
+    assumed_byz = max(1, min(eval_budget, (n_cl - 1) // 2))
     dnc_m = args.dnc_num_byzantine if args.dnc_num_byzantine is not None else assumed_byz
     mk_f = args.multikrum_f if args.multikrum_f is not None else assumed_byz
 

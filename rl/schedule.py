@@ -33,7 +33,7 @@ from core.types import RoundLog
 from core.debug import dbg
 from rl.grpo import grpo_step
 from rl.policy import PolicyGenerator
-from rl.rewards import attacker_reward, defender_reward
+from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
 from rl.switch import PhaseController, SwitchConfig, committed_success
 from rl.turns import AttackerTurn, DefenderTurn
 
@@ -162,9 +162,11 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     ctx = env.begin_round()
 
     dbg.round_header(ctx.round_num, learner, opp, phase_index, phase_round,
-                     ctx.poisoned_ids, ctx.global_accuracy, k["G"],
+                     ctx.pool_ids, ctx.budget, ctx.global_accuracy, k["G"],
                      k["scoring_opp_temp"], k["opp_temp"])
-    dbg.fl_round(ctx.round_num, ctx.poisoned_ids, env.honest_updates,
+    # The poison SET is chosen per-rollout by the attacker, so it is unknown at
+    # begin_round — show only the federated fine-tuning here (poison at commit).
+    dbg.fl_round(ctx.round_num, [], env.honest_updates,
                  env.current_accuracy, env.benign_retrain)
 
     if learner == "attacker":
@@ -193,15 +195,16 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     # Advance the env by committing the best-scoring candidate action.
     best = _argmax(stats["rewards"]) if stats["rewards"] else 0
     info = turn.commit(stats["completions"][best])
+    poisoned_ids = info["poisoned_ids"]        # the attacker's committed choice
 
     drop = ctx.global_accuracy - info["post_accuracy"]
-    success = committed_success(learner, drop, info["verdicts"], ctx.poisoned_ids,
+    success = committed_success(learner, drop, info["verdicts"], poisoned_ids,
                                 state["switch_cfg"])
 
     _log_round(env, ctx, info, learner, stats, state["metrics_tracker"],
                state["save_round_log"], reward_att=k["reward_att"], reward_def=k["reward_def"],
                phase_index=phase_index, phase_round=phase_round, success=success,
-               best_index=best)
+               best_index=best, poisoned_ids=poisoned_ids)
     return stats, drop, success
 
 
@@ -320,27 +323,37 @@ def _save_adapters(policy, adapter_paths: dict):
 
 def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                reward_att=None, reward_def=None, phase_index=0, phase_round=0,
-               success=False, best_index=0):
+               success=False, best_index=0, poisoned_ids=None):
     verdicts = info["verdicts"]
     post_acc = info["post_accuracy"]
     n_malformed = info["n_malformed"]
+    poisoned_ids = poisoned_ids if poisoned_ids is not None else info.get("poisoned_ids", [])
     reward_att = reward_att or {}
     reward_def = reward_def or {}
 
+    # Diversity of the committed (possibly multi-client) attack; 0 for one client.
+    diversity = perturbation_diversity(
+        info.get("poisoned_by_client", {}),
+        {cid: env.pool_benign[cid] for cid in poisoned_ids if cid in env.pool_benign},
+    )
     a_rew = attacker_reward(ctx.global_accuracy, post_acc, env.goal,
-                            ctx.poisoned_ids, verdicts, n_malformed,
+                            poisoned_ids, verdicts, n_malformed,
                             alpha=reward_att.get("alpha", 1.0),
                             beta=reward_att.get("beta", 0.5),
-                            gamma=reward_att.get("gamma", 1.0))
-    d_rew = defender_reward(verdicts, ctx.poisoned_ids,
+                            gamma=reward_att.get("gamma", 1.0),
+                            delta=reward_att.get("delta", 0.0),
+                            zeta=reward_att.get("zeta", 0.0),
+                            pool_size=env.n_compromisable,
+                            diversity=diversity)
+    d_rew = defender_reward(verdicts, poisoned_ids,
                             mode=reward_def.get("mode", "soft_f1"),
                             fpr_penalty=reward_def.get("fpr_penalty", 1.0))
 
-    metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(ctx.poisoned_ids))
+    metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(poisoned_ids))
     save_round_log(RoundLog(
         round_num=ctx.round_num,
         attack_goal=env.goal,
-        poisoned_client_ids=ctx.poisoned_ids,
+        poisoned_client_ids=poisoned_ids,
         predicted_labels=[
             {"client_id": v.client_id, "is_suspicious": v.is_suspicious,
              "confidence": v.confidence, "reason": v.reason}
@@ -353,6 +366,10 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
         learning_agent=learner,
         attack_metadata={
             "n_malformed": n_malformed,
+            "budget": ctx.budget,
+            "n_used": len(poisoned_ids),
+            "controllable_pool": ctx.pool_ids,
+            "attack_diversity": round(float(diversity), 4),
             "phase_index": phase_index,
             "phase_round": phase_round,
             "learner_success": success,
@@ -368,7 +385,7 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     ))
     dbg.commit_summary(
         learner, best_index, info, ctx.global_accuracy, post_acc,
-        ctx.global_accuracy - post_acc, success, a_rew, d_rew, ctx.poisoned_ids,
+        ctx.global_accuracy - post_acc, success, a_rew, d_rew, poisoned_ids,
     )
     dbg.flush()
     logger.info(
