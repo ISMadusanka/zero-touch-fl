@@ -23,7 +23,7 @@ import copy
 import logging
 
 from clients.benign_client import BenignClient
-from core.types import ModelUpdate
+from core.types import ModelUpdate, DetectionVerdict
 from detector.features import compute_client_features
 from server.aggregation import FedAvgAggregator
 from server.fed_server import FedServer
@@ -198,3 +198,56 @@ class FLArmsRaceEnv:
         else:
             logger.warning("Round commit: all clients flagged — global model unchanged")
         return self.current_accuracy
+
+    # ------------------------------------------------------------------
+    def run_benign_fl_round(self) -> dict | None:
+        """Run ONE honest FedAvg round (exactly like a Phase-1 round) to advance
+        the shared FL state between arms-race phases.
+
+        Every client trains locally from the CURRENT global model; the updates are
+        FedAvg-aggregated with NO attacker and NO detector (all clients benign)
+        into a new global, and the resulting per-client local weights REPLACE the
+        frozen benign references in ``self.client_weights``. This is the
+        ``benign_retrain`` path run once, on demand: afterwards the next learner
+        (attacker or defender), the frozen opponent, and the aggregator all operate
+        on freshly trained client weights + a new global — with
+        ``benign_retrain_each_round=False`` these refreshed weights become the
+        honest updates the attacker poisons and the defender inspects every
+        following round.
+
+        Advances ``round_index`` so the interlude gets its own sequential round
+        number, and returns a summary dict for logging. Returns ``None`` when the
+        env has no client loaders (e.g. some unit tests) so callers can no-op.
+        """
+        if self._clients is None:
+            logger.warning("run_benign_fl_round: no client loaders — FL round skipped")
+            return None
+
+        self.round_index += 1
+        round_num = self.training_rounds + self.round_index
+        prev_accuracy = self.current_accuracy
+
+        updates = [c.train(self.server.model) for c in self._clients]
+        # All clients are honest here — every verdict is benign, so FedAvg averages
+        # the full set (mirrors Phase 1's clean aggregation).
+        clean = [DetectionVerdict(u.client_id, False, 0.0, "benign_fl") for u in updates]
+        new_global = self.aggregator.aggregate(updates, clean)
+        if new_global is not None:
+            self.server.set_global_weights(new_global)
+        self.current_accuracy = self.server.evaluate(self.test_loader)
+
+        # Refresh the per-client benign references the rest of Phase 2 consumes.
+        self.client_weights = [copy.deepcopy(u.weights) for u in updates]
+
+        logger.info(
+            f"[FL round {round_num}] benign FedAvg over {len(updates)} clients "
+            f"(honest, no attacker/detector): accuracy {prev_accuracy:.4f} -> "
+            f"{self.current_accuracy:.4f}"
+        )
+        return {
+            "round_num": round_num,
+            "prev_accuracy": prev_accuracy,
+            "post_accuracy": self.current_accuracy,
+            "updates": updates,
+            "n_clients": len(updates),
+        }

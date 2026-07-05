@@ -101,6 +101,7 @@ def train(
     switch_mode = str(rl.get("switch_mode", "best_response"))
     first_learner = str(rl.get("first_learner", "attacker"))
     curriculum_on_cap = bool(rl.get("curriculum_on_cap", True))
+    fl_interlude = bool(rl.get("fl_interlude_between_phases", True))
     adapter_paths = rl.get("adapter_paths", {
         "attacker": "checkpoints/attacker_adapter",
         "defender": "checkpoints/defender_adapter",
@@ -134,6 +135,7 @@ def train(
         adapter_paths=adapter_paths, progress_cb=progress_cb, total_rounds=total_rounds,
         save_every=save_every, snap_every=snap_every, league_prob=league_prob,
         max_new_tokens=max_new_tokens, rng=rng, curriculum_on_cap=curriculum_on_cap,
+        fl_interlude=fl_interlude,
     )
 
     if switch_mode == "best_response":
@@ -237,6 +239,62 @@ def _opponent_generator(state, opp, face_snapshot):
     return opp_gen, restore
 
 
+def _run_fl_interlude(state, next_learner, phase_index):
+    """Between two arms-race phases, advance the shared FL state by one honest
+    FedAvg round (exactly like a Phase-1 round) and log it.
+
+    The user-facing contract: after a learner wins and we hand off, we do NOT let
+    the incoming learner keep training against the same frozen client weights —
+    we first run one benign FL round so the refreshed client weights + global are
+    what the next learner, the frozen opponent, AND the aggregator now consume
+    (see ``FLArmsRaceEnv.run_benign_fl_round``). This runs before EVERY phase
+    after the first, whatever caused the switch (sustained win or cap)."""
+    env = state["env"]
+    info = env.run_benign_fl_round()
+    if info is None:
+        return
+    round_num = info["round_num"]
+    updates = info["updates"]
+
+    # Structured debug view (reuse the per-round FL panel; benign_retrain=True so
+    # it prints each client's local-training stats).
+    dbg.phase_event("FL ROUND (interlude)", round=round_num, next_learner=next_learner,
+                    phase=phase_index,
+                    prev_acc=round(info["prev_accuracy"], 4),
+                    post_acc=round(info["post_accuracy"], 4))
+    dbg.fl_round(round_num, [], updates, info["post_accuracy"], benign_retrain=True)
+    dbg.flush()
+
+    # Persist a round log so the interlude shows up in logs/round_data/round_NNN.json.
+    state["save_round_log"](RoundLog(
+        round_num=round_num,
+        attack_goal=env.goal,
+        poisoned_client_ids=[],
+        predicted_labels=[],
+        test_accuracy=info["post_accuracy"],
+        baseline_accuracy=env.baseline_accuracy,
+        attacker_reward=0.0,
+        defender_reward=0.0,
+        learning_agent="none",
+        attack_metadata={
+            "event": "benign_fl_round",
+            "next_learner": next_learner,
+            "phase_index": phase_index,
+            "prev_accuracy": info["prev_accuracy"],
+            "post_accuracy": info["post_accuracy"],
+            "n_clients": info["n_clients"],
+            "clients": [
+                {"client_id": u.client_id, **(u.metadata or {})} for u in updates
+            ],
+        },
+    ))
+    logger.info(
+        f"[FL round {round_num}] interlude before {next_learner} phase {phase_index}: "
+        f"acc {info['prev_accuracy']:.4f} -> {info['post_accuracy']:.4f} "
+        f"— new benign client weights now consumed by attacker/defender/aggregator"
+    )
+
+
 def _train_best_response(state, first_learner, start_round):
     """Success-gated iterated best response. Returns the final round count."""
     ctrl = PhaseController(state["switch_cfg"], first_learner=first_learner)
@@ -245,6 +303,12 @@ def _train_best_response(state, first_learner, start_round):
 
     while done < state["total_rounds"]:
         learner, opp = ctrl.learner, ctrl.opponent
+        # Before every phase AFTER the first, run one honest FL round so the
+        # incoming learner + frozen opponent + aggregator train against a freshly
+        # advanced client state (mirrors a Phase-1 round). Skipped for the very
+        # first phase, which uses the Phase-1 checkpoint as-is.
+        if ctrl.phase_index > 0 and state.get("fl_interlude", True):
+            _run_fl_interlude(state, next_learner=learner, phase_index=ctrl.phase_index)
         # Curriculum: a phase that capped without a win means the opponent is too
         # strong — let this learner face an earlier snapshot of it. Otherwise mix
         # in a league snapshot with probability league_prob (anti-overfit).

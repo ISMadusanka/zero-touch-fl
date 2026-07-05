@@ -333,6 +333,8 @@ def main():
                 "G": base_config.get("rl", {}).get("G"),
                 "switch_mode": base_config.get("rl", {}).get("switch_mode"),
                 "first_learner": base_config.get("rl", {}).get("first_learner"),
+                "success_streak": base_config.get("rl", {}).get("success_streak"),
+                "fl_interlude_between_phases": base_config.get("rl", {}).get("fl_interlude_between_phases"),
                 "baseline_accuracy": round(float(baseline_accuracy), 4),
                 "n_rounds": n_rounds,
             },

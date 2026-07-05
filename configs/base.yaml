@@ -75,9 +75,16 @@ rl:
   # --- Schedule: success-gated iterated best response (the arms-race ratchet) ---
   switch_mode: "best_response"    # best_response | fixed (legacy K_a/K_d alternation)
   first_learner: "attacker"       # who trains first
-  min_phase_rounds: 8             # earliest a phase may switch on a sustained win
-  max_phase_rounds: 1000           # hard cap: switch even without a win (prevents a stuck phase)
+  min_phase_rounds: 8             # earliest a phase may switch on a sustained win. Set equal to
+                                  # success_streak so a phase switches as soon as the learner wins
+                                  # success_streak times IN A ROW (no extra minimum-length gate).
+  max_phase_rounds: 4000           # hard cap: switch even without a win (prevents a stuck phase)
   success_streak: 3               # consecutive winning rounds needed to freeze + switch
+  fl_interlude_between_phases: true # before every phase AFTER the first, run ONE honest FL round
+                                  # (like Phase 1): all benign clients retrain from the current
+                                  # global, FedAvg into a new global, and the refreshed per-client
+                                  # weights become what the next learner / frozen opponent /
+                                  # aggregator consume. false = keep the frozen Phase-1 weights.
   curriculum_on_cap: true         # after a phase caps without a win, next learner faces an
                                   # earlier opponent snapshot so it can find a foothold
   attacker_min_drop: 0.02         # committed accuracy drop (prev-post) for an "attack passed"

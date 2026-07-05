@@ -48,6 +48,13 @@ Different GRPO rollouts may pick different subsets, so each rollout is rewarded
 against its OWN chosen set; the committed rollout's set becomes the round's ground
 truth.
 
+**Arms-race handoff.** The attacker trains (defender frozen) until it wins 3
+committed rounds in a row, then a single **benign FL round** runs (step 1 above
+for all clients, no attacker/detector — the refreshed client weights + global are
+kept), and the defender trains (attacker frozen) until it wins 3 in a row, then
+another benign FL round runs, and so on. Every GRPO phase after the first starts
+from a freshly advanced client state (see "Between-phase benign FL round" below).
+
 ## Attacker contract (client selection + attack-plan DSL)
 
 - **Input** (`agents/attacker_agent.build_user_prompt`): `round`,
@@ -117,6 +124,22 @@ Both continuous, so GRPO group advantages don't collapse.
   greedy), repeat. The best-scoring sampled action is committed to advance the
   env. An **opponent league** snapshots adapters periodically and, with
   probability `league_prob`, makes a phase face a random past snapshot.
+- **Switch trigger** (`best_response` mode): a phase freezes-and-switches as soon
+  as the learner wins `success_streak` (default **3**) committed rounds **in a
+  row**. `min_phase_rounds` is set equal to `success_streak`, so there is no
+  extra minimum-length gate — 3 consecutive wins is the whole condition (a
+  `max_phase_rounds` cap still forces a switch if the win never comes).
+- **Between-phase benign FL round** (`fl_interlude_between_phases`, default on):
+  before EVERY phase after the first — i.e. right before the incoming learner
+  starts GRPO — the schedule runs ONE honest FL round exactly like Phase 1
+  (`FLArmsRaceEnv.run_benign_fl_round`): all benign clients retrain from the
+  current global, FedAvg into a new global, and the freshly trained per-client
+  weights REPLACE the frozen benign references. So each new attacker/defender
+  phase (and the frozen opponent + aggregator) trains against an advanced client
+  state rather than the same frozen Phase-1 weights. The interlude gets its own
+  sequential round number and is logged to `logs/system.log`,
+  `logs/round_data/round_NNN.json` (`attack_metadata.event="benign_fl_round"`)
+  and `logs/debug.json`.
 
 ## Modes (`main.py`)
 
