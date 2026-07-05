@@ -58,28 +58,73 @@ def extract_json(text):
 
 
 # ---------------------------------------------------------------------------
-# Layer details (the attacker's observation)
+# Update details (the attacker's observation)
 # ---------------------------------------------------------------------------
 
-def layer_details(state_dict: dict, precision: int = 4) -> dict:
-    """Per-layer summary statistics describing benign weights (no raw values)."""
+def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Cosine similarity of two flat tensors (0 if either is degenerate)."""
+    denom = float(a.norm()) * float(b.norm())
+    if denom < _EPS:
+        return 0.0
+    return float(torch.dot(a, b) / denom)
+
+
+def delta_details(client_sd: dict, global_sd: dict, precision: int = 4) -> dict:
+    """Summarize a client's HONEST UPDATE ``Δ = client − global`` for the attacker.
+
+    A partial-insider attacker sees only the global model (broadcast to every
+    participant each round) and its OWN clients' benign weights — never the other
+    clients' updates (defender-only), and never a stable pool baseline (the poison
+    budget makes the controllable pool's size/membership vary, and those clients
+    are the poison target, not a reference). So EVERY statistic here is normalized
+    only against the global ``G`` or the client's own weights. That keeps them
+    self-contained, dimensionless, and independent of the model architecture and
+    of how many clients are poisoned this round:
+
+      per layer (and whole model):
+        rel_update      ‖Δ‖ / ‖G‖               update size relative to the model
+        rms_delta       ‖Δ‖ / sqrt(count)       per-coordinate step size
+        energy_frac     ‖Δ_layer‖² / ‖Δ‖²       share of the update in this layer
+        sign_flip_frac  mean(sign c ≠ sign G)   fraction of weights flipped vs G
+        std_ratio       std(Δ) / std(G)         spread of Δ vs the model's own
+        absmean_ratio   mean|Δ| / mean|G|       typical |change| vs the model's own
+      whole model also: cos_to_global = cos(Δ, G)
+
+    ``client_sd`` and ``global_sd`` must share keys (same architecture).
+    """
     def r(x):
         return round(float(x), precision)
 
-    out = {}
-    for k, v in state_dict.items():
-        t = v.flatten().float()
-        out[k] = {
-            "shape": list(v.shape),
-            "count": int(t.numel()),
-            "mean": r(t.mean()),
-            "std": r(t.std(unbiased=False)),
-            "min": r(t.min()),
-            "max": r(t.max()),
-            "l2_norm": r(t.norm()),
-            "abs_mean": r(t.abs().mean()),
+    keys = list(global_sd.keys())
+    g_flat = torch.cat([global_sd[k].flatten().float() for k in keys])
+    c_flat = torch.cat([client_sd[k].flatten().float() for k in keys])
+    d_norm_sq = float((c_flat - g_flat).pow(2).sum())
+
+    def _stats(c: torch.Tensor, g: torch.Tensor) -> dict:
+        d = c - g
+        dl_norm = float(d.norm())
+        count = max(1, int(d.numel()))
+        return {
+            "rel_update": r(dl_norm / (float(g.norm()) + _EPS)),
+            "rms_delta": r(dl_norm / (count ** 0.5)),
+            "energy_frac": r((dl_norm ** 2) / (d_norm_sq + _EPS)),
+            "sign_flip_frac": r(float((torch.sign(c) != torch.sign(g)).float().mean())),
+            "std_ratio": r(float(d.std(unbiased=False)) / (float(g.std(unbiased=False)) + _EPS)),
+            "absmean_ratio": r(float(d.abs().mean()) / (float(g.abs().mean()) + _EPS)),
         }
-    return out
+
+    layers = {}
+    for k in keys:
+        g = global_sd[k].flatten().float()
+        c = client_sd[k].flatten().float()
+        entry = {"shape": list(global_sd[k].shape)}   # context only, not a magnitude
+        entry.update(_stats(c, g))
+        layers[k] = entry
+
+    whole = _stats(c_flat, g_flat)
+    whole.pop("energy_frac", None)                    # trivially 1.0 for the whole model
+    whole["cos_to_global"] = r(_cos(c_flat - g_flat, g_flat))
+    return {"layers": layers, "whole": whole}
 
 
 # ---------------------------------------------------------------------------

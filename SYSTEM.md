@@ -59,9 +59,16 @@ from a freshly advanced client state (see "Between-phase benign FL round" below)
 
 - **Input** (`agents/attacker_agent.build_user_prompt`): `round`,
   `current_global_accuracy`, `attack_goal`, `controllable_client_ids` (the pool it
-  may touch), `max_poison_clients` (this round's budget), and
-  `client_layer_details` — per-layer **statistics** (shape, mean, std, min, max,
-  L2 norm, abs-mean) of **each pool client's** benign weights. No raw weights.
+  may touch), `max_poison_clients` (this round's budget), and `client_update_stats`
+  — per-layer + whole-model **statistics of each pool client's HONEST UPDATE**
+  `Δ = local − global` (`agents/attack_ops.delta_details`): `rel_update`
+  (‖Δ‖/‖G‖), `rms_delta`, `energy_frac`, `sign_flip_frac`, `std_ratio`,
+  `absmean_ratio`, and whole-model `cos_to_global`. Every value is normalized
+  against the **global model only** — never a median/mean/pairwise reference over
+  other clients (those are defender-only; a partial-insider attacker cannot
+  observe the honest majority) and never a pool baseline (the budget makes the
+  pool unstable and it is the poison target). This keeps the observation
+  dimensionless, architecture-independent, and budget-invariant. No raw weights.
 - **Output**: a single JSON object
   `{"clients": [ {"id": <pool id>, "operations": [ {op, target, ...params}, ... ]}, ... ]}`.
   The attacker **selects which** pool clients to poison (≤ budget) and gives **each

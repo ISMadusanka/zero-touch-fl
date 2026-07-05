@@ -22,7 +22,7 @@ import json
 import logging
 
 from agents.attack_ops import (
-    OPERATOR_DOCS, apply_plan, extract_plan, extract_selection, layer_details,
+    OPERATOR_DOCS, apply_plan, delta_details, extract_plan, extract_selection,
 )
 from core.debug import dbg
 
@@ -51,7 +51,7 @@ Your action each round has TWO parts:
      `max_poison_clients` of them. Using FEWER clients is better: every extra
      client is penalized and is more likely to be detected. Only recruit more
      clients if a single one cannot achieve the goal. The clients hold different
-     data (non-IID), so WHICH ones you pick matters — use `client_layer_details`.
+     data (non-IID), so WHICH ones you pick matters — use `client_update_stats`.
   2. For each selected client, output an ATTACK PLAN: an ordered list of primitive
      operations applied to THAT client's benign weights to produce its poisoned
      weights. When you use more than one client, give each a DIFFERENT, COORDINATED
@@ -59,9 +59,23 @@ Your action each round has TWO parts:
      their average moves the global model where you want WITHOUT the clients
      looking alike.
 
-You are given per-client per-layer STATISTICS of the benign weights
-(`client_layer_details`) — shapes, means, stds, norms — not the raw values. Use
-them to decide which clients to hit, which layers, and how hard.
+You are given, per controllable client, statistics of its HONEST UPDATE
+Δ = (local weights − current global model), in `client_update_stats` — per layer
+and for the whole model, never the raw values. You canNOT see the other clients'
+updates, so these are normalized against the GLOBAL model ONLY, which makes them
+dimensionless:
+- `rel_update`     = ‖Δ‖ / ‖global‖ for that layer — how large this client's honest
+                     change already is. Your poison ADDS to this; the bigger it
+                     grows, the more the update stands out and the easier the
+                     defender flags it.
+- `rms_delta`      = per-coordinate size of Δ (its typical step per weight).
+- `energy_frac`    = share of the client's total update that lives in this layer
+                     (where its honest change is concentrated).
+- `sign_flip_frac` = fraction of weights whose sign differs from the global.
+- `std_ratio` / `absmean_ratio` = spread / typical magnitude of Δ vs the global's own.
+- whole-model `cos_to_global` = how aligned the update is with the current model.
+Use these to decide which clients and layers to hit and how hard, while keeping
+each poisoned update close to a normal honest update so it is not filtered out.
 
 Your objective is in `attack_goal`:
 - "untargeted_degrade": lower global test accuracy by about `target_accuracy_drop`
@@ -110,6 +124,7 @@ class AttackerAgent:
         round_num: int,
         global_accuracy: float,
         benign_by_client: dict[int, dict],
+        global_weights: dict,
         budget: int | None = None,
     ) -> str:
         """Serialize the attacker's per-round observation into a user message.
@@ -119,6 +134,12 @@ class AttackerAgent:
             global_accuracy: current global model test accuracy.
             benign_by_client: {client_id: benign_state_dict} for the CONTROLLABLE
                 pool (all clients the attacker may choose from this round).
+            global_weights: the current global model state_dict — the ONLY
+                reference the (partial-insider) attacker is allowed to normalize
+                against. Each client's stats describe its honest update
+                ``Δ = local − global`` relative to this model (see
+                ``attack_ops.delta_details``); the attacker never sees other
+                clients' updates.
             budget: max number of clients the attacker may poison this round
                 (defaults to the whole pool).
         """
@@ -131,8 +152,8 @@ class AttackerAgent:
             "attack_goal": self.goal,
             "controllable_client_ids": pool_ids,
             "max_poison_clients": int(budget),
-            "client_layer_details": {
-                str(cid): layer_details(sd, self.detail_precision)
+            "client_update_stats": {
+                str(cid): delta_details(sd, global_weights, self.detail_precision)
                 for cid, sd in benign_by_client.items()
             },
         }

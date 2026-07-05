@@ -46,7 +46,7 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
         # the SAME poisoned updates go to every defense (vary defense, hold attack).
         system = attacker_agent.system_prompt()
         user = attacker_agent.build_user_prompt(ctx.round_num, reference_acc,
-                                                ctx.pool_benign, ctx.budget)
+                                                ctx.pool_benign, env.global_weights, ctx.budget)
         text = policy.generate(attacker_adapter, system, user, n=1,
                                temperature=attack_temperature, max_new_tokens=max_new_tokens)[0]
         poisoned, chosen_ids, _n_malformed = attacker_agent.select_and_apply(

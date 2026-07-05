@@ -56,7 +56,7 @@ class AttackerTurn:
         self.system = attacker_agent.system_prompt()
         self.user = attacker_agent.build_user_prompt(
             env.round_index + env.training_rounds, env.current_accuracy,
-            self.pool_references, self.budget,
+            self.pool_references, env.global_weights, self.budget,
         )
         dbg.attacker_prompt(self.system, self.user, who="learner")
 
@@ -141,7 +141,7 @@ class DefenderTurn:
         a_sys = attacker_agent.system_prompt()
         a_user = attacker_agent.build_user_prompt(
             env.round_index + env.training_rounds, env.current_accuracy,
-            env.pool_benign, env.round_budget,
+            env.pool_benign, env.global_weights, env.round_budget,
         )
         dbg.attacker_prompt(a_sys, a_user, who="frozen-opponent")
         a_text = attacker_gen.generate(a_sys, a_user, n=1, temperature=opponent_temperature)[0]
