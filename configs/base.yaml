@@ -1,21 +1,112 @@
 # Federated Learning Configuration
 
 fl:
-  training_rounds: 20          # Phase 1: honest training rounds
-  simulation_rounds: 2000       # Phase 2: attack/defend rounds
-  n_clients: 5
-  malicious_client_id: 0      # 0-indexed client that becomes adversarial
+  training_rounds: 20             # Phase 1: honest training rounds
+  simulation_rounds: 2000000         # Phase 2: adversarial RL rounds
+  n_clients: 20                   # total federated clients (honest majority)
+  n_compromisable: 5              # the attacker can ONLY access clients [0 .. n_compromisable-1];
+                                  # the remaining clients are always honest & out of reach.
+  poison_fraction: 0.2            # DEPRECATED for selection: the attacker now CHOOSES which of
+                                  # its pool to poison (see attack.max_poison_clients). Kept only
+                                  # as a legacy fallback for defenses that assume a #malicious.
+  poison_seed: 0                  # RNG seed: non-IID partition + per-round budget sampling + repro
+  benign_retrain_each_round: false # false = benign clients replay frozen Phase-1 final-round local weights every round
   local_epochs: 3
   batch_size: 64
   lr: 0.002
-  device: "cpu"
+  device: "cuda"                  # RL training needs a GPU; use "cpu" only for --dry-run/--baseline
 
 data:
   dataset: "mnist"
   iid: false
+  noniid_bias: 0.5                # FLTrust bias probability q (iid=false only). 1/n_classes=0.1
+                                  # is IID; larger = more non-IID; paper default 0.5.
   data_dir: "./data/mnist_raw"
 
-# Default Ollama settings (used when --env linux)
+# Attack goal (configurable). First experiment = untargeted accuracy reduction.
+attack:
+  goal:
+    type: "untargeted_degrade"    # untargeted_degrade | slow_degrade | targeted_label
+    target_accuracy_drop: 0.20    # untargeted_degrade: aim to drop accuracy ~20pts
+    # per_round_drop: 0.02        # slow_degrade
+    # label: 7                    # targeted_label (per-class eval is a TODO; falls back to overall)
+  # --- Client-selection budget (the attacker chooses WHICH & HOW MANY to poison) ---
+  max_poison_clients: 5           # TRAINING budget cap: attacker may poison up to this many of its
+                                  # pool each round (must be <= n_compromisable). Reward penalizes
+                                  # using more than needed (see rl.reward.attacker.delta).
+  sample_budget_in_training: true # true = randomize the per-round cap in [1..max_poison_clients] so
+                                  # the policy is BUDGET-AWARE (generalizes to any eval budget).
+  eval_poison_clients: 1          # EVALUATION default budget (benchmark --max-poison-clients override)
+
+# Inference-only LLM defaults (used by --dry-run and the OpenAI path).
 llm:
   ollama_base_url: "http://localhost:11434"
-  ollama_model: "gpt-oss:20b"
+  ollama_model: "llama3.2:3b"
+
+# Reinforcement learning (GRPO) settings — see README "LLM handling".
+rl:
+  model: "unsloth/Llama-3.2-3B-Instruct"  # HF/Unsloth base for QLoRA training
+  attn_implementation: "eager"    # broadly compatible; Llama 3.2 also supports "sdpa"
+  use_fast_generate: true         # KV-cached generation (fast); auto-falls back to no-cache on failure
+  max_seq_len: 8192
+  load_in_4bit: false             # bf16 LoRA: 3B fits easily on 32GB+; skips QLoRA dequant -> faster grad passes
+  lora_r: 16
+  lora_alpha: 32
+  G: 4                            # rollouts per GRPO step (group size)
+  kl_beta: 0.02                   # KL penalty toward the frozen base model
+  lr: 1.0e-5
+  temperature: 1.0                # learner sampling temperature (exploration)
+  opponent_temperature: 0.0       # frozen opponent plays greedily when a round is COMMITTED
+  scoring_opponent_temperature: 0.7 # frozen opponent temp while SCORING the G rollouts;
+                                  # >0 so candidates see varied opponent verdicts -> restores
+                                  # within-group reward spread (fixes attacker zero-advantage)
+  max_new_tokens: 1024            # headroom for the defender's 20-client verdict list and the
+                                  # attacker's per-client plans (raise if outputs get truncated)
+  grad_clip: 1.0
+  save_every: 25                  # checkpoint adapters + progress every N rounds (resume granularity)
+  league_snapshot_every: 100      # snapshot adapters into the opponent league
+  league_prob: 0.25               # chance a training phase faces a league snapshot
+
+  # --- Zero-advantage guard (stops the attacker un-learning toward base) ---
+  resample_on_zero_advantage: true # if a group has no reward spread, re-roll once at higher temp
+  resample_temperature: 1.3       # temperature for that re-roll
+  skip_zero_advantage: true       # if still degenerate, skip the step (apply NO gradient)
+
+  # --- Schedule: success-gated iterated best response (the arms-race ratchet) ---
+  switch_mode: "best_response"    # best_response | fixed (legacy K_a/K_d alternation)
+  first_learner: "attacker"       # who trains first
+  min_phase_rounds: 8             # earliest a phase may switch on a sustained win. Set equal to
+                                  # success_streak so a phase switches as soon as the learner wins
+                                  # success_streak times IN A ROW (no extra minimum-length gate).
+  max_phase_rounds: 4000           # hard cap: switch even without a win (prevents a stuck phase)
+  success_streak: 3               # consecutive winning rounds needed to freeze + switch
+  fl_interlude_between_phases: true # before every phase AFTER the first, run ONE honest FL round
+                                  # (like Phase 1): all benign clients retrain from the current
+                                  # global, FedAvg into a new global, and the refreshed per-client
+                                  # weights become what the next learner / frozen opponent /
+                                  # aggregator consume. false = keep the frozen Phase-1 weights.
+  curriculum_on_cap: true         # after a phase caps without a win, next learner faces an
+                                  # earlier opponent snapshot so it can find a foothold
+  attacker_min_drop: 0.02         # committed accuracy drop (prev-post) for an "attack passed"
+  attacker_min_evaded: 1.0        # fraction of poisoned clients that must evade detection
+  defender_min_tpr: 0.99          # defender "win": catches the poisoned client(s)...
+  defender_max_fpr: 0.10          # ...without over-flagging honest clients
+  # Legacy fixed-mode knobs (used only when switch_mode: fixed):
+  K_a: 4                          # attacker rounds per alternation
+  K_d: 4                          # defender rounds per alternation
+  adapter_paths:
+    attacker: "checkpoints/attacker_adapter"
+    defender: "checkpoints/defender_adapter"
+  reward:
+    attacker:
+      alpha: 1.0                  # weight on accuracy-drop term
+      beta: 0.5                   # weight on evasion term
+      gamma: 1.0                  # penalty for malformed weight output
+      delta: 0.3                  # penalty for using MORE poison clients than needed
+                                  # (client_cost = (n_used-1)/(n_compromisable-1) in [0,1])
+      zeta: 0.2                   # bonus for COLLABORATIVE multi-client attacks: diversity =
+                                  # 1 - mean pairwise cosine of chosen clients' perturbations
+                                  # (0 for a single client). Rewards distinct, coordinated roles.
+    defender:
+      mode: "soft_f1"             # soft_f1 | tpr_minus_fpr
+      fpr_penalty: 1.0

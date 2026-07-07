@@ -38,3 +38,31 @@ def load_state():
 
 def state_exists() -> bool:
     return os.path.exists(os.path.join(CHECKPOINT_DIR, "global_model.pt"))
+
+
+# ---------------------------------------------------------------------------
+# RL training progress (for resuming the Phase-2 GRPO loop)
+# ---------------------------------------------------------------------------
+
+_PROGRESS_FILE = "rl_progress.json"
+
+
+def save_progress(rounds_done: int):
+    """Persist how many Phase-2 rounds have been trained (resume support)."""
+    _ensure_dir()
+    with open(os.path.join(CHECKPOINT_DIR, _PROGRESS_FILE), "w") as f:
+        json.dump({"rounds_done": int(rounds_done)}, f)
+
+
+def load_progress() -> int:
+    """Return rounds already trained (0 if none)."""
+    try:
+        with open(os.path.join(CHECKPOINT_DIR, _PROGRESS_FILE)) as f:
+            return int(json.load(f)["rounds_done"])
+    except (FileNotFoundError, KeyError, ValueError):
+        return 0
+
+
+def adapter_exists(path: str) -> bool:
+    """True if a saved LoRA adapter directory looks present at ``path``."""
+    return os.path.exists(os.path.join(path, "adapter_config.json"))

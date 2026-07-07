@@ -1,170 +1,262 @@
-"""Attacker LLM agent — selects and tunes model poisoning attacks.
+"""Attacker LLM agent — SELECTS which clients to poison and emits a per-client
+ATTACK PLAN (primitive operators), not raw weights.
 
-Only adapts strategy when the previous attack was CAUGHT by the defender.
-If the attack succeeded (passed through), the same strategy is reused.
+This is a **pure prompt-builder + output-parser**. It never calls an LLM itself:
+generation (and, during training, the log-probs GRPO needs) is owned by the RL
+policy (`rl/policy.py`) or the inference backend (`rl/inference.py`).
+
+The attacker is a **partial insider**: it can only touch a fixed pool of
+controllable clients (the first `n_compromisable` ids). Each round it is given a
+budget — the max number of those it may poison — and it must decide WHICH clients
+to recruit (preferring the fewest) and HOW to poison each. Because clients hold
+non-IID data, which client it picks matters; and when it uses several clients it
+must give them distinct, coordinated roles (identical clones are caught as Sybils
+and waste the budget).
+
+Composing primitives (scale, sign_flip, mask, noise, permute, …) lets the LLM
+discover novel poisoning strategies while keeping its output tiny and
+RL-trainable.
 """
 
 import json
 import logging
-import numpy as np
 
-from agents.embedder import embed, get_dimension
-
-from agents.llm_client import create_llm_client
-from storage.vector_store import VectorStore
+from agents.attack_ops import (
+    OPERATOR_DOCS, apply_plan, delta_details, extract_plan, extract_selection,
+)
+from core.debug import dbg
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are an adversarial agent in a federated learning system.
-Your goal: craft model poisoning attacks that evade the anomaly detector while
-degrading the global model's accuracy.
 
-Available attack types (model poisoning only):
-{available_attacks}
+# Default goal for the first experiment (untargeted accuracy reduction).
+DEFAULT_GOAL = {"type": "untargeted_degrade", "target_accuracy_drop": 0.20}
 
-You receive:
-- baseline_accuracy: the clean model accuracy (before any attacks)
-- current_accuracy: test accuracy after the last round's aggregation
-- was_detected: whether your last attack was caught
-- history: summary of past rounds
-- similar_past_experiences: relevant past episodes from memory
 
-Respond with ONLY a JSON object:
-{{
-    "attack_type": "<one of the available attacks>",
-    "params": {{<attack-specific parameters>}},
-    "reasoning": "<brief explanation>"
-}}
+SYSTEM_PROMPT = """You are an adversarial participant in a federated-learning system trained on MNIST.
 
-Attack parameter ranges:
-- sign_flip: {{"c": 1.0 to 4.0, "k": 10 to total_params}}  (c = scaling factor, k = weights to flip; omit k to flip all)
-- noise_injection: {{"scale": 0.1 to 10.0, "k": 10 to total_params}}  (scale = noise std dev, k = weights to noise; omit k to noise all)
-- scaling: {{"factor": 1.5 to 100.0, "k": 10 to total_params}}  (factor = delta multiplier, k = weights to scale; omit k to scale all)
-- gaussian_noise: {{"sigma": 0.1 to 10.0}}
+Setup you must reason about:
+- Many clients each submit a model update every round. The server averages the
+  accepted clients' weights (FedAvg) into the new global model.
+- A defender inspects statistical features of every client's update and removes
+  the clients it judges malicious BEFORE averaging. Updates that look wildly
+  different from the others (much larger norm, opposite sign pattern, low cosine
+  similarity) are the easiest to catch. Several of YOUR clients that look nearly
+  IDENTICAL to each other are also easy to catch — they look like colluding Sybils.
+- You are a partial insider: you control ONLY the clients listed in
+  `controllable_client_ids`. Every other client is honest and out of your reach.
 
-For sign_flip, noise_injection, and scaling: the optional k parameter selects only
-the top-k weights (by gradient magnitude) to attack. The rest stay honest.
-Smaller k = stealthier but weaker. Past attack_metadata shows which layers were
-targeted and gradient magnitude statistics — use this to refine your choices.
+Your action each round has TWO parts:
+  1. SELECT which of your controllable clients to poison. You may poison AT MOST
+     `max_poison_clients` of them. Using FEWER clients is better: every extra
+     client is penalized and is more likely to be detected. Only recruit more
+     clients if a single one cannot achieve the goal. The clients hold different
+     data (non-IID), so WHICH ones you pick matters — use `client_update_stats`.
+  2. For each selected client, output an ATTACK PLAN: an ordered list of primitive
+     operations applied to THAT client's benign weights to produce its poisoned
+     weights. When you use more than one client, give each a DIFFERENT, COORDINATED
+     role (e.g. one amplifies one layer while another shifts a different layer) so
+     their average moves the global model where you want WITHOUT the clients
+     looking alike.
 
-Be strategic. If you were detected, try a subtler approach (lower params, smaller k).
-If your attack was too subtle (accuracy didn't drop), be more aggressive."""
+You are given, per controllable client, statistics of its HONEST UPDATE
+Δ = (local weights − current global model), in `client_update_stats` — per layer
+and for the whole model, never the raw values. You canNOT see the other clients'
+updates, so these are normalized against the GLOBAL model ONLY, which makes them
+dimensionless:
+- `rel_update`     = ‖Δ‖ / ‖global‖ for that layer — how large this client's honest
+                     change already is. Your poison ADDS to this; the bigger it
+                     grows, the more the update stands out and the easier the
+                     defender flags it.
+- `rms_delta`      = per-coordinate size of Δ (its typical step per weight).
+- `energy_frac`    = share of the client's total update that lives in this layer
+                     (where its honest change is concentrated).
+- `sign_flip_frac` = fraction of weights whose sign differs from the global.
+- `std_ratio` / `absmean_ratio` = spread / typical magnitude of Δ vs the global's own.
+- whole-model `cos_to_global` = how aligned the update is with the current model.
+Use these to decide which clients and layers to hit and how hard, while keeping
+each poisoned update close to a normal honest update so it is not filtered out.
+
+Your objective is in `attack_goal`:
+- "untargeted_degrade": lower global test accuracy by about `target_accuracy_drop`
+  WHILE staying similar enough to benign updates to avoid being filtered out.
+- "slow_degrade": reduce accuracy only slightly (`per_round_drop`) to stay stealthy.
+- "targeted_label": harm a specific class `label` while keeping overall accuracy high.
+
+There is a tension: large changes degrade accuracy more but are easier to detect;
+subtle changes evade detection but do less damage. Compose operators to balance
+them and to invent non-obvious attacks.
+
+%OPERATOR_DOCS%
+
+OUTPUT FORMAT — respond with ONLY a single JSON object, no prose, no markdown:
+{"clients": [
+   {"id": <a controllable client id>, "operations": [
+      {"op": "<name>", "target": "<all|layer-group|key>", ...params},
+      ...
+   ]},
+   ...
+]}
+Rules:
+- Only choose ids from `controllable_client_ids`, and AT MOST `max_poison_clients`
+  of them. Prefer the fewest clients that achieve the goal.
+- Each client's "operations" is its own ordered plan (1-6 ops); order matters.
+- Use only the operators listed above with their stated params.
+- To poison a single client, return a "clients" list with exactly ONE entry."""
 
 
 class AttackerAgent:
-    """LLM-powered attacker that adapts only when caught."""
+    """Pure attacker policy: builds the prompt, parses + applies the attack plan."""
 
-    def __init__(self, config: dict):
-        llm_cfg = config.get("llm", {})
-        backend = llm_cfg.get("backend", "openai")
+    def __init__(self, config: dict | None = None):
+        config = config or {}
+        self.goal = config.get("attack_goal", dict(DEFAULT_GOAL))
+        self.detail_precision = int(config.get("detail_precision", 4))
+        self.max_abs = float(config.get("max_weight_abs", 100.0))
+        self._system = SYSTEM_PROMPT.replace("%OPERATOR_DOCS%", OPERATOR_DOCS)
 
-        # Pick model name based on backend
-        if backend == "ollama":
-            model = llm_cfg.get("ollama_model", "deepseek-r1:70b")
-        else:
-            model = llm_cfg.get("model", "gpt-4o-mini")
+    # ------------------------------------------------------------------
+    def system_prompt(self) -> str:
+        return self._system
 
-        self.llm = create_llm_client(
-            backend=backend,
-            model=model,
-            temperature=llm_cfg.get("temperature", 0.7),
-            ollama_base_url=llm_cfg.get("ollama_base_url", "http://localhost:11434"),
-        )
-        self.available_attacks = config.get("available_attacks", ["sign_flip"])
-        self.memory = VectorStore(
-            dimension=get_dimension(),
-            persist_path=config.get("memory", {}).get("persist_path"),
-        )
-        self.current_strategy: dict | None = None
-        self.history: list[dict] = []
+    def build_user_prompt(
+        self,
+        round_num: int,
+        global_accuracy: float,
+        benign_by_client: dict[int, dict],
+        global_weights: dict,
+        budget: int | None = None,
+    ) -> str:
+        """Serialize the attacker's per-round observation into a user message.
 
-    def decide(self, context: dict) -> dict:
-        """Decide attack strategy for this round.
-
-        Only invokes the LLM if the last attack was detected.
-        Otherwise, returns the same strategy.
+        Args:
+            round_num: current global round.
+            global_accuracy: current global model test accuracy.
+            benign_by_client: {client_id: benign_state_dict} for the CONTROLLABLE
+                pool (all clients the attacker may choose from this round).
+            global_weights: the current global model state_dict — the ONLY
+                reference the (partial-insider) attacker is allowed to normalize
+                against. Each client's stats describe its honest update
+                ``Δ = local − global`` relative to this model (see
+                ``attack_ops.delta_details``); the attacker never sees other
+                clients' updates.
+            budget: max number of clients the attacker may poison this round
+                (defaults to the whole pool).
         """
-        was_detected = context.get("was_detected")
-
-        # First round — always ask LLM
-        if self.current_strategy is None:
-            logger.info("Attacker: first round — consulting LLM for initial strategy")
-            self.current_strategy = self._ask_llm(context)
-            return self.current_strategy
-
-        # Attack succeeded → keep strategy
-        if not was_detected:
-            logger.info("Attacker: last attack passed through — keeping strategy")
-            return self.current_strategy
-
-        # Attack was caught → adapt
-        logger.info("Attacker: last attack was CAUGHT — consulting LLM for new strategy")
-        self.current_strategy = self._ask_llm(context)
-        return self.current_strategy
-
-    def record_outcome(self, round_num: int, strategy: dict, was_detected: bool, accuracy: float, attack_metadata: dict | None = None):
-        """Store round outcome in history and vector memory.
-
-        attack_metadata may contain details like flipped_per_layer,
-        flipped_indices_per_layer, and gradient magnitude stats from
-        the sign_flip attack (or other attacks that populate it).
-        """
-        entry = {
+        pool_ids = list(benign_by_client.keys())
+        if budget is None:
+            budget = len(pool_ids)
+        payload = {
             "round": round_num,
-            "strategy": strategy,
-            "was_detected": was_detected,
-            "accuracy_after": accuracy,
+            "current_global_accuracy": round(float(global_accuracy), 4),
+            "attack_goal": self.goal,
+            "controllable_client_ids": pool_ids,
+            "max_poison_clients": int(budget),
+            "client_update_stats": {
+                str(cid): delta_details(sd, global_weights, self.detail_precision)
+                for cid, sd in benign_by_client.items()
+            },
         }
-        if attack_metadata:
-            entry["attack_metadata"] = attack_metadata
-            layer_info = attack_metadata.get("flipped_per_layer", attack_metadata.get("affected_per_layer", {}))
-            logger.info(
-                f"Attacker memory: storing attack_metadata for round {round_num} "
-                f"(k={attack_metadata.get('k', 'N/A')}, "
-                f"targeted_layers={list(layer_info.keys())})"
-            )
+        return json.dumps(payload)
 
-        self.history.append(entry)
-        logger.info(f"Attacker memory: round {round_num} recorded (short-term: {len(self.history)} entries)")
+    # ------------------------------------------------------------------
+    def select_and_apply(
+        self, text, pool_references: dict[int, dict], budget: int
+    ) -> tuple[dict[int, dict], list[int], int]:
+        """Parse the attacker's client selection + per-client plans and apply them.
 
-        # Create a simple feature vector from the outcome for FAISS
-        vec = self._make_vector(entry)
-        self.memory.add(vec, entry)
-        self.memory.save()
-        logger.info(f"Attacker memory: round {round_num} persisted to long-term FAISS store")
+        Args:
+            text: raw attacker LLM output.
+            pool_references: {client_id: benign_state_dict} for the controllable pool.
+            budget: max number of clients that may be poisoned this round.
 
-    def _ask_llm(self, context: dict) -> dict:
-        """Query the LLM for a new attack strategy."""
-        # Retrieve similar past experiences
-        if self.history:
-            query_vec = self._make_vector(context)
-            similar = self.memory.search(query_vec, k=3)
-        else:
-            similar = []
+        Returns ``(poisoned_by_client, chosen_ids, n_malformed)``:
+          * poisoned_by_client: {client_id: poisoned_state_dict} for chosen clients.
+          * chosen_ids: clients actually poisoned (subset of pool, ordered, <= budget).
+          * n_malformed: number of chosen clients whose plan was missing/unusable
+            (they fall back to benign weights — a wasted client, a reward penalty).
 
-        system = SYSTEM_PROMPT.format(available_attacks=self.available_attacks)
-        user_msg = json.dumps({
-            "baseline_accuracy": context.get("baseline_accuracy"),
-            "current_accuracy": context.get("current_accuracy"),
-            "was_detected": context.get("was_detected"),
-            "recent_history": self.history[-5:],
-            "similar_past_experiences": similar,
-        }, default=str)
-
-        result = self.llm.call(system, user_msg)
-
-        # Validate and fallback
-        if not result or "attack_type" not in result:
-            logger.warning("Attacker LLM returned invalid response — using sign_flip default")
-            return {"attack_type": "sign_flip", "params": {}, "reasoning": "fallback"}
-
-        logger.info(f"Attacker chose: {result.get('attack_type')} — {result.get('reasoning', '')}")
-        return result
-
-    def _make_vector(self, data: dict) -> np.ndarray:
-        """Create a semantic embedding vector for FAISS indexing.
-
-        Uses SentenceTransformers so that similar contexts (e.g. close
-        accuracies, same detection outcomes) map to nearby vectors.
+        Always returns at least one chosen client (falls back to the first pool
+        client with benign weights on total garbage) so the reward/metrics that
+        divide by the poison count stay well-defined.
         """
-        return embed(data)
+        pool_ids = list(pool_references.keys())
+        budget = max(1, min(int(budget), len(pool_ids)))
+
+        def _benign_fallback():
+            cid = pool_ids[0]
+            poisoned = {cid: {k: v.clone() for k, v in pool_references[cid].items()}}
+            dbg.poison(None, {cid: pool_references[cid]}, poisoned, n_malformed=1)
+            return poisoned, [cid], 1
+
+        sel = extract_selection(text)
+        if sel is None:
+            return _benign_fallback()
+
+        # Ordered list of (id, ops) candidates from the parsed selection.
+        candidates: list[tuple[int, list | None]] = []
+        if sel["per_client"]:
+            candidates = [(e["id"], e["operations"]) for e in sel["per_client"]]
+        elif sel["shared_ids"]:
+            candidates = [(cid, sel["shared_ops"]) for cid in sel["shared_ids"]]
+        elif sel["shared_ops"] is not None:
+            # Shared plan, no ids -> auto-select the first `budget` pool clients.
+            candidates = [(cid, sel["shared_ops"]) for cid in pool_ids[:budget]]
+        else:
+            return _benign_fallback()
+
+        # Keep only pool ids, dedup (first wins), truncate to the budget.
+        chosen: list[tuple[int, list | None]] = []
+        seen: set[int] = set()
+        for cid, ops in candidates:
+            if cid not in pool_references or cid in seen:
+                continue
+            seen.add(cid)
+            chosen.append((cid, ops))
+            if len(chosen) >= budget:
+                break
+        if not chosen:
+            return _benign_fallback()
+
+        poisoned: dict[int, dict] = {}
+        n_malformed = 0
+        plan_for_dbg: dict[int, list] = {}
+        for cid, ops in chosen:
+            if not ops:                        # empty/missing plan -> wasted client
+                poisoned[cid] = {k: v.clone() for k, v in pool_references[cid].items()}
+                n_malformed += 1
+                plan_for_dbg[cid] = []
+                continue
+            pw, _n_invalid = apply_plan(pool_references[cid], ops, self.max_abs)
+            poisoned[cid] = pw
+            plan_for_dbg[cid] = ops
+        chosen_ids = [cid for cid, _ in chosen]
+        dbg.poison(plan_for_dbg, {cid: pool_references[cid] for cid in chosen_ids},
+                   poisoned, n_malformed=n_malformed)
+        return poisoned, chosen_ids, n_malformed
+
+    # ------------------------------------------------------------------
+    def parse(self, text, references: dict[int, dict]) -> tuple[dict[int, dict], int]:
+        """Backward-compatible shared-plan parse: apply ONE plan to every client in
+        ``references`` (no client selection). Retained for external callers/tests;
+        the training/eval pipeline uses :meth:`select_and_apply` instead.
+
+        Returns ``(poisoned_by_client, n_malformed)``. If no usable plan can be
+        extracted, every client falls back to its benign weights and
+        ``n_malformed = len(references)``.
+        """
+        plan = extract_plan(text)
+        if plan is None:
+            poisoned = {cid: {k: v.clone() for k, v in ref.items()}
+                        for cid, ref in references.items()}
+            dbg.poison(None, references, poisoned, n_malformed=len(references))
+            return poisoned, len(references)
+
+        poisoned = {}
+        n_invalid_total = 0
+        for cid, ref in references.items():
+            pw, n_invalid = apply_plan(ref, plan, self.max_abs)
+            poisoned[cid] = pw
+            n_invalid_total += n_invalid
+        dbg.poison(plan, references, poisoned, n_malformed=0, n_invalid_ops=n_invalid_total)
+        return poisoned, 0
