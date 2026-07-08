@@ -3,15 +3,13 @@
 fl:
   training_rounds: 20             # Phase 1: honest training rounds
   simulation_rounds: 2000000         # Phase 2: adversarial RL rounds
-  n_clients: 5
-  poison_fraction: 0.2            # fraction of clients poisoned each round (random subset).
-                                  # NOTE (rebalance lever): with n_clients=5 this clamps to
-                                  # exactly 1 poisoned client/round, which a strong defender
-                                  # filters out entirely (-> attacker drop ~0). If the arms-race
-                                  # ratchet stalls because the attacker can't get a foothold,
-                                  # raise this (e.g. 0.4 -> 2 of 5) so one detection no longer
-                                  # zeroes the attack. This CHANGES the threat model.
-  poison_seed: 0                  # RNG seed for the poisoned-subset selection + reproducibility
+  n_clients: 20                   # total federated clients (honest majority)
+  n_compromisable: 5              # the attacker can ONLY access clients [0 .. n_compromisable-1];
+                                  # the remaining clients are always honest & out of reach.
+  poison_fraction: 0.2            # DEPRECATED for selection: the attacker now CHOOSES which of
+                                  # its pool to poison (see attack.max_poison_clients). Kept only
+                                  # as a legacy fallback for defenses that assume a #malicious.
+  poison_seed: 0                  # RNG seed: non-IID partition + per-round budget sampling + repro
   benign_retrain_each_round: false # false = benign clients replay frozen Phase-1 final-round local weights every round
   local_epochs: 3
   batch_size: 64
@@ -21,6 +19,8 @@ fl:
 data:
   dataset: "mnist"
   iid: false
+  noniid_bias: 0.5                # FLTrust bias probability q (iid=false only). 1/n_classes=0.1
+                                  # is IID; larger = more non-IID; paper default 0.5.
   data_dir: "./data/mnist_raw"
 
 # Attack goal (configurable). First experiment = untargeted accuracy reduction.
@@ -30,6 +30,13 @@ attack:
     target_accuracy_drop: 0.20    # untargeted_degrade: aim to drop accuracy ~20pts
     # per_round_drop: 0.02        # slow_degrade
     # label: 7                    # targeted_label (per-class eval is a TODO; falls back to overall)
+  # --- Client-selection budget (the attacker chooses WHICH & HOW MANY to poison) ---
+  max_poison_clients: 5           # TRAINING budget cap: attacker may poison up to this many of its
+                                  # pool each round (must be <= n_compromisable). Reward penalizes
+                                  # using more than needed (see rl.reward.attacker.delta).
+  sample_budget_in_training: true # true = randomize the per-round cap in [1..max_poison_clients] so
+                                  # the policy is BUDGET-AWARE (generalizes to any eval budget).
+  eval_poison_clients: 1          # EVALUATION default budget (benchmark --max-poison-clients override)
 
 # Inference-only LLM defaults (used by --dry-run and the OpenAI path).
 llm:
@@ -53,7 +60,8 @@ rl:
   scoring_opponent_temperature: 0.7 # frozen opponent temp while SCORING the G rollouts;
                                   # >0 so candidates see varied opponent verdicts -> restores
                                   # within-group reward spread (fixes attacker zero-advantage)
-  max_new_tokens: 512             # attack plans / verdicts are short JSON
+  max_new_tokens: 1024            # headroom for the defender's 20-client verdict list and the
+                                  # attacker's per-client plans (raise if outputs get truncated)
   grad_clip: 1.0
   save_every: 25                  # checkpoint adapters + progress every N rounds (resume granularity)
   league_snapshot_every: 100      # snapshot adapters into the opponent league
@@ -67,9 +75,16 @@ rl:
   # --- Schedule: success-gated iterated best response (the arms-race ratchet) ---
   switch_mode: "best_response"    # best_response | fixed (legacy K_a/K_d alternation)
   first_learner: "attacker"       # who trains first
-  min_phase_rounds: 8             # earliest a phase may switch on a sustained win
-  max_phase_rounds: 1000           # hard cap: switch even without a win (prevents a stuck phase)
+  min_phase_rounds: 8             # earliest a phase may switch on a sustained win. Set equal to
+                                  # success_streak so a phase switches as soon as the learner wins
+                                  # success_streak times IN A ROW (no extra minimum-length gate).
+  max_phase_rounds: 4000           # hard cap: switch even without a win (prevents a stuck phase)
   success_streak: 3               # consecutive winning rounds needed to freeze + switch
+  fl_interlude_between_phases: true # before every phase AFTER the first, run ONE honest FL round
+                                  # (like Phase 1): all benign clients retrain from the current
+                                  # global, FedAvg into a new global, and the refreshed per-client
+                                  # weights become what the next learner / frozen opponent /
+                                  # aggregator consume. false = keep the frozen Phase-1 weights.
   curriculum_on_cap: true         # after a phase caps without a win, next learner faces an
                                   # earlier opponent snapshot so it can find a foothold
   attacker_min_drop: 0.02         # committed accuracy drop (prev-post) for an "attack passed"
@@ -87,6 +102,11 @@ rl:
       alpha: 1.0                  # weight on accuracy-drop term
       beta: 0.5                   # weight on evasion term
       gamma: 1.0                  # penalty for malformed weight output
+      delta: 0.3                  # penalty for using MORE poison clients than needed
+                                  # (client_cost = (n_used-1)/(n_compromisable-1) in [0,1])
+      zeta: 0.2                   # bonus for COLLABORATIVE multi-client attacks: diversity =
+                                  # 1 - mean pairwise cosine of chosen clients' perturbations
+                                  # (0 for a single client). Rewards distinct, coordinated roles.
     defender:
       mode: "soft_f1"             # soft_f1 | tpr_minus_fpr
       fpr_penalty: 1.0

@@ -14,7 +14,7 @@ Examples
 python infer.py --adapter attacker --prompt "Describe a stealthy MNIST model-poisoning attack."
 
 # Use the REAL system prompt the agent was trained with; read the user message from stdin:
-echo '{"round": 5, "current_global_accuracy": 0.8, "attack_goal": {"type":"untargeted_degrade","target_accuracy_drop":0.2}, "poisoned_client_ids":[0], "benign_layer_details": {}}' \
+echo '{"round": 5, "current_global_accuracy": 0.8, "attack_goal": {"type":"untargeted_degrade","target_accuracy_drop":0.2}, "controllable_client_ids":[0,1,2,3,4], "max_poison_clients":1, "client_update_stats": {}}' \
   | python infer.py --adapter attacker --role
 
 # Sample 4 completions at temperature 1.0:

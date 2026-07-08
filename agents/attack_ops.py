@@ -58,28 +58,73 @@ def extract_json(text):
 
 
 # ---------------------------------------------------------------------------
-# Layer details (the attacker's observation)
+# Update details (the attacker's observation)
 # ---------------------------------------------------------------------------
 
-def layer_details(state_dict: dict, precision: int = 4) -> dict:
-    """Per-layer summary statistics describing benign weights (no raw values)."""
+def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Cosine similarity of two flat tensors (0 if either is degenerate)."""
+    denom = float(a.norm()) * float(b.norm())
+    if denom < _EPS:
+        return 0.0
+    return float(torch.dot(a, b) / denom)
+
+
+def delta_details(client_sd: dict, global_sd: dict, precision: int = 4) -> dict:
+    """Summarize a client's HONEST UPDATE ``Δ = client − global`` for the attacker.
+
+    A partial-insider attacker sees only the global model (broadcast to every
+    participant each round) and its OWN clients' benign weights — never the other
+    clients' updates (defender-only), and never a stable pool baseline (the poison
+    budget makes the controllable pool's size/membership vary, and those clients
+    are the poison target, not a reference). So EVERY statistic here is normalized
+    only against the global ``G`` or the client's own weights. That keeps them
+    self-contained, dimensionless, and independent of the model architecture and
+    of how many clients are poisoned this round:
+
+      per layer (and whole model):
+        rel_update      ‖Δ‖ / ‖G‖               update size relative to the model
+        rms_delta       ‖Δ‖ / sqrt(count)       per-coordinate step size
+        energy_frac     ‖Δ_layer‖² / ‖Δ‖²       share of the update in this layer
+        sign_flip_frac  mean(sign c ≠ sign G)   fraction of weights flipped vs G
+        std_ratio       std(Δ) / std(G)         spread of Δ vs the model's own
+        absmean_ratio   mean|Δ| / mean|G|       typical |change| vs the model's own
+      whole model also: cos_to_global = cos(Δ, G)
+
+    ``client_sd`` and ``global_sd`` must share keys (same architecture).
+    """
     def r(x):
         return round(float(x), precision)
 
-    out = {}
-    for k, v in state_dict.items():
-        t = v.flatten().float()
-        out[k] = {
-            "shape": list(v.shape),
-            "count": int(t.numel()),
-            "mean": r(t.mean()),
-            "std": r(t.std(unbiased=False)),
-            "min": r(t.min()),
-            "max": r(t.max()),
-            "l2_norm": r(t.norm()),
-            "abs_mean": r(t.abs().mean()),
+    keys = list(global_sd.keys())
+    g_flat = torch.cat([global_sd[k].flatten().float() for k in keys])
+    c_flat = torch.cat([client_sd[k].flatten().float() for k in keys])
+    d_norm_sq = float((c_flat - g_flat).pow(2).sum())
+
+    def _stats(c: torch.Tensor, g: torch.Tensor) -> dict:
+        d = c - g
+        dl_norm = float(d.norm())
+        count = max(1, int(d.numel()))
+        return {
+            "rel_update": r(dl_norm / (float(g.norm()) + _EPS)),
+            "rms_delta": r(dl_norm / (count ** 0.5)),
+            "energy_frac": r((dl_norm ** 2) / (d_norm_sq + _EPS)),
+            "sign_flip_frac": r(float((torch.sign(c) != torch.sign(g)).float().mean())),
+            "std_ratio": r(float(d.std(unbiased=False)) / (float(g.std(unbiased=False)) + _EPS)),
+            "absmean_ratio": r(float(d.abs().mean()) / (float(g.abs().mean()) + _EPS)),
         }
-    return out
+
+    layers = {}
+    for k in keys:
+        g = global_sd[k].flatten().float()
+        c = client_sd[k].flatten().float()
+        entry = {"shape": list(global_sd[k].shape)}   # context only, not a magnitude
+        entry.update(_stats(c, g))
+        layers[k] = entry
+
+    whole = _stats(c_flat, g_flat)
+    whole.pop("energy_frac", None)                    # trivially 1.0 for the whole model
+    whole["cos_to_global"] = r(_cos(c_flat - g_flat, g_flat))
+    return {"layers": layers, "whole": whole}
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +144,84 @@ def extract_plan(text):
     if isinstance(raw, list):
         return raw
     return None
+
+
+def _coerce_int(x):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_selection(text):
+    """Parse the attacker's client-selection output into a normalized structure.
+
+    Returns ``{"per_client": [{"id": int, "operations": [...]}, ...],
+    "shared_ops": [...] | None, "shared_ids": [int, ...] | None}`` or ``None`` if
+    nothing usable was found. Robust to markdown / surrounding prose (via
+    ``extract_json``). Accepted shapes:
+
+      * ``{"clients": [{"id": 0, "operations": [ops]}, ...]}``  (canonical: a
+        DISTINCT plan per client — enables coordinated multi-client attacks)
+      * ``{"clients": [0, 3], "operations": [ops]}``            (explicit ids +
+        one shared plan)
+      * ``{"operations": [ops]}`` / a bare ``[ops]`` list        (shared plan, no
+        ids -> the caller auto-selects clients)
+      * ``targets`` / ``ids`` / ``client_ids`` are accepted as aliases for a
+        shared id list.
+    """
+    raw = extract_json(text)
+    if raw is None:
+        return None
+    if isinstance(raw, list):                 # bare list -> a shared ops plan
+        return {"per_client": [], "shared_ops": raw, "shared_ids": None}
+    if not isinstance(raw, dict):
+        return None
+
+    per_client = []
+    shared_ids = None
+    clients = raw.get("clients")
+    if isinstance(clients, list):
+        int_ids = []
+        for entry in clients:
+            if isinstance(entry, dict):
+                cid = _coerce_int(entry.get("id", entry.get("client_id")))
+                if cid is None:
+                    continue
+                ops = entry.get("operations")
+                if isinstance(ops, dict):
+                    ops = [ops]
+                elif not isinstance(ops, list):
+                    ops = []
+                per_client.append({"id": cid, "operations": ops})
+            else:                              # a bare int in the clients list
+                cid = _coerce_int(entry)
+                if cid is not None:
+                    int_ids.append(cid)
+        if int_ids:
+            shared_ids = int_ids
+
+    shared_ops = None
+    ops = raw.get("operations")
+    if isinstance(ops, list):
+        shared_ops = ops
+    elif isinstance(ops, dict):
+        shared_ops = [ops]
+    elif "op" in raw:                          # a single bare operation at top level
+        shared_ops = [raw]
+
+    if shared_ids is None:
+        for key in ("targets", "ids", "client_ids"):
+            v = raw.get(key)
+            if isinstance(v, list):
+                ids = [c for c in (_coerce_int(x) for x in v) if c is not None]
+                if ids:
+                    shared_ids = ids
+                    break
+
+    if not per_client and shared_ops is None and shared_ids is None:
+        return None
+    return {"per_client": per_client, "shared_ops": shared_ops, "shared_ids": shared_ids}
 
 
 # ---------------------------------------------------------------------------

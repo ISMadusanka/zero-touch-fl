@@ -5,6 +5,11 @@ the GRPO sampler can score G candidate actions against an identical state and a
 frozen opponent (the Stackelberg structure: the leader/attacker moves, the
 follower/defender best-responds).
 
+The attacker's action now includes CLIENT SELECTION: from its controllable pool
+(``env.pool_benign``) it picks up to ``env.round_budget`` clients and poisons each
+(see ``AttackerAgent.select_and_apply``). Different rollouts may pick different
+subsets, so each rollout's reward is computed against ITS OWN chosen set.
+
 Generators are duck-typed: any object with
 ``generate(system, user, n, temperature) -> list[str]`` works — a
 ``PolicyGenerator`` (trainable LoRA adapter) during RL, or an
@@ -14,7 +19,7 @@ Generators are duck-typed: any object with
 import logging
 
 from core.debug import dbg
-from rl.rewards import attacker_reward, defender_reward
+from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +46,17 @@ class AttackerTurn:
             else scoring_opponent_temperature
         )
 
-        self.references = env.benign_by_poisoned          # {cid: benign state_dict}
-        self.poisoned_ids = list(env.poisoned_ids)
+        # The controllable pool + this round's budget (the attacker chooses which
+        # of these to poison, and how).
+        self.pool_references = env.pool_benign            # {cid: benign state_dict}
+        self.budget = env.round_budget
+        self.pool_size = env.n_compromisable
         self.prev_accuracy = env.current_accuracy
 
         self.system = attacker_agent.system_prompt()
         self.user = attacker_agent.build_user_prompt(
-            env.round_index + env.training_rounds, env.current_accuracy, self.references
+            env.round_index + env.training_rounds, env.current_accuracy,
+            self.pool_references, env.global_weights, self.budget,
         )
         dbg.attacker_prompt(self.system, self.user, who="learner")
 
@@ -63,46 +72,60 @@ class AttackerTurn:
         text = self.defender_gen.generate(d_sys, d_user, n=1, temperature=temperature)[0]
         verdicts = self.defender_agent.parse(text, client_ids)
         dbg.defender_io(d_sys, d_user, text, verdicts, who="opponent",
-                        temperature=temperature, poisoned_ids=self.poisoned_ids)
+                        temperature=temperature)
         return verdicts
 
     def _apply(self, attacker_text, temperature):
-        poisoned, n_malformed = self.attacker_agent.parse(attacker_text, self.references)
+        poisoned, chosen_ids, n_malformed = self.attacker_agent.select_and_apply(
+            attacker_text, self.pool_references, self.budget
+        )
         updates = self.env.build_updates(poisoned)
         verdicts = self._defender_verdicts(updates, temperature)
-        return updates, verdicts, n_malformed
+        return updates, verdicts, n_malformed, chosen_ids, poisoned
 
     def reward(self, attacker_text) -> float:
         dbg.scoring_rollout(attacker_text)
-        updates, verdicts, n_malformed = self._apply(attacker_text, self.scoring_opp_temp)
+        updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
+            attacker_text, self.scoring_opp_temp)
         post_acc = self.env.evaluate_updates(updates, verdicts)
+        diversity = perturbation_diversity(
+            poisoned, {cid: self.pool_references[cid] for cid in chosen_ids})
         r = attacker_reward(
-            self.prev_accuracy, post_acc, self.env.goal, self.poisoned_ids,
+            self.prev_accuracy, post_acc, self.env.goal, chosen_ids,
             verdicts, n_malformed,
             alpha=self.reward_cfg.get("alpha", 1.0),
             beta=self.reward_cfg.get("beta", 0.5),
             gamma=self.reward_cfg.get("gamma", 1.0),
+            delta=self.reward_cfg.get("delta", 0.0),
+            zeta=self.reward_cfg.get("zeta", 0.0),
+            pool_size=self.pool_size,
+            diversity=diversity,
         )
-        dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed)
+        dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed,
+                            verdicts=verdicts, poisoned_ids=chosen_ids)
         return r
 
     def commit(self, attacker_text) -> dict:
         dbg.committing()
-        updates, verdicts, n_malformed = self._apply(attacker_text, self.opp_temp)
+        updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
+            attacker_text, self.opp_temp)
+        self.env.set_committed_poison(chosen_ids)
         new_acc = self.env.commit(updates, verdicts)
         return {
             "updates": updates,
             "verdicts": verdicts,
             "n_malformed": n_malformed,
             "post_accuracy": new_acc,
+            "poisoned_ids": chosen_ids,
+            "poisoned_by_client": poisoned,
         }
 
 
 class DefenderTurn:
     """Learning agent = defender. Opponent = frozen attacker (greedy).
 
-    The frozen attacker's poisoned weights are sampled ONCE here so all G
-    defender candidates classify the same set of updates.
+    The frozen attacker's client selection + poisoned weights are sampled ONCE
+    here so all G defender candidates classify the same set of updates.
     """
 
     def __init__(self, env, attacker_agent, defender_agent, attacker_gen,
@@ -112,19 +135,22 @@ class DefenderTurn:
         self.defender_agent = defender_agent
         self.reward_cfg = reward_cfg or {}
 
-        self.references = env.benign_by_poisoned
-        self.poisoned_ids = list(env.poisoned_ids)
-
-        # Frozen attacker plays its (greedy) move for this round.
+        # Frozen attacker plays its move for this round: it selects which of its
+        # pool to poison (<= budget) and how.
         dbg.opponent_move(opponent_temperature)
         a_sys = attacker_agent.system_prompt()
         a_user = attacker_agent.build_user_prompt(
-            env.round_index + env.training_rounds, env.current_accuracy, self.references
+            env.round_index + env.training_rounds, env.current_accuracy,
+            env.pool_benign, env.global_weights, env.round_budget,
         )
         dbg.attacker_prompt(a_sys, a_user, who="frozen-opponent")
         a_text = attacker_gen.generate(a_sys, a_user, n=1, temperature=opponent_temperature)[0]
         dbg.attacker_output(a_text, who="frozen-opponent")
-        poisoned, self.n_malformed = attacker_agent.parse(a_text, self.references)
+        poisoned, chosen_ids, self.n_malformed = attacker_agent.select_and_apply(
+            a_text, env.pool_benign, env.round_budget)
+        self.poisoned_ids = chosen_ids
+        self.poisoned_by_client = poisoned
+        env.set_committed_poison(chosen_ids)
 
         self.updates = env.build_updates(poisoned)
         self.client_ids = [u.client_id for u in self.updates]
@@ -157,4 +183,6 @@ class DefenderTurn:
             "verdicts": verdicts,
             "n_malformed": self.n_malformed,
             "post_accuracy": new_acc,
+            "poisoned_ids": self.poisoned_ids,
+            "poisoned_by_client": self.poisoned_by_client,
         }

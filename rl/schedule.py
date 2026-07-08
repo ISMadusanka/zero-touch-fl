@@ -33,7 +33,7 @@ from core.types import RoundLog
 from core.debug import dbg
 from rl.grpo import grpo_step
 from rl.policy import PolicyGenerator
-from rl.rewards import attacker_reward, defender_reward
+from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
 from rl.switch import PhaseController, SwitchConfig, committed_success
 from rl.turns import AttackerTurn, DefenderTurn
 
@@ -101,6 +101,7 @@ def train(
     switch_mode = str(rl.get("switch_mode", "best_response"))
     first_learner = str(rl.get("first_learner", "attacker"))
     curriculum_on_cap = bool(rl.get("curriculum_on_cap", True))
+    fl_interlude = bool(rl.get("fl_interlude_between_phases", True))
     adapter_paths = rl.get("adapter_paths", {
         "attacker": "checkpoints/attacker_adapter",
         "defender": "checkpoints/defender_adapter",
@@ -134,6 +135,7 @@ def train(
         adapter_paths=adapter_paths, progress_cb=progress_cb, total_rounds=total_rounds,
         save_every=save_every, snap_every=snap_every, league_prob=league_prob,
         max_new_tokens=max_new_tokens, rng=rng, curriculum_on_cap=curriculum_on_cap,
+        fl_interlude=fl_interlude,
     )
 
     if switch_mode == "best_response":
@@ -162,9 +164,11 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     ctx = env.begin_round()
 
     dbg.round_header(ctx.round_num, learner, opp, phase_index, phase_round,
-                     ctx.poisoned_ids, ctx.global_accuracy, k["G"],
+                     ctx.pool_ids, ctx.budget, ctx.global_accuracy, k["G"],
                      k["scoring_opp_temp"], k["opp_temp"])
-    dbg.fl_round(ctx.round_num, ctx.poisoned_ids, env.honest_updates,
+    # The poison SET is chosen per-rollout by the attacker, so it is unknown at
+    # begin_round — show only the federated fine-tuning here (poison at commit).
+    dbg.fl_round(ctx.round_num, [], env.honest_updates,
                  env.current_accuracy, env.benign_retrain)
 
     if learner == "attacker":
@@ -193,15 +197,16 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     # Advance the env by committing the best-scoring candidate action.
     best = _argmax(stats["rewards"]) if stats["rewards"] else 0
     info = turn.commit(stats["completions"][best])
+    poisoned_ids = info["poisoned_ids"]        # the attacker's committed choice
 
     drop = ctx.global_accuracy - info["post_accuracy"]
-    success = committed_success(learner, drop, info["verdicts"], ctx.poisoned_ids,
+    success = committed_success(learner, drop, info["verdicts"], poisoned_ids,
                                 state["switch_cfg"])
 
     _log_round(env, ctx, info, learner, stats, state["metrics_tracker"],
                state["save_round_log"], reward_att=k["reward_att"], reward_def=k["reward_def"],
                phase_index=phase_index, phase_round=phase_round, success=success,
-               best_index=best)
+               best_index=best, poisoned_ids=poisoned_ids)
     return stats, drop, success
 
 
@@ -234,6 +239,62 @@ def _opponent_generator(state, opp, face_snapshot):
     return opp_gen, restore
 
 
+def _run_fl_interlude(state, next_learner, phase_index):
+    """Between two arms-race phases, advance the shared FL state by one honest
+    FedAvg round (exactly like a Phase-1 round) and log it.
+
+    The user-facing contract: after a learner wins and we hand off, we do NOT let
+    the incoming learner keep training against the same frozen client weights —
+    we first run one benign FL round so the refreshed client weights + global are
+    what the next learner, the frozen opponent, AND the aggregator now consume
+    (see ``FLArmsRaceEnv.run_benign_fl_round``). This runs before EVERY phase
+    after the first, whatever caused the switch (sustained win or cap)."""
+    env = state["env"]
+    info = env.run_benign_fl_round()
+    if info is None:
+        return
+    round_num = info["round_num"]
+    updates = info["updates"]
+
+    # Structured debug view (reuse the per-round FL panel; benign_retrain=True so
+    # it prints each client's local-training stats).
+    dbg.phase_event("FL ROUND (interlude)", round=round_num, next_learner=next_learner,
+                    phase=phase_index,
+                    prev_acc=round(info["prev_accuracy"], 4),
+                    post_acc=round(info["post_accuracy"], 4))
+    dbg.fl_round(round_num, [], updates, info["post_accuracy"], benign_retrain=True)
+    dbg.flush()
+
+    # Persist a round log so the interlude shows up in logs/round_data/round_NNN.json.
+    state["save_round_log"](RoundLog(
+        round_num=round_num,
+        attack_goal=env.goal,
+        poisoned_client_ids=[],
+        predicted_labels=[],
+        test_accuracy=info["post_accuracy"],
+        baseline_accuracy=env.baseline_accuracy,
+        attacker_reward=0.0,
+        defender_reward=0.0,
+        learning_agent="none",
+        attack_metadata={
+            "event": "benign_fl_round",
+            "next_learner": next_learner,
+            "phase_index": phase_index,
+            "prev_accuracy": info["prev_accuracy"],
+            "post_accuracy": info["post_accuracy"],
+            "n_clients": info["n_clients"],
+            "clients": [
+                {"client_id": u.client_id, **(u.metadata or {})} for u in updates
+            ],
+        },
+    ))
+    logger.info(
+        f"[FL round {round_num}] interlude before {next_learner} phase {phase_index}: "
+        f"acc {info['prev_accuracy']:.4f} -> {info['post_accuracy']:.4f} "
+        f"— new benign client weights now consumed by attacker/defender/aggregator"
+    )
+
+
 def _train_best_response(state, first_learner, start_round):
     """Success-gated iterated best response. Returns the final round count."""
     ctrl = PhaseController(state["switch_cfg"], first_learner=first_learner)
@@ -242,6 +303,12 @@ def _train_best_response(state, first_learner, start_round):
 
     while done < state["total_rounds"]:
         learner, opp = ctrl.learner, ctrl.opponent
+        # Before every phase AFTER the first, run one honest FL round so the
+        # incoming learner + frozen opponent + aggregator train against a freshly
+        # advanced client state (mirrors a Phase-1 round). Skipped for the very
+        # first phase, which uses the Phase-1 checkpoint as-is.
+        if ctrl.phase_index > 0 and state.get("fl_interlude", True):
+            _run_fl_interlude(state, next_learner=learner, phase_index=ctrl.phase_index)
         # Curriculum: a phase that capped without a win means the opponent is too
         # strong — let this learner face an earlier snapshot of it. Otherwise mix
         # in a league snapshot with probability league_prob (anti-overfit).
@@ -320,27 +387,37 @@ def _save_adapters(policy, adapter_paths: dict):
 
 def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                reward_att=None, reward_def=None, phase_index=0, phase_round=0,
-               success=False, best_index=0):
+               success=False, best_index=0, poisoned_ids=None):
     verdicts = info["verdicts"]
     post_acc = info["post_accuracy"]
     n_malformed = info["n_malformed"]
+    poisoned_ids = poisoned_ids if poisoned_ids is not None else info.get("poisoned_ids", [])
     reward_att = reward_att or {}
     reward_def = reward_def or {}
 
+    # Diversity of the committed (possibly multi-client) attack; 0 for one client.
+    diversity = perturbation_diversity(
+        info.get("poisoned_by_client", {}),
+        {cid: env.pool_benign[cid] for cid in poisoned_ids if cid in env.pool_benign},
+    )
     a_rew = attacker_reward(ctx.global_accuracy, post_acc, env.goal,
-                            ctx.poisoned_ids, verdicts, n_malformed,
+                            poisoned_ids, verdicts, n_malformed,
                             alpha=reward_att.get("alpha", 1.0),
                             beta=reward_att.get("beta", 0.5),
-                            gamma=reward_att.get("gamma", 1.0))
-    d_rew = defender_reward(verdicts, ctx.poisoned_ids,
+                            gamma=reward_att.get("gamma", 1.0),
+                            delta=reward_att.get("delta", 0.0),
+                            zeta=reward_att.get("zeta", 0.0),
+                            pool_size=env.n_compromisable,
+                            diversity=diversity)
+    d_rew = defender_reward(verdicts, poisoned_ids,
                             mode=reward_def.get("mode", "soft_f1"),
                             fpr_penalty=reward_def.get("fpr_penalty", 1.0))
 
-    metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(ctx.poisoned_ids))
+    metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(poisoned_ids))
     save_round_log(RoundLog(
         round_num=ctx.round_num,
         attack_goal=env.goal,
-        poisoned_client_ids=ctx.poisoned_ids,
+        poisoned_client_ids=poisoned_ids,
         predicted_labels=[
             {"client_id": v.client_id, "is_suspicious": v.is_suspicious,
              "confidence": v.confidence, "reason": v.reason}
@@ -353,6 +430,10 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
         learning_agent=learner,
         attack_metadata={
             "n_malformed": n_malformed,
+            "budget": ctx.budget,
+            "n_used": len(poisoned_ids),
+            "controllable_pool": ctx.pool_ids,
+            "attack_diversity": round(float(diversity), 4),
             "phase_index": phase_index,
             "phase_round": phase_round,
             "learner_success": success,
@@ -368,7 +449,7 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     ))
     dbg.commit_summary(
         learner, best_index, info, ctx.global_accuracy, post_acc,
-        ctx.global_accuracy - post_acc, success, a_rew, d_rew, ctx.poisoned_ids,
+        ctx.global_accuracy - post_acc, success, a_rew, d_rew, poisoned_ids,
     )
     dbg.flush()
     logger.info(
