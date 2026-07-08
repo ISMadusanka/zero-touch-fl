@@ -256,7 +256,7 @@ def _topk_mask(t, fraction, largest=True):
     if k > 0:
         idx = torch.topk(flat.abs(), min(k, n), largest=largest).indices
         mask[idx] = True
-    return mask.view_as(t)
+    return mask.view(t.shape)
 
 
 def _resolve_target(target, sd):
@@ -283,81 +283,114 @@ def _resolve_target(target, sd):
 # Operators: (tensor, op_dict) -> tensor
 # ---------------------------------------------------------------------------
 
+def _apply_on_indices(t, op, func):
+    """
+    Applies the unary tensor function `func(t_subset)` either to the whole tensor
+    or only to the slices specified by `op["indices"]` along dim 0.
+    """
+    indices = op.get("indices")
+    if indices is None:
+        return func(t)
+    
+    if not isinstance(indices, list):
+        return func(t)
+
+    out = t.clone()
+    valid_indices = [i for i in indices if isinstance(i, int) and 0 <= i < t.shape[0]]
+    if not valid_indices:
+        return out
+        
+    out[valid_indices] = func(t[valid_indices])
+    return out
+
 def _op_scale(t, op):
-    return t * _f(op, "factor", 1.0)
+    return _apply_on_indices(t, op, lambda subset: subset * _f(op, "factor", 1.0))
 
 
 def _op_sign_flip(t, op):
-    m = _topk_mask(t, _f(op, "fraction", 1.0), largest=True)
-    return torch.where(m, -t, t)
+    def fn(subset):
+        m = _topk_mask(subset, _f(op, "fraction", 1.0), largest=True)
+        return torch.where(m, -subset, subset)
+    return _apply_on_indices(t, op, fn)
 
 
 def _op_add_gaussian_noise(t, op):
-    sigma = abs(_f(op, "sigma", 0.0))
-    return t + torch.randn(t.shape, generator=_gen(op)) * sigma
+    def fn(subset):
+        sigma = abs(_f(op, "sigma", 0.0))
+        return subset + torch.randn(subset.shape, generator=_gen(op)) * sigma
+    return _apply_on_indices(t, op, fn)
 
 
 def _op_mask(t, op):
-    frac = _clamp(_f(op, "fraction", 0.0), 0.0, 1.0)
-    mode = str(op.get("mode", "largest")).lower()
-    if mode == "random":
-        n = t.numel()
-        k = int(round(frac * n))
-        mask = torch.zeros(n, dtype=torch.bool)
-        if k > 0:
-            idx = torch.randperm(n, generator=_gen(op))[:k]
-            mask[idx] = True
-        mask = mask.view_as(t)
-    else:
-        mask = _topk_mask(t, frac, largest=(mode != "smallest"))
-    return t.masked_fill(mask, 0.0)
+    def fn(subset):
+        frac = _clamp(_f(op, "fraction", 0.0), 0.0, 1.0)
+        mode = str(op.get("mode", "largest")).lower()
+        if mode == "random":
+            n = subset.numel()
+            k = int(round(frac * n))
+            mask = torch.zeros(n, dtype=torch.bool)
+            if k > 0:
+                idx = torch.randperm(n, generator=_gen(op))[:k]
+                mask[idx] = True
+            mask = mask.view(subset.shape)
+        else:
+            mask = _topk_mask(subset, frac, largest=(mode != "smallest"))
+        return subset.masked_fill(mask, 0.0)
+    return _apply_on_indices(t, op, fn)
 
 
 def _op_clip(t, op):
-    v = abs(_f(op, "value", 1.0))
-    return t.clamp(-v, v)
+    return _apply_on_indices(t, op, lambda subset: subset.clamp(-abs(_f(op, "value", 1.0)), abs(_f(op, "value", 1.0))))
 
 
 def _op_add_constant(t, op):
-    return t + _f(op, "value", 0.0)
+    return _apply_on_indices(t, op, lambda subset: subset + _f(op, "value", 0.0))
 
 
 def _op_permute(t, op):
-    flat = t.flatten()
-    perm = torch.randperm(flat.numel(), generator=_gen(op))
-    return flat[perm].view_as(t)
+    def fn(subset):
+        flat = subset.flatten()
+        perm = torch.randperm(flat.numel(), generator=_gen(op))
+        return flat[perm].view(subset.shape)
+    return _apply_on_indices(t, op, fn)
 
 
 def _op_scale_neurons(t, op):
     """Scale a fraction of the most important output units (rows)."""
-    factor = _f(op, "factor", 1.0)
-    frac = _clamp(_f(op, "fraction", 1.0), 0.0, 1.0)
-    out = t.clone()
-    n_units = t.shape[0]
-    k = int(round(frac * n_units))
-    if k <= 0:
+    def fn(subset):
+        factor = _f(op, "factor", 1.0)
+        frac = _clamp(_f(op, "fraction", 1.0), 0.0, 1.0)
+        out = subset.clone()
+        n_units = subset.shape[0]
+        k = int(round(frac * n_units))
+        if k <= 0:
+            return out
+        if subset.dim() >= 2:
+            row_norms = subset.flatten(1).norm(dim=1)
+        else:
+            row_norms = subset.abs()
+        idx = torch.topk(row_norms, min(k, n_units), largest=True).indices
+        out[idx] = out[idx] * factor
         return out
-    if t.dim() >= 2:
-        row_norms = t.flatten(1).norm(dim=1)
-    else:
-        row_norms = t.abs()
-    idx = torch.topk(row_norms, min(k, n_units), largest=True).indices
-    out[idx] = out[idx] * factor
-    return out
+    return _apply_on_indices(t, op, fn)
 
 
 def _op_blend_random(t, op):
-    alpha = _clamp(_f(op, "alpha", 0.0), 0.0, 1.0)
-    scale = max(float(t.std(unbiased=False)), _EPS)
-    rand = (torch.rand(t.shape, generator=_gen(op)) * 2.0 - 1.0) * scale
-    return (1.0 - alpha) * t + alpha * rand
+    def fn(subset):
+        alpha = _clamp(_f(op, "alpha", 0.0), 0.0, 1.0)
+        scale = max(float(subset.std(unbiased=False)), _EPS)
+        rand = (torch.rand(subset.shape, generator=_gen(op)) * 2.0 - 1.0) * scale
+        return (1.0 - alpha) * subset + alpha * rand
+    return _apply_on_indices(t, op, fn)
 
 
 def _op_quantize(t, op):
-    step = abs(_f(op, "step", 0.0))
-    if step <= _EPS:
-        return t
-    return torch.round(t / step) * step
+    def fn(subset):
+        step = abs(_f(op, "step", 0.0))
+        if step <= _EPS:
+            return subset
+        return torch.round(subset / step) * step
+    return _apply_on_indices(t, op, fn)
 
 
 OP_FUNCS = {

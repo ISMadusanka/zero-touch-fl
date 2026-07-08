@@ -139,12 +139,16 @@ class DefenderTurn:
         # pool to poison (<= budget) and how.
         dbg.opponent_move(opponent_temperature)
         a_sys = attacker_agent.system_prompt()
-        a_user = attacker_agent.build_user_prompt(
-            env.round_index + env.training_rounds, env.current_accuracy,
-            env.pool_benign, env.global_weights, env.round_budget,
+        self.user = attacker_agent.build_user_prompt(
+            env.round_index + env.training_rounds,
+            env.current_accuracy,
+            env.pool_benign,
+            env.global_weights,
+            env.round_budget,
+            env.target_neuron_indices,
         )
-        dbg.attacker_prompt(a_sys, a_user, who="frozen-opponent")
-        a_text = attacker_gen.generate(a_sys, a_user, n=1, temperature=opponent_temperature)[0]
+        dbg.attacker_prompt(a_sys, self.user, who="frozen-opponent")
+        a_text = attacker_gen.generate(a_sys, self.user, n=1, temperature=opponent_temperature)[0]
         dbg.attacker_output(a_text, who="frozen-opponent")
         poisoned, chosen_ids, self.n_malformed = attacker_agent.select_and_apply(
             a_text, env.pool_benign, env.round_budget)

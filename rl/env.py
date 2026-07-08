@@ -39,12 +39,13 @@ class RoundContext:
     so ``poisoned_ids`` is empty here and filled in once the choice is committed.
     """
 
-    def __init__(self, round_num, global_accuracy, pool_ids, pool_benign, budget):
+    def __init__(self, round_num, global_accuracy, pool_ids, pool_benign, budget, target_neuron_indices=None):
         self.round_num = round_num
         self.global_accuracy = global_accuracy
         self.pool_ids = pool_ids                          # list[int] controllable pool
         self.pool_benign = pool_benign                    # {cid: state_dict} for the pool
         self.budget = budget                              # max clients that may be poisoned
+        self.target_neuron_indices = target_neuron_indices # {cid: {layer: [indices]}}
         self.poisoned_ids = []                            # set at commit (attacker's choice)
 
 
@@ -141,12 +142,23 @@ class FLArmsRaceEnv:
             f"Round {round_num}: controllable_pool={self.pool_ids} "
             f"budget={self.round_budget} (global_acc={self.current_accuracy:.4f})"
         )
+        self.target_neuron_indices = None
+        if self.goal.get("type") == "targeted_label" and self._clients is not None:
+            target_class = int(self.goal.get("label", 0))
+            from attacks.neuron_importance import compute_neuron_importance
+            self.target_neuron_indices = {}
+            for cid in self.pool_ids:
+                self.target_neuron_indices[str(cid)] = compute_neuron_importance(
+                    self.server.model, self._clients[cid].data_loader, target_class, device=self.device
+                )
+
         return RoundContext(
             round_num=round_num,
             global_accuracy=self.current_accuracy,
             pool_ids=list(self.pool_ids),
             pool_benign=self.pool_benign,
             budget=self.round_budget,
+            target_neuron_indices=self.target_neuron_indices,
         )
 
     def set_committed_poison(self, chosen_ids) -> None:

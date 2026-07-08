@@ -92,7 +92,7 @@ them and to invent non-obvious attacks.
 OUTPUT FORMAT — respond with ONLY a single JSON object, no prose, no markdown:
 {"clients": [
    {"id": <a controllable client id>, "operations": [
-      {"op": "<name>", "target": "<all|layer-group|key>", ...params},
+      {"op": "<name>", "target": "<all|layer-group|key>", "indices": [optional list of integers], ...params},
       ...
    ]},
    ...
@@ -126,6 +126,7 @@ class AttackerAgent:
         benign_by_client: dict[int, dict],
         global_weights: dict,
         budget: int | None = None,
+        target_neuron_indices: dict | None = None,
     ) -> str:
         """Serialize the attacker's per-round observation into a user message.
 
@@ -142,6 +143,8 @@ class AttackerAgent:
                 clients' updates.
             budget: max number of clients the attacker may poison this round
                 (defaults to the whole pool).
+            target_neuron_indices: Optional {cid: {layer: [indices]}} identifying
+                the most important neurons for a targeted class.
         """
         pool_ids = list(benign_by_client.keys())
         if budget is None:
@@ -157,6 +160,8 @@ class AttackerAgent:
                 for cid, sd in benign_by_client.items()
             },
         }
+        if target_neuron_indices is not None:
+            payload["target_neuron_indices"] = target_neuron_indices
         return json.dumps(payload)
 
     # ------------------------------------------------------------------
