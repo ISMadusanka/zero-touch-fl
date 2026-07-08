@@ -144,13 +144,28 @@ class FLArmsRaceEnv:
         )
         self.target_neuron_indices = None
         if self.goal.get("type") == "targeted_label" and self._clients is not None:
-            target_class = int(self.goal.get("label", 0))
+            label_cfg = self.goal.get("label", 0)
             from attacks.neuron_importance import compute_neuron_importance
             self.target_neuron_indices = {}
-            for cid in self.pool_ids:
-                self.target_neuron_indices[str(cid)] = compute_neuron_importance(
-                    self.server.model, self._clients[cid].data_loader, target_class, device=self.device
-                )
+            
+            if str(label_cfg).lower() == "menu":
+                for cid in self.pool_ids:
+                    # Find all unique classes present in this client's dataset
+                    available_labels = set()
+                    for _, labels in self._clients[cid].data_loader:
+                        available_labels.update(labels.tolist())
+                    
+                    self.target_neuron_indices[str(cid)] = {}
+                    for cls in sorted(list(available_labels)):
+                        self.target_neuron_indices[str(cid)][str(cls)] = compute_neuron_importance(
+                            self.server.model, self._clients[cid].data_loader, cls, device=self.device
+                        )
+            else:
+                target_class = int(label_cfg)
+                for cid in self.pool_ids:
+                    self.target_neuron_indices[str(cid)] = compute_neuron_importance(
+                        self.server.model, self._clients[cid].data_loader, target_class, device=self.device
+                    )
 
         return RoundContext(
             round_num=round_num,

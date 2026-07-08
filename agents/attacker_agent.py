@@ -82,6 +82,9 @@ Your objective is in `attack_goal`:
   WHILE staying similar enough to benign updates to avoid being filtered out.
 - "slow_degrade": reduce accuracy only slightly (`per_round_drop`) to stay stealthy.
 - "targeted_label": harm a specific class `label` while keeping overall accuracy high.
+  If the label is "menu", you will receive `target_neuron_indices` showing the most
+  vulnerable neurons grouped by class. YOU must autonomously decide which class(es) 
+  to sabotage by passing those specific indices into your operators via the `"indices"` parameter.
 
 There is a tension: large changes degrade accuracy more but are easier to detect;
 subtle changes evade detection but do less damage. Compose operators to balance
@@ -143,8 +146,8 @@ class AttackerAgent:
                 clients' updates.
             budget: max number of clients the attacker may poison this round
                 (defaults to the whole pool).
-            target_neuron_indices: Optional {cid: {layer: [indices]}} identifying
-                the most important neurons for a targeted class.
+            target_neuron_indices: Optional {cid: {layer: [indices]}} or {cid: {class: {layer: [indices]}}}
+                identifying the most important neurons for targeted attacks.
         """
         pool_ids = list(benign_by_client.keys())
         if budget is None:

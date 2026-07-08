@@ -29,7 +29,7 @@ attack:
     type: "targeted_label"        # untargeted_degrade | slow_degrade | targeted_label
     target_accuracy_drop: 0.20    # untargeted_degrade: aim to drop accuracy ~20pts
     # per_round_drop: 0.02        # slow_degrade
-    # label: 7                    # targeted_label (identifies and poisons the most important neurons for class 7)
+    label: "menu"                 # "menu" provides LLM a list of all vulnerable neurons by class
   # --- Client-selection budget (the attacker chooses WHICH & HOW MANY to poison) ---
   max_poison_clients: 5           # TRAINING budget cap: attacker may poison up to this many of its
                                   # pool each round (must be <= n_compromisable). Reward penalizes
