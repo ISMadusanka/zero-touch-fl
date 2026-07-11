@@ -83,16 +83,21 @@ DEBUG_DEFAULT_ROUNDS = 3
 def quiet_noisy_warnings():
     """Silence the high-frequency, harmless library chatter during training:
     the per-generation 'max_new_tokens vs max_length' notice and Transformers'
-    AttentionMaskConverter deprecation FutureWarnings."""
+    AttentionMaskConverter deprecation FutureWarnings.
+
+    IMPORTANT: this must NOT import ``transformers``. It runs at program startup,
+    and importing ``transformers`` here would pull it in BEFORE Unsloth (which is
+    imported lazily in ``rl/policy.py`` on the training path) — tripping Unsloth's
+    "import unsloth before transformers" warning and potentially skipping some of
+    its optimizations. Transformers' own log verbosity is lowered in
+    ``LLMPolicy.__init__`` instead, right after Unsloth is imported. The
+    ``warnings.filterwarnings`` calls below are pure ``warnings``-module filters
+    and do not import ``transformers``.
+    """
     import warnings
     warnings.filterwarnings("ignore", message=r".*max_new_tokens.*max_length.*")
     warnings.filterwarnings("ignore", message=r".*AttentionMaskConverter.*")
     warnings.filterwarnings("ignore", category=FutureWarning, module=r"transformers.*")
-    try:
-        from transformers.utils import logging as hf_logging
-        hf_logging.set_verbosity_error()
-    except Exception:
-        pass
 
 
 def load_config(path: str) -> dict:

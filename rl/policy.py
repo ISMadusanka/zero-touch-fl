@@ -57,6 +57,15 @@ class LLMPolicy:
         # regular (working) forward — fast AND correct, no version downgrade.
         os.environ.setdefault("UNSLOTH_DISABLE_FAST_GENERATION", "1")
         from unsloth import FastLanguageModel
+        # Unsloth is now imported FIRST (before transformers), so its optimizations
+        # patch cleanly. Only now is it safe to touch transformers — lower its log
+        # verbosity here (moved out of main.quiet_noisy_warnings, which runs at
+        # startup and would otherwise import transformers ahead of unsloth).
+        try:
+            from transformers.utils import logging as hf_logging
+            hf_logging.set_verbosity_error()
+        except Exception:
+            pass
         from peft import LoraConfig
 
         self.torch = torch
