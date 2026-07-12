@@ -83,10 +83,11 @@ class AttackerTurn:
         verdicts = self._defender_verdicts(updates, temperature)
         return updates, verdicts, n_malformed, chosen_ids, poisoned
 
-    def reward(self, attacker_text) -> float:
-        dbg.scoring_rollout(attacker_text)
-        updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
-            attacker_text, self.scoring_opp_temp)
+    def _score(self, updates, verdicts, chosen_ids, poisoned, n_malformed) -> float:
+        """Verifiable attacker reward for one already-applied candidate.
+
+        The reward maths lives here so the per-rollout ``reward`` path and the
+        batched ``rewards`` path are guaranteed identical."""
         post_acc = self.env.evaluate_updates(updates, verdicts)
         diversity = perturbation_diversity(
             poisoned, {cid: self.pool_references[cid] for cid in chosen_ids})
@@ -104,6 +105,52 @@ class AttackerTurn:
         dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed,
                             verdicts=verdicts, poisoned_ids=chosen_ids)
         return r
+
+    def reward(self, attacker_text) -> float:
+        dbg.scoring_rollout(attacker_text)
+        updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
+            attacker_text, self.scoring_opp_temp)
+        return self._score(updates, verdicts, chosen_ids, poisoned, n_malformed)
+
+    def rewards(self, attacker_texts) -> list[float]:
+        """Score a whole GRPO group of attacker candidates.
+
+        Fast path (normal training): parse every candidate's attack plan, build its
+        poisoned updates + defender prompt, then sample the frozen defender's
+        verdicts for ALL candidates in ONE batched generation. Each row is an
+        independent sample at ``scoring_opp_temp`` — the same distribution as the
+        per-rollout calls, so the reward signal is unchanged; only the G sequential
+        defender decodes collapse into one batched decode.
+
+        Falls back to the exact per-rollout ``reward`` loop when a debug run is
+        active (it needs strict per-rollout log interleaving) or when the frozen
+        opponent generator can't batch (e.g. the Ollama/OpenAI dry-run generator).
+        The commit path is untouched — the real round is unaffected.
+        """
+        gen = self.defender_gen
+        if dbg.enabled or not hasattr(gen, "generate_batch"):
+            return [self.reward(t) for t in attacker_texts]
+
+        d_sys = self.defender_agent.system_prompt()
+        prepared = []
+        for text in attacker_texts:
+            poisoned, chosen_ids, n_malformed = self.attacker_agent.select_and_apply(
+                text, self.pool_references, self.budget)
+            updates = self.env.build_updates(poisoned)
+            feats = self.env.features(updates)
+            client_ids = [u.client_id for u in updates]
+            d_user = self.defender_agent.build_user_prompt(feats)
+            prepared.append((updates, client_ids, chosen_ids, poisoned, n_malformed, d_user))
+
+        d_texts = gen.generate_batch(
+            [(d_sys, p[5]) for p in prepared], temperature=self.scoring_opp_temp)
+
+        out = []
+        for (updates, client_ids, chosen_ids, poisoned, n_malformed, _d_user), d_text in zip(
+                prepared, d_texts):
+            verdicts = self.defender_agent.parse(d_text, client_ids)
+            out.append(self._score(updates, verdicts, chosen_ids, poisoned, n_malformed))
+        return out
 
     def commit(self, attacker_text) -> dict:
         dbg.committing()
@@ -173,6 +220,12 @@ class DefenderTurn:
         )
         dbg.rollout_outcome(reward=r, verdicts=verdicts, poisoned_ids=self.poisoned_ids)
         return r
+
+    def rewards(self, defender_texts) -> list[float]:
+        """Score a group of defender candidates. The frozen attacker already moved
+        once in __init__, so scoring each candidate is pure parse + count (no LLM
+        call) — there is nothing to batch here; kept for a uniform turn interface."""
+        return [self.reward(t) for t in defender_texts]
 
     def commit(self, defender_text) -> dict:
         dbg.committing()

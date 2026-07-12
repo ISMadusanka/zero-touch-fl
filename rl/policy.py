@@ -32,6 +32,37 @@ DEFAULT_TARGET_MODULES = [
 ]
 
 
+def _gather_completion_logprobs(logits, full_ids, prompt_len, comp_lens):
+    """Per-token log-probs of each row's COMPLETION tokens, from a padded batch.
+
+    Pure tensor math (uses only tensor methods, so this module stays importable
+    without torch and this function is unit-testable on CPU). Shared by the
+    batched policy/reference log-prob passes.
+
+    Args:
+        logits:     (B, T, V) raw model logits over the RIGHT-padded batch. Every
+                    row is ``[shared prompt (prompt_len) | completion_i | pad]``.
+        full_ids:   (B, T) the token ids those logits were produced from.
+        prompt_len: length P of the prompt prefix shared by every row.
+        comp_lens:  list[int] — completion length C_i of each row (0 allowed).
+
+    Returns a list of 1-D tensors, one per row, each holding that row's C_i
+    completion-token log-probs (grad-connected iff ``logits`` was). Right padding
+    is safe for a causal model: a real token never attends to a later pad token,
+    so its logits are identical to the unpadded forward — we simply slice out the
+    positions that predict the completion tokens (targets P .. P+C_i-1 live at
+    logit positions P-1 .. P+C_i-2).
+    """
+    logp = logits[:, :-1, :].float().log_softmax(dim=-1)       # (B, T-1, V)
+    targets = full_ids[:, 1:]                                  # (B, T-1)
+    tok = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)   # (B, T-1)
+    P = prompt_len
+    out = []
+    for i, ci in enumerate(comp_lens):
+        out.append(tok[i, P - 1:P - 1 + ci] if ci > 0 else tok[i, :0])
+    return out
+
+
 class LLMPolicy:
     def __init__(
         self,
@@ -286,7 +317,10 @@ class LLMPolicy:
             if not do_sample:
                 texts = texts * n   # deterministic greedy → replicate the single completion
             del out
-            torch.cuda.empty_cache()
+            # NOTE: no torch.cuda.empty_cache() here — it's a synchronizing allocator
+            # flush that forces re-allocation on the next call. With ample GPU headroom
+            # (3B bf16 on a 24GB+ card) keeping the cache is faster; the allocator reuses
+            # freed blocks. Reinstate only if you actually hit fragmentation OOMs.
             return texts
         finally:
             if was_training:
@@ -342,8 +376,92 @@ class LLMPolicy:
         if not do_sample:
             texts = texts * n   # deterministic greedy → replicate the single completion
         del ids
-        torch.cuda.empty_cache()
+        # NOTE: no torch.cuda.empty_cache() here (see _fast_generate) — avoid the
+        # per-generate allocator flush; the cache is reused on the next call.
         return texts
+
+    def generate_batch(self, adapter, prompts, temperature=0.0, max_new_tokens=2048) -> list[str]:
+        """Generate ONE completion for each DISTINCT ``(system, user)`` prompt in a
+        single batched decode (left-padded so all rows share one prefill + decode
+        loop). Returns a list aligned with ``prompts``.
+
+        This is the batched analogue of ``generate`` used to score a GRPO group's
+        opponent responses in one pass instead of G sequential calls. It is
+        behaviourally equivalent to calling ``generate(...n=1...)`` per prompt:
+        each row is an INDEPENDENT sample at the same temperature (batched
+        sampling draws each sequence independently), so the reward distribution is
+        unchanged — only the wall-clock differs. Any failure falls back to the
+        per-prompt path so results are always produced.
+        """
+        prompts = list(prompts)
+        if not prompts:
+            return []
+        # Single prompt, or manual (no-cache) generation active → just loop; the
+        # batched fast path below needs the KV-cached generate.
+        if len(prompts) == 1 or not self._use_fast_generate:
+            return [
+                self.generate(adapter, s, u, n=1, temperature=temperature,
+                              max_new_tokens=max_new_tokens)[0]
+                for (s, u) in prompts
+            ]
+        try:
+            return self._fast_generate_batch(adapter, prompts, temperature, max_new_tokens)
+        except Exception as e:
+            logger.warning(
+                f"batched generate failed ({type(e).__name__}: {e}); "
+                "falling back to per-prompt generate for this call."
+            )
+            return [
+                self.generate(adapter, s, u, n=1, temperature=temperature,
+                              max_new_tokens=max_new_tokens)[0]
+                for (s, u) in prompts
+            ]
+
+    def _fast_generate_batch(self, adapter, prompts, temperature, max_new_tokens):
+        """KV-cached batched generation over DISTINCT prompts (one completion each).
+
+        Prompts are LEFT-padded to a common width with an attention mask — the
+        canonical HF batched-generation layout (real tokens attend only to real
+        tokens; new tokens for every row begin at the padded prompt width). Uses
+        the same eval()/train() toggle as ``_fast_generate`` so gradient
+        checkpointing doesn't force ``use_cache=False`` during the call.
+        """
+        torch = self.torch
+        self.set_adapter(adapter)
+        do_sample = bool(temperature and temperature > 0)
+
+        id_rows = [self._prompt_ids(s, u)[0] for (s, u) in prompts]   # each (Li,)
+        maxlen = max(int(t.shape[0]) for t in id_rows)
+        pad_id = self._tok.pad_token_id
+        B = len(id_rows)
+        input_ids = torch.full((B, maxlen), pad_id, dtype=id_rows[0].dtype, device=self.device)
+        attn = torch.zeros((B, maxlen), dtype=torch.long, device=self.device)
+        for i, t in enumerate(id_rows):
+            li = int(t.shape[0])
+            input_ids[i, maxlen - li:] = t            # LEFT pad
+            attn[i, maxlen - li:] = 1
+
+        was_training = self.model.training
+        try:
+            self.model.eval()
+            gen_kwargs = dict(
+                max_new_tokens=max_new_tokens, do_sample=do_sample, use_cache=True,
+                pad_token_id=pad_id, num_return_sequences=1,
+            )
+            if do_sample:
+                gen_kwargs.update(temperature=float(temperature), top_p=0.95)
+            with torch.no_grad():
+                out = self.model.generate(input_ids, attention_mask=attn, **gen_kwargs)
+            # New tokens start at the padded prompt width for every row.
+            texts = [
+                self._tok.decode(out[i, maxlen:], skip_special_tokens=True)
+                for i in range(out.shape[0])
+            ]
+            del out
+            return texts
+        finally:
+            if was_training:
+                self.model.train()   # restore training mode for the GRPO backward
 
     def _completion_token_logprobs(self, system, user, completion, with_grad):
         """Per-token log-probs of ``completion`` given the prompt.
@@ -385,6 +503,62 @@ class LLMPolicy:
         with self.model.disable_adapter():
             return self._completion_token_logprobs(system, user, completion, with_grad=False).detach()
 
+    # ------------------------------------------------------------------
+    # Batched log-probs — G completions sharing ONE prompt, in a single forward.
+    # Used by grpo_step to replace 2·G sequential forwards with 2 (one adapter-on
+    # grad pass + one base no-grad pass). Same per-token values as the sequential
+    # path (right-padding is exact for a causal LM); grpo falls back on any error.
+    # ------------------------------------------------------------------
+    def _batch_completion_logprobs(self, system, user, completions, with_grad):
+        """Per-completion-token log-probs for many completions sharing one prompt.
+
+        Returns a list of 1-D tensors aligned with ``completions`` (empty tensor
+        for an empty completion). Right-pads ``[prompt | completion_i | pad]`` to a
+        common width and runs ONE forward. Raises if that width would exceed
+        ``max_seq_len`` so the caller can fall back to the per-completion path
+        (which left-truncates exactly like the original single-sequence code).
+        """
+        torch = self.torch
+        prompt_ids = self._prompt_ids(system, user)          # (1, P)
+        P = int(prompt_ids.shape[1])
+        comp_rows, lens = [], []
+        for c in completions:
+            cids = self._tok(c, add_special_tokens=False, return_tensors="pt").input_ids.to(self.device)
+            lens.append(int(cids.shape[1]))
+            comp_rows.append(cids[0] if cids.shape[1] > 0 else None)
+        maxC = max(lens) if lens else 0
+        if maxC == 0:
+            return [torch.zeros(0, device=self.device) for _ in completions]
+        B = len(completions)
+        total = P + maxC
+        if total > self.max_seq_len:
+            raise RuntimeError(f"batched log-prob width {total} exceeds max_seq_len {self.max_seq_len}")
+        pad_id = self._tok.pad_token_id
+        full = torch.full((B, total), pad_id, dtype=prompt_ids.dtype, device=self.device)
+        attn = torch.zeros((B, total), dtype=torch.long, device=self.device)
+        full[:, :P] = prompt_ids                             # shared prompt prefix ((1,P)->(B,P))
+        attn[:, :P] = 1
+        for i, row in enumerate(comp_rows):
+            ci = lens[i]
+            if ci:
+                full[i, P:P + ci] = row
+                attn[i, P:P + ci] = 1
+        ctx = torch.enable_grad() if with_grad else torch.no_grad()
+        with ctx:
+            logits = self.model(full, attention_mask=attn).logits
+            return _gather_completion_logprobs(logits, full, P, lens)
+
+    def policy_completion_logprobs_batch(self, adapter, system, user, completions):
+        """Differentiable per-completion log-probs under ``adapter`` (one batched forward)."""
+        self.set_adapter(adapter)
+        return self._batch_completion_logprobs(system, user, completions, with_grad=True)
+
+    def reference_completion_logprobs_batch(self, system, user, completions):
+        """No-grad per-completion log-probs under the BASE model (KL reference), batched."""
+        with self.model.disable_adapter():
+            lps = self._batch_completion_logprobs(system, user, completions, with_grad=False)
+        return [t.detach() for t in lps]
+
 
 class PolicyGenerator:
     """Adapt an ``LLMPolicy`` + fixed adapter to the turn-generator interface."""
@@ -398,4 +572,15 @@ class PolicyGenerator:
         return self.policy.generate(
             self.adapter, system, user, n=n, temperature=temperature,
             max_new_tokens=self.max_new_tokens,
+        )
+
+    def generate_batch(self, prompts, temperature: float = 0.0) -> list[str]:
+        """One completion per ``(system, user)`` prompt in a single batched decode.
+
+        Used by ``AttackerTurn`` to sample the frozen defender's response to all G
+        candidate attacks at once. Behaviourally equivalent to calling ``generate``
+        per prompt (each row independently sampled at ``temperature``).
+        """
+        return self.policy.generate_batch(
+            self.adapter, prompts, temperature=temperature, max_new_tokens=self.max_new_tokens,
         )
