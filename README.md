@@ -50,15 +50,30 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
 
 - **Training happens on a GPU machine — not through Ollama.** Ollama and the
   OpenAI API are **inference-only** and cannot fine-tune.
-- The policy is **one frozen `Llama-3.2-3B-Instruct` base loaded via Unsloth in
+- The policy is **one frozen `Qwen2.5-1.5B-Instruct` base loaded via Unsloth in
   bf16 LoRA by default** (4-bit QLoRA is available via `rl.load_in_4bit: true` —
   use it only when GPU memory is tight; on a 5090 bf16 is faster as it skips the
   per-matmul dequant), with **two LoRA adapters** over it — `attacker` and
   `defender`. This is exactly "separate checkpoints on the same LLM": the base is
   never duplicated; each policy is its own small adapter, saved independently to
-  `checkpoints/attacker_adapter/` and `checkpoints/defender_adapter/`.
+  `checkpoints/attacker_adapter/` and `checkpoints/defender_adapter/`. Qwen2.5 is
+  Llama-style, so the LoRA target modules + chat-template handling are unchanged —
+  point `rl.model` at any Unsloth-supported instruct model to swap it.
   (Loaded with `attn_implementation="eager"` by default — see `rl.attn_implementation`;
-  Llama 3.2 also supports `"sdpa"`.)
+  Qwen2.5 also supports `"sdpa"`.)
+- **Throughput knobs** (this is a 1M+ round arms race, so per-round cost matters):
+  - `rl.unsloth_fast_generation: true` engages Unsloth's fused fast-inference
+    kernel for sampling (needs `unsloth>=2026.6.9`); set false to fall back to
+    plain HF KV-cached generation.
+  - `rl.stop_on_json: true` is **structured decoding** — each rollout stops the
+    instant it emits one complete top-level JSON object (both agents emit exactly
+    one), so nothing is generated past the closing brace.
+  - The `G` attacker rollouts are scored with a **single batched frozen-defender
+    generation** (`LLMPolicy.generate_many` + `AttackerTurn.reward_batch`), not `G`
+    sequential calls.
+  - `rl.reward_eval_samples: 1500` evaluates each rollout's reward on a fixed
+    subsample of the (preloaded) test set; the committed round still uses the full
+    10k. The constant subsample bias cancels in GRPO's group-relative advantage.
 - GRPO is implemented directly in [`rl/grpo.py`](rl/grpo.py) (environment-coupled
   reward, KL penalty to the frozen base) on top of Unsloth + PEFT — no TRL
   trainer dependency required.
@@ -67,15 +82,15 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
 - **`gpt-4o-mini` (OpenAI) and Ollama `llama3.2` are inference/baseline only** —
   used by `--dry-run` and `--baseline`. They are **not** fine-tuned.
 - **Serving a trained adapter**: use **vLLM** (multi-LoRA hot-swap), or **merge**
-  the adapter into the base and export a single GGUF for Ollama (Llama 3.2 is
-  supported by Ollama as `llama3.2`; merging gives up the two-swappable-adapters
+  the adapter into the base and export a single GGUF for Ollama (Qwen2.5 is
+  supported by Ollama as `qwen2.5`; merging gives up the two-swappable-adapters
   design but is the simplest serving path).
-- **Hardware**: Llama-3.2-3B fits comfortably on a single GPU — ~6 GB of weights
-  in the default bf16 LoRA (or ~4–6 GB floor under 4-bit QLoRA), so your 5090
-  (31 GB) has ample headroom for either. Generation is short: the attacker emits a
-  client selection + per-client plans, and the defender emits one verdict per
-  client (20 clients). `rl.max_new_tokens` defaults to 1024 to fit the defender's
-  full verdict list without truncation.
+- **Hardware**: Qwen2.5-1.5B fits easily on a single GPU — ~3 GB of weights in the
+  default bf16 LoRA (even less under 4-bit QLoRA), so your 5090 (31 GB) has ample
+  headroom. Generation is short: the attacker emits a client selection + per-client
+  plans, and the defender emits one verdict per client (20 clients).
+  `rl.max_new_tokens` defaults to 512 — an upper bound only; with `stop_on_json` a
+  rollout normally stops well before it, once its JSON object closes.
 
 ## Setup
 
@@ -83,7 +98,7 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
 
 ```bash
 pip install -r requirements.txt   # installs unsloth/peft/transformers/bitsandbytes
-# Llama-3.2-3B-Instruct is downloaded from Hugging Face on first run (unsloth/Llama-3.2-3B-Instruct)
+# Qwen2.5-1.5B-Instruct is downloaded from Hugging Face on first run (unsloth/Qwen2.5-1.5B-Instruct)
 ```
 
 ### CPU machine (logic dry-run / baseline only)
@@ -145,7 +160,7 @@ python infer.py --adapter attacker --prompt "Describe a stealthy model-poisoning
 # Sample several completions (temperature > 0):
 python infer.py --adapter attacker --role --prompt '...' --n 4 --temperature 1.0
 
-# Interactive — load the 3B model ONCE, then keep prompting (best for exploring):
+# Interactive — load the model ONCE, then keep prompting (best for exploring):
 python infer.py --adapter defender --role --interactive
 
 # Pipe a prompt from stdin / a file:
@@ -174,7 +189,9 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
   `max_poison_clients`, `sample_budget_in_training`, `eval_poison_clients`), and
   the `rl:` block — GRPO + LoRA + league + reward weights, including
   `reward.attacker.delta` (use-fewer-clients penalty) and `.zeta` (multi-client
-  collaboration/diversity bonus).
+  collaboration/diversity bonus), and the throughput knobs (`model`,
+  `unsloth_fast_generation`, `stop_on_json`, `reward_eval_samples`,
+  `max_new_tokens`).
 - **`configs/attacker_agent.yaml`** — attacker goal fallback, layer-detail
   precision, poisoned-weight clamp, attacker adapter path.
 - **`configs/defender_agent.yaml`** — defender defaults, defender adapter path.

@@ -234,7 +234,8 @@ Key points:
 `LLMPolicy` ([rl/policy.py:35](rl/policy.py)) is the only GPU-heavy module. Its
 design is **"two checkpoints on one brain"**:
 
-- **One** frozen 4-bit (QLoRA) **Llama-3.2-3B-Instruct** base, loaded once.
+- **One** frozen **Qwen2.5-1.5B-Instruct** base, loaded once (bf16 LoRA by default;
+  4-bit QLoRA optional).
 - **Two LoRA adapters** over it — `"attacker"` and `"defender"`. A LoRA adapter is
   a small set of trainable low-rank matrices added to the frozen base; it's like a
   lightweight "personality patch." Two adapters = two independently-trained
@@ -247,16 +248,21 @@ Switch which "personality" is active. `set_adapter("attacker")` makes the attack
 the live policy; `disable_adapter()` exposes the **bare base model**, which is
 used as the KL reference.
 
-**(b) `generate(adapter, system, user, n, temperature, max_new_tokens)`** — [policy.py:219](rl/policy.py)
+**(b) `generate(adapter, system, user, n, temperature, max_new_tokens)`**
 Sample `n` answers (no gradient). Two paths:
-- `_fast_generate` ([policy.py:241](rl/policy.py)) — the default: standard
-  Transformers generation **with a KV cache** (fast). It flips the model to
-  `eval()` during generation (so gradient-checkpointing doesn't disable the cache)
-  then back to `train()` for the backward pass.
-- `_manual_generate` ([policy.py:273](rl/policy.py)) — a fallback no-cache
-  decoder (slower, O(L²)) used automatically if the fast path errors on this
-  Unsloth/Transformers combo. In both paths `temperature=0` → greedy (argmax);
-  `>0` → sampling (the fast path uses top-p 0.95; the manual path uses top-k 50).
+- `_fast_generate` — the default: KV-cached generation, using Unsloth's fused
+  fast-inference kernel when `rl.unsloth_fast_generation` is on (else standard
+  Transformers generate). It flips the model to inference/`eval()` during
+  generation, then back to `train()` for the backward pass.
+- `_manual_generate` — a fallback no-cache decoder (slower, O(L²)) used
+  automatically if the fast path errors on this Unsloth/Transformers combo. In both
+  paths `temperature=0` → greedy (argmax); `>0` → sampling (fast path top-p 0.95,
+  manual path top-k 50).
+
+With `rl.stop_on_json` both paths end a rollout as soon as it emits one complete
+top-level JSON object (structured decoding). **`generate_many`** samples one
+completion per prompt in a single left-padded batch — used to score all `G`
+attacker rollouts' frozen-defender responses in one call (`AttackerTurn.reward_batch`).
 
 **(c) `policy_token_logprobs(adapter, system, user, completion)`** — [policy.py:331](rl/policy.py)
 Re-run the chosen adapter over `prompt + completion` **with gradients** and return
@@ -364,7 +370,7 @@ guards in `grpo_step`:
 3. the `zero_advantage_fraction` is logged so the monitor can warn you.
 
 **Why two LoRA adapters instead of two models?** Memory and simplicity — one frozen
-3B base in 4-bit, plus two small adapter weight-sets. Switching "who is playing" is
+1.5B base, plus two small adapter weight-sets. Switching "who is playing" is
 just `set_adapter(name)`; the KL reference is the same base via `disable_adapter()`.
 
 **Where does `G` come from / can I change it?** `rl.G` in `configs/base.yaml`

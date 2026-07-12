@@ -123,9 +123,10 @@ Both continuous, so GRPO group advantages don't collapse.
   `mean_i[ −A_i·mean_t logπ(o_i,t) + β·mean_t KL_t ]` with the k3 KL estimator
   against the **frozen base model** (adapters disabled). Single-iteration ⇒ no
   clipping needed. Reports the zero-advantage-group fraction (stall signal).
-- **`rl/policy.py`**: one Unsloth `Llama-3.2-3B-Instruct` 4-bit base + two PEFT LoRA
-  adapters (`attacker`, `defender`). `set_adapter` selects the active policy;
-  `disable_adapter` exposes the base as the KL reference.
+- **`rl/policy.py`**: one Unsloth `Qwen2.5-1.5B-Instruct` base (bf16 LoRA by
+  default; 4-bit QLoRA optional) + two PEFT LoRA adapters (`attacker`, `defender`).
+  `set_adapter` selects the active policy; `disable_adapter` exposes the base as
+  the KL reference.
 - **`rl/schedule.py`**: freeze-and-alternate — train attacker `K_a` rounds
   (defender frozen, greedy), then defender `K_d` rounds (attacker frozen,
   greedy), repeat. The best-scoring sampled action is committed to advance the
@@ -147,6 +148,27 @@ Both continuous, so GRPO group advantages don't collapse.
   sequential round number and is logged to `logs/system.log`,
   `logs/round_data/round_NNN.json` (`attack_metadata.event="benign_fl_round"`)
   and `logs/debug.json`.
+
+## Throughput (per-round cost)
+
+This is a 1M+ round arms race, so each round is engineered to minimize GPU work:
+
+- **Unsloth fast inference** (`rl.unsloth_fast_generation`) engages the fused
+  fast-generation kernel for sampling; falls back to HF KV-cached generate, and
+  again to a no-cache decoder, on any incompatibility.
+- **Structured decoding** (`rl.stop_on_json`) stops each rollout as soon as it
+  emits one complete top-level JSON object — both agents emit exactly one, so no
+  tokens are wasted past the closing brace. `rl.max_new_tokens` (512) is only the
+  ceiling. See `first_json_object_end` + the `StoppingCriteria` in `rl/policy.py`.
+- **Batched opponent scoring**: an attacker round scores its `G` rollouts with a
+  SINGLE batched frozen-defender generation (`LLMPolicy.generate_many` +
+  `AttackerTurn.reward_batch`) instead of `G` sequential calls. (Defender rounds
+  score by parsing only — no generation per rollout — so nothing to batch.)
+- **Cheap reward eval**: the per-rollout reward accuracy is measured on a fixed
+  `rl.reward_eval_samples` (1500) subsample of the preloaded test set
+  (`FedServer.preload_test_set` caches it as one device tensor pair); the committed
+  round uses the full 10k. A constant subsample bias cancels in the group-relative
+  advantage, so the gradient is unchanged.
 
 ## Modes (`main.py`)
 
