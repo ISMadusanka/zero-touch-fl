@@ -28,6 +28,16 @@ class InferenceGenerator:
             for _ in range(n)
         ]
 
+    def generate_many(self, prompts, temperature: float = 0.7) -> list[str]:
+        """One completion per (system, user) prompt. The Ollama/OpenAI backends
+        have no batch endpoint, so this loops — it exists for interface parity with
+        ``PolicyGenerator.generate_many`` (so AttackerTurn.reward_batch works under
+        --dry-run too)."""
+        return [
+            self.llm.complete(s, u, temperature=temperature, max_tokens=self.max_new_tokens)
+            for (s, u) in prompts
+        ]
+
 
 def run_inference(
     env,

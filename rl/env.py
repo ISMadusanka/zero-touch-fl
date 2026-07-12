@@ -69,6 +69,12 @@ class FLArmsRaceEnv:
             int(attack.get("max_poison_clients", self.n_compromisable)), self.n_compromisable))
         self.sample_budget = bool(attack.get("sample_budget_in_training", True))
 
+        # Per-rollout reward eval subsample size: scoring the G rollouts only needs
+        # a relative accuracy drop, so we evaluate on the first N test images (the
+        # loader is unshuffled → deterministic). The committed round still uses the
+        # full test set for the tracked/logged accuracy. 0/None => full test set.
+        self.reward_eval_samples = int(config.get("rl", {}).get("reward_eval_samples", 1500))
+
         self.test_loader = test_loader
         self.rng = rng
         self.aggregator = FedAvgAggregator()
@@ -106,6 +112,9 @@ class FLArmsRaceEnv:
         self.baseline_accuracy = float(baseline_accuracy)
         self.current_accuracy = float(baseline_accuracy)
         self.round_index = 0
+        # Preload the test set once so every per-round evaluation is a single
+        # forward on cached device tensors (no DataLoader re-iteration).
+        self._ensure_preloaded()
         logger.info(
             f"Env reset — n_clients={self.n_clients}, n_compromisable={self.n_compromisable}, "
             f"budget_cap={self.budget_cap}, sample_budget={self.sample_budget}, "
@@ -174,27 +183,46 @@ class FLArmsRaceEnv:
     def features(self, updates: list[ModelUpdate]) -> dict[int, dict]:
         return compute_client_features(updates, self.server.get_global_weights())
 
-    def _eval_state(self, state: dict | None) -> float:
-        """Evaluate a candidate aggregated state without committing it."""
+    def _ensure_preloaded(self) -> None:
+        """Preload the test set into the server's device tensors if not already
+        done (and we have a loader). Makes eval independent of DataLoader re-iteration."""
+        if getattr(self.server, "_eval_x", None) is None and self.test_loader is not None:
+            self.server.preload_test_set(self.test_loader)
+
+    def _eval_state(self, state: dict | None, n_samples: int | None = None) -> float:
+        """Evaluate a candidate aggregated state without committing it.
+
+        ``n_samples`` restricts the eval to the first N test images (deterministic
+        subsample) — used to make the per-rollout reward cheap. ``None`` => full set.
+        """
         if state is None:
             return self.current_accuracy
+        self._ensure_preloaded()
         backup = self.server.get_global_weights()
         self.server.set_global_weights(state)
-        acc = self.server.evaluate(self.test_loader)
+        acc = self.server.evaluate(n_samples=n_samples)
         self.server.set_global_weights(backup)
         return acc
 
     def evaluate_updates(self, updates, verdicts) -> float:
-        """Post-aggregation accuracy for these updates+verdicts (no commit)."""
+        """Post-aggregation accuracy for these updates+verdicts (no commit).
+
+        Used to SCORE the G GRPO rollouts, so it runs on the cheap reward subsample
+        (``reward_eval_samples``). The absolute value is biased vs the full test set
+        by at most subsample noise, but a bias shared by all G rollouts cancels in
+        the group-relative advantage, so the learning signal is unaffected.
+        """
         candidate = self.aggregator.aggregate(updates, verdicts)
-        return self._eval_state(candidate)
+        return self._eval_state(candidate, n_samples=self.reward_eval_samples)
 
     def commit(self, updates, verdicts) -> float:
         """Aggregate, update the global model, and advance the round."""
         candidate = self.aggregator.aggregate(updates, verdicts)
         if candidate is not None:
             self.server.set_global_weights(candidate)
-            self.current_accuracy = self.server.evaluate(self.test_loader)
+            self._ensure_preloaded()
+            # Full test set for the committed/tracked accuracy (not the subsample).
+            self.current_accuracy = self.server.evaluate()
         else:
             logger.warning("Round commit: all clients flagged — global model unchanged")
         return self.current_accuracy
@@ -234,7 +262,8 @@ class FLArmsRaceEnv:
         new_global = self.aggregator.aggregate(updates, clean)
         if new_global is not None:
             self.server.set_global_weights(new_global)
-        self.current_accuracy = self.server.evaluate(self.test_loader)
+        self._ensure_preloaded()
+        self.current_accuracy = self.server.evaluate()   # full test set (tracked accuracy)
 
         # Refresh the per-client benign references the rest of Phase 2 consumes.
         self.client_weights = [copy.deepcopy(u.weights) for u in updates]

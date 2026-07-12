@@ -45,11 +45,20 @@ llm:
 
 # Reinforcement learning (GRPO) settings — see README "LLM handling".
 rl:
-  model: "unsloth/Llama-3.2-3B-Instruct"  # HF/Unsloth base for QLoRA training
-  attn_implementation: "eager"    # broadly compatible; Llama 3.2 also supports "sdpa"
+  model: "unsloth/Qwen2.5-1.5B-Instruct"  # HF/Unsloth base. Qwen2.5-1.5B is ~2x smaller than
+                                  # Llama-3.2-3B (faster per token for the short JSON actions) and
+                                  # Llama-style, so LoRA targets + chat template carry over unchanged.
+  attn_implementation: "eager"    # broadly compatible; Qwen2.5 also supports "sdpa"
   use_fast_generate: true         # KV-cached generation (fast); auto-falls back to no-cache on failure
+  unsloth_fast_generation: true   # engage Unsloth's fused fast-inference kernel (for_inference);
+                                  # needs unsloth>=2026.6.9. Set false to use plain HF generate.
+  stop_on_json: true              # structured decoding: stop each rollout as soon as it emits one
+                                  # complete top-level JSON object (both agents emit exactly one),
+                                  # cutting wasted tokens after the object closes.
+  reward_eval_samples: 1500       # per-rollout REWARD eval runs on the first N test images (fast,
+                                  # deterministic). 0 => full test set. Committed round always uses full.
   max_seq_len: 8192
-  load_in_4bit: false             # bf16 LoRA: 3B fits easily on 32GB+; skips QLoRA dequant -> faster grad passes
+  load_in_4bit: false             # bf16 LoRA: 1.5B fits easily on 32GB+; skips QLoRA dequant -> faster grad passes
   lora_r: 16
   lora_alpha: 32
   G: 4                            # rollouts per GRPO step (group size)
@@ -60,8 +69,9 @@ rl:
   scoring_opponent_temperature: 0.7 # frozen opponent temp while SCORING the G rollouts;
                                   # >0 so candidates see varied opponent verdicts -> restores
                                   # within-group reward spread (fixes attacker zero-advantage)
-  max_new_tokens: 1024            # headroom for the defender's 20-client verdict list and the
-                                  # attacker's per-client plans (raise if outputs get truncated)
+  max_new_tokens: 512             # cap on generated tokens. With stop_on_json the rollout usually
+                                  # ends well before this once the JSON object closes; this is just
+                                  # the hard ceiling (raise if a full 20-client verdict list truncates)
   grad_clip: 1.0
   save_every: 25                  # checkpoint adapters + progress every N rounds (resume granularity)
   league_snapshot_every: 100      # snapshot adapters into the opponent league

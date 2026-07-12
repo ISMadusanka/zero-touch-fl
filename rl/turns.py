@@ -83,14 +83,11 @@ class AttackerTurn:
         verdicts = self._defender_verdicts(updates, temperature)
         return updates, verdicts, n_malformed, chosen_ids, poisoned
 
-    def reward(self, attacker_text) -> float:
-        dbg.scoring_rollout(attacker_text)
-        updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
-            attacker_text, self.scoring_opp_temp)
-        post_acc = self.env.evaluate_updates(updates, verdicts)
+    def _score_one(self, chosen_ids, poisoned, verdicts, n_malformed, post_acc) -> float:
+        """The attacker reward for one scored rollout (shared by single + batch)."""
         diversity = perturbation_diversity(
             poisoned, {cid: self.pool_references[cid] for cid in chosen_ids})
-        r = attacker_reward(
+        return attacker_reward(
             self.prev_accuracy, post_acc, self.env.goal, chosen_ids,
             verdicts, n_malformed,
             alpha=self.reward_cfg.get("alpha", 1.0),
@@ -101,9 +98,50 @@ class AttackerTurn:
             pool_size=self.pool_size,
             diversity=diversity,
         )
-        dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed,
-                            verdicts=verdicts, poisoned_ids=chosen_ids)
-        return r
+
+    def reward_batch(self, attacker_texts: list[str]) -> list[float]:
+        """Score G candidate attacker plans with ONE batched frozen-defender pass.
+
+        Previously each rollout triggered its own ``defender_gen.generate`` call in
+        a Python loop — the dominant cost of an attacker-learning round. Here we
+        first apply every plan (cheap, CPU tensor ops on the tiny MLP) and build
+        each rollout's defender prompt, then issue a SINGLE batched defender
+        generation across all rollouts, then compute each reward. Sampling is still
+        independent per row (different prompts + ``scoring_opp_temp`` > 0), so the
+        within-group reward spread GRPO needs is preserved.
+        """
+        d_sys = self.defender_agent.system_prompt()
+        applied = []            # per rollout: (updates, client_ids, n_malformed, chosen_ids, poisoned, d_user)
+        d_prompts = []          # per rollout: (d_sys, d_user)
+        for text in attacker_texts:
+            dbg.scoring_rollout(text)
+            poisoned, chosen_ids, n_malformed = self.attacker_agent.select_and_apply(
+                text, self.pool_references, self.budget)
+            updates = self.env.build_updates(poisoned)
+            d_user = self.defender_agent.build_user_prompt(self.env.features(updates))
+            client_ids = [u.client_id for u in updates]
+            d_prompts.append((d_sys, d_user))
+            applied.append((updates, client_ids, n_malformed, chosen_ids, poisoned, d_user))
+
+        # ONE batched frozen-defender generation for ALL rollouts.
+        d_texts = self.defender_gen.generate_many(d_prompts, temperature=self.scoring_opp_temp)
+
+        rewards = []
+        for (updates, client_ids, n_malformed, chosen_ids, poisoned, d_user), d_text in zip(
+            applied, d_texts
+        ):
+            verdicts = self.defender_agent.parse(d_text, client_ids)
+            dbg.defender_io(d_sys, d_user, d_text, verdicts, who="opponent",
+                            temperature=self.scoring_opp_temp)
+            post_acc = self.env.evaluate_updates(updates, verdicts)
+            r = self._score_one(chosen_ids, poisoned, verdicts, n_malformed, post_acc)
+            dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed,
+                                verdicts=verdicts, poisoned_ids=chosen_ids)
+            rewards.append(r)
+        return rewards
+
+    def reward(self, attacker_text) -> float:
+        return self.reward_batch([attacker_text])[0]
 
     def commit(self, attacker_text) -> dict:
         dbg.committing()
@@ -173,6 +211,12 @@ class DefenderTurn:
         )
         dbg.rollout_outcome(reward=r, verdicts=verdicts, poisoned_ids=self.poisoned_ids)
         return r
+
+    def reward_batch(self, defender_texts: list[str]) -> list[float]:
+        """Defender scoring is pure parsing + F1 (no generation / no FL eval), so
+        there is nothing to batch — loop. Provided so the GRPO step can call
+        ``reward_batch`` uniformly for both learners."""
+        return [self.reward(t) for t in defender_texts]
 
     def commit(self, defender_text) -> dict:
         dbg.committing()

@@ -25,17 +25,63 @@ import os
 logger = logging.getLogger(__name__)
 
 # Default LoRA target modules — the attention/MLP projection names shared by
-# Llama 3.x, Gemma, Qwen, Mistral, etc.
+# Llama 3.x, Gemma, Qwen, Mistral, etc. Qwen2.5 uses these exact names, so the
+# LoRA setup carries over unchanged from the Llama base.
 DEFAULT_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
 ]
 
+# Default base model. Qwen2.5-1.5B-Instruct is ~2x smaller than Llama-3.2-3B
+# (faster per token for the short JSON actions both agents emit) and shares the
+# Llama-style architecture, so the LoRA target modules, chat-template folding,
+# and eos/pad handling below all apply without change.
+DEFAULT_BASE_MODEL = "unsloth/Qwen2.5-1.5B-Instruct"
+
+
+def first_json_object_end(text: str) -> int | None:
+    """Index just past the end of the FIRST balanced top-level ``{...}`` object.
+
+    Returns the character index one past the closing brace of the first complete
+    JSON object in ``text``, or ``None`` if no complete object is present yet.
+    String literals (and their escapes) are respected so that braces appearing
+    inside a string value do not affect the depth count. Text before the first
+    ``{`` (e.g. a ```json fence or a "Here is:" preamble) and text after the
+    closing ``}`` are ignored — both attacker and defender emit a single
+    top-level object, so this marks exactly where generation can stop.
+
+    Pure function (no torch / no model) so the structured-decoding stop condition
+    is unit-testable on any machine.
+    """
+    depth = 0
+    in_str = False
+    escape = False
+    started = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+            started = True
+        elif ch == "}":
+            depth -= 1
+            if started and depth == 0:
+                return i + 1
+    return None
+
 
 class LLMPolicy:
     def __init__(
         self,
-        base_model: str = "unsloth/Llama-3.2-3B-Instruct",
+        base_model: str = DEFAULT_BASE_MODEL,
         max_seq_len: int = 8192,
         lora_r: int = 16,
         lora_alpha: int = 32,
@@ -46,16 +92,20 @@ class LLMPolicy:
         adapters: tuple[str, ...] = ("attacker", "defender"),
         attn_implementation: str = "eager",
         use_fast_generate: bool = True,
+        unsloth_fast_generation: bool = True,
+        stop_on_json: bool = True,
     ):
         # Heavy imports kept local so importing this module is cheap.
         import torch
-        # Disable Unsloth's fused fast-generate wrapper BEFORE importing unsloth:
-        # its paged-KV inference kernel (LlamaAttention_fast_forward_inference) is
-        # incompatible with the installed Transformers and crashes on a RoPE
-        # cos/sin broadcast. With it disabled, model.generate() falls through to
-        # standard Transformers generation, which uses a normal KV cache via the
-        # regular (working) forward — fast AND correct, no version downgrade.
-        os.environ.setdefault("UNSLOTH_DISABLE_FAST_GENERATION", "1")
+        # Unsloth's fused fast-generation kernel (for_inference) is the fastest
+        # sampling path. It was previously force-disabled because an older Unsloth
+        # (2026.3.11) shipped a broken Llama paged-KV kernel (RoPE cos/sin
+        # broadcast crash) vs Transformers 5.3; requirements now pin
+        # unsloth>=2026.6.9, which fixes it. The env var MUST be set before
+        # importing unsloth, so gate it on the config flag here. When disabled we
+        # fall back to standard Transformers generate + a normal KV cache (still
+        # correct, just slower).
+        os.environ["UNSLOTH_DISABLE_FAST_GENERATION"] = "0" if unsloth_fast_generation else "1"
         from unsloth import FastLanguageModel
         # Unsloth is now imported FIRST (before transformers), so its optimizations
         # patch cleanly. Only now is it safe to touch transformers — lower its log
@@ -119,8 +169,14 @@ class LLMPolicy:
         self._active = None
         self._logits_kw = None   # resolved on first use: which "last-token-only" kwarg works
         self._use_fast_generate = bool(use_fast_generate)  # KV-cached generate; auto-falls back on failure
+        self._FLM = FastLanguageModel        # for for_inference()/for_training() toggles
+        self._unsloth_fast = bool(unsloth_fast_generation)  # engage Unsloth's fused inference kernel
+        self._stop_on_json = bool(stop_on_json)             # stop at the first complete JSON object
         self.set_adapter(self.adapters[0])
-        logger.info(f"LLMPolicy ready — adapters={self.adapters}, device={self.device}")
+        logger.info(
+            f"LLMPolicy ready — base={base_model}, adapters={self.adapters}, device={self.device}, "
+            f"unsloth_fast={self._unsloth_fast}, stop_on_json={self._stop_on_json}"
+        )
 
     # ------------------------------------------------------------------
     # Adapter management
@@ -178,17 +234,21 @@ class LLMPolicy:
     # ------------------------------------------------------------------
     # Generation + log-probs
     # ------------------------------------------------------------------
-    def _prompt_ids(self, system: str, user: str):
-        # Fold the system instructions into a single user turn. Llama 3.2 has a
-        # native system role, but some templates (e.g. Gemma) don't — folding is
-        # the universally-safe approach and keeps behaviour identical across models.
-        # Render to text via the processor (tokenize=False → str), then tokenize
-        # with the raw tokenizer. The template already injects BOS + turn tokens,
-        # so add_special_tokens=False avoids a duplicate BOS.
+    def _render_text(self, system: str, user: str) -> str:
+        # Fold the system instructions into a single user turn. Llama 3.2 and
+        # Qwen2.5 both have a native system role, but some templates (e.g. Gemma)
+        # don't — folding is the universally-safe approach and keeps behaviour
+        # identical across models. Render to text via the processor's chat
+        # template (tokenize=False → str). The template injects BOS + turn tokens.
         messages = [{"role": "user", "content": f"{system}\n\n{user}"}]
-        text = self.tokenizer.apply_chat_template(
+        return self.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False,
         )
+
+    def _prompt_ids(self, system: str, user: str):
+        # Tokenize the rendered prompt with the raw tokenizer. The template already
+        # injects BOS + turn tokens, so add_special_tokens=False avoids a duplicate BOS.
+        text = self._render_text(system, user)
         enc = self._tok(text, return_tensors="pt", add_special_tokens=False)
         return enc["input_ids"].to(self.device)
 
@@ -231,11 +291,11 @@ class LLMPolicy:
         plen = prompt_ids.shape[1]
         do_sample = bool(temperature and temperature > 0)
 
-        # Prefer KV-cached generation (much faster). With Unsloth's fused fast
-        # wrapper disabled (see __init__), this uses standard Transformers
-        # generate + a normal KV cache, avoiding the broken paged-KV kernel. If
-        # it still fails on this Unsloth/Transformers combo, fall back ONCE to
-        # the manual no-cache decoder and stay there for the rest of the run.
+        # Prefer KV-cached generation (much faster): Unsloth's fused fast-inference
+        # kernel when unsloth_fast_generation is on, else standard Transformers
+        # generate + a normal KV cache. If it fails on this Unsloth/Transformers
+        # combo, fall back ONCE to the manual no-cache decoder and stay there for
+        # the rest of the run.
         if self._use_fast_generate:
             try:
                 return self._fast_generate(prompt_ids, plen, n, do_sample, temperature, max_new_tokens)
@@ -248,14 +308,14 @@ class LLMPolicy:
         return self._manual_generate(prompt_ids, plen, n, do_sample, temperature, max_new_tokens)
 
     def _fast_generate(self, prompt_ids, plen, n, do_sample, temperature, max_new_tokens):
-        """KV-cached generation via STANDARD Transformers generate.
+        """KV-cached generation.
 
-        Unsloth's fused fast-generate wrapper is disabled
-        (UNSLOTH_DISABLE_FAST_GENERATION, see __init__), so this uses the regular
-        forward + a normal KV cache. We switch to eval() for the call so
-        gradient checkpointing doesn't force use_cache=False, then restore
-        train() for the GRPO backward. We deliberately do NOT call for_inference()
-        — that re-enables the broken paged-KV inference kernel.
+        When ``unsloth_fast_generation`` is on we engage Unsloth's fused
+        fast-inference kernel via ``for_inference()`` (restored with
+        ``for_training()`` in ``finally`` for the GRPO backward); otherwise we just
+        switch to eval() so gradient checkpointing doesn't force use_cache=False and
+        let standard Transformers generate + a normal KV cache run. If
+        ``for_inference()`` itself errors we degrade to the plain eval() path.
 
         The whole group is sampled in ONE batched call (``num_return_sequences=n``)
         instead of an n-iteration Python loop: n independent rollouts share a
@@ -268,15 +328,30 @@ class LLMPolicy:
         """
         torch = self.torch
         was_training = self.model.training
+        n_rows = n if do_sample else 1
+        used_unsloth = False
         try:
-            self.model.eval()
+            # Engage Unsloth's fused fast-inference kernel when enabled; otherwise
+            # just switch to eval() so gradient checkpointing doesn't force
+            # use_cache=False. Either way we restore training mode in `finally` for
+            # the GRPO backward.
+            if self._unsloth_fast:
+                try:
+                    self._FLM.for_inference(self.model)
+                    used_unsloth = True
+                except Exception:
+                    self.model.eval()
+            else:
+                self.model.eval()
             gen_kwargs = dict(
                 max_new_tokens=max_new_tokens, do_sample=do_sample, use_cache=True,
                 pad_token_id=self._tok.pad_token_id,
-                num_return_sequences=(n if do_sample else 1),
+                num_return_sequences=n_rows,
             )
             if do_sample:
                 gen_kwargs.update(temperature=float(temperature), top_p=0.95)
+            if self._stop_on_json:
+                gen_kwargs["stopping_criteria"] = self._json_stopping_criteria(plen, n_rows)
             with torch.no_grad():
                 out = self.model.generate(prompt_ids, **gen_kwargs)
             texts = [
@@ -286,9 +361,13 @@ class LLMPolicy:
             if not do_sample:
                 texts = texts * n   # deterministic greedy → replicate the single completion
             del out
-            torch.cuda.empty_cache()
             return texts
         finally:
+            if used_unsloth:
+                try:
+                    self._FLM.for_training(self.model)
+                except Exception:
+                    pass
             if was_training:
                 self.model.train()   # restore training mode for the GRPO backward
 
@@ -327,14 +406,17 @@ class LLMPolicy:
                 nxt = top.indices.gather(-1, torch.multinomial(probs, 1))  # (n_gen, 1)
             else:
                 nxt = logits.argmax(dim=-1, keepdim=True)           # (n_gen, 1)
-            if eos_tensor is not None:
-                # Rows already done keep emitting pad → rectangular + stripped on decode.
-                nxt = nxt.masked_fill(finished.unsqueeze(1), pad_id)
+            # Rows already done keep emitting pad → rectangular + stripped on decode.
+            nxt = nxt.masked_fill(finished.unsqueeze(1), pad_id)
             ids = torch.cat([ids, nxt], dim=1)
             if eos_tensor is not None:
                 finished = finished | torch.isin(nxt.squeeze(1), eos_tensor)
-                if bool(finished.all()):
-                    break
+            if self._stop_on_json:
+                # Structured stop: end a row once its completion holds a complete
+                # top-level JSON object (matches the fast-path StoppingCriteria).
+                finished = self._json_finished(ids, plen, finished)
+            if bool(finished.all()):
+                break
         texts = [
             self._tok.decode(ids[i, plen:], skip_special_tokens=True)
             for i in range(n_gen)
@@ -342,8 +424,128 @@ class LLMPolicy:
         if not do_sample:
             texts = texts * n   # deterministic greedy → replicate the single completion
         del ids
-        torch.cuda.empty_cache()
         return texts
+
+    def _json_stopping_criteria(self, plen: int, n_rows: int):
+        """A StoppingCriteria that stops generation once EVERY row's completion
+        (the tokens after ``plen``) contains a complete top-level JSON object.
+
+        We track per-row completion but return a scalar ``bool`` (True only when
+        all rows are done) rather than a per-row BoolTensor: the scalar form is
+        accepted by every transformers version, whereas a per-row return that a
+        given version rejected would raise and force the whole run onto the slow
+        no-cache decoder. Rows finish at similar lengths here (same-shaped verdict
+        lists / plans), so stopping at the batch max costs little."""
+        from transformers import StoppingCriteria, StoppingCriteriaList
+        torch = self.torch
+        tok = self._tok
+
+        class _JsonObjectStop(StoppingCriteria):
+            def __init__(self):
+                self.done = torch.zeros(n_rows, dtype=torch.bool)
+
+            def __call__(self, input_ids, scores=None, **kwargs):
+                b = input_ids.shape[0]
+                if self.done.shape[0] != b:                    # be robust to batch expansion
+                    self.done = torch.zeros(b, dtype=torch.bool)
+                # Cheap gate: only fully decode a row when its newest token has '}'.
+                last_texts = tok.batch_decode(input_ids[:, -1:], skip_special_tokens=True)
+                for r in range(b):
+                    if bool(self.done[r]) or "}" not in last_texts[r]:
+                        continue
+                    comp = tok.decode(input_ids[r, plen:], skip_special_tokens=True)
+                    if first_json_object_end(comp) is not None:
+                        self.done[r] = True
+                return bool(self.done.all())
+
+        return StoppingCriteriaList([_JsonObjectStop()])
+
+    def _json_finished(self, ids, plen, finished):
+        """Manual-decode analogue of the StoppingCriteria: mark rows whose
+        completion now holds a complete top-level JSON object."""
+        torch = self.torch
+        last_texts = self._tok.batch_decode(ids[:, -1:], skip_special_tokens=True)
+        newly = []
+        for r in range(ids.shape[0]):
+            if bool(finished[r]) or "}" not in last_texts[r]:
+                continue
+            comp = self._tok.decode(ids[r, plen:], skip_special_tokens=True)
+            if first_json_object_end(comp) is not None:
+                newly.append(r)
+        if newly:
+            finished = finished.index_fill(0, torch.tensor(newly, device=finished.device), True)
+        return finished
+
+    def generate_many(self, adapter, prompts, temperature=0.0, max_new_tokens=2048) -> list[str]:
+        """Generate ONE completion for EACH ``(system, user)`` prompt in a single
+        left-padded batch.
+
+        Used to score all G attacker rollouts' frozen-defender responses in one
+        forward/decode loop instead of G sequential ``generate`` calls — the main
+        cost on attacker-learning rounds. Uses standard Transformers generation
+        with an attention mask (correct for left-padded, unequal-length prompts);
+        on any failure it falls back to sequential single-prompt generation so the
+        run never dies on a batching edge case.
+        """
+        if not prompts:
+            return []
+        self.set_adapter(adapter)
+        texts_in = [self._render_text(s, u) for (s, u) in prompts]
+        tok = self._tok
+        prev_side = tok.padding_side
+        tok.padding_side = "left"   # decoder-only batched generation needs left padding
+        try:
+            enc = tok(texts_in, return_tensors="pt", add_special_tokens=False, padding=True)
+        finally:
+            tok.padding_side = prev_side
+        input_ids = enc["input_ids"].to(self.device)
+        attn = enc["attention_mask"].to(self.device)
+        if input_ids.shape[1] > self.max_seq_len:            # guard context length
+            input_ids = input_ids[:, -self.max_seq_len:]
+            attn = attn[:, -self.max_seq_len:]
+        do_sample = bool(temperature and temperature > 0)
+        try:
+            return self._batched_generate(input_ids, attn, do_sample, temperature, max_new_tokens)
+        except Exception as e:
+            logger.warning(
+                f"Batched generate_many failed ({type(e).__name__}: {e}); "
+                "falling back to sequential single-prompt generation."
+            )
+            return [
+                self.generate(adapter, s, u, n=1, temperature=temperature,
+                              max_new_tokens=max_new_tokens)[0]
+                for (s, u) in prompts
+            ]
+
+    def _batched_generate(self, input_ids, attn, do_sample, temperature, max_new_tokens):
+        """One batched generate over a left-padded prompt batch (num_return_sequences=1
+        per row). All rows share the padded prompt length, so each completion is
+        ``row[plen:]``."""
+        torch = self.torch
+        was_training = self.model.training
+        plen = input_ids.shape[1]
+        n_rows = input_ids.shape[0]
+        try:
+            self.model.eval()
+            gen_kwargs = dict(
+                attention_mask=attn, max_new_tokens=max_new_tokens, do_sample=do_sample,
+                use_cache=True, pad_token_id=self._tok.pad_token_id, num_return_sequences=1,
+            )
+            if do_sample:
+                gen_kwargs.update(temperature=float(temperature), top_p=0.95)
+            if self._stop_on_json:
+                gen_kwargs["stopping_criteria"] = self._json_stopping_criteria(plen, n_rows)
+            with torch.no_grad():
+                out = self.model.generate(input_ids, **gen_kwargs)
+            texts = [
+                self._tok.decode(out[i, plen:], skip_special_tokens=True)
+                for i in range(out.shape[0])
+            ]
+            del out
+            return texts
+        finally:
+            if was_training:
+                self.model.train()
 
     def _completion_token_logprobs(self, system, user, completion, with_grad):
         """Per-token log-probs of ``completion`` given the prompt.
@@ -398,4 +600,10 @@ class PolicyGenerator:
         return self.policy.generate(
             self.adapter, system, user, n=n, temperature=temperature,
             max_new_tokens=self.max_new_tokens,
+        )
+
+    def generate_many(self, prompts, temperature: float = 0.0) -> list[str]:
+        """One completion per (system, user) prompt, generated in a single batch."""
+        return self.policy.generate_many(
+            self.adapter, prompts, temperature=temperature, max_new_tokens=self.max_new_tokens,
         )

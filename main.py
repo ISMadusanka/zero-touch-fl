@@ -211,7 +211,7 @@ def run_phase2(
             "defender": "checkpoints/defender_adapter",
         })
         policy = LLMPolicy(
-            base_model=rl_cfg.get("model", "unsloth/Llama-3.2-3B-Instruct"),
+            base_model=rl_cfg.get("model", "unsloth/Qwen2.5-1.5B-Instruct"),
             max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
             lora_r=int(rl_cfg.get("lora_r", 16)),
             lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
@@ -219,6 +219,8 @@ def run_phase2(
             seed=int(fl.get("poison_seed", 0)),
             attn_implementation=rl_cfg.get("attn_implementation", "eager"),
             use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
+            unsloth_fast_generation=bool(rl_cfg.get("unsloth_fast_generation", True)),
+            stop_on_json=bool(rl_cfg.get("stop_on_json", True)),
         )
         # Resume adapters if present.
         for name, path in adapter_paths.items():

@@ -57,13 +57,20 @@ def grpo_step(
     """
     system, user = turn.messages()
 
+    def _score(comps):
+        # Prefer the batched scorer (AttackerTurn collapses the G frozen-defender
+        # generations into one batched call); fall back to per-candidate scoring.
+        if hasattr(turn, "reward_batch"):
+            return [float(r) for r in turn.reward_batch(comps)]
+        return [float(turn.reward(c)) for c in comps]
+
     # 1. Sample a group of G candidate actions (no grad).
     completions = policy.generate(
         adapter, system, user, n=G, temperature=temperature, max_new_tokens=max_new_tokens,
     )
 
     # 2. Verifiable reward for each candidate.
-    rewards = [float(turn.reward(c)) for c in completions]
+    rewards = _score(completions)
 
     # 3. Group-relative advantages.
     advantages, zero_frac = group_advantages(rewards)
@@ -79,7 +86,7 @@ def grpo_step(
             temperature=max(temperature, resample_temperature),
             max_new_tokens=max_new_tokens,
         )
-        rewards = [float(turn.reward(c)) for c in completions]
+        rewards = _score(completions)
         advantages, zero_frac = group_advantages(rewards)
 
     mean_r = sum(rewards) / len(rewards) if rewards else 0.0
