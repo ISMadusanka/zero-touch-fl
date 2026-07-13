@@ -101,11 +101,49 @@ def plot_accuracy(rounds, out_dir):
     rns = [r["round_num"] for r in rounds]
     test = [r["test_accuracy"] for r in rounds]
     base = [r["baseline_accuracy"] for r in rounds]
+    
+    goal = rounds[0].get("attack_goal", {})
+    is_targeted = goal.get("strategy") == "targeted"
+    target_class = str(goal.get("label", "menu"))
+
     fig, ax = plt.subplots(figsize=(12, 5))
-    apply_dark_style(ax, "Global Model Accuracy Over Rounds", "Round", "Accuracy")
-    ax.plot(rns, base, "--", color=COLORS["accent3"], linewidth=1.5, label="Baseline", alpha=0.7)
-    ax.plot(rns, test, "-", color=COLORS["accent"], linewidth=1.8, label="Test Accuracy")
-    ax.fill_between(rns, test, base, alpha=0.12, color=COLORS["accent"])
+    apply_dark_style(ax, "Model Accuracy Over Rounds", "Round", "Accuracy")
+    
+    if is_targeted:
+        # Extract targeted class accuracies
+        cls_acc = []
+        best_class = None
+        for r in rounds:
+            pc = r.get("attack_metadata", {}).get("post_class_accuracy")
+            if not pc:
+                cls_acc.append(np.nan)
+                continue
+            
+            # If label is menu, the attacker dynamically targets the most vulnerable class each round.
+            # We track the class that was worst-hit in the final round to plot as the main target.
+            if target_class == "menu":
+                if best_class is None and r == rounds[-1]:
+                     best_class = min(pc, key=pc.get)
+                target = best_class if best_class is not None else 0 # fallback
+                cls_acc.append(pc.get(str(target), pc.get(target, np.nan)))
+            else:
+                cls_acc.append(pc.get(str(target_class), pc.get(int(target_class), np.nan)))
+                
+        # Fill missing values with the first valid one if necessary
+        for i in range(1, len(cls_acc)):
+            if np.isnan(cls_acc[i]) and not np.isnan(cls_acc[i-1]):
+                 cls_acc[i] = cls_acc[i-1]
+                 
+        ax.plot(rns, base, "--", color=COLORS["text_dim"], linewidth=1.5, label="Global Baseline", alpha=0.5)
+        ax.plot(rns, test, "-", color=COLORS["accent"], linewidth=2.0, label="Global Accuracy (Constrained)")
+        target_name = f"Class {best_class}" if target_class == "menu" else f"Class {target_class}"
+        ax.plot(rns, cls_acc, "-", color=COLORS["accent2"], linewidth=2.5, label=f"Target {target_name} Accuracy")
+        ax.fill_between(rns, cls_acc, 1.0, alpha=0.15, color=COLORS["accent2"])
+    else:
+        ax.plot(rns, base, "--", color=COLORS["accent3"], linewidth=1.5, label="Baseline", alpha=0.7)
+        ax.plot(rns, test, "-", color=COLORS["accent"], linewidth=1.8, label="Test Accuracy")
+        ax.fill_between(rns, test, base, alpha=0.12, color=COLORS["accent"])
+        
     ax.legend(facecolor=COLORS["card"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"])
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "01_accuracy.png"), dpi=150)
@@ -276,6 +314,16 @@ def generate_html_report(rounds, out_dir, summary=None):
     mean_a = np.mean([r.get("attacker_reward", 0.0) for r in rounds])
     mean_d = np.mean([r.get("defender_reward", 0.0) for r in rounds])
     final_acc = rounds[-1]["test_accuracy"]
+    
+    goal = rounds[0].get("attack_goal", {})
+    is_targeted = goal.get("strategy") == "targeted"
+    
+    target_info_html = ""
+    if is_targeted:
+        pc = rounds[-1].get("attack_metadata", {}).get("post_class_accuracy", {})
+        if pc:
+            worst_class, worst_acc = min(pc.items(), key=lambda x: x[1])
+            target_info_html = f'<div class="stat"><div class="val">{worst_acc:.4f}</div><div class="lbl">Class {worst_class} Acc</div></div>'
 
     metrics_html = ""
     if summary and "aggregate" in summary:
@@ -314,7 +362,8 @@ def generate_html_report(rounds, out_dir, summary=None):
 <p class="subtitle">Rounds {rns[0]}–{rns[-1]} • Generated {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
 <div class="stats">
   <div class="stat"><div class="val">{len(rounds)}</div><div class="lbl">Rounds</div></div>
-  <div class="stat"><div class="val">{final_acc:.4f}</div><div class="lbl">Final Accuracy</div></div>
+  <div class="stat"><div class="val">{final_acc:.4f}</div><div class="lbl">Global Accuracy</div></div>
+  {target_info_html}
   <div class="stat"><div class="val">{mean_a:.3f}</div><div class="lbl">Mean Attacker Reward</div></div>
   <div class="stat"><div class="val">{mean_d:.3f}</div><div class="lbl">Mean Defender Reward</div></div>
 </div>
