@@ -90,8 +90,11 @@ class FLArmsRaceEnv:
         # Set by reset().
         self.client_weights: list[dict] = []
         self.baseline_accuracy: float = 0.0
+        self.baseline_class_accuracies: dict | None = None
         self.current_accuracy: float = 0.0
+        self.current_class_accuracies: dict | None = None
         self.round_index: int = 0
+        self._is_targeted = (self.goal.get("type") == "targeted_label")
 
         # Set by begin_round().
         self.honest_updates: list[ModelUpdate] = []
@@ -104,13 +107,25 @@ class FLArmsRaceEnv:
     def reset(self, global_weights, client_weights, baseline_accuracy):
         self.server.set_global_weights(copy.deepcopy(global_weights))
         self.client_weights = [copy.deepcopy(w) for w in client_weights]
-        self.baseline_accuracy = float(baseline_accuracy)
-        self.current_accuracy = float(baseline_accuracy)
+
+        if self._is_targeted:
+            acc, class_acc = self.server.evaluate(self.test_loader, return_per_class=True)
+            self.baseline_accuracy = acc
+            self.baseline_class_accuracies = dict(class_acc)
+            self.current_accuracy = acc
+            self.current_class_accuracies = dict(class_acc)
+            logger.info(f"Targeted mode — baseline class accuracies recorded for {len(class_acc)} classes")
+        else:
+            self.baseline_accuracy = float(baseline_accuracy)
+            self.baseline_class_accuracies = None
+            self.current_accuracy = float(baseline_accuracy)
+            self.current_class_accuracies = None
+
         self.round_index = 0
         logger.info(
             f"Env reset — n_clients={self.n_clients}, n_compromisable={self.n_compromisable}, "
             f"budget_cap={self.budget_cap}, sample_budget={self.sample_budget}, "
-            f"benign_retrain={self.benign_retrain}, baseline_acc={baseline_accuracy:.4f}"
+            f"benign_retrain={self.benign_retrain}, baseline_acc={self.baseline_accuracy:.4f}"
         )
 
     # ------------------------------------------------------------------
@@ -201,18 +216,26 @@ class FLArmsRaceEnv:
     def features(self, updates: list[ModelUpdate]) -> dict[int, dict]:
         return compute_client_features(updates, self.server.get_global_weights())
 
-    def _eval_state(self, state: dict | None) -> float:
-        """Evaluate a candidate aggregated state without committing it."""
+    def _eval_state(self, state: dict | None):
+        """Evaluate a candidate aggregated state without committing it.
+
+        Returns ``(accuracy, class_accuracies_or_None)``."""
         if state is None:
-            return self.current_accuracy
+            return self.current_accuracy, self.current_class_accuracies
         backup = self.server.get_global_weights()
         self.server.set_global_weights(state)
-        acc = self.server.evaluate(self.test_loader)
+        if self._is_targeted:
+            acc, class_acc = self.server.evaluate(self.test_loader, return_per_class=True)
+        else:
+            acc = self.server.evaluate(self.test_loader)
+            class_acc = None
         self.server.set_global_weights(backup)
-        return acc
+        return acc, class_acc
 
-    def evaluate_updates(self, updates, verdicts) -> float:
-        """Post-aggregation accuracy for these updates+verdicts (no commit)."""
+    def evaluate_updates(self, updates, verdicts):
+        """Post-aggregation accuracy for these updates+verdicts (no commit).
+
+        Returns ``(accuracy, class_accuracies_or_None)``."""
         candidate = self.aggregator.aggregate(updates, verdicts)
         return self._eval_state(candidate)
 
@@ -221,7 +244,23 @@ class FLArmsRaceEnv:
         candidate = self.aggregator.aggregate(updates, verdicts)
         if candidate is not None:
             self.server.set_global_weights(candidate)
-            self.current_accuracy = self.server.evaluate(self.test_loader)
+            if self._is_targeted:
+                acc, class_acc = self.server.evaluate(self.test_loader, return_per_class=True)
+                self.current_accuracy = acc
+                self.current_class_accuracies = class_acc
+                # Log the most-damaged class for quick visibility
+                if self.baseline_class_accuracies:
+                    drops = {c: self.baseline_class_accuracies.get(c, 0.0) - class_acc.get(c, 0.0)
+                             for c in class_acc}
+                    worst_cls = max(drops, key=drops.get)
+                    logger.info(
+                        f"Targeted commit — worst class={worst_cls}, "
+                        f"class_drop={drops[worst_cls]:.4f}, "
+                        f"global_drop={self.baseline_accuracy - acc:.4f}"
+                    )
+            else:
+                self.current_accuracy = self.server.evaluate(self.test_loader)
+                self.current_class_accuracies = None
         else:
             logger.warning("Round commit: all clients flagged — global model unchanged")
         return self.current_accuracy

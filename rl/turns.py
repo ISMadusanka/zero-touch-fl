@@ -87,7 +87,7 @@ class AttackerTurn:
         dbg.scoring_rollout(attacker_text)
         updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
             attacker_text, self.scoring_opp_temp)
-        post_acc = self.env.evaluate_updates(updates, verdicts)
+        post_acc, post_class_acc = self.env.evaluate_updates(updates, verdicts)
         diversity = perturbation_diversity(
             poisoned, {cid: self.pool_references[cid] for cid in chosen_ids})
         r = attacker_reward(
@@ -100,6 +100,9 @@ class AttackerTurn:
             zeta=self.reward_cfg.get("zeta", 0.0),
             pool_size=self.pool_size,
             diversity=diversity,
+            prev_class_acc=self.env.current_class_accuracies,
+            post_class_acc=post_class_acc,
+            baseline_class_acc=self.env.baseline_class_accuracies,
         )
         dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed,
                             verdicts=verdicts, poisoned_ids=chosen_ids)
@@ -116,6 +119,7 @@ class AttackerTurn:
             "verdicts": verdicts,
             "n_malformed": n_malformed,
             "post_accuracy": new_acc,
+            "post_class_accuracy": self.env.current_class_accuracies,
             "poisoned_ids": chosen_ids,
             "poisoned_by_client": poisoned,
         }
@@ -187,6 +191,7 @@ class DefenderTurn:
             "verdicts": verdicts,
             "n_malformed": self.n_malformed,
             "post_accuracy": new_acc,
+            "post_class_accuracy": self.env.current_class_accuracies,
             "poisoned_ids": self.poisoned_ids,
             "poisoned_by_client": self.poisoned_by_client,
         }

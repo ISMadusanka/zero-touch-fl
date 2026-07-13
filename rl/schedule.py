@@ -200,8 +200,21 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     poisoned_ids = info["poisoned_ids"]        # the attacker's committed choice
 
     drop = ctx.global_accuracy - info["post_accuracy"]
+
+    # For targeted attacks, compute the class-level drop for the phase switch
+    class_drop = None
+    if env._is_targeted and env.baseline_class_accuracies and info.get("post_class_accuracy"):
+        label_cfg = env.goal.get("label", "menu")
+        drops = {c: env.baseline_class_accuracies.get(c, 0.0) - info["post_class_accuracy"].get(c, 0.0)
+                 for c in info["post_class_accuracy"]}
+        if str(label_cfg).lower() == "menu":
+            best_class = max(drops, key=drops.get) if drops else 0
+            class_drop = drops.get(best_class, 0.0)
+        else:
+            class_drop = drops.get(int(label_cfg), 0.0)
+
     success = committed_success(learner, drop, info["verdicts"], poisoned_ids,
-                                state["switch_cfg"])
+                                state["switch_cfg"], class_drop)
 
     _log_round(env, ctx, info, learner, stats, state["metrics_tracker"],
                state["save_round_log"], reward_att=k["reward_att"], reward_def=k["reward_def"],

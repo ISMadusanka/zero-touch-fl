@@ -33,23 +33,29 @@ def attacker_reward(
     zeta: float = 0.0,
     pool_size: int | None = None,
     diversity: float | None = None,
+    # --- Per-class accuracy (targeted attacks) ---
+    prev_class_acc: dict | None = None,
+    post_class_acc: dict | None = None,
+    baseline_class_acc: dict | None = None,
 ) -> float:
     """Reward the attacker for degrading accuracy while staying stealthy, using
     the FEWEST clients, and (when it uses several) collaborating with them.
 
-    reward = alpha * clip(drop / target, -0.5, 1.5)
+    reward = alpha * drop_term
            + beta  * stealth
            - gamma * malformed_fraction
            - delta * client_cost
            + zeta  * collab_bonus
 
-    ``drop = prev_accuracy - post_accuracy``. ``stealth`` is a CONTINUOUS evasion
-    signal in [0, 1]: the mean over poisoned clients of ``1 - soft P(malicious)``
-    derived from the defender's *confidence* (not just the binary flag).
-    Confidently caught -> ~0; confidently passed as benign -> ~1; unsure -> ~0.5.
-    Because it moves smoothly with the defender's confidence, it gives GRPO a
-    gradient even when every sampled plan ends up with the SAME hard flag — the
-    fix for zero-advantage attacker groups.
+    For ``targeted_label`` with per-class data available, the ``drop_term`` is
+    computed from the most-damaged class accuracy (not global accuracy), and a
+    **stealth penalty** is applied if the global accuracy drops beyond
+    ``max_global_drop``.  This dual-objective formulation forces the LLM to
+    learn precision: destroy one class while keeping the model healthy overall.
+
+    ``stealth`` is a CONTINUOUS evasion signal in [0, 1]: the mean over poisoned
+    clients of ``1 - soft P(malicious)`` derived from the defender's *confidence*
+    (not just the binary flag).
 
     ``client_cost`` = ``(n_used - 1) / (pool_size - 1)`` in [0, 1] penalizes using
     more of the controllable pool than necessary (0 for a single client), so the
@@ -57,17 +63,56 @@ def attacker_reward(
     = ``diversity`` in [0, 1] (only when >1 client) rewards distinct, coordinated
     per-client perturbations over identical clones — see ``perturbation_diversity``.
     """
-    gtype = goal.get("type", "untargeted_degrade")
-    if gtype == "slow_degrade":
-        target = float(goal.get("per_round_drop", 0.02))
-    else:
-        # untargeted_degrade (and, for now, targeted_label falls back to overall
-        # accuracy until per-class evaluation is wired in).
-        target = float(goal.get("target_accuracy_drop", 0.20))
-    target = max(target, 1e-6)
+    import logging
+    _logger = logging.getLogger("rl.rewards")
 
-    drop = prev_accuracy - post_accuracy
-    drop_term = _clip(drop / target, -0.5, 1.5)
+    gtype = goal.get("type", "untargeted_degrade")
+
+    if gtype == "targeted_label" and post_class_acc is not None and baseline_class_acc is not None:
+        # --- Dual-objective: class damage + stealth constraint ---
+        target_class_drop = float(goal.get("target_class_drop", 0.80))
+        max_global_drop = float(goal.get("max_global_drop", 0.03))
+        target_class_drop = max(target_class_drop, 1e-6)
+        label_cfg = goal.get("label", "menu")
+
+        # Compute per-class accuracy drops relative to baseline
+        drops = {c: baseline_class_acc.get(c, 0.0) - post_class_acc.get(c, 0.0)
+                 for c in post_class_acc}
+
+        if str(label_cfg).lower() == "menu":
+            # LLM chose dynamically — reward the best class it attacked
+            best_class = max(drops, key=drops.get) if drops else 0
+            class_drop = drops.get(best_class, 0.0)
+        else:
+            best_class = int(label_cfg)
+            class_drop = drops.get(best_class, 0.0)
+
+        drop_term = _clip(class_drop / target_class_drop, -0.5, 1.5)
+
+        # Stealth penalty: penalize if global accuracy drops too much
+        global_drop = prev_accuracy - post_accuracy
+        stealth_penalty = 0.0
+        if global_drop > max_global_drop:
+            stealth_penalty = (global_drop - max_global_drop) * 5.0
+            drop_term -= stealth_penalty
+
+        _logger.info(
+            f"Targeted reward — best_class={best_class}, class_drop={class_drop:.4f}, "
+            f"global_drop={global_drop:.4f}, stealth_penalty={stealth_penalty:.4f}, "
+            f"drop_term={drop_term:.4f}"
+        )
+
+    elif gtype == "slow_degrade":
+        target = float(goal.get("per_round_drop", 0.02))
+        target = max(target, 1e-6)
+        drop = prev_accuracy - post_accuracy
+        drop_term = _clip(drop / target, -0.5, 1.5)
+    else:
+        # untargeted_degrade (default)
+        target = float(goal.get("target_accuracy_drop", 0.20))
+        target = max(target, 1e-6)
+        drop = prev_accuracy - post_accuracy
+        drop_term = _clip(drop / target, -0.5, 1.5)
 
     verdict_by_id = {v.client_id: v for v in verdicts}
     n_used = len(poisoned_ids)
@@ -93,8 +138,15 @@ def attacker_reward(
     if zeta and n_used > 1 and diversity is not None:
         collab_bonus = _clip(float(diversity), 0.0, 1.0)
 
-    return (alpha * drop_term + beta * stealth - gamma * malformed_fraction
-            - delta * client_cost + zeta * collab_bonus)
+    reward = (alpha * drop_term + beta * stealth - gamma * malformed_fraction
+              - delta * client_cost + zeta * collab_bonus)
+
+    _logger.info(
+        f"Attacker reward={reward:.4f} (drop_term={drop_term:.4f}, stealth={stealth:.4f}, "
+        f"malformed={malformed_fraction:.4f}, client_cost={client_cost:.4f}, collab={collab_bonus:.4f})"
+    )
+
+    return reward
 
 
 def perturbation_diversity(poisoned_by_client: dict, references: dict) -> float:

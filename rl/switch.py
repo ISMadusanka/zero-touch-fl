@@ -36,6 +36,7 @@ class SwitchConfig:
 
     # Attacker "an attack passed through the defender".
     attacker_min_drop: float = 0.02  # committed accuracy drop (prev-post) to count as damage
+    attacker_min_class_drop: float = 0.10  # targeted_label: min per-class drop to count as damage
     attacker_min_evaded: float = 1.0 # fraction of poisoned clients that must evade detection
 
     # Defender "defense succeeded against the frozen attacker".
@@ -49,6 +50,7 @@ class SwitchConfig:
             max_phase_rounds=int(rl.get("max_phase_rounds", 200)),
             success_streak=int(rl.get("success_streak", 3)),
             attacker_min_drop=float(rl.get("attacker_min_drop", 0.02)),
+            attacker_min_class_drop=float(rl.get("attacker_min_class_drop", 0.10)),
             attacker_min_evaded=float(rl.get("attacker_min_evaded", 1.0)),
             defender_min_tpr=float(rl.get("defender_min_tpr", 0.99)),
             defender_max_fpr=float(rl.get("defender_max_fpr", 0.10)),
@@ -66,16 +68,34 @@ def _tpr_fpr(verdicts, poisoned_ids) -> tuple[float, float]:
     return tpr, fpr
 
 
-def attacker_succeeded(drop: float, verdicts, poisoned_ids, cfg: SwitchConfig) -> bool:
+def attacker_succeeded(drop: float, verdicts, poisoned_ids, cfg: SwitchConfig,
+                       class_drop: float | None = None) -> bool:
     """True when the committed attack 'passed': enough poisoned clients evaded
-    detection AND the round actually lost accuracy. A flagged client is dropped
-    from FedAvg, so meaningful ``drop`` already implies evasion — we keep the
-    explicit evasion check for the multi-poisoner case."""
+    detection AND the round caused damage.
+
+    For targeted attacks, ``class_drop`` (the most-damaged class's accuracy drop)
+    is checked against ``attacker_min_class_drop`` instead of global ``drop``.
+    A flagged client is dropped from FedAvg, so meaningful damage already implies
+    evasion — we keep the explicit evasion check for the multi-poisoner case."""
+    import logging
+    _logger = logging.getLogger("rl.switch")
+
     if not poisoned_ids:
         return False
     flagged = {v.client_id for v in verdicts if v.is_suspicious}
     evaded = sum(1 for cid in poisoned_ids if cid not in flagged)
     evaded_frac = evaded / len(poisoned_ids)
+
+    if class_drop is not None:
+        # Targeted mode: check class-level damage
+        success = evaded_frac >= cfg.attacker_min_evaded and class_drop >= cfg.attacker_min_class_drop
+        _logger.info(
+            f"Targeted attacker_succeeded: class_drop={class_drop:.4f} "
+            f"(min={cfg.attacker_min_class_drop}), evaded={evaded_frac:.2f} "
+            f"(min={cfg.attacker_min_evaded}) → {success}"
+        )
+        return success
+
     return evaded_frac >= cfg.attacker_min_evaded and drop >= cfg.attacker_min_drop
 
 
@@ -87,10 +107,10 @@ def defender_succeeded(verdicts, poisoned_ids, cfg: SwitchConfig) -> bool:
 
 
 def committed_success(learner: str, drop: float, verdicts, poisoned_ids,
-                      cfg: SwitchConfig) -> bool:
+                      cfg: SwitchConfig, class_drop: float | None = None) -> bool:
     """Did the learner win on this committed round?"""
     if learner == "attacker":
-        return attacker_succeeded(drop, verdicts, poisoned_ids, cfg)
+        return attacker_succeeded(drop, verdicts, poisoned_ids, cfg, class_drop)
     return defender_succeeded(verdicts, poisoned_ids, cfg)
 
 
