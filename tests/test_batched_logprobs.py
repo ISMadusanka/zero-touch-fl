@@ -2,12 +2,11 @@
 
 The important property: computing the G completions' per-token log-probs in ONE
 right-padded batched forward must give byte-for-byte the same values as the
-existing per-completion path. We verify this against the REAL
-LLMPolicy._batched_completion_logprobs / _completion_token_logprobs methods, run
-on a tiny randomly-initialized causal LM (built from config — no download, CPU),
-by binding them to a lightweight stub that supplies the few attributes they use.
-
-Also unit-tests the pure index math in _slice_completion_logprobs.
+existing per-completion path — for BOTH the memory-lean ``logits_to_keep`` branch
+(only the completion positions are projected) and the full-logits fallback. We
+verify this against the REAL LLMPolicy methods, run on a tiny randomly-initialized
+causal LM (built from config — no download, CPU), by binding them to a
+lightweight stub that supplies the few attributes they use.
 
 Run on any box with torch + transformers:  python tests/test_batched_logprobs.py
 """
@@ -23,15 +22,13 @@ from rl.policy import LLMPolicy  # noqa: E402  (module import is cheap — no un
 VOCAB = 64
 
 
-def test_slice_completion_logprobs_indexing():
-    G, Tm1 = 3, 12
-    tok_logp = torch.arange(G * Tm1, dtype=torch.float).reshape(G, Tm1)
-    P = 4
-    lengths = [3, 5, 0]
-    out = LLMPolicy._slice_completion_logprobs(tok_logp, P, lengths)
-    # Row completion tokens sit at absolute [P, P+Ci) → predicted by [P-1, P-1+Ci).
-    assert torch.equal(out[0], tok_logp[0, 3:6])
-    assert torch.equal(out[1], tok_logp[1, 3:8])
+def test_take_completion_prefix():
+    G, maxC = 3, 5
+    comp_logp = torch.arange(G * maxC, dtype=torch.float).reshape(G, maxC)
+    lengths = [2, 5, 0]
+    out = LLMPolicy._take_completion_prefix(comp_logp, lengths)
+    assert torch.equal(out[0], comp_logp[0, :2])   # first Ci entries, not the tail
+    assert torch.equal(out[1], comp_logp[1, :5])
     assert out[2].numel() == 0
 
 
@@ -56,7 +53,8 @@ class _FakeTok:
 class _StubPolicy:
     """Minimal object exposing what the log-prob methods touch, with the REAL
     methods bound onto it (so we test production code, not a reimplementation)."""
-    _slice_completion_logprobs = staticmethod(LLMPolicy._slice_completion_logprobs)
+    _take_completion_prefix = staticmethod(LLMPolicy._take_completion_prefix)
+    _resolve_logits_kw = LLMPolicy._resolve_logits_kw
     _batched_completion_logprobs = LLMPolicy._batched_completion_logprobs
     _completion_token_logprobs = LLMPolicy._completion_token_logprobs
 
@@ -66,10 +64,11 @@ class _StubPolicy:
         self._tok = _FakeTok()
         self.device = "cpu"
         self.max_seq_len = 4096
+        self._logits_kw = None      # let _resolve_logits_kw probe the model
 
     def _prompt_ids(self, system, user):
-        # Same prompt tokenization used by BOTH paths → keeps them comparable
-        # without needing a real chat template.
+        # Same prompt tokenization for BOTH paths → keeps them comparable without
+        # needing a real chat template.
         return self._tok(f"{system} || {user}").input_ids.to(self.device)
 
 
@@ -96,8 +95,7 @@ COMPLETIONS = [
 ]
 
 
-def test_batched_equals_per_sample_values():
-    stub = _StubPolicy(_tiny_model())
+def _assert_matches_per_sample(stub):
     batched = stub._batched_completion_logprobs(SYSTEM, USER, COMPLETIONS, with_grad=False)
     per = [stub._completion_token_logprobs(SYSTEM, USER, c, with_grad=False) for c in COMPLETIONS]
     assert len(batched) == len(per) == len(COMPLETIONS)
@@ -106,10 +104,25 @@ def test_batched_equals_per_sample_values():
         assert torch.allclose(b, p, atol=1e-4, rtol=1e-4), (i, (b - p).abs().max().item())
 
 
+def test_batched_equals_per_sample_logits_to_keep():
+    # Default: _resolve_logits_kw probes the model. transformers Llama supports
+    # logits_to_keep, so this exercises the memory-lean branch.
+    stub = _StubPolicy(_tiny_model())
+    kw = stub._resolve_logits_kw()
+    assert kw in ("logits_to_keep", "num_logits_to_keep"), kw   # confirm the lean path is taken
+    _assert_matches_per_sample(stub)
+
+
+def test_batched_equals_per_sample_full_logits():
+    # Force the full-logits fallback branch and confirm it still matches.
+    stub = _StubPolicy(_tiny_model())
+    stub._logits_kw = ""
+    _assert_matches_per_sample(stub)
+
+
 def test_batched_grad_flows():
     stub = _StubPolicy(_tiny_model())
     out = stub._batched_completion_logprobs(SYSTEM, USER, COMPLETIONS, with_grad=True)
-    # A non-empty completion's log-probs must be differentiable (so .backward works).
     non_empty = [t for t in out if t.numel() > 0]
     assert non_empty and all(t.requires_grad for t in non_empty)
     non_empty[0].sum().backward()   # must not raise
@@ -118,10 +131,8 @@ def test_batched_grad_flows():
 def test_empty_and_edge_cases():
     stub = _StubPolicy(_tiny_model())
     assert stub._batched_completion_logprobs(SYSTEM, USER, [], with_grad=False) == []
-    # All-empty completions → all length-0 vectors.
     out = stub._batched_completion_logprobs(SYSTEM, USER, ["", ""], with_grad=False)
     assert len(out) == 2 and all(t.numel() == 0 for t in out)
-    # Mixed empty + non-empty stays aligned.
     out2 = stub._batched_completion_logprobs(SYSTEM, USER, ["", "abc"], with_grad=False)
     assert out2[0].numel() == 0 and out2[1].numel() == 3
 

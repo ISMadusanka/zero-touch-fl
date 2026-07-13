@@ -596,19 +596,45 @@ class LLMPolicy:
     # Batched log-probs (all G completions in one forward)
     # ------------------------------------------------------------------
     @staticmethod
-    def _slice_completion_logprobs(tok_logp, P, lengths):
-        """From per-position next-token log-probs ``(G, T-1)`` pull each row's
-        completion tokens. For row ``i`` the completion occupies absolute positions
-        ``[P, P+Ci)``, whose log-probs are ``tok_logp[i, P-1 : P-1+Ci]`` (the token
-        at position ``k`` is predicted by the logits at ``k-1``). Right padding sits
-        AFTER the completion, so we slice from ``P-1`` — never the tail."""
+    def _take_completion_prefix(comp_logp, lengths):
+        """``comp_logp[i, j]`` is the log-prob of row ``i``'s completion token at
+        offset ``j`` (``j`` in ``[0, maxC)``). Return each row's first ``Ci`` entries
+        — its real completion; entries ``[Ci, maxC)`` correspond to right-padding."""
         out = []
         for i, Ci in enumerate(lengths):
             if Ci == 0:
-                out.append(tok_logp.new_zeros(0))
+                out.append(comp_logp.new_zeros(0))
             else:
-                out.append(tok_logp[i, P - 1:P - 1 + Ci])
+                out.append(comp_logp[i, :Ci])
         return out
+
+    def _resolve_logits_kw(self) -> str:
+        """Name of the model's 'project logits for only the last-k positions' kwarg
+        (``logits_to_keep`` / ``num_logits_to_keep``), or ``""`` if unsupported.
+        Cached (shared with ``_last_logits``). Lets the batched log-prob forward
+        skip the 128k-vocab projection over the prompt — a large memory saving."""
+        if self._logits_kw is not None:
+            return self._logits_kw
+        torch = self.torch
+        dummy = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        for kw in ("logits_to_keep", "num_logits_to_keep"):
+            try:
+                with torch.no_grad():
+                    self.model(dummy, **{kw: 1})
+                self._logits_kw = kw
+                return kw
+            except TypeError:
+                continue
+            except Exception:
+                break   # non-signature failure → assume unsupported, use full logits
+        self._logits_kw = ""
+        return ""
+
+    def _empty_cache(self):
+        try:
+            self.torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def _batched_completion_logprobs(self, system, user, completions, with_grad):
         """Per-token completion log-probs for a GROUP of completions in ONE forward.
@@ -652,17 +678,26 @@ class LLMPolicy:
                 full[i, P:P + Ci] = c[0]
             attn[i, :P + Ci] = 1
 
+        # We only need logits for the completion region: positions [P, P+maxC) are
+        # predicted by the logits AT positions [P-1, P+maxC-1). Project just those
+        # (last maxC+1 positions) instead of the full (G, T, V) tensor — the prompt
+        # is long, so this is the difference between an OOM and a small forward.
+        logits_kw = self._resolve_logits_kw()
+        targets = full[:, P:P + maxC]                                          # (G, maxC)
         ctx = torch.enable_grad() if with_grad else torch.no_grad()
         with ctx:
-            logits = self.model(full, attention_mask=attn).logits[:, :-1, :]   # (G, T-1, V)
-            targets = full[:, 1:]                                              # (G, T-1)
-            # log p(target) = logit[target] - logsumexp(logits), i.e. exactly
-            # log_softmax(logits)[target], computed without materializing a second
-            # full (G, T-1, V) tensor.
-            tgt = logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1).float() # (G, T-1)
-            lse = torch.logsumexp(logits.float(), dim=-1)                      # (G, T-1)
-            tok_logp = tgt - lse                                               # (G, T-1)
-        return self._slice_completion_logprobs(tok_logp, P, lengths)
+            if logits_kw:
+                logits = self.model(full, attention_mask=attn, **{logits_kw: maxC + 1}).logits
+                pred = logits[:, :maxC, :]                                     # (G, maxC, V)
+            else:
+                logits = self.model(full, attention_mask=attn).logits          # (G, T, V)
+                pred = logits[:, P - 1:P - 1 + maxC, :]                        # (G, maxC, V)
+            # pred[:, j] is the distribution predicting the completion token at
+            # absolute position P+j. log p(target) = logit[target] - logsumexp.
+            tgt = pred.gather(-1, targets.unsqueeze(-1)).squeeze(-1).float()   # (G, maxC)
+            lse = torch.logsumexp(pred.float(), dim=-1)                        # (G, maxC)
+            comp_logp = tgt - lse                                             # (G, maxC)
+        return self._take_completion_prefix(comp_logp, lengths)
 
     def batched_policy_logprobs(self, adapter, system, user, completions):
         """Differentiable per-token log-probs for ALL completions under ``adapter``
@@ -672,6 +707,7 @@ class LLMPolicy:
         try:
             return self._batched_completion_logprobs(system, user, completions, with_grad=True)
         except RuntimeError as e:
+            self._empty_cache()   # release fragmented blocks before retrying one-at-a-time
             logger.warning(
                 f"Batched policy logprobs failed ({type(e).__name__}: {e}); per-sample fallback."
             )
@@ -687,6 +723,7 @@ class LLMPolicy:
             try:
                 lps = self._batched_completion_logprobs(system, user, completions, with_grad=False)
             except RuntimeError as e:
+                self._empty_cache()
                 logger.warning(
                     f"Batched reference logprobs failed ({type(e).__name__}: {e}); per-sample fallback."
                 )

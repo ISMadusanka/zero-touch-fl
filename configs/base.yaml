@@ -59,9 +59,10 @@ rl:
                                   # deterministic). 0 => full test set. Committed round always uses full.
   max_seq_len: 8192
   load_in_4bit: false             # bf16 LoRA: 1.5B fits easily on 32GB+; skips QLoRA dequant -> faster grad passes
-  gradient_checkpointing: false   # false = keep all activations (uses more VRAM, faster backward). On a
-                                  # 1.5B model with headroom this speeds up the GRPO backward. Does NOT
-                                  # affect adapter saving. Set true if VRAM is tight.
+  gradient_checkpointing: true    # keep this ON. false stores all activations (faster backward) but,
+                                  # combined with the batched G-completion log-prob forward, OOMs a 31GB
+                                  # GPU. Only set false if you have large VRAM headroom. Does NOT affect
+                                  # adapter saving.
   lora_r: 16
   lora_alpha: 32
   G: 4                            # rollouts per GRPO step (group size)
