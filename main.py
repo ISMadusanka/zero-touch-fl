@@ -221,6 +221,7 @@ def run_phase2(
             use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
             unsloth_fast_generation=bool(rl_cfg.get("unsloth_fast_generation", True)),
             stop_on_json=bool(rl_cfg.get("stop_on_json", True)),
+            gradient_checkpointing=bool(rl_cfg.get("gradient_checkpointing", True)),
         )
         # Resume adapters if present.
         for name, path in adapter_paths.items():

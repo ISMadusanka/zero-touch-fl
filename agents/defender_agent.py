@@ -50,13 +50,15 @@ A client is likely malicious when several signals agree: high rel_norm, low
 cos_to_median / cos_to_mean, low sign_agreement, or high dnc_score. Flagging an
 honest client (false positive) is costly, so require corroborating evidence.
 
-OUTPUT FORMAT — respond with ONLY a single JSON object, no prose, no markdown:
+OUTPUT FORMAT — respond with ONLY a single JSON object, no prose, no markdown, no
+explanations:
 {"clients": [
-   {"client_id": <int>, "is_suspicious": <true|false>,
-    "confidence": <float 0..1>, "reason": "<short>"},
+   {"client_id": <int>, "is_suspicious": <true|false>, "confidence": <float 0..1>},
    ...
 ]}
-Include EXACTLY one entry for every client_id you were given."""
+Include EXACTLY one entry for every client_id you were given. Emit ONLY those three
+fields per client — do NOT add a "reason" or any other field. Keeping the output
+terse matters: stop right after the final `}`."""
 
 
 class DefenderAgent:

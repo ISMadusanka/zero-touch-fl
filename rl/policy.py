@@ -94,6 +94,7 @@ class LLMPolicy:
         use_fast_generate: bool = True,
         unsloth_fast_generation: bool = True,
         stop_on_json: bool = True,
+        gradient_checkpointing: bool = True,
     ):
         # Heavy imports kept local so importing this module is cheap.
         import torch
@@ -143,7 +144,10 @@ class LLMPolicy:
             lora_dropout=lora_dropout,
             bias="none",
             target_modules=target_modules,
-            use_gradient_checkpointing="unsloth",
+            # Gradient checkpointing trades compute (a recomputed forward in the
+            # backward) for memory. On a small model with VRAM headroom, disabling
+            # it speeds up the GRPO backward. Does NOT affect adapter saving.
+            use_gradient_checkpointing=("unsloth" if gradient_checkpointing else False),
             random_state=seed,
         )
 
@@ -175,7 +179,8 @@ class LLMPolicy:
         self.set_adapter(self.adapters[0])
         logger.info(
             f"LLMPolicy ready — base={base_model}, adapters={self.adapters}, device={self.device}, "
-            f"unsloth_fast={self._unsloth_fast}, stop_on_json={self._stop_on_json}"
+            f"unsloth_fast={self._unsloth_fast}, stop_on_json={self._stop_on_json}, "
+            f"grad_checkpointing={gradient_checkpointing}"
         )
 
     # ------------------------------------------------------------------
@@ -586,6 +591,110 @@ class LLMPolicy:
         """No-grad per-token log-probs under the BASE model (KL reference)."""
         with self.model.disable_adapter():
             return self._completion_token_logprobs(system, user, completion, with_grad=False).detach()
+
+    # ------------------------------------------------------------------
+    # Batched log-probs (all G completions in one forward)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _slice_completion_logprobs(tok_logp, P, lengths):
+        """From per-position next-token log-probs ``(G, T-1)`` pull each row's
+        completion tokens. For row ``i`` the completion occupies absolute positions
+        ``[P, P+Ci)``, whose log-probs are ``tok_logp[i, P-1 : P-1+Ci]`` (the token
+        at position ``k`` is predicted by the logits at ``k-1``). Right padding sits
+        AFTER the completion, so we slice from ``P-1`` — never the tail."""
+        out = []
+        for i, Ci in enumerate(lengths):
+            if Ci == 0:
+                out.append(tok_logp.new_zeros(0))
+            else:
+                out.append(tok_logp[i, P - 1:P - 1 + Ci])
+        return out
+
+    def _batched_completion_logprobs(self, system, user, completions, with_grad):
+        """Per-token completion log-probs for a GROUP of completions in ONE forward.
+
+        Every completion shares the same prompt, so we build a single right-padded
+        ``(G, P + maxC)`` batch and run one forward instead of one per completion —
+        the policy + KL passes go from ``2*G`` forwards to ``2``. Right padding plus
+        an attention mask keeps each completion's log-probs identical to the
+        unbatched result: a causal model's real-token logits never depend on the
+        pad tokens that follow them. Returns a list of 1-D tensors (one per
+        completion, variable length; empty completion → length 0), differentiable
+        when ``with_grad``.
+        """
+        torch = self.torch
+        if not completions:
+            return []
+        prompt_ids = self._prompt_ids(system, user)                        # (1, P)
+        P = prompt_ids.shape[1]
+        comp_ids = [
+            self._tok(c, add_special_tokens=False, return_tensors="pt").input_ids.to(self.device)
+            for c in completions
+        ]
+        lengths = [c.shape[1] for c in comp_ids]
+        maxC = max(lengths)
+        if maxC == 0:
+            return [torch.zeros(0, device=self.device) for _ in completions]
+        T = P + maxC
+        if T > self.max_seq_len:
+            # Rare: prompt + longest completion exceeds context. Signal the caller
+            # to use the per-sample path (which left-truncates safely).
+            raise RuntimeError(f"batched logprob length {T} > max_seq_len {self.max_seq_len}")
+
+        G = len(completions)
+        pad_id = self._tok.pad_token_id if self._tok.pad_token_id is not None else 0
+        full = torch.full((G, T), pad_id, dtype=prompt_ids.dtype, device=self.device)
+        attn = torch.zeros((G, T), dtype=torch.long, device=self.device)
+        full[:, :P] = prompt_ids                                           # same prompt for every row
+        for i, c in enumerate(comp_ids):
+            Ci = lengths[i]
+            if Ci:
+                full[i, P:P + Ci] = c[0]
+            attn[i, :P + Ci] = 1
+
+        ctx = torch.enable_grad() if with_grad else torch.no_grad()
+        with ctx:
+            logits = self.model(full, attention_mask=attn).logits[:, :-1, :]   # (G, T-1, V)
+            targets = full[:, 1:]                                              # (G, T-1)
+            # log p(target) = logit[target] - logsumexp(logits), i.e. exactly
+            # log_softmax(logits)[target], computed without materializing a second
+            # full (G, T-1, V) tensor.
+            tgt = logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1).float() # (G, T-1)
+            lse = torch.logsumexp(logits.float(), dim=-1)                      # (G, T-1)
+            tok_logp = tgt - lse                                               # (G, T-1)
+        return self._slice_completion_logprobs(tok_logp, P, lengths)
+
+    def batched_policy_logprobs(self, adapter, system, user, completions):
+        """Differentiable per-token log-probs for ALL completions under ``adapter``
+        in one forward. Falls back to the per-sample path on any runtime error
+        (e.g. CUDA OOM), so a batching edge case can't kill the run."""
+        self.set_adapter(adapter)
+        try:
+            return self._batched_completion_logprobs(system, user, completions, with_grad=True)
+        except RuntimeError as e:
+            logger.warning(
+                f"Batched policy logprobs failed ({type(e).__name__}: {e}); per-sample fallback."
+            )
+            return [
+                self._completion_token_logprobs(system, user, c, with_grad=True)
+                for c in completions
+            ]
+
+    def batched_reference_logprobs(self, system, user, completions):
+        """No-grad per-token log-probs for ALL completions under the BASE model
+        (the KL reference) in one forward."""
+        with self.model.disable_adapter():
+            try:
+                lps = self._batched_completion_logprobs(system, user, completions, with_grad=False)
+            except RuntimeError as e:
+                logger.warning(
+                    f"Batched reference logprobs failed ({type(e).__name__}: {e}); per-sample fallback."
+                )
+                lps = [
+                    self._completion_token_logprobs(system, user, c, with_grad=False)
+                    for c in completions
+                ]
+        return [lp.detach() for lp in lps]
 
 
 class PolicyGenerator:

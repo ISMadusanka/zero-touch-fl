@@ -94,28 +94,33 @@ def grpo_step(
     # 3c. Still degenerate → do NOT step (would only pull the adapter to base).
     stepped = not (zero_frac >= 1.0 and skip_zero_advantage)
 
-    # 4. Accumulate the GRPO loss; backward per-sample to bound memory.
+    # 4. GRPO loss. The G completions' log-probs are computed in TWO batched
+    #    forwards (one policy w/ grad, one reference no-grad) instead of 2 per
+    #    completion, then summed into a single backward.
     total_loss = 0.0
     n_used = 0
     if stepped:
         optimizer.zero_grad()
-        for completion, adv in zip(completions, advantages):
-            lp = policy.policy_token_logprobs(adapter, system, user, completion)  # (L,) grad
+        policy_lps = policy.batched_policy_logprobs(adapter, system, user, completions)   # list[(L,)] grad
+        ref_lps = policy.batched_reference_logprobs(system, user, completions)            # list[(L,)] no grad
+
+        losses = []
+        for lp, ref, adv in zip(policy_lps, ref_lps, advantages):
             if lp.numel() == 0:
                 continue
-            ref = policy.reference_token_logprobs(system, user, completion)       # (L,) no grad
             L = min(lp.shape[0], ref.shape[0])
             lp, ref = lp[-L:], ref[-L:]
 
             log_ratio = ref - lp
             kl = (torch.exp(log_ratio) - log_ratio - 1.0).mean()
             pg = -(adv * lp.mean())
-            loss_i = (pg + kl_beta * kl) / max(1, G)
-            loss_i.backward()
-            total_loss += float(loss_i.detach())
+            losses.append((pg + kl_beta * kl) / max(1, G))
             n_used += 1
 
-        if n_used > 0:
+        if losses:
+            loss = torch.stack(losses).sum()
+            loss.backward()
+            total_loss = float(loss.detach())
             torch.nn.utils.clip_grad_norm_(policy.adapter_parameters(adapter), grad_clip)
             optimizer.step()
         else:
