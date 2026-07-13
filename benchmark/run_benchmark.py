@@ -175,7 +175,7 @@ def main():
         adapter_paths["defender"] = args.defender_adapter
 
     policy = LLMPolicy(
-        base_model=rl_cfg.get("model", "unsloth/Llama-3.2-3B-Instruct"),
+        base_model=rl_cfg.get("model", "unsloth/Qwen2.5-1.5B-Instruct"),
         max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
         lora_r=int(rl_cfg.get("lora_r", 16)),
         lora_alpha=int(rl_cfg.get("lora_alpha", 32)),

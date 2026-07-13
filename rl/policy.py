@@ -1,4 +1,4 @@
-"""LLMPolicy — one frozen Llama-3.2-3B-Instruct base, two trainable LoRA adapters.
+"""LLMPolicy — one frozen Qwen2.5-1.5B-Instruct base, two trainable LoRA adapters.
 
 This is the only module with heavy GPU dependencies (unsloth / peft /
 transformers / torch + a CUDA box). It is imported only on the training path;
@@ -6,7 +6,7 @@ the dry-run path uses ``rl/inference.py`` instead, so the rest of the package
 stays importable on a CPU machine.
 
 Design — "separate checkpoints on the same LLM":
-  * One 4-bit (QLoRA) Llama-3.2-3B-Instruct base, loaded once and frozen.
+  * One (optionally 4-bit / QLoRA) Qwen2.5-1.5B-Instruct base, loaded once and frozen.
   * Two LoRA adapters over it: ``"attacker"`` and ``"defender"``. Each is an
     independent set of low-rank deltas → two separate checkpoints
     (``adapter_model.safetensors`` + ``adapter_config.json``) sharing one base.
@@ -35,7 +35,7 @@ DEFAULT_TARGET_MODULES = [
 class LLMPolicy:
     def __init__(
         self,
-        base_model: str = "unsloth/Llama-3.2-3B-Instruct",
+        base_model: str = "unsloth/Qwen2.5-1.5B-Instruct",
         max_seq_len: int = 8192,
         lora_r: int = 16,
         lora_alpha: int = 32,
@@ -50,8 +50,8 @@ class LLMPolicy:
         # Heavy imports kept local so importing this module is cheap.
         import torch
         # Disable Unsloth's fused fast-generate wrapper BEFORE importing unsloth:
-        # its paged-KV inference kernel (LlamaAttention_fast_forward_inference) is
-        # incompatible with the installed Transformers and crashes on a RoPE
+        # its fused paged-KV inference kernel (e.g. the *Attention_fast_forward_inference
+        # path) can be incompatible with the installed Transformers and crash on a RoPE
         # cos/sin broadcast. With it disabled, model.generate() falls through to
         # standard Transformers generation, which uses a normal KV cache via the
         # regular (working) forward — fast AND correct, no version downgrade.
@@ -75,7 +75,7 @@ class LLMPolicy:
 
         logger.info(f"Loading base model {base_model} (4bit={load_in_4bit}) ...")
         # Eager attention is the broadly-compatible choice (avoids SDPA-dispatch
-        # errors some architectures hit). Llama 3.2 also works with "sdpa".
+        # errors some architectures hit). Qwen2.5 also works with "sdpa".
         # Override via configs/base.yaml -> rl.attn_implementation.
         base, self.tokenizer = FastLanguageModel.from_pretrained(
             model_name=base_model,
@@ -107,7 +107,7 @@ class LLMPolicy:
 
         # Multimodal models (e.g. Gemma 3) return a Processor whose chat template
         # is used to RENDER prompts, with the raw text tokenizer at ``.tokenizer``.
-        # Text-only models (e.g. Llama 3.2) return the tokenizer directly. Keep
+        # Text-only models (e.g. Qwen2.5) return the tokenizer directly. Keep
         # both handles: ``self.tokenizer`` renders, ``self._tok`` tokenizes — for
         # a plain tokenizer the getattr fallback makes them the same object.
         self._tok = getattr(self.tokenizer, "tokenizer", self.tokenizer)
@@ -179,7 +179,7 @@ class LLMPolicy:
     # Generation + log-probs
     # ------------------------------------------------------------------
     def _prompt_ids(self, system: str, user: str):
-        # Fold the system instructions into a single user turn. Llama 3.2 has a
+        # Fold the system instructions into a single user turn. Qwen2.5 has a
         # native system role, but some templates (e.g. Gemma) don't — folding is
         # the universally-safe approach and keeps behaviour identical across models.
         # Render to text via the processor (tokenize=False → str), then tokenize

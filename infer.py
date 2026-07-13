@@ -35,7 +35,7 @@ def _load_policy(cfg):
     from rl.policy import LLMPolicy  # heavy import (torch/unsloth) — deferred
     rl = cfg.get("rl", {})
     return LLMPolicy(
-        base_model=rl.get("model", "unsloth/Llama-3.2-3B-Instruct"),
+        base_model=rl.get("model", "unsloth/Qwen2.5-1.5B-Instruct"),
         max_seq_len=int(rl.get("max_seq_len", 8192)),
         lora_r=int(rl.get("lora_r", 16)),
         lora_alpha=int(rl.get("lora_alpha", 32)),

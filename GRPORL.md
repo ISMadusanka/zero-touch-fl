@@ -234,7 +234,8 @@ Key points:
 `LLMPolicy` ([rl/policy.py:35](rl/policy.py)) is the only GPU-heavy module. Its
 design is **"two checkpoints on one brain"**:
 
-- **One** frozen 4-bit (QLoRA) **Llama-3.2-3B-Instruct** base, loaded once.
+- **One** frozen **Qwen2.5-1.5B-Instruct** base (bf16 LoRA by default; 4-bit
+  QLoRA optional via `rl.load_in_4bit`), loaded once.
 - **Two LoRA adapters** over it — `"attacker"` and `"defender"`. A LoRA adapter is
   a small set of trainable low-rank matrices added to the frozen base; it's like a
   lightweight "personality patch." Two adapters = two independently-trained
@@ -364,7 +365,7 @@ guards in `grpo_step`:
 3. the `zero_advantage_fraction` is logged so the monitor can warn you.
 
 **Why two LoRA adapters instead of two models?** Memory and simplicity — one frozen
-3B base in 4-bit, plus two small adapter weight-sets. Switching "who is playing" is
+1.5B base (bf16 or 4-bit), plus two small adapter weight-sets. Switching "who is playing" is
 just `set_adapter(name)`; the KL reference is the same base via `disable_adapter()`.
 
 **Where does `G` come from / can I change it?** `rl.G` in `configs/base.yaml`

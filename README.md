@@ -50,7 +50,7 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
 
 - **Training happens on a GPU machine — not through Ollama.** Ollama and the
   OpenAI API are **inference-only** and cannot fine-tune.
-- The policy is **one frozen `Llama-3.2-3B-Instruct` base loaded via Unsloth in
+- The policy is **one frozen `Qwen2.5-1.5B-Instruct` base loaded via Unsloth in
   bf16 LoRA by default** (4-bit QLoRA is available via `rl.load_in_4bit: true` —
   use it only when GPU memory is tight; on a 5090 bf16 is faster as it skips the
   per-matmul dequant), with **two LoRA adapters** over it — `attacker` and
@@ -58,20 +58,27 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   never duplicated; each policy is its own small adapter, saved independently to
   `checkpoints/attacker_adapter/` and `checkpoints/defender_adapter/`.
   (Loaded with `attn_implementation="eager"` by default — see `rl.attn_implementation`;
-  Llama 3.2 also supports `"sdpa"`.)
+  Qwen2.5 also supports `"sdpa"`.)
 - GRPO is implemented directly in [`rl/grpo.py`](rl/grpo.py) (environment-coupled
   reward, KL penalty to the frozen base) on top of Unsloth + PEFT — no TRL
   trainer dependency required.
 - **Resume**: rerun the same command. Existing adapters and
   `checkpoints/rl_progress.json` are reloaded and training continues.
-- **`gpt-4o-mini` (OpenAI) and Ollama `llama3.2` are inference/baseline only** —
+- **Switching the base model invalidates old adapters.** A LoRA adapter is
+  dimensioned for the exact base it was trained on, so adapters from a previous
+  base (e.g. an earlier Llama run) **cannot** load onto `Qwen2.5-1.5B-Instruct`.
+  If `checkpoints/attacker_adapter/` or `checkpoints/defender_adapter/` exist from
+  an old base, delete them (and `checkpoints/rl_progress.json`) and retrain from
+  scratch. The Phase-1 MNIST checkpoint (`global_model.pt`, `client_updates.pt`,
+  `baseline.json`) is model-agnostic and can stay.
+- **`gpt-4o-mini` (OpenAI) and Ollama `qwen2.5` are inference/baseline only** —
   used by `--dry-run` and `--baseline`. They are **not** fine-tuned.
 - **Serving a trained adapter**: use **vLLM** (multi-LoRA hot-swap), or **merge**
-  the adapter into the base and export a single GGUF for Ollama (Llama 3.2 is
-  supported by Ollama as `llama3.2`; merging gives up the two-swappable-adapters
+  the adapter into the base and export a single GGUF for Ollama (Qwen2.5 is
+  supported by Ollama as `qwen2.5`; merging gives up the two-swappable-adapters
   design but is the simplest serving path).
-- **Hardware**: Llama-3.2-3B fits comfortably on a single GPU — ~6 GB of weights
-  in the default bf16 LoRA (or ~4–6 GB floor under 4-bit QLoRA), so your 5090
+- **Hardware**: Qwen2.5-1.5B fits comfortably on a single GPU — ~3 GB of weights
+  in the default bf16 LoRA (or ~1–2 GB floor under 4-bit QLoRA), so your 5090
   (31 GB) has ample headroom for either. Generation is short: the attacker emits a
   client selection + per-client plans, and the defender emits one verdict per
   client (20 clients). `rl.max_new_tokens` defaults to 1024 to fit the defender's
@@ -83,15 +90,15 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
 
 ```bash
 pip install -r requirements.txt   # installs unsloth/peft/transformers/bitsandbytes
-# Llama-3.2-3B-Instruct is downloaded from Hugging Face on first run (unsloth/Llama-3.2-3B-Instruct)
+# Qwen2.5-1.5B-Instruct is downloaded from Hugging Face on first run (unsloth/Qwen2.5-1.5B-Instruct)
 ```
 
 ### CPU machine (logic dry-run / baseline only)
 
 ```bash
 pip install torch torchvision numpy pyyaml matplotlib openai requests
-# For --dry-run you also need an Ollama server with llama3.2:
-#   ollama serve & ; ollama pull llama3.2:3b
+# For --dry-run you also need an Ollama server with qwen2.5:
+#   ollama serve & ; ollama pull qwen2.5:1.5b
 ```
 
 ## Usage
@@ -145,7 +152,7 @@ python infer.py --adapter attacker --prompt "Describe a stealthy model-poisoning
 # Sample several completions (temperature > 0):
 python infer.py --adapter attacker --role --prompt '...' --n 4 --temperature 1.0
 
-# Interactive — load the 3B model ONCE, then keep prompting (best for exploring):
+# Interactive — load the 1.5B model ONCE, then keep prompting (best for exploring):
 python infer.py --adapter defender --role --interactive
 
 # Pipe a prompt from stdin / a file:

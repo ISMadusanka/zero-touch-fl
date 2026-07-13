@@ -41,15 +41,15 @@ attack:
 # Inference-only LLM defaults (used by --dry-run and the OpenAI path).
 llm:
   ollama_base_url: "http://localhost:11434"
-  ollama_model: "llama3.2:3b"
+  ollama_model: "qwen2.5:1.5b"
 
 # Reinforcement learning (GRPO) settings — see README "LLM handling".
 rl:
-  model: "unsloth/Llama-3.2-3B-Instruct"  # HF/Unsloth base for QLoRA training
-  attn_implementation: "eager"    # broadly compatible; Llama 3.2 also supports "sdpa"
+  model: "unsloth/Qwen2.5-1.5B-Instruct"  # HF/Unsloth base for QLoRA training
+  attn_implementation: "eager"    # broadly compatible; Qwen2.5 also supports "sdpa"
   use_fast_generate: true         # KV-cached generation (fast); auto-falls back to no-cache on failure
-  max_seq_len: 8192
-  load_in_4bit: false             # bf16 LoRA: 3B fits easily on 32GB+; skips QLoRA dequant -> faster grad passes
+  max_seq_len: 8192               # well within Qwen2.5-1.5B's 32k native context
+  load_in_4bit: false             # bf16 LoRA: 1.5B fits easily on 8GB+; skips QLoRA dequant -> faster grad passes
   lora_r: 16
   lora_alpha: 32
   G: 4                            # rollouts per GRPO step (group size)
