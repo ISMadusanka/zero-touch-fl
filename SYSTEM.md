@@ -97,8 +97,11 @@ from a freshly advanced client state (see "Between-phase benign FL round" below)
     sign-flip/targeted attacks that preserve norm).
   - Whole model: `l2_norm`, `rel_norm`, `cos_to_mean`, `max_pairwise_cos`
     (FoolsGold), `dnc_score` (SVD spectral outlier).
-- **Output**: `{"clients": [{client_id, is_suspicious, confidence, reason}, ...]}`
-  → one `DetectionVerdict` per client (missing/garbled entries default benign).
+- **Output**: `{"clients": [{client_id, is_suspicious, confidence}, ...]}`
+  → one `DetectionVerdict` per client (missing/garbled entries default benign). A
+  short free-text `reason` per client is **off by default** to save generation
+  tokens (informational only — never used by the reward/metrics); re-enable it
+  with `emit_reason: true` in `configs/defender_agent.yaml`.
 
 ## Verifiable rewards (`rl/rewards.py`)
 

@@ -52,11 +52,22 @@ honest client (false positive) is costly, so require corroborating evidence.
 
 OUTPUT FORMAT — respond with ONLY a single JSON object, no prose, no markdown:
 {"clients": [
-   {"client_id": <int>, "is_suspicious": <true|false>,
-    "confidence": <float 0..1>, "reason": "<short>"},
+   %CLIENT_SCHEMA%,
    ...
 ]}
-Include EXACTLY one entry for every client_id you were given."""
+Include EXACTLY one entry for every client_id you were given.%REASON_HINT%"""
+
+# Per-client output schema, with and without the free-text "reason". The reason
+# is a short natural-language explanation that costs generation tokens (one string
+# per client — 20 clients = 20 strings per verdict, per rollout). It is purely
+# informational (logged only; never used by the reward or metrics), so it can be
+# turned off to save tokens via ``emit_reason`` in configs/defender_agent.yaml.
+_SCHEMA_WITH_REASON = ('{"client_id": <int>, "is_suspicious": <true|false>, '
+                       '"confidence": <float 0..1>, "reason": "<short>"}')
+_SCHEMA_NO_REASON = ('{"client_id": <int>, "is_suspicious": <true|false>, '
+                     '"confidence": <float 0..1>}')
+_REASON_HINT_OFF = ('\nOutput ONLY those fields per client — do NOT add a '
+                    '"reason" or any other keys.')
 
 
 class DefenderAgent:
@@ -66,10 +77,20 @@ class DefenderAgent:
         config = config or {}
         # Confidence to assume when the model omits/garbles a client entry.
         self.default_confidence = float(config.get("default_confidence", 0.0))
+        # Whether to ask the LLM for a short per-client "reason". Off by default to
+        # save generation tokens; flip ``emit_reason: true`` in the config to restore
+        # the explanations. The prompt is built once here so it stays consistent
+        # across generation and (during training) the log-prob passes.
+        self.emit_reason = bool(config.get("emit_reason", False))
+        schema = _SCHEMA_WITH_REASON if self.emit_reason else _SCHEMA_NO_REASON
+        hint = "" if self.emit_reason else _REASON_HINT_OFF
+        self._system = (
+            SYSTEM_PROMPT.replace("%CLIENT_SCHEMA%", schema).replace("%REASON_HINT%", hint)
+        )
 
     # ------------------------------------------------------------------
     def system_prompt(self) -> str:
-        return SYSTEM_PROMPT
+        return self._system
 
     def build_user_prompt(self, features: dict[int, dict]) -> str:
         """Serialize per-client feature vectors into a user message.
@@ -124,7 +145,9 @@ class DefenderAgent:
                 client_id=cid,
                 is_suspicious=bool(e.get("is_suspicious", False)),
                 confidence=_coerce_float(e.get("confidence"), self.default_confidence),
-                reason=str(e.get("reason", ""))[:200],
+                # When reasons are disabled, drop any stray field the model emits so
+                # the verdict stays empty-reason regardless of model behaviour.
+                reason=(str(e.get("reason", ""))[:200] if self.emit_reason else ""),
             ))
         return verdicts
 

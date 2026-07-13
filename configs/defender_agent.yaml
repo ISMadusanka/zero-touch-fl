@@ -8,5 +8,11 @@ llm:
 # Confidence assumed when the model omits/garbles a client entry.
 default_confidence: 0.0
 
+# Ask the defender LLM for a short free-text "reason" per client. Disabled to save
+# generation tokens (20 clients => 20 fewer strings per verdict, per rollout). The
+# reason is informational only (logged; never used by the reward or metrics), so
+# turning it off does not change training. Set to true to restore the explanations.
+emit_reason: false
+
 # RL checkpoint — a LoRA adapter over the shared Qwen2.5 base.
 adapter_path: "checkpoints/defender_adapter"
