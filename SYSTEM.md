@@ -74,8 +74,9 @@ from a freshly advanced client state (see "Between-phase benign FL round" below)
   The attacker **selects which** pool clients to poison (≤ budget) and gives **each
   its own plan**. Operators (`agents/attack_ops.py`, 10): `scale`, `sign_flip`,
   `add_gaussian_noise`, `mask`, `clip`, `add_constant`, `permute`,
-  `scale_neurons`, `blend_random`, `quantize`. `target` is `"all"`, a layer
-  group (`"net.2"`), or a full key (`"net.4.weight"`). Operations apply in order.
+  `scale_neurons`, `blend_random`, `quantize`. `target` is `"all"`, a layer name,
+  or a full parameter key — the exact names come from `client_update_stats` (for
+  MnistNet e.g. `"net.2"` / `"net.4.weight"`). Operations apply in order.
 - **Selection + application** (`agents/attacker_agent.select_and_apply` →
   `attack_ops.apply_plan`): filters ids to the pool, dedups, **truncates to the
   budget**; per chosen client deep-copies its benign weights, applies its plan,
@@ -92,7 +93,7 @@ from a freshly advanced client state (see "Between-phase benign FL round" below)
 - **Input** (`agents/defender_agent.build_user_prompt`): per-client features
   from `detector/features.compute_client_features` — **only** features, never the
   ground truth.
-  - Per layer (`net.2`, `net.4`): `l2_norm`, `rel_norm` (vs median), `cos_to_median`,
+  - Per layer (one per model layer; e.g. `net.2`, `net.4` for MnistNet): `l2_norm`, `rel_norm` (vs median), `cos_to_median`,
     `sign_agreement` (fraction of coords matching the median sign — catches
     sign-flip/targeted attacks that preserve norm).
   - Whole model: `l2_norm`, `rel_norm`, `cos_to_mean`, `max_pairwise_cos`

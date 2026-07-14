@@ -118,6 +118,7 @@ class LLMPolicy:
         self.model.train()
         self._active = None
         self._logits_kw = None   # resolved on first use: which "last-token-only" kwarg works
+        self._use_system_role = None  # resolved on first use: does the chat template accept a system role?
         self._use_fast_generate = bool(use_fast_generate)  # KV-cached generate; auto-falls back on failure
         self.set_adapter(self.adapters[0])
         logger.info(f"LLMPolicy ready — adapters={self.adapters}, device={self.device}")
@@ -179,18 +180,48 @@ class LLMPolicy:
     # Generation + log-probs
     # ------------------------------------------------------------------
     def _prompt_ids(self, system: str, user: str):
-        # Fold the system instructions into a single user turn. Qwen2.5 has a
-        # native system role, but some templates (e.g. Gemma) don't — folding is
-        # the universally-safe approach and keeps behaviour identical across models.
-        # Render to text via the processor (tokenize=False → str), then tokenize
-        # with the raw tokenizer. The template already injects BOS + turn tokens,
-        # so add_special_tokens=False avoids a duplicate BOS.
-        messages = [{"role": "user", "content": f"{system}\n\n{user}"}]
-        text = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False,
-        )
+        # Deliver the instructions in the model's NATIVE system role (Qwen2.5,
+        # Llama, Mistral all support it) so they carry system-level authority and
+        # the model adopts the role cleanly — this matters for a small instruct
+        # model and, for the attacker, keeps the adversarial framing from being
+        # overridden by the template's default "helpful assistant" system persona.
+        # Templates without a system role (e.g. Gemma) fall back to folding
+        # system+user into one user turn — resolved once in _render_chat.
+        # Render to text (tokenize=False → str), then tokenize with the raw
+        # tokenizer. The template already injects BOS + turn tokens, so
+        # add_special_tokens=False avoids a duplicate BOS.
+        text = self._render_chat(system, user)
         enc = self._tok(text, return_tensors="pt", add_special_tokens=False)
         return enc["input_ids"].to(self.device)
+
+    def _render_chat(self, system: str, user: str) -> str:
+        """Render the chat template, preferring a native system role.
+
+        Whether this model's template accepts a ``system`` message is probed ONCE
+        and cached in ``self._use_system_role`` (a cheap string render, no model
+        forward); afterwards this is a plain dispatch. Generation and the log-prob
+        passes both go through here, so the two stay byte-identical.
+        """
+        if self._use_system_role is None:
+            try:
+                self.tokenizer.apply_chat_template(
+                    [{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    add_generation_prompt=True, tokenize=False,
+                )
+                self._use_system_role = True
+            except Exception:
+                self._use_system_role = False
+                logger.info("Chat template has no system role — folding system into the user turn.")
+        if self._use_system_role:
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+        else:
+            messages = [{"role": "user", "content": f"{system}\n\n{user}"}]
+        return self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False,
+        )
 
     def _last_logits(self, ids):
         """Logits for the LAST position only — skips the 128k-vocab projection

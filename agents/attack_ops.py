@@ -375,21 +375,20 @@ OP_FUNCS = {
 
 
 # Human-readable operator reference for the attacker prompt.
-OPERATOR_DOCS = """Available primitive operators (compose several for novel attacks).
-Each operation is {"op": <name>, "target": <target>, ...params}, where <target> is
-"all", a layer-group (e.g. "net.2" = both its weight and bias), a full key
-(e.g. "net.4.weight"), OR a list of those (e.g. ["net.2.weight", "net.4.bias"])
-to hit several layers in one operation:
-- scale            {"factor": float}                  multiply weights by factor (negative flips sign, |f|>1 amplifies).
-- sign_flip        {"fraction": 0..1}                 negate the top-`fraction` largest-magnitude weights (1.0 = all).
-- add_gaussian_noise {"sigma": float>=0, "seed": int} add zero-mean Gaussian noise of std `sigma`.
-- mask             {"fraction": 0..1, "mode": "largest"|"smallest"|"random", "seed": int}  zero out a fraction of weights.
-- clip             {"value": float>=0}                clamp weights into [-value, value].
-- add_constant     {"value": float}                   add a constant to every weight.
-- permute          {"seed": int}                      randomly shuffle weights within the target (destroys structure).
-- scale_neurons    {"fraction": 0..1, "factor": float} scale the top-`fraction` most important output units (rows).
-- blend_random     {"alpha": 0..1, "seed": int}       interpolate toward random noise: (1-alpha)*w + alpha*noise.
-- quantize         {"step": float>0}                  round weights to a coarse grid of size `step`."""
+OPERATOR_DOCS = """Operators (compose several for novel attacks). Each op is
+{"op":<name>,"target":<target>, ...params}. `target` is "all", a layer name, a full
+parameter key, or a list of these -- use the exact names shown in `client_update_stats`
+(a layer groups its ".weight" and ".bias"):
+- scale {"factor":float}: multiply weights (negative flips sign, |factor|>1 amplifies).
+- sign_flip {"fraction":0..1}: negate the top-fraction largest-magnitude weights (1.0=all).
+- add_gaussian_noise {"sigma":float>=0,"seed":int}: add zero-mean noise of std sigma.
+- mask {"fraction":0..1,"mode":"largest"|"smallest"|"random","seed":int}: zero out a fraction of weights.
+- clip {"value":float>=0}: clamp weights into [-value, value].
+- add_constant {"value":float}: add a constant to every weight.
+- permute {"seed":int}: randomly shuffle weights within the target (destroys structure).
+- scale_neurons {"fraction":0..1,"factor":float}: scale the top-fraction most important output units (rows).
+- blend_random {"alpha":0..1,"seed":int}: move toward random noise: (1-alpha)*w + alpha*noise.
+- quantize {"step":float>0}: round weights to a coarse grid of size step."""
 
 
 # ---------------------------------------------------------------------------

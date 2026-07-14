@@ -19,38 +19,20 @@ from core.types import DetectionVerdict
 logger = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = """You are the defender in a federated-learning system trained on MNIST.
+SYSTEM_PROMPT = """You are the defender in a federated-learning system. Each round every client submits a model update; some clients are malicious (model poisoning) and the rest honest, and you do NOT know which. Given statistical features of each client's weight delta (client - global), decide for EACH client whether it is malicious.
 
-Every round each client submits a model update. A subset of clients are
-malicious (model poisoning) and the rest are honest. You do NOT know which.
-You are given statistical features of every client's weight delta (client minus
-global), and you must decide, for EACH client, whether it is malicious.
+Honest clients are the MAJORITY, so median-based references describe honest behaviour and outliers are suspicious.
 
-Assume the HONEST clients are the MAJORITY, so the robust reference statistics
-(medians) describe honest behaviour and outliers are suspicious.
+Features per client:
+- `layers` -- per-layer stats:
+  * l2_norm: this layer's update magnitude. rel_norm: l2_norm / median over clients (>> 1 = abnormally large).
+  * cos_to_median: cosine to the others' median update (near 1 = normal; low/negative = anomalous direction, e.g. sign-flip).
+  * sign_agreement: fraction of coordinates whose sign matches the median (honest ~> 0.6; flipped drops below 0.5).
+- `whole` -- model-wide: l2_norm, rel_norm; cos_to_mean; max_pairwise_cos (colluding Sybils look alike -> high); dnc_score (spectral outlier, higher = stronger).
 
-Per-client features:
-- `layers`: stats per logical layer (e.g. "net.2" = hidden, "net.4" = output):
-   * l2_norm        : magnitude of this layer's update.
-   * rel_norm       : l2_norm / median over clients. >> 1 means abnormally large.
-   * cos_to_median  : cosine similarity to the median update of the others.
-                      Near 1 = aligned with the crowd; low or negative = anomalous
-                      direction (e.g. sign-flipping).
-   * sign_agreement : fraction of coordinates whose sign matches the median sign.
-                      Honest updates mostly agree (~>0.6); flipped/poisoned ones
-                      drop well below 0.5.
-- `whole`: model-wide stats:
-   * l2_norm / rel_norm : as above, across all parameters.
-   * cos_to_mean        : cosine to the mean update.
-   * max_pairwise_cos   : highest similarity to any other single client (colluding
-                          Sybils look unusually similar to each other).
-   * dnc_score          : spectral outlier score; larger = stronger outlier.
+Flag a client malicious when SEVERAL signals agree: high rel_norm, low cos_to_median/cos_to_mean, low sign_agreement, or high dnc_score. False positives are costly -- require corroborating evidence.
 
-A client is likely malicious when several signals agree: high rel_norm, low
-cos_to_median / cos_to_mean, low sign_agreement, or high dnc_score. Flagging an
-honest client (false positive) is costly, so require corroborating evidence.
-
-OUTPUT FORMAT — respond with ONLY a single JSON object, no prose, no markdown:
+OUTPUT FORMAT -- respond with ONLY a single JSON object, no prose, no markdown:
 {"clients": [
    %CLIENT_SCHEMA%,
    ...

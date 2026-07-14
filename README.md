@@ -140,7 +140,7 @@ python monitor.py --window 50     # smooth over a larger recent window for long 
 ```
 # Attacker — using the REAL system prompt it was trained with (recommended):
 python infer.py --adapter attacker --role \
-  --prompt '{"round":5,"current_global_accuracy":0.8,"attack_goal":{"type":"untargeted_degrade","target_accuracy_drop":0.2},"controllable_client_ids":[0,1,2,3,4],"max_poison_clients":1,"client_layer_details":{}}'
+  --prompt '{"round":5,"current_global_accuracy":0.8,"attack_goal":{"type":"untargeted_degrade","target_accuracy_drop":0.2},"controllable_client_ids":[0,1,2,3,4],"max_poison_clients":1,"client_update_stats":{}}'
 
 # Defender — real system prompt, feature JSON as the user message:
 python infer.py --adapter defender --role \
