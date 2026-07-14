@@ -78,7 +78,7 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             updates = env.build_updates(poisoned)
             verdicts = fixed_defender(env.features(updates))
             post_acc = env.evaluate_updates(updates, verdicts)
-            reward = attacker_reward(ctx.global_accuracy, post_acc, env.goal,
+            reward = attacker_reward(ctx.global_accuracy, post_acc, ctx.goal,
                                      chosen_ids, verdicts, n_malformed=0)
             scored.append((label, poisoned, updates, verdicts, post_acc, reward))
             logger.info(
@@ -91,14 +91,14 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
         best = max(scored, key=lambda s: s[5])
         label, poisoned, updates, verdicts, _, _ = best
         new_acc = env.commit(updates, verdicts)
-        a_rew = attacker_reward(ctx.global_accuracy, new_acc, env.goal,
+        a_rew = attacker_reward(ctx.global_accuracy, new_acc, ctx.goal,
                                 chosen_ids, verdicts, n_malformed=0)
         d_rew = defender_reward(verdicts, chosen_ids)
 
         metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
         save_round_log(RoundLog(
             round_num=ctx.round_num,
-            attack_goal=env.goal,
+            attack_goal=ctx.goal,
             poisoned_client_ids=chosen_ids,
             predicted_labels=[
                 {"client_id": v.client_id, "is_suspicious": v.is_suspicious,

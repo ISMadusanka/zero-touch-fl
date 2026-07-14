@@ -52,11 +52,12 @@ class AttackerTurn:
         self.budget = env.round_budget
         self.pool_size = env.n_compromisable
         self.prev_accuracy = env.current_accuracy
+        self.goal = env.round_goal                        # this round's (maybe sampled) goal
 
         self.system = attacker_agent.system_prompt()
         self.user = attacker_agent.build_user_prompt(
             env.round_index + env.training_rounds, env.current_accuracy,
-            self.pool_references, env.global_weights, self.budget,
+            self.pool_references, env.global_weights, self.budget, goal=self.goal,
         )
         dbg.attacker_prompt(self.system, self.user, who="learner")
 
@@ -91,7 +92,7 @@ class AttackerTurn:
         diversity = perturbation_diversity(
             poisoned, {cid: self.pool_references[cid] for cid in chosen_ids})
         r = attacker_reward(
-            self.prev_accuracy, post_acc, self.env.goal, chosen_ids,
+            self.prev_accuracy, post_acc, self.goal, chosen_ids,
             verdicts, n_malformed,
             alpha=self.reward_cfg.get("alpha", 1.0),
             beta=self.reward_cfg.get("beta", 0.5),
@@ -141,7 +142,7 @@ class DefenderTurn:
         a_sys = attacker_agent.system_prompt()
         a_user = attacker_agent.build_user_prompt(
             env.round_index + env.training_rounds, env.current_accuracy,
-            env.pool_benign, env.global_weights, env.round_budget,
+            env.pool_benign, env.global_weights, env.round_budget, goal=env.round_goal,
         )
         dbg.attacker_prompt(a_sys, a_user, who="frozen-opponent")
         a_text = attacker_gen.generate(a_sys, a_user, n=1, temperature=opponent_temperature)[0]

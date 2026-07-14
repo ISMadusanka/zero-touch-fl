@@ -25,6 +25,8 @@ objects (anything exposing ``.client_id`` and ``.is_suspicious``).
 
 from dataclasses import dataclass
 
+from rl.rewards import goal_target
+
 
 @dataclass
 class SwitchConfig:
@@ -35,7 +37,10 @@ class SwitchConfig:
     success_streak: int = 3          # consecutive winning rounds needed to freeze+switch
 
     # Attacker "an attack passed through the defender".
-    attacker_min_drop: float = 0.02  # committed accuracy drop (prev-post) to count as damage
+    attacker_min_drop: float = 0.02  # absolute drop bar, used only when the round's goal/target
+                                     # is unknown (fallback); normally the RELATIVE gate applies.
+    win_fraction: float = 0.6        # RELATIVE damage bar: fraction of the round's requested
+                                     # target drop the attack must achieve to count as a win.
     attacker_min_evaded: float = 1.0 # fraction of poisoned clients that must evade detection
 
     # Defender "defense succeeded against the frozen attacker".
@@ -49,6 +54,7 @@ class SwitchConfig:
             max_phase_rounds=int(rl.get("max_phase_rounds", 200)),
             success_streak=int(rl.get("success_streak", 3)),
             attacker_min_drop=float(rl.get("attacker_min_drop", 0.02)),
+            win_fraction=float(rl.get("win_fraction", 0.6)),
             attacker_min_evaded=float(rl.get("attacker_min_evaded", 1.0)),
             defender_min_tpr=float(rl.get("defender_min_tpr", 0.99)),
             defender_max_fpr=float(rl.get("defender_max_fpr", 0.10)),
@@ -66,17 +72,26 @@ def _tpr_fpr(verdicts, poisoned_ids) -> tuple[float, float]:
     return tpr, fpr
 
 
-def attacker_succeeded(drop: float, verdicts, poisoned_ids, cfg: SwitchConfig) -> bool:
+def attacker_succeeded(drop: float, verdicts, poisoned_ids, cfg: SwitchConfig,
+                       goal: dict | None = None) -> bool:
     """True when the committed attack 'passed': enough poisoned clients evaded
-    detection AND the round actually lost accuracy. A flagged client is dropped
-    from FedAvg, so meaningful ``drop`` already implies evasion — we keep the
+    detection AND the round lost enough accuracy.
+
+    The damage bar is RELATIVE to the round's requested target when ``goal`` is
+    given — ``win_fraction * target`` (``target`` via :func:`rl.rewards.goal_target`)
+    — so a per-round-sampled target is judged on its own scale (a 0.05-target round
+    and a 0.30-target round need proportional drops, not one absolute floor). Without
+    a goal it falls back to the absolute ``attacker_min_drop``. A flagged client is
+    dropped from FedAvg, so meaningful ``drop`` already implies evasion — we keep the
     explicit evasion check for the multi-poisoner case."""
     if not poisoned_ids:
         return False
     flagged = {v.client_id for v in verdicts if v.is_suspicious}
     evaded = sum(1 for cid in poisoned_ids if cid not in flagged)
     evaded_frac = evaded / len(poisoned_ids)
-    return evaded_frac >= cfg.attacker_min_evaded and drop >= cfg.attacker_min_drop
+    min_drop = (cfg.win_fraction * goal_target(goal) if goal is not None
+                else cfg.attacker_min_drop)
+    return evaded_frac >= cfg.attacker_min_evaded and drop >= min_drop
 
 
 def defender_succeeded(verdicts, poisoned_ids, cfg: SwitchConfig) -> bool:
@@ -87,10 +102,11 @@ def defender_succeeded(verdicts, poisoned_ids, cfg: SwitchConfig) -> bool:
 
 
 def committed_success(learner: str, drop: float, verdicts, poisoned_ids,
-                      cfg: SwitchConfig) -> bool:
-    """Did the learner win on this committed round?"""
+                      cfg: SwitchConfig, goal: dict | None = None) -> bool:
+    """Did the learner win on this committed round? ``goal`` (this round's attack
+    goal) enables the attacker's relative win-gate; it is ignored for the defender."""
     if learner == "attacker":
-        return attacker_succeeded(drop, verdicts, poisoned_ids, cfg)
+        return attacker_succeeded(drop, verdicts, poisoned_ids, cfg, goal)
     return defender_succeeded(verdicts, poisoned_ids, cfg)
 
 

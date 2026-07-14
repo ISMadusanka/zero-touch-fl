@@ -39,12 +39,13 @@ class RoundContext:
     so ``poisoned_ids`` is empty here and filled in once the choice is committed.
     """
 
-    def __init__(self, round_num, global_accuracy, pool_ids, pool_benign, budget):
+    def __init__(self, round_num, global_accuracy, pool_ids, pool_benign, budget, goal=None):
         self.round_num = round_num
         self.global_accuracy = global_accuracy
         self.pool_ids = pool_ids                          # list[int] controllable pool
         self.pool_benign = pool_benign                    # {cid: state_dict} for the pool
         self.budget = budget                              # max clients that may be poisoned
+        self.goal = goal                                  # this round's attack goal (maybe sampled)
         self.poisoned_ids = []                            # set at commit (attacker's choice)
 
 
@@ -68,6 +69,13 @@ class FLArmsRaceEnv:
         self.budget_cap = max(1, min(
             int(attack.get("max_poison_clients", self.n_compromisable)), self.n_compromisable))
         self.sample_budget = bool(attack.get("sample_budget_in_training", True))
+        # Per-round attack-goal target sampling (untargeted_degrade): when on, draw
+        # target_accuracy_drop from target_choices each round so the policy generalizes
+        # across targets instead of overfitting one. Eval fixes it (sample_target=False ->
+        # the configured attack.goal). Overridable by the benchmark (env.sample_target).
+        self.sample_target = bool(attack.get("sample_target_in_training", False))
+        self.target_choices = [float(x) for x in attack.get(
+            "target_choices", [0.05, 0.10, 0.20, 0.30])]
 
         self.test_loader = test_loader
         self.rng = rng
@@ -97,6 +105,7 @@ class FLArmsRaceEnv:
         self.pool_ids: list[int] = []
         self.pool_benign: dict[int, dict] = {}
         self.round_budget: int = 1
+        self.round_goal: dict = dict(self.goal)           # this round's (maybe sampled) goal
         self.poisoned_ids: list[int] = []                 # attacker's committed choice
 
     # ------------------------------------------------------------------
@@ -119,6 +128,16 @@ class FLArmsRaceEnv:
             return self.rng.randint(1, self.budget_cap)
         return self.budget_cap
 
+    def _round_goal(self) -> dict:
+        """This round's attack goal. When target sampling is on (untargeted_degrade),
+        draw ``target_accuracy_drop`` from ``target_choices`` so the policy becomes
+        TARGET-AWARE and generalizes across targets; otherwise the fixed config goal.
+        The returned dict is the CLEAN goal shown to the LLM and used by the reward."""
+        if self.sample_target and self.goal.get("type") == "untargeted_degrade":
+            return {"type": "untargeted_degrade",
+                    "target_accuracy_drop": self.rng.choice(self.target_choices)}
+        return self.goal
+
     def _honest_update(self, cid: int) -> ModelUpdate:
         if self.benign_retrain and self._clients is not None:
             return self._clients[cid].train(self.server.model)
@@ -135,11 +154,13 @@ class FLArmsRaceEnv:
         self.pool_ids = list(range(self.n_compromisable))
         self.pool_benign = {cid: self.honest_updates[cid].weights for cid in self.pool_ids}
         self.round_budget = self._round_budget()
+        self.round_goal = self._round_goal()
         self.poisoned_ids = []                            # attacker decides at commit
 
         logger.info(
             f"Round {round_num}: controllable_pool={self.pool_ids} "
-            f"budget={self.round_budget} (global_acc={self.current_accuracy:.4f})"
+            f"budget={self.round_budget} goal={self.round_goal} "
+            f"(global_acc={self.current_accuracy:.4f})"
         )
         return RoundContext(
             round_num=round_num,
@@ -147,6 +168,7 @@ class FLArmsRaceEnv:
             pool_ids=list(self.pool_ids),
             pool_benign=self.pool_benign,
             budget=self.round_budget,
+            goal=self.round_goal,
         )
 
     def set_committed_poison(self, chosen_ids) -> None:

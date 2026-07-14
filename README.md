@@ -190,6 +190,27 @@ Attack goals (configurable; `untargeted_degrade` is the first experiment):
 `untargeted_degrade` (target accuracy drop), `slow_degrade` (per-round drop),
 `targeted_label` (per-class — scaffolded).
 
+**Target generalization (untargeted_degrade).** Rather than overfitting a single
+target, training randomizes `target_accuracy_drop` each round from
+`attack.target_choices` (default `[0.05, 0.10, 0.20, 0.30]`) when
+`attack.sample_target_in_training: true` — the same domain-randomization idea as
+the per-round poison budget, so the policy becomes **target-aware** and generalizes
+to any requested drop. The sampled target is placed in the attacker's prompt AND
+used by its reward every round (sampled once per round, so all `G` GRPO rollouts in
+a group share it). The arms-race success gate is likewise **relative**: an attack
+"passes" when its committed drop reaches `rl.win_fraction` (default 0.6) of that
+round's target, so phase-switching tracks the sampled target instead of one absolute
+floor (`rl.attacker_min_drop` is only the fallback when no target is known). Set the
+flag to `false` to train against the single fixed `attack.goal.target_accuracy_drop`.
+Evaluation never samples: pick the target at the benchmark with `--goal` (see below).
+
+Benchmark a trained attacker against a specific goal (fixed for the whole run):
+
+```bash
+python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.1'
+# forms: untargeted_degrade=<drop> | slow_degrade=<drop> | targeted_label=<label>
+```
+
 ## Project structure
 
 ```

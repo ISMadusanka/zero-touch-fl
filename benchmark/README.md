@@ -16,6 +16,15 @@ On the GPU box (needs torch / unsloth / peft + the trained adapters in `checkpoi
 ```bash
 python -m benchmark.run_benchmark --rounds 200
 
+# Pick the attack goal the attacker aims for (fixed for the whole run, no per-round
+# sampling). The trained attacker generalizes across targets, so you can evaluate it
+# at any requested drop and read each defense's acc_drop against that target:
+python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.1'
+python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.3'
+#   forms: untargeted_degrade=<drop> | slow_degrade=<drop> | targeted_label=<label>
+#   default (no --goal): attack.goal from configs/base.yaml
+# The chosen goal is printed in the report header and saved to benchmark.json.
+
 # to chnage outcomes
 python -m benchmark.run_benchmark --rounds 10 --seed 1
 python -m benchmark.run_benchmark --rounds 10 --seed 2

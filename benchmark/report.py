@@ -31,10 +31,23 @@ def format_table(summaries: list[dict]) -> str:
     return "\n".join(out)
 
 
+def _goal_str(goal: dict | None) -> str:
+    """Compact 'type=value' rendering of an attack goal for the report header."""
+    if not goal:
+        return ""
+    gtype = goal.get("type", "untargeted_degrade")
+    val = (goal.get("target_accuracy_drop") if gtype == "untargeted_degrade"
+           else goal.get("per_round_drop") if gtype == "slow_degrade"
+           else goal.get("label"))
+    return f"{gtype}={val}" if val is not None else str(gtype)
+
+
 def render(summaries: list[dict], n_rounds: int, baseline_accuracy: float,
-           out_dir: str | None = None) -> str:
+           out_dir: str | None = None, goal: dict | None = None) -> str:
+    goal_s = _goal_str(goal)
     title = (f"DEFENSE BENCHMARK — {n_rounds} attack rounds  "
-             f"(clean baseline acc = {baseline_accuracy:.3f})")
+             f"(clean baseline acc = {baseline_accuracy:.3f}"
+             f"{f'; goal = {goal_s}' if goal_s else ''})")
     bar = "=" * len(title)
     text = f"{bar}\n{title}\n{bar}\n{format_table(summaries)}\n"
     text += (
@@ -48,7 +61,7 @@ def render(summaries: list[dict], n_rounds: int, baseline_accuracy: float,
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "benchmark.json"), "w") as f:
             json.dump({"n_rounds": n_rounds, "baseline_accuracy": baseline_accuracy,
-                       "results": summaries}, f, indent=2)
+                       "goal": goal, "results": summaries}, f, indent=2)
         if summaries:
             with open(os.path.join(out_dir, "benchmark.csv"), "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=list(summaries[0].keys()))

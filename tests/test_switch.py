@@ -57,6 +57,30 @@ def test_committed_success_dispatch():
     assert committed_success("defender", 0.0, [V(0, True), V(1, False)], [0], cfg)
 
 
+def test_attacker_relative_win_gate():
+    """With a per-round goal, the damage bar is win_fraction * target_accuracy_drop."""
+    cfg = _cfg(win_fraction=0.6)
+    small = {"type": "untargeted_degrade", "target_accuracy_drop": 0.05}   # bar = 0.03
+    big = {"type": "untargeted_degrade", "target_accuracy_drop": 0.30}     # bar = 0.18
+    evaded = [V(0, False)]
+    # Small target: 0.04 clears 0.03; 0.02 does not.
+    assert attacker_succeeded(0.04, evaded, [0], cfg, small)
+    assert not attacker_succeeded(0.02, evaded, [0], cfg, small)
+    # Big target: a 0.05 drop that would win ABSOLUTELY (>=0.02) now fails (< 0.18);
+    # 0.20 clears the proportional bar.
+    assert not attacker_succeeded(0.05, evaded, [0], cfg, big)
+    assert attacker_succeeded(0.20, evaded, [0], cfg, big)
+    # committed_success threads the goal through to the attacker gate.
+    assert not committed_success("attacker", 0.05, evaded, [0], cfg, big)
+    assert committed_success("attacker", 0.20, evaded, [0], cfg, big)
+    # slow_degrade uses per_round_drop as the target (bar = 0.6 * 0.02 = 0.012).
+    slow = {"type": "slow_degrade", "per_round_drop": 0.02}
+    assert attacker_succeeded(0.015, evaded, [0], cfg, slow)
+    # No goal -> absolute fallback (attacker_min_drop = 0.02) is preserved.
+    assert attacker_succeeded(0.03, evaded, [0], cfg)
+    assert not attacker_succeeded(0.01, evaded, [0], cfg)
+
+
 def test_switch_requires_sustained_win_after_min_rounds():
     cfg = _cfg(min_phase_rounds=3, success_streak=2)
     ctrl = PhaseController(cfg, first_learner="attacker")
@@ -100,6 +124,8 @@ def test_from_cfg_reads_yaml_dict():
     cfg = SwitchConfig.from_cfg({"min_phase_rounds": 5, "success_streak": 4})
     assert cfg.min_phase_rounds == 5 and cfg.success_streak == 4
     assert cfg.max_phase_rounds == 200   # default preserved
+    assert cfg.win_fraction == 0.6       # relative-gate default preserved
+    assert SwitchConfig.from_cfg({"win_fraction": 0.8}).win_fraction == 0.8
 
 
 def _run():

@@ -85,6 +85,7 @@ class AttackerAgent:
         benign_by_client: dict[int, dict],
         global_weights: dict,
         budget: int | None = None,
+        goal: dict | None = None,
     ) -> str:
         """Serialize the attacker's per-round observation into a user message.
 
@@ -101,6 +102,9 @@ class AttackerAgent:
                 clients' updates.
             budget: max number of clients the attacker may poison this round
                 (defaults to the whole pool).
+            goal: this round's attack goal (e.g. a per-round-sampled
+                ``target_accuracy_drop``). Defaults to the agent's fixed
+                ``self.goal`` when not given (inference / benchmark paths).
         """
         pool_ids = list(benign_by_client.keys())
         if budget is None:
@@ -108,7 +112,7 @@ class AttackerAgent:
         payload = {
             "round": round_num,
             "current_global_accuracy": round(float(global_accuracy), 4),
-            "attack_goal": self.goal,
+            "attack_goal": goal if goal is not None else self.goal,
             "controllable_client_ids": pool_ids,
             "max_poison_clients": int(budget),
             "client_update_stats": {

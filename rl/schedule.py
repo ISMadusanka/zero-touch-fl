@@ -201,7 +201,7 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
 
     drop = ctx.global_accuracy - info["post_accuracy"]
     success = committed_success(learner, drop, info["verdicts"], poisoned_ids,
-                                state["switch_cfg"])
+                                state["switch_cfg"], ctx.goal)
 
     _log_round(env, ctx, info, learner, stats, state["metrics_tracker"],
                state["save_round_log"], reward_att=k["reward_att"], reward_def=k["reward_def"],
@@ -394,13 +394,15 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     poisoned_ids = poisoned_ids if poisoned_ids is not None else info.get("poisoned_ids", [])
     reward_att = reward_att or {}
     reward_def = reward_def or {}
+    # This round's actual goal (per-round target sampling); falls back to the env default.
+    goal = ctx.goal if getattr(ctx, "goal", None) is not None else env.goal
 
     # Diversity of the committed (possibly multi-client) attack; 0 for one client.
     diversity = perturbation_diversity(
         info.get("poisoned_by_client", {}),
         {cid: env.pool_benign[cid] for cid in poisoned_ids if cid in env.pool_benign},
     )
-    a_rew = attacker_reward(ctx.global_accuracy, post_acc, env.goal,
+    a_rew = attacker_reward(ctx.global_accuracy, post_acc, goal,
                             poisoned_ids, verdicts, n_malformed,
                             alpha=reward_att.get("alpha", 1.0),
                             beta=reward_att.get("beta", 0.5),
@@ -416,7 +418,7 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(poisoned_ids))
     save_round_log(RoundLog(
         round_num=ctx.round_num,
-        attack_goal=env.goal,
+        attack_goal=goal,
         poisoned_client_ids=poisoned_ids,
         predicted_labels=[
             {"client_id": v.client_id, "is_suspicious": v.is_suspicious,

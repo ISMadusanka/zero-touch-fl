@@ -18,6 +18,24 @@ def _clip(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
+def goal_target(goal: dict) -> float:
+    """The target accuracy drop this goal asks for (>0).
+
+    Single source of truth shared by the attacker reward (which normalizes the
+    drop by it) and the schedule's relative win-gate (``rl/switch.py``) so the two
+    never disagree about what the round's target is. ``slow_degrade`` uses
+    ``per_round_drop``; ``untargeted_degrade`` (and, for now, ``targeted_label``,
+    which falls back to overall accuracy until per-class eval is wired in) uses
+    ``target_accuracy_drop``.
+    """
+    gtype = goal.get("type", "untargeted_degrade")
+    if gtype == "slow_degrade":
+        target = float(goal.get("per_round_drop", 0.02))
+    else:
+        target = float(goal.get("target_accuracy_drop", 0.20))
+    return max(target, 1e-6)
+
+
 def attacker_reward(
     prev_accuracy: float,
     post_accuracy: float,
@@ -57,14 +75,7 @@ def attacker_reward(
     = ``diversity`` in [0, 1] (only when >1 client) rewards distinct, coordinated
     per-client perturbations over identical clones — see ``perturbation_diversity``.
     """
-    gtype = goal.get("type", "untargeted_degrade")
-    if gtype == "slow_degrade":
-        target = float(goal.get("per_round_drop", 0.02))
-    else:
-        # untargeted_degrade (and, for now, targeted_label falls back to overall
-        # accuracy until per-class evaluation is wired in).
-        target = float(goal.get("target_accuracy_drop", 0.20))
-    target = max(target, 1e-6)
+    target = goal_target(goal)   # shared with the schedule's relative win-gate
 
     drop = prev_accuracy - post_accuracy
     drop_term = _clip(drop / target, -0.5, 1.5)

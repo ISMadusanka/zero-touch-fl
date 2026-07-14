@@ -30,6 +30,10 @@ def _parse_args():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rounds", type=int, default=200, help="number of attack rounds")
     ap.add_argument("--config", default="configs/base.yaml")
+    ap.add_argument("--goal", default=None,
+                    help="attack goal the attacker aims for, e.g. 'untargeted_degrade=0.1', "
+                         "'slow_degrade=0.02', or 'targeted_label=7'. Fixed for the whole run "
+                         "(no per-round sampling). Default: attack.goal from --config.")
     ap.add_argument("--defenses", default="fedavg,oracle,llm_defender,fltrust,defl,dnc,multikrum",
                     help="comma-separated; 'fedavg' is always included (attacker reference)")
     ap.add_argument("--attacker-adapter", default=None, help="override attacker checkpoint dir")
@@ -68,6 +72,27 @@ def _parse_args():
     return ap.parse_args()
 
 
+def _parse_goal(spec: str) -> dict:
+    """Parse a --goal string into an attack-goal dict.
+
+    Forms (value optional — falls back to the type's default):
+        untargeted_degrade=0.1  -> {"type": "untargeted_degrade", "target_accuracy_drop": 0.1}
+        slow_degrade=0.02       -> {"type": "slow_degrade", "per_round_drop": 0.02}
+        targeted_label=7        -> {"type": "targeted_label", "label": 7}
+    """
+    gtype, _sep, val = spec.strip().partition("=")
+    gtype, val = gtype.strip(), val.strip()
+    if gtype == "slow_degrade":
+        return {"type": gtype, "per_round_drop": float(val) if val else 0.02}
+    if gtype == "targeted_label":
+        return {"type": gtype, "label": int(val) if val else 7}
+    if gtype in ("untargeted_degrade", ""):
+        return {"type": "untargeted_degrade",
+                "target_accuracy_drop": float(val) if val else 0.20}
+    raise SystemExit(f"ERROR: unknown --goal type {gtype!r}; use "
+                     f"untargeted_degrade=<drop> | slow_degrade=<drop> | targeted_label=<label>")
+
+
 def _build_root_loader(data_cfg, root_size, batch_size, seed):
     import torch
     from torch.utils.data import DataLoader, Subset
@@ -99,9 +124,14 @@ def main():
     base_cfg = yaml.safe_load(open(args.config))
     attacker_cfg = yaml.safe_load(open("configs/attacker_agent.yaml"))
     defender_cfg = yaml.safe_load(open("configs/defender_agent.yaml"))
-    goal = base_cfg.get("attack", {}).get("goal")
+    # Attack goal: --goal overrides the config. Set it on BOTH the base config (so the
+    # env's goal/logging match) and the attacker agent (whose self.goal drives the
+    # benchmark prompt). Evaluation always uses a FIXED goal — never per-round sampling.
+    goal = _parse_goal(args.goal) if args.goal else base_cfg.get("attack", {}).get("goal")
     if goal:
+        base_cfg.setdefault("attack", {})["goal"] = goal
         attacker_cfg["attack_goal"] = goal
+    log.info(f"Attack goal (fixed for the run): {goal}")
 
     fl = base_cfg["fl"]
     rl_cfg = base_cfg.get("rl", {})
@@ -160,6 +190,9 @@ def main():
     eval_budget = max(1, min(eval_budget, env.n_compromisable))
     env.sample_budget = False
     env.budget_cap = eval_budget
+    # Evaluation uses the FIXED attack goal above (no per-round target sampling), so the
+    # attacker is measured against one requested target for the whole run.
+    env.sample_target = False
     log.info(f"Eval poison budget = {eval_budget} of pool {env.n_compromisable} "
              f"(clients {list(range(env.n_compromisable))}); attacker selects which to poison")
 
@@ -231,7 +264,7 @@ def main():
 
     out_dir = args.out or None
     print("\n" + report.render([summaries[n] for n in defenses], args.rounds,
-                                baseline_accuracy, out_dir=out_dir))
+                                baseline_accuracy, out_dir=out_dir, goal=goal))
 
     # Persist per-round history + draw the per-round graphs.
     if out_dir:

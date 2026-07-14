@@ -47,7 +47,8 @@ def run_inference(
         # Attacker SELECTS which of its controllable pool to poison (<= budget) and how.
         a_sys = attacker_agent.system_prompt()
         a_user = attacker_agent.build_user_prompt(
-            ctx.round_num, ctx.global_accuracy, ctx.pool_benign, env.global_weights, ctx.budget
+            ctx.round_num, ctx.global_accuracy, ctx.pool_benign, env.global_weights,
+            ctx.budget, goal=ctx.goal,
         )
         a_text = generator.generate(a_sys, a_user, n=1, temperature=temperature)[0]
         poisoned, chosen_ids, n_malformed = attacker_agent.select_and_apply(
@@ -68,14 +69,14 @@ def run_inference(
 
         diversity = perturbation_diversity(
             poisoned, {cid: ctx.pool_benign[cid] for cid in chosen_ids})
-        a_rew = attacker_reward(prev_acc, new_acc, env.goal, chosen_ids, verdicts, n_malformed,
+        a_rew = attacker_reward(prev_acc, new_acc, ctx.goal, chosen_ids, verdicts, n_malformed,
                                 pool_size=env.n_compromisable, diversity=diversity)
         d_rew = defender_reward(verdicts, chosen_ids)
 
         metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
         save_round_log(RoundLog(
             round_num=ctx.round_num,
-            attack_goal=env.goal,
+            attack_goal=ctx.goal,
             poisoned_client_ids=chosen_ids,
             predicted_labels=[
                 {"client_id": v.client_id, "is_suspicious": v.is_suspicious,
