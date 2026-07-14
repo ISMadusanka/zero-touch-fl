@@ -1,7 +1,7 @@
 # Federated Learning Configuration
 
 fl:
-  training_rounds: 30             # Phase 1: honest training rounds
+  training_rounds: 40             # Phase 1: honest training rounds
   simulation_rounds: 2000000         # Phase 2: adversarial RL rounds
   n_clients: 20                   # total federated clients (honest majority)
   n_compromisable: 5              # the attacker can ONLY access clients [0 .. n_compromisable-1];
