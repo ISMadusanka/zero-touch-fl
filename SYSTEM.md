@@ -166,9 +166,20 @@ Both continuous, so GRPO group advantages don't collapse.
 - `checkpoints/global_model.pt`, `client_updates.pt`, `baseline.json` — Phase 1.
 - `checkpoints/attacker_adapter/`, `checkpoints/defender_adapter/` — LoRA adapters
   (`adapter_model.safetensors` + `adapter_config.json`).
-- `checkpoints/rl_progress.json` — rounds completed.
-- Rerunning resumes: adapters + progress are reloaded; the env restarts from the
-  Phase-1 baseline and replays forward.
+- `checkpoints/rl_progress.json` — resume state:
+  `{"rounds_done", "round_index", "controller"}`. `rounds_done` is the GRPO-step
+  counter; `round_index` is the FL round-number counter (so round labels and
+  `logs/round_data/round_NNN.json` continue instead of overwriting from the first
+  Phase-2 round); `controller` is the `PhaseController` snapshot
+  (`learner`, `phase_index`, `phase_round`, `streak`, `capped`) so the arms-race
+  schedule continues where it left off. Written together with the adapters on the
+  `rl.save_every` cadence and on exit. Older files with only `rounds_done` still
+  load (the missing fields fall back: `round_index`→`rounds_done`, `controller`→a
+  fresh schedule).
+- Rerunning resumes: adapters + `rounds_done` + `round_index` + `controller` are all
+  reloaded. The env still re-derives its weights from the Phase-1 baseline (the model
+  state lives in the adapters), but the round counter and schedule pick up in place.
+  **Not** persisted: the in-memory opponent **league** (snapshots restart empty).
 
 ## Logs
 

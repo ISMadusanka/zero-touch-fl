@@ -79,8 +79,15 @@ def train(
     rng,
     progress_cb=None,
     start_round: int = 0,
+    resume: dict | None = None,
 ):
-    """Run the alternating GRPO training loop over ``simulation_rounds`` rounds."""
+    """Run the alternating GRPO training loop over ``simulation_rounds`` rounds.
+
+    ``resume`` is the dict from ``storage.load_progress`` — ``rounds_done`` (also
+    passed as ``start_round``), plus, for a full resume, the saved FL ``round_index``
+    (so round numbering/logs continue) and ``controller`` snapshot (so the arms-race
+    schedule continues instead of restarting at the first attacker phase).
+    """
     rl = cfg.get("rl", {})
     G = int(rl.get("G", 4))
     kl_beta = float(rl.get("kl_beta", 0.02))
@@ -135,8 +142,17 @@ def train(
         adapter_paths=adapter_paths, progress_cb=progress_cb, total_rounds=total_rounds,
         save_every=save_every, snap_every=snap_every, league_prob=league_prob,
         max_new_tokens=max_new_tokens, rng=rng, curriculum_on_cap=curriculum_on_cap,
-        fl_interlude=fl_interlude,
+        fl_interlude=fl_interlude, controller=None,
     )
+
+    # Resume the FL round-number counter so round labels + logs/round_data advance
+    # across restarts instead of overwriting from the first Phase-2 round. Prefer the
+    # saved round_index; fall back to start_round for old progress files that only
+    # stored rounds_done. (env.reset() zeroed round_index just before this.)
+    if resume and resume.get("round_index") is not None:
+        env.round_index = int(resume["round_index"])
+    elif start_round:
+        env.round_index = int(start_round)
 
     if switch_mode == "best_response":
         logger.info(
@@ -144,12 +160,12 @@ def train(
             f"(first_learner={first_learner}, streak={switch_cfg.success_streak}, "
             f"min/max phase={switch_cfg.min_phase_rounds}/{switch_cfg.max_phase_rounds})"
         )
-        done = _train_best_response(state, first_learner, start_round)
+        done = _train_best_response(state, first_learner, start_round, resume=resume)
     else:
         logger.info(f"Schedule=fixed: K_a={K_a}, K_d={K_d}")
         done = _train_fixed(state, K_a, K_d, start_round)
 
-    _checkpoint(policy, adapter_paths, progress_cb, done)   # final save
+    _checkpoint(state, done)   # final save
     logger.info(f"Training complete — {done} rounds. Adapters saved to {adapter_paths}")
 
 
@@ -217,7 +233,7 @@ def _post_round_bookkeeping(state, done):
     # Checkpoint adapters + progress TOGETHER so a resume is always consistent
     # (the saved round count never points past the saved adapter weights).
     if state["save_every"] and done % state["save_every"] == 0:
-        _checkpoint(state["policy"], state["adapter_paths"], state["progress_cb"], done)
+        _checkpoint(state, done)
 
 
 def _opponent_generator(state, opp, face_snapshot):
@@ -295,9 +311,16 @@ def _run_fl_interlude(state, next_learner, phase_index):
     )
 
 
-def _train_best_response(state, first_learner, start_round):
+def _train_best_response(state, first_learner, start_round, resume=None):
     """Success-gated iterated best response. Returns the final round count."""
     ctrl = PhaseController(state["switch_cfg"], first_learner=first_learner)
+    if resume and resume.get("controller"):
+        ctrl.load_state_dict(resume["controller"])
+        logger.info(
+            f"Resumed schedule state: learner={ctrl.learner} phase={ctrl.phase_index} "
+            f"phase_round={ctrl.phase_round} streak={ctrl.streak} capped={ctrl.capped}"
+        )
+    state["controller"] = ctrl   # exposed so _checkpoint can persist it
     rng = state["rng"]
     done = start_round
 
@@ -373,11 +396,14 @@ def _train_fixed(state, K_a, K_d, start_round):
     return done
 
 
-def _checkpoint(policy, adapter_paths, progress_cb, done):
-    """Atomically-ish save: adapters first, then advance the progress counter."""
-    _save_adapters(policy, adapter_paths)
-    if progress_cb:
-        progress_cb(done)
+def _checkpoint(state, done):
+    """Atomically-ish save: adapters first, then the resume state (round count, FL
+    round index, and the PhaseController snapshot) so a resume is always consistent."""
+    _save_adapters(state["policy"], state["adapter_paths"])
+    if state["progress_cb"]:
+        ctrl = state.get("controller")
+        state["progress_cb"](done, state["env"].round_index,
+                             ctrl.state_dict() if ctrl is not None else None)
 
 
 def _save_adapters(policy, adapter_paths: dict):

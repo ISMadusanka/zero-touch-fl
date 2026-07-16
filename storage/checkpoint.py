@@ -47,20 +47,44 @@ def state_exists() -> bool:
 _PROGRESS_FILE = "rl_progress.json"
 
 
-def save_progress(rounds_done: int):
-    """Persist how many Phase-2 rounds have been trained (resume support)."""
+def save_progress(rounds_done: int, round_index: int | None = None,
+                  controller: dict | None = None):
+    """Persist Phase-2 resume state.
+
+    Backward compatible: ``rounds_done`` is always written. For a FULL resume we also
+    persist ``round_index`` (the FL round-number counter, so round labels and
+    ``logs/round_data`` continue across restarts instead of overwriting from the first
+    Phase-2 round) and ``controller`` (the arms-race ``PhaseController`` snapshot, so
+    the learner/phase/streak resume instead of restarting at the first attacker phase).
+    """
     _ensure_dir()
+    payload = {"rounds_done": int(rounds_done)}
+    if round_index is not None:
+        payload["round_index"] = int(round_index)
+    if controller is not None:
+        payload["controller"] = controller
     with open(os.path.join(CHECKPOINT_DIR, _PROGRESS_FILE), "w") as f:
-        json.dump({"rounds_done": int(rounds_done)}, f)
+        json.dump(payload, f)
 
 
-def load_progress() -> int:
-    """Return rounds already trained (0 if none)."""
+def load_progress() -> dict:
+    """Return the Phase-2 resume state as a dict:
+    ``{"rounds_done": int, "round_index": int|None, "controller": dict|None}``.
+
+    Old progress files that only hold ``rounds_done`` load fine (the new keys come
+    back ``None`` → the caller falls back gracefully); a missing or corrupt file
+    yields a fresh-start dict (``rounds_done=0``).
+    """
     try:
         with open(os.path.join(CHECKPOINT_DIR, _PROGRESS_FILE)) as f:
-            return int(json.load(f)["rounds_done"])
-    except (FileNotFoundError, KeyError, ValueError):
-        return 0
+            data = json.load(f)
+        return {
+            "rounds_done": int(data.get("rounds_done", 0)),
+            "round_index": data.get("round_index"),
+            "controller": data.get("controller"),
+        }
+    except (FileNotFoundError, ValueError, TypeError):
+        return {"rounds_done": 0, "round_index": None, "controller": None}
 
 
 def adapter_exists(path: str) -> bool:

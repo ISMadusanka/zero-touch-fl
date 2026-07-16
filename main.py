@@ -224,16 +224,17 @@ def run_phase2(
         for name, path in adapter_paths.items():
             if adapter_exists(path):
                 policy.load_adapter(name, path)
-        start_round = load_progress()
+        progress = load_progress()
+        start_round = progress["rounds_done"]
         if start_round:
             logger.info(f"Resuming Phase-2 training from round {start_round}")
 
-        def progress_cb(done):
-            save_progress(done)
+        def progress_cb(done, round_index=None, controller=None):
+            save_progress(done, round_index=round_index, controller=controller)
 
         train(env, policy, attacker_agent, defender_agent, config,
               metrics_tracker, _save_round_log, rng,
-              progress_cb=progress_cb, start_round=start_round)
+              progress_cb=progress_cb, start_round=start_round, resume=progress)
 
     logger.info("\n" + "=" * 60)
     logger.info("PHASE 2 COMPLETE")

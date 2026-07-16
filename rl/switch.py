@@ -128,6 +128,27 @@ class PhaseController:
         self.streak = 0
         self.capped = False   # did the most recently *completed* phase hit the cap?
 
+    def state_dict(self) -> dict:
+        """Serializable snapshot of the schedule state, for resume."""
+        return {
+            "learner": self.learner,
+            "phase_index": self.phase_index,
+            "phase_round": self.phase_round,
+            "streak": self.streak,
+            "capped": self.capped,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore a snapshot from :meth:`state_dict` (missing keys keep current)."""
+        learner = state.get("learner", self.learner)
+        if learner not in ("attacker", "defender"):
+            raise ValueError(f"controller learner must be attacker|defender, got {learner!r}")
+        self.learner = learner
+        self.phase_index = int(state.get("phase_index", self.phase_index))
+        self.phase_round = int(state.get("phase_round", self.phase_round))
+        self.streak = int(state.get("streak", self.streak))
+        self.capped = bool(state.get("capped", self.capped))
+
     @property
     def opponent(self) -> str:
         return "defender" if self.learner == "attacker" else "attacker"

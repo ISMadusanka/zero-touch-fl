@@ -63,7 +63,13 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   reward, KL penalty to the frozen base) on top of Unsloth + PEFT — no TRL
   trainer dependency required.
 - **Resume**: rerun the same command. Existing adapters and
-  `checkpoints/rl_progress.json` are reloaded and training continues.
+  `checkpoints/rl_progress.json` are reloaded and training continues where it left
+  off — not just the trained adapters and the round count (`rounds_done`), but also
+  the FL round number (`round_index`, so round labels and `logs/round_data` keep
+  advancing instead of overwriting from the first Phase-2 round) and the arms-race
+  schedule (`controller`: which agent is learning, phase index, win streak). The
+  in-memory opponent league is the one piece not persisted (it restarts empty). Old
+  progress files that only hold `rounds_done` still load (the rest falls back safely).
 - **Switching the base model invalidates old adapters.** A LoRA adapter is
   dimensioned for the exact base it was trained on, so adapters from a previous
   base (e.g. an earlier Llama run) **cannot** load onto `Qwen2.5-1.5B-Instruct`.

@@ -81,6 +81,34 @@ def test_attacker_relative_win_gate():
     assert not attacker_succeeded(0.01, evaded, [0], cfg)
 
 
+def test_controller_state_roundtrip():
+    """state_dict/load_state_dict preserve the schedule state (resume support)."""
+    cfg = _cfg()
+    ctrl = PhaseController(cfg, first_learner="attacker")
+    ctrl.record(True)                 # phase_round=1, streak=1
+    ctrl.next_phase("cap")            # -> defender, phase_index=1, capped=True, streak=0
+    ctrl.record(True)                 # phase_round=1, streak=1
+    snap = ctrl.state_dict()
+    assert snap == {"learner": "defender", "phase_index": 1, "phase_round": 1,
+                    "streak": 1, "capped": True}
+    # Restore into a fresh (default-attacker) controller — it becomes an exact copy.
+    restored = PhaseController(cfg, first_learner="attacker")
+    restored.load_state_dict(snap)
+    assert restored.state_dict() == snap
+    assert restored.learner == "defender" and restored.opponent == "attacker"
+    # And it continues consistently from the restored streak.
+    restored.record(True)
+    assert restored.streak == 2
+    # Missing keys keep current values; a bad learner is rejected.
+    restored.load_state_dict({"streak": 5})
+    assert restored.streak == 5 and restored.learner == "defender"
+    try:
+        restored.load_state_dict({"learner": "bogus"})
+        assert False, "should reject an invalid learner"
+    except ValueError:
+        pass
+
+
 def test_switch_requires_sustained_win_after_min_rounds():
     cfg = _cfg(min_phase_rounds=3, success_streak=2)
     ctrl = PhaseController(cfg, first_learner="attacker")
