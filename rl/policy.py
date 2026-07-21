@@ -21,6 +21,7 @@ reference log-prob under the base model.
 
 import logging
 import os
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,11 @@ class LLMPolicy:
         adapters: tuple[str, ...] = ("attacker", "defender"),
         attn_implementation: str = "eager",
         use_fast_generate: bool = True,
+        use_vllm: bool = False,
+        vllm_gpu_memory_utilization: float = 0.30,
+        vllm_enforce_eager: bool = True,
+        vllm_dtype: str = "bfloat16",
+        vllm_adapter_dir: str | None = None,
     ):
         # Heavy imports kept local so importing this module is cheap.
         import torch
@@ -123,6 +129,48 @@ class LLMPolicy:
         self.set_adapter(self.adapters[0])
         logger.info(f"LLMPolicy ready — adapters={self.adapters}, device={self.device}")
 
+        # Optional vLLM generation backend (rollouts + scoring). Only generation is
+        # offloaded; the log-prob / KL-reference passes stay on this HF model. Built
+        # last so a failure here leaves a fully-working HF-only policy. See
+        # rl/vllm_backend.py for the online LoRA weight-sync contract.
+        self.vllm = None
+        self._use_vllm = False
+        if use_vllm:
+            try:
+                from rl.vllm_backend import VLLMGenerator
+                adapter_dir = vllm_adapter_dir or os.path.join(
+                    tempfile.gettempdir(), "ztfl_vllm_lora"
+                )
+                self.vllm = VLLMGenerator(
+                    base_model=base_model,
+                    adapters=self.adapters,
+                    adapter_dir=adapter_dir,
+                    max_seq_len=max_seq_len,
+                    lora_rank=lora_r,
+                    dtype=vllm_dtype,
+                    gpu_memory_utilization=vllm_gpu_memory_utilization,
+                    enforce_eager=vllm_enforce_eager,
+                    seed=seed,
+                )
+                self._use_vllm = True
+                if load_in_4bit:
+                    logger.warning(
+                        "use_vllm + load_in_4bit: the HF trainer runs a 4-bit base "
+                        "while vLLM samples from a bf16 base, so generation and the "
+                        "log-prob pass see slightly different base weights. Prefer "
+                        "rl.load_in_4bit: false when rl.use_vllm: true."
+                    )
+                logger.info("Generation backend: vLLM (rollouts + scoring offloaded).")
+            except Exception as e:
+                logger.error(
+                    f"vLLM backend requested but failed to initialize "
+                    f"({type(e).__name__}: {e}). Falling back to transformers "
+                    f"generation for the whole run.",
+                    exc_info=True,
+                )
+                self.vllm = None
+                self._use_vllm = False
+
     # ------------------------------------------------------------------
     # Adapter management
     # ------------------------------------------------------------------
@@ -130,6 +178,14 @@ class LLMPolicy:
         if name != self._active:
             self.model.set_adapter(name)
             self._active = name
+
+    def mark_adapter_dirty(self, name: str):
+        """Signal that ``name``'s weights changed so the vLLM backend re-syncs its
+        copy before the next generation. No-op when vLLM is not in use — callers
+        (grpo_step after optimizer.step) can invoke it unconditionally."""
+        vllm = getattr(self, "vllm", None)
+        if vllm is not None:
+            vllm.mark_dirty(name)
 
     def adapter_parameters(self, name: str):
         """Trainable LoRA parameters belonging to one adapter (for an optimizer)."""
@@ -151,19 +207,31 @@ class LLMPolicy:
         from peft import set_peft_model_state_dict
         on_device = {k: v.to(self.device) for k, v in state.items()}
         set_peft_model_state_dict(self.model, on_device, adapter_name=name)
+        # Weights changed (league snapshot swap / restore, or a resume load) → the
+        # vLLM copy is now stale.
+        self.mark_adapter_dirty(name)
 
-    def save_adapter(self, name: str, path: str):
+    def save_adapter(self, name: str, path: str, quiet: bool = False):
         """Save one adapter to ``path`` with a flat, version-stable layout.
 
         Writes ``adapter_model.safetensors`` + ``adapter_config.json`` directly
         in ``path`` (no per-adapter subfolder), so ``load_adapter`` and
-        ``storage.checkpoint.adapter_exists`` agree on where files live.
+        ``storage.checkpoint.adapter_exists`` agree on where files live. This is
+        also exactly the PEFT layout vLLM's LoRA loader consumes.
+
+        ``quiet`` downgrades the log line to DEBUG — used by the vLLM weight-sync,
+        which writes the adapter to a temp dir on (potentially) every round.
         """
         from safetensors.torch import save_file
         os.makedirs(path, exist_ok=True)
         save_file(self.get_adapter_state(name), os.path.join(path, "adapter_model.safetensors"))
         self.model.peft_config[name].save_pretrained(path)
-        logger.info(f"Saved adapter '{name}' -> {path}")
+        (logger.debug if quiet else logger.info)(f"Saved adapter '{name}' -> {path}")
+
+    def _save_adapter_for_vllm(self, name: str, path: str):
+        """Dump ``name``'s current LoRA to ``path`` for the vLLM backend to reload
+        (quiet — this runs whenever the adapter is re-synced)."""
+        self.save_adapter(name, path, quiet=True)
 
     def load_adapter(self, name: str, path: str):
         """Load saved LoRA weights INTO the already-created ``name`` adapter.
@@ -261,6 +329,25 @@ class LLMPolicy:
         prompt_ids = self._prompt_ids(system, user)
         plen = prompt_ids.shape[1]
         do_sample = bool(temperature and temperature > 0)
+
+        # vLLM generation backend (optional). We feed the SAME token ids the HF path
+        # builds, so tokenization is identical; vLLM re-syncs the adapter's LoRA
+        # weights from the HF model first (see rl/vllm_backend.py). If any vLLM call
+        # raises, drop to transformers generation for the rest of the run — the HF
+        # path is the correctness reference, so this never changes results, only
+        # speed (mirrors the fast->manual fallback below).
+        if self._use_vllm:
+            try:
+                return self.vllm.generate(
+                    adapter, prompt_ids[0].tolist(), self._save_adapter_for_vllm,
+                    n=n, temperature=temperature, max_new_tokens=max_new_tokens,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"vLLM generate failed ({type(e).__name__}: {e}); falling back "
+                    "to transformers generation for the rest of the run."
+                )
+                self._use_vllm = False
 
         # Prefer KV-cached generation (much faster). With Unsloth's fused fast
         # wrapper disabled (see __init__), this uses standard Transformers

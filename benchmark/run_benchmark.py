@@ -216,6 +216,14 @@ def main():
         seed=seed,
         attn_implementation=rl_cfg.get("attn_implementation", "eager"),
         use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
+        # vLLM-served generation (same knobs as training). Eval never updates the
+        # adapters, so each is synced into vLLM once (right after load_adapter marks
+        # it dirty) and then reused for the whole benchmark.
+        use_vllm=bool(rl_cfg.get("use_vllm", False)),
+        vllm_gpu_memory_utilization=float(rl_cfg.get("vllm_gpu_memory_utilization", 0.30)),
+        vllm_enforce_eager=bool(rl_cfg.get("vllm_enforce_eager", True)),
+        vllm_dtype=rl_cfg.get("vllm_dtype", "bfloat16"),
+        vllm_adapter_dir=rl_cfg.get("vllm_adapter_dir"),
     )
     if not adapter_exists(adapter_paths["attacker"]):
         sys.exit(f"ERROR: no trained attacker adapter at {adapter_paths['attacker']}")

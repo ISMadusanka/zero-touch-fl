@@ -89,6 +89,22 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   client selection + per-client plans, and the defender emits one verdict per
   client (20 clients). `rl.max_new_tokens` defaults to 1024 to fit the defender's
   full verdict list without truncation.
+- **Faster rollouts via vLLM (`rl.use_vllm: true`)**: autoregressive generation —
+  the learner's `G` rollouts *and* the frozen opponent's per-rollout scoring passes
+  — is the dominant per-round cost. With `use_vllm: true` an in-process vLLM engine
+  (paged KV cache) serves every `generate()` call; only generation moves, the
+  differentiable log-prob + KL-reference passes stay on the HF model. The trained
+  LoRA is re-synced into vLLM before each rollout so it never samples stale weights.
+  vLLM and the trainer share the GPU, so vLLM only reserves
+  `rl.vllm_gpu_memory_utilization` (default 0.30). Needs vLLM installed
+  (`vllm>=0.6.2`, Linux/CUDA) and a bf16 base (`rl.load_in_4bit: false`); if it
+  can't initialize, the run transparently falls back to `transformers` generation.
+  **On by default** (`use_vllm: true`) — set it `false` to force `transformers`
+  generation (e.g. a box without vLLM, or to A/B the speedup). This applies to both
+  Phase-2 training and the **benchmark eval path** (`benchmark.run_benchmark`),
+  where the loaded adapter is synced into vLLM once and reused for the whole run.
+  `rl.attn_implementation` also defaults to `sdpa` (faster than `eager` for the
+  log-prob passes).
 
 ## Setup
 

@@ -219,6 +219,11 @@ def run_phase2(
             seed=int(fl.get("poison_seed", 0)),
             attn_implementation=rl_cfg.get("attn_implementation", "eager"),
             use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
+            use_vllm=bool(rl_cfg.get("use_vllm", False)),
+            vllm_gpu_memory_utilization=float(rl_cfg.get("vllm_gpu_memory_utilization", 0.30)),
+            vllm_enforce_eager=bool(rl_cfg.get("vllm_enforce_eager", True)),
+            vllm_dtype=rl_cfg.get("vllm_dtype", "bfloat16"),
+            vllm_adapter_dir=rl_cfg.get("vllm_adapter_dir"),
         )
         # Resume adapters if present.
         for name, path in adapter_paths.items():

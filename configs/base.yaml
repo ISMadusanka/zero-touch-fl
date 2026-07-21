@@ -52,8 +52,25 @@ llm:
 # Reinforcement learning (GRPO) settings — see README "LLM handling".
 rl:
   model: "unsloth/Qwen2.5-1.5B-Instruct"  # HF/Unsloth base for QLoRA training
-  attn_implementation: "eager"    # broadly compatible; Qwen2.5 also supports "sdpa"
+  attn_implementation: "sdpa"     # faster than "eager" for the log-prob passes; Qwen2.5 supports it
   use_fast_generate: true         # KV-cached generation (fast); auto-falls back to no-cache on failure
+
+  # --- vLLM generation backend (rollouts + scoring) ---------------------------
+  # When true, EVERY generation (the learner's G rollouts AND the frozen opponent's
+  # per-rollout scoring passes) runs through an in-process vLLM engine with a paged
+  # KV cache instead of transformers.generate — the dominant per-round cost. Only
+  # generation moves; the differentiable log-prob + KL-reference passes stay on the
+  # HF model. The trained LoRA is re-synced into vLLM before each rollout, so vLLM
+  # never samples from stale weights (see rl/vllm_backend.py). Requires vLLM
+  # installed on the GPU box; if it fails to init the run transparently falls back
+  # to transformers generation. Keep load_in_4bit=false when this is on (vLLM runs
+  # a bf16 base). Both engines share the GPU, so vLLM only takes the fraction below.
+  # Applies to Phase-2 training (rollouts + scoring) AND the benchmark eval path.
+  use_vllm: true                  # vLLM-served generation; set false to force transformers
+  vllm_gpu_memory_utilization: 0.30  # fraction of GPU vLLM reserves (rest is left for the trainer)
+  vllm_enforce_eager: true        # skip CUDA-graph capture (robust with LoRA hot-swap); set false for a bit more speed
+  vllm_dtype: "bfloat16"          # base precision for the vLLM engine (match the bf16 trainer)
+  # vllm_adapter_dir: null        # temp dir for the synced LoRA files (default: <tmp>/ztfl_vllm_lora)
   max_seq_len: 8192               # well within Qwen2.5-1.5B's 32k native context
   load_in_4bit: false             # bf16 LoRA: 1.5B fits easily on 8GB+; skips QLoRA dequant -> faster grad passes
   lora_r: 16

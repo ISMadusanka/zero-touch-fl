@@ -111,6 +111,11 @@ def grpo_step(
         if n_used > 0:
             torch.nn.utils.clip_grad_norm_(policy.adapter_parameters(adapter), grad_clip)
             optimizer.step()
+            # The learner's LoRA weights just changed → any vLLM generation copy is
+            # now stale and must be re-synced before the next rollout. No-op unless
+            # the policy runs a vLLM backend.
+            if hasattr(policy, "mark_adapter_dirty"):
+                policy.mark_adapter_dirty(adapter)
         else:
             stepped = False
 

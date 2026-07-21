@@ -23,3 +23,10 @@ transformers>=4.45
 accelerate
 bitsandbytes
 matplotlib
+
+# --- Optional: vLLM generation backend (rl.use_vllm: true) ---
+# Serves the GRPO rollouts + scoring through a paged-KV engine (the dominant
+# per-round cost) with online LoRA hot-sync. Only needed when rl.use_vllm is on;
+# training works without it (transformers generation). Install on the CUDA box.
+# Use a bf16 base (rl.load_in_4bit: false) with this. Linux/CUDA only.
+# vllm>=0.6.2
