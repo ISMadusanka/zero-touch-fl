@@ -22,7 +22,10 @@ set -euo pipefail
 ENV_DIR="${ZTFL_ENV:-$PWD/venv}"
 
 echo "[setup] Creating virtual environment at: $ENV_DIR"
-python3 -m venv "$ENV_DIR"
+# --system-site-packages reuses the shared ai_env (torch etc. already there),
+# so only the missing RL stack (unsloth/peft/bitsandbytes) gets installed —
+# no ~6GB torch re-download. Drop the flag for a fully isolated venv.
+python3 -m venv --system-site-packages "$ENV_DIR"
 # shellcheck disable=SC1091
 source "$ENV_DIR/bin/activate"
 
