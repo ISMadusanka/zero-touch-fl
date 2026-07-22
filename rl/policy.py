@@ -21,6 +21,7 @@ reference log-prob under the base model.
 
 import logging
 import os
+import sys
 import tempfile
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,65 @@ DEFAULT_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
 ]
+
+# CUDA shared libraries that downstream wheels hard-link (DT_NEEDED) but that pip
+# drops in a directory the dynamic linker doesn't search. Extend if a NEW missing
+# ".so.N" surfaces in the logs (keep the exact soname, matching torch's CUDA major).
+_PRELOAD_CUDA_SONAMES = (
+    "libnvJitLink.so.13",   # bitsandbytes 0.49.x on CUDA 13 (unsloth import chain)
+)
+
+
+def _find_pip_cuda_libs(sonames: tuple[str, ...]) -> list[str]:
+    """Full paths of pip-installed NVIDIA CUDA ``.so`` files matching ``sonames``.
+
+    pip's ``nvidia-*`` wheels install their shared objects under
+    ``<site-packages>/nvidia/<component>/lib/`` — a directory the dynamic linker
+    does not search by default, which is why a hard-linked dependency like
+    ``libnvJitLink.so.13`` fails to load even though the wheel is installed. We scan
+    that layout on every ``sys.path`` entry."""
+    import glob
+    found: list[str] = []
+    seen: set[str] = set()
+    for entry in sys.path:
+        if not entry:
+            continue
+        root = os.path.join(entry, "nvidia")
+        if root in seen or not os.path.isdir(root):
+            continue
+        seen.add(root)
+        for name in sonames:
+            found.extend(glob.glob(os.path.join(root, "**", name), recursive=True))
+    return found
+
+
+def _preload_pip_cuda_libs(sonames: tuple[str, ...] = _PRELOAD_CUDA_SONAMES) -> list[str]:
+    """``dlopen`` pip-installed CUDA libs with ``RTLD_GLOBAL`` so libraries that
+    hard-link them (e.g. bitsandbytes → ``libnvJitLink.so.13``, imported via
+    unsloth) resolve even when the wheels' ``lib`` dirs aren't on
+    ``LD_LIBRARY_PATH``.
+
+    Editing ``LD_LIBRARY_PATH`` in-process is too late (glibc reads it once at
+    startup); loading the soname into the GLOBAL symbol namespace first makes the
+    dependent load find it. Call this BEFORE importing unsloth/bitsandbytes.
+
+    Best-effort and silent: any failure just leaves the pre-existing (already
+    handled, non-fatal for bf16) import warning in place. A no-op on non-Linux and
+    when the libs are already resolvable or absent."""
+    import ctypes
+    loaded: list[str] = []
+    for path in _find_pip_cuda_libs(sonames):
+        try:
+            ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            loaded.append(path)
+        except OSError:
+            continue
+    if loaded:
+        logger.info(
+            "Preloaded CUDA libs so bitsandbytes/unsloth can load them: "
+            + ", ".join(os.path.basename(p) for p in loaded)
+        )
+    return loaded
 
 
 class LLMPolicy:
@@ -53,6 +113,11 @@ class LLMPolicy:
         vllm_dtype: str = "bfloat16",
         vllm_adapter_dir: str | None = None,
     ):
+        # Make pip-installed CUDA libs (e.g. libnvJitLink.so.13, hard-linked by
+        # bitsandbytes on CUDA 13) loadable BEFORE unsloth pulls bitsandbytes in —
+        # otherwise its native load fails with "libnvJitLink.so.13: cannot open
+        # shared object file". No-op when already resolvable or absent.
+        _preload_pip_cuda_libs()
         # Heavy imports kept local so importing this module is cheap.
         import torch
         # Disable Unsloth's fused fast-generate wrapper BEFORE importing unsloth:
