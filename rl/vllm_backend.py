@@ -68,6 +68,14 @@ class VLLMGenerator:
         # Must be set BEFORE importing vllm.
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
+        # Don't let vLLM use the FlashInfer sampler. On bleeding-edge GPUs (e.g.
+        # Blackwell sm_120) FlashInfer's JIT arch check fails during warmup
+        # ("FlashInfer requires GPUs with sm75 or higher" / "SM 12.x requires CUDA
+        # >= 12.9"), which otherwise kills engine init. vLLM's native Torch sampler
+        # is correct on any arch torch supports; we only lose a minor sampling
+        # speedup. Override with =1 to force FlashInfer where it does work.
+        os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+
         # Deferred, so the module imports on a CPU box and only a real training
         # run with use_vllm=true pays the (heavy) vLLM import cost.
         from vllm import LLM, SamplingParams
