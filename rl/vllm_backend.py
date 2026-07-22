@@ -57,6 +57,17 @@ class VLLMGenerator:
         enforce_eager: bool = True,
         seed: int = 0,
     ):
+        # Run vLLM's engine core IN-PROCESS instead of spawning a subprocess.
+        # vLLM's V1 default spawns an ``EngineCore`` child that re-imports the
+        # parent's ``__main__`` — which breaks when the trainer is launched in a way
+        # whose main module isn't a re-importable file (a ``python - <<EOF`` heredoc,
+        # a notebook, ``runpy``), and needlessly re-imports the whole heavy training
+        # main in every worker otherwise. Embedded in the training process we want a
+        # single shared CUDA context anyway, so force the in-process engine. Set via
+        # ``setdefault`` so an operator can still opt back into multiprocessing.
+        # Must be set BEFORE importing vllm.
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
         # Deferred, so the module imports on a CPU box and only a real training
         # run with use_vllm=true pays the (heavy) vLLM import cost.
         from vllm import LLM, SamplingParams
