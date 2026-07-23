@@ -24,6 +24,17 @@ from rl.rewards import group_advantages
 logger = logging.getLogger(__name__)
 
 
+def _score(turn, completions) -> list[float]:
+    """Rewards for all rollouts. Uses the turn's BATCHED scorer when it exposes
+    one (``AttackerTurn.reward_many`` runs the frozen defender for all G rollouts
+    in a single batched generation) and falls back to per-rollout ``reward``
+    otherwise (``DefenderTurn`` scores with no generation, so nothing to batch)."""
+    batch = getattr(turn, "reward_many", None)
+    if batch is not None:
+        return [float(r) for r in batch(completions)]
+    return [float(turn.reward(c)) for c in completions]
+
+
 def grpo_step(
     policy,
     adapter: str,
@@ -62,8 +73,8 @@ def grpo_step(
         adapter, system, user, n=G, temperature=temperature, max_new_tokens=max_new_tokens,
     )
 
-    # 2. Verifiable reward for each candidate.
-    rewards = [float(turn.reward(c)) for c in completions]
+    # 2. Verifiable reward for each candidate (batched opponent gen when available).
+    rewards = _score(turn, completions)
 
     # 3. Group-relative advantages.
     advantages, zero_frac = group_advantages(rewards)
@@ -79,7 +90,7 @@ def grpo_step(
             temperature=max(temperature, resample_temperature),
             max_new_tokens=max_new_tokens,
         )
-        rewards = [float(turn.reward(c)) for c in completions]
+        rewards = _score(turn, completions)
         advantages, zero_frac = group_advantages(rewards)
 
     mean_r = sum(rewards) / len(rewards) if rewards else 0.0
@@ -87,16 +98,23 @@ def grpo_step(
     # 3c. Still degenerate → do NOT step (would only pull the adapter to base).
     stepped = not (zero_frac >= 1.0 and skip_zero_advantage)
 
-    # 4. Accumulate the GRPO loss; backward per-sample to bound memory.
+    # 4. Accumulate the GRPO loss over the group, then one backward for the batch.
     total_loss = 0.0
     n_used = 0
     if stepped:
         optimizer.zero_grad()
-        for completion, adv in zip(completions, advantages):
-            lp = policy.policy_token_logprobs(adapter, system, user, completion)  # (L,) grad
+        # All G completions share this turn's prompt, so score their per-token
+        # log-probs in ONE batched forward each (policy w/ grad, reference w/o)
+        # instead of 2·G sequential forwards. The per-sample loss is unchanged
+        # (each completion normalized by its OWN length); summing the group and
+        # backprop-ing once yields the identical accumulated gradient.
+        policy_lps = policy.policy_token_logprobs_batch(adapter, system, user, completions)
+        ref_lps = policy.reference_token_logprobs_batch(system, user, completions)
+
+        losses = []
+        for lp, ref, adv in zip(policy_lps, ref_lps, advantages):
             if lp.numel() == 0:
                 continue
-            ref = policy.reference_token_logprobs(system, user, completion)       # (L,) no grad
             L = min(lp.shape[0], ref.shape[0])
             lp, ref = lp[-L:], ref[-L:]
 
@@ -104,11 +122,12 @@ def grpo_step(
             kl = (torch.exp(log_ratio) - log_ratio - 1.0).mean()
             pg = -(adv * lp.mean())
             loss_i = (pg + kl_beta * kl) / max(1, G)
-            loss_i.backward()
+            losses.append(loss_i)
             total_loss += float(loss_i.detach())
             n_used += 1
 
         if n_used > 0:
+            torch.stack(losses).sum().backward()
             torch.nn.utils.clip_grad_norm_(policy.adapter_parameters(adapter), grad_clip)
             optimizer.step()
         else:

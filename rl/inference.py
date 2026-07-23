@@ -28,6 +28,12 @@ class InferenceGenerator:
             for _ in range(n)
         ]
 
+    def generate_many(self, prompts, temperature: float = 0.7) -> list[str]:
+        """One completion per (system, user) prompt. Interface parity with
+        ``PolicyGenerator.generate_many``; the frozen LLM path has no batching, so
+        this loops (results identical to per-prompt ``generate``)."""
+        return [self.generate(s, u, n=1, temperature=temperature)[0] for (s, u) in prompts]
+
 
 def run_inference(
     env,
