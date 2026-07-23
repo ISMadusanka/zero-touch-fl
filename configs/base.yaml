@@ -54,6 +54,10 @@ rl:
   model: "unsloth/Qwen2.5-1.5B-Instruct"  # HF/Unsloth base for QLoRA training
   attn_implementation: "eager"    # broadly compatible; Qwen2.5 also supports "sdpa"
   use_fast_generate: true         # KV-cached generation (fast); auto-falls back to no-cache on failure
+  logprob_micro_batch: 2          # rows per batched log-prob forward (backward runs per chunk).
+                                  # Higher = fewer/faster forwards but more peak VRAM; the code
+                                  # auto-halves on CUDA OOM. Lower to 1 on a memory-tight/shared GPU
+                                  # (or set env GRPO_LOGPROB_MICROBATCH without a resync).
   max_seq_len: 8192               # well within Qwen2.5-1.5B's 32k native context
   load_in_4bit: false             # bf16 LoRA: 1.5B fits easily on 8GB+; skips QLoRA dequant -> faster grad passes
   lora_r: 16

@@ -219,6 +219,7 @@ def run_phase2(
             seed=int(fl.get("poison_seed", 0)),
             attn_implementation=rl_cfg.get("attn_implementation", "eager"),
             use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
+            logprob_micro_batch=int(rl_cfg.get("logprob_micro_batch", 2)),
         )
         # Resume adapters if present.
         for name, path in adapter_paths.items():

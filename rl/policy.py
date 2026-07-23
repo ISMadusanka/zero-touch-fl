@@ -46,7 +46,14 @@ class LLMPolicy:
         adapters: tuple[str, ...] = ("attacker", "defender"),
         attn_implementation: str = "eager",
         use_fast_generate: bool = True,
+        logprob_micro_batch: int = 2,
     ):
+        # Reduce allocator fragmentation BEFORE the CUDA caching allocator inits
+        # (helps the batched log-prob forwards fit on a memory-tight / shared GPU;
+        # both env names are set so torch 2.11's PYTORCH_ALLOC_CONF and the legacy
+        # PYTORCH_CUDA_ALLOC_CONF are covered).
+        os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         # Heavy imports kept local so importing this module is cheap.
         import torch
         # Disable Unsloth's fused fast-generate wrapper BEFORE importing unsloth:
@@ -120,6 +127,10 @@ class LLMPolicy:
         self._logits_kw = None   # resolved on first use: which "last-token-only" kwarg works
         self._use_system_role = None  # resolved on first use: does the chat template accept a system role?
         self._use_fast_generate = bool(use_fast_generate)  # KV-cached generate; auto-falls back on failure
+        # Rows per batched log-prob forward. Small caps peak memory (each row holds
+        # a (T, vocab) logits slice); env override tunes it per GPU without a resync.
+        self.logprob_micro_batch = max(1, int(
+            os.environ.get("GRPO_LOGPROB_MICROBATCH", logprob_micro_batch)))
         self.set_adapter(self.adapters[0])
         logger.info(f"LLMPolicy ready — adapters={self.adapters}, device={self.device}")
 
@@ -448,13 +459,27 @@ class LLMPolicy:
             if was_training:
                 self.model.train()   # restore training mode for the GRPO backward
 
+    def _logprobs_from_logits(self, logits, target_ids):
+        """Per-token log-probs of ``target_ids`` from ``logits`` that PREDICT them.
+
+        ``logits[..., t, :]`` predicts ``target_ids[..., t]``. Uses the identity
+        ``logπ = logit_target − logsumexp(logits)`` instead of materializing a full
+        ``log_softmax`` over the vocabulary — the softmax result would be a second
+        ``(…, T, V)`` float tensor (≈9 GB for G=4 long completions on a 150k vocab),
+        the exact allocation that OOMs the batched path. Mathematically identical
+        to ``log_softmax(...).gather(...)`` to float precision."""
+        logits = logits.float()
+        tgt = logits.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+        return tgt - self.torch.logsumexp(logits, dim=-1)
+
     def _completion_token_logprobs(self, system, user, completion, with_grad):
-        """Per-token log-probs of ``completion`` given the prompt.
+        """Per-token log-probs of ``completion`` given the prompt (single sequence).
 
         Returns a 1-D tensor (one entry per completion token). Differentiable
         when ``with_grad`` and an adapter is active; used both for the policy
         term (grad) and, under ``disable_adapter`` + no_grad, the KL reference.
-        """
+        Only the COMPLETION positions are projected to log-probs (the long prompt
+        prefix is sliced off before the vocab reduction) to bound memory."""
         torch = self.torch
         prompt_ids = self._prompt_ids(system, user)
         comp_ids = self._tok(
@@ -466,17 +491,20 @@ class LLMPolicy:
             return torch.zeros(0, device=self.device)
 
         full = torch.cat([prompt_ids, comp_ids], dim=1)
-        # Guard against exceeding context.
+        # Guard against exceeding context (left-truncate, keeping the completion).
         if full.shape[1] > self.max_seq_len:
             full = full[:, -self.max_seq_len:]
+        T = full.shape[1]
+        comp_len = min(int(comp_ids.shape[1]), T - 1)
         ctx = torch.enable_grad() if with_grad else torch.no_grad()
         with ctx:
-            logits = self.model(full).logits[:, :-1, :]
-            logp = torch.log_softmax(logits.float(), dim=-1)
-            targets = full[:, 1:]
-            tok_logp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)[0]
-        comp_len = comp_ids.shape[1]
-        return tok_logp[-comp_len:]
+            logits = self.model(full).logits              # (1, T, V)
+            # Completion tokens are the last comp_len positions; the logits that
+            # predict them are the comp_len positions just before each.
+            sl = logits[:, -comp_len - 1:-1, :]           # (1, comp_len, V)
+            tgt = full[:, -comp_len:]                     # (1, comp_len)
+            tok_logp = self._logprobs_from_logits(sl, tgt)[0]
+        return tok_logp
 
     def policy_token_logprobs(self, adapter, system, user, completion):
         """Differentiable per-token log-probs under ``adapter``."""
@@ -488,17 +516,18 @@ class LLMPolicy:
         with self.model.disable_adapter():
             return self._completion_token_logprobs(system, user, completion, with_grad=False).detach()
 
-    def _batch_completion_token_logprobs(self, system, user, completions, with_grad):
+    def _forward_logprobs(self, system, user, completions, with_grad):
         """Per-token log-probs for MULTIPLE completions of the SAME prompt in ONE
-        forward. Returns a list of 1-D tensors (one per completion, each its own
-        length). The completions share the turn's prompt, so they are RIGHT-padded
-        after the common prefix: with causal attention every real position attends
-        only to earlier real tokens, so each row's logits are identical to the
-        unpadded single-sequence forward — the same numbers ``_completion_token_logprobs``
-        would return per completion, just batched.
+        forward. Returns a list of 1-D tensors (one per completion, its own length).
 
-        Defers to the exact single-sequence path when the batch would exceed the
-        context window (rare), preserving that path's left-truncation semantics."""
+        The completions share the turn's prompt, so they are RIGHT-padded after the
+        common prefix: with causal attention every real position attends only to
+        earlier real tokens, so each row's logits equal the unpadded single-sequence
+        forward — the same numbers ``_completion_token_logprobs`` returns per
+        completion, just batched. Only the shared completion window ``[P-1, P-1+maxLi)``
+        is projected to log-probs (the long prompt prefix is sliced off first) to
+        keep the float upcast small. Defers to the exact single-sequence path when
+        the batch would exceed the context window (rare)."""
         torch = self.torch
         if not completions:
             return []
@@ -510,8 +539,10 @@ class LLMPolicy:
             for c in completions
         ]
         lengths = [int(t.shape[0]) for t in comp_rows]
-        Tmax = P + max(lengths, default=0)
-        if Tmax > self.max_seq_len:
+        maxLi = max(lengths, default=0)
+        if maxLi == 0:
+            return [torch.zeros(0, device=self.device) for _ in completions]
+        if P + maxLi > self.max_seq_len:
             return [
                 self._completion_token_logprobs(system, user, c, with_grad)
                 for c in completions
@@ -519,6 +550,7 @@ class LLMPolicy:
 
         pad_id = self._tok.pad_token_id
         B = len(completions)
+        Tmax = P + maxLi
         input_ids = torch.full((B, Tmax), pad_id, device=self.device, dtype=prompt_ids.dtype)
         attn = torch.zeros((B, Tmax), device=self.device, dtype=torch.long)
         prompt_row = prompt_ids[0]
@@ -531,30 +563,52 @@ class LLMPolicy:
 
         ctx = torch.enable_grad() if with_grad else torch.no_grad()
         with ctx:
-            logits = self.model(input_ids, attention_mask=attn).logits[:, :-1, :]
-            logp = torch.log_softmax(logits.float(), dim=-1)
-            targets = input_ids[:, 1:]
-            tok_logp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)   # (B, Tmax-1)
-
-        # Completion tokens are targets at full-positions [P, P+Li); their log-probs
-        # sit at tok_logp index [P-1, P-1+Li) (predict-next shift). P is shared.
+            logits = self.model(input_ids, attention_mask=attn).logits   # (B, Tmax, V)
+            # Positions [P-1, P-1+maxLi) predict the completion tokens at [P, P+maxLi).
+            sl = logits[:, P - 1:P - 1 + maxLi, :]        # (B, maxLi, V)
+            tgt = input_ids[:, P:P + maxLi]               # (B, maxLi)
+            tok_logp = self._logprobs_from_logits(sl, tgt)   # (B, maxLi)
+        # Row i's completion occupies the first Li columns of the shared window.
         return [
-            (tok_logp[i, P - 1:P - 1 + Li] if Li else torch.zeros(0, device=self.device))
+            (tok_logp[i, :Li] if Li else torch.zeros(0, device=self.device))
             for i, Li in enumerate(lengths)
         ]
 
     def policy_token_logprobs_batch(self, adapter, system, user, completions):
         """Differentiable per-token log-probs for a GROUP of completions of the
-        same prompt (one forward) under ``adapter``."""
+        same prompt in ONE forward under ``adapter``. The caller keeps the group
+        small (``logprob_micro_batch``) and back-propagates before the next group,
+        so the grad graph for at most that many rows is alive at once."""
         self.set_adapter(adapter)
-        return self._batch_completion_token_logprobs(system, user, completions, with_grad=True)
+        return self._forward_logprobs(system, user, completions, with_grad=True)
 
     def reference_token_logprobs_batch(self, system, user, completions):
         """No-grad per-token log-probs for a GROUP of completions of the same
-        prompt (one forward) under the BASE model (KL reference)."""
+        prompt under the BASE model (KL reference). Processed in
+        ``logprob_micro_batch``-sized chunks (freeing the big logits tensor between
+        chunks) and auto-halves the chunk on CUDA OOM so a memory-tight shared GPU
+        degrades gracefully instead of crashing."""
+        torch = self.torch
         with self.model.disable_adapter():
-            outs = self._batch_completion_token_logprobs(system, user, completions, with_grad=False)
-        return [o.detach() for o in outs]
+            out = [None] * len(completions)
+            i, step = 0, max(1, int(self.logprob_micro_batch))
+            while i < len(completions):
+                j = min(i + step, len(completions))
+                try:
+                    res = self._forward_logprobs(system, user, completions[i:j], with_grad=False)
+                    for k, r in enumerate(res):
+                        out[i + k] = r.detach()
+                    i = j
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except torch.cuda.OutOfMemoryError:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    if step == 1:
+                        raise
+                    step = max(1, step // 2)
+                    logger.warning(f"Reference log-prob OOM — halving micro-batch to {step}")
+        return out
 
 
 class PolicyGenerator:

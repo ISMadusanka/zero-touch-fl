@@ -102,32 +102,55 @@ def grpo_step(
     total_loss = 0.0
     n_used = 0
     if stepped:
-        optimizer.zero_grad()
-        # All G completions share this turn's prompt, so score their per-token
-        # log-probs in ONE batched forward each (policy w/ grad, reference w/o)
-        # instead of 2·G sequential forwards. The per-sample loss is unchanged
-        # (each completion normalized by its OWN length); summing the group and
-        # backprop-ing once yields the identical accumulated gradient.
-        policy_lps = policy.policy_token_logprobs_batch(adapter, system, user, completions)
+        # All G completions share this turn's prompt, so their per-token log-probs
+        # are scored in BATCHED forwards instead of 2·G sequential ones. Reference
+        # (no-grad) is done in one internally-chunked call; the policy (grad) side
+        # is chunked into ``logprob_micro_batch`` rows with a backward PER chunk, so
+        # at most that many grad graphs live at once (bounds peak GPU memory — a
+        # single all-G grad forward materialises a (G, T, vocab) tensor that OOMs a
+        # tight/shared card). Per-sample loss is unchanged (each completion is
+        # normalised by its OWN length); accumulating the chunk backwards yields the
+        # identical gradient a single summed backward would.
         ref_lps = policy.reference_token_logprobs_batch(system, user, completions)
+        micro = max(1, int(getattr(policy, "logprob_micro_batch", 1)))
+        while True:
+            optimizer.zero_grad()
+            total_loss, n_used = 0.0, 0
+            try:
+                for s in range(0, len(completions), micro):
+                    comp_chunk = completions[s:s + micro]
+                    adv_chunk = advantages[s:s + micro]
+                    ref_chunk = ref_lps[s:s + micro]
+                    lp_chunk = policy.policy_token_logprobs_batch(
+                        adapter, system, user, comp_chunk)
+                    chunk_losses = []
+                    for lp, ref, adv in zip(lp_chunk, ref_chunk, adv_chunk):
+                        if lp.numel() == 0:
+                            continue
+                        L = min(lp.shape[0], ref.shape[0])
+                        lp, ref = lp[-L:], ref[-L:]
 
-        losses = []
-        for lp, ref, adv in zip(policy_lps, ref_lps, advantages):
-            if lp.numel() == 0:
-                continue
-            L = min(lp.shape[0], ref.shape[0])
-            lp, ref = lp[-L:], ref[-L:]
-
-            log_ratio = ref - lp
-            kl = (torch.exp(log_ratio) - log_ratio - 1.0).mean()
-            pg = -(adv * lp.mean())
-            loss_i = (pg + kl_beta * kl) / max(1, G)
-            losses.append(loss_i)
-            total_loss += float(loss_i.detach())
-            n_used += 1
+                        log_ratio = ref - lp
+                        kl = (torch.exp(log_ratio) - log_ratio - 1.0).mean()
+                        pg = -(adv * lp.mean())
+                        loss_i = (pg + kl_beta * kl) / max(1, G)
+                        chunk_losses.append(loss_i)
+                        total_loss += float(loss_i.detach())
+                        n_used += 1
+                    if chunk_losses:
+                        torch.stack(chunk_losses).sum().backward()
+                break
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if micro == 1:
+                    raise
+                micro = max(1, micro // 2)
+                policy.logprob_micro_batch = micro
+                logger.warning(
+                    f"Policy log-prob OOM — halving micro-batch to {micro} and retrying step"
+                )
 
         if n_used > 0:
-            torch.stack(losses).sum().backward()
             torch.nn.utils.clip_grad_norm_(policy.adapter_parameters(adapter), grad_clip)
             optimizer.step()
         else:
