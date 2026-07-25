@@ -88,6 +88,19 @@ def test_report_table_has_all_defenses():
     assert "DEFENSE BENCHMARK" in text and "Legend" in text
 
 
+def test_report_header_shows_poisoner_count():
+    s = [DefenseMetrics("fedavg", 0.8).summary()]
+    text = report.render(s, n_rounds=10, baseline_accuracy=0.8, n_poisoners=3,
+                         goal={"type": "untargeted_degrade", "target_accuracy_drop": 0.1})
+    assert "Num of poisoners=3" in text
+    # The '=' bar under the title spans the whole (now longer) title line.
+    lines = text.splitlines()
+    title = next(ln for ln in lines if ln.startswith("DEFENSE BENCHMARK"))
+    assert set(lines[lines.index(title) + 1]) == {"="} and len(lines[lines.index(title) + 1]) == len(title)
+    # Omitted entirely when not provided (backward compatible).
+    assert "Num of poisoners" not in report.render(s, n_rounds=10, baseline_accuracy=0.8)
+
+
 def test_rolling_rate():
     from benchmark.plot import _rolling_rate
     # window=2 over tp=[1,0,1], den=[1,1,1]: r0=1/1, r1=1/2, r2=1/2

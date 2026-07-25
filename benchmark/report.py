@@ -49,11 +49,15 @@ def _goal_str(goal: dict | None) -> str:
 
 
 def render(summaries: list[dict], n_rounds: int, baseline_accuracy: float,
-           out_dir: str | None = None, goal: dict | None = None) -> str:
+           out_dir: str | None = None, goal: dict | None = None,
+           n_poisoners: int | None = None) -> str:
     goal_s = _goal_str(goal)
+    # ``n_poisoners`` = the per-round poison budget (max clients the attacker may
+    # poison each round; it chooses which/how many up to this). Shown in the header.
     title = (f"DEFENSE BENCHMARK — {n_rounds} attack rounds  "
              f"(clean baseline acc = {baseline_accuracy:.3f}"
-             f"{f'; goal = {goal_s}' if goal_s else ''})")
+             f"{f'; goal = {goal_s}' if goal_s else ''})"
+             f"{f', Num of poisoners={n_poisoners}' if n_poisoners is not None else ''}")
     bar = "=" * len(title)
     text = f"{bar}\n{title}\n{bar}\n{format_table(summaries)}\n"
     # Threshold acc at/below which the attack's degradation goal counts as met.
@@ -77,7 +81,7 @@ def render(summaries: list[dict], n_rounds: int, baseline_accuracy: float,
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "benchmark.json"), "w") as f:
             json.dump({"n_rounds": n_rounds, "baseline_accuracy": baseline_accuracy,
-                       "goal": goal, "results": summaries}, f, indent=2)
+                       "n_poisoners": n_poisoners, "goal": goal, "results": summaries}, f, indent=2)
         if summaries:
             with open(os.path.join(out_dir, "benchmark.csv"), "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=list(summaries[0].keys()))

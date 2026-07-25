@@ -268,7 +268,8 @@ def main():
 
     out_dir = args.out or None
     print("\n" + report.render([summaries[n] for n in defenses], args.rounds,
-                                baseline_accuracy, out_dir=out_dir, goal=goal))
+                                baseline_accuracy, out_dir=out_dir, goal=goal,
+                                n_poisoners=eval_budget))
 
     # Persist per-round history + draw the per-round graphs.
     if out_dir:
