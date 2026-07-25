@@ -9,7 +9,7 @@ emits an attack plan (primitive weight operators) applied to the benign weights;
 a defender LLM classifies each client benign/
 malicious from per-client per-layer statistics. Both get a verifiable per-round
 reward and are trained with GRPO (separate LoRA adapters over one frozen
-Qwen2.5-1.5B-Instruct base).
+Qwen2.5-3B-Instruct base).
 
 Modes:
   python main.py --env linux                 # full GRPO training (needs a GPU)
@@ -212,7 +212,7 @@ def run_phase2(
             "defender": "checkpoints/defender_adapter",
         })
         policy = LLMPolicy(
-            base_model=rl_cfg.get("model", "unsloth/Qwen2.5-1.5B-Instruct"),
+            base_model=rl_cfg.get("model", "unsloth/Qwen2.5-3B-Instruct"),
             max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
             lora_r=int(rl_cfg.get("lora_r", 16)),
             lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
@@ -297,7 +297,7 @@ def main():
         agent_cfg.setdefault("llm", {})
         agent_cfg["llm"]["backend"] = llm_backend
         agent_cfg["llm"].setdefault("ollama_base_url", llm_defaults.get("ollama_base_url", "http://localhost:11434"))
-        agent_cfg["llm"].setdefault("ollama_model", llm_defaults.get("ollama_model", "qwen2.5:1.5b"))
+        agent_cfg["llm"].setdefault("ollama_model", llm_defaults.get("ollama_model", "qwen2.5:3b"))
 
     # Single source of truth for the attack goal: base config -> attacker agent.
     goal = base_config.get("attack", {}).get("goal")

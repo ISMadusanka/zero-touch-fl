@@ -50,7 +50,7 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
 
 - **Training happens on a GPU machine — not through Ollama.** Ollama and the
   OpenAI API are **inference-only** and cannot fine-tune.
-- The policy is **one frozen `Qwen2.5-1.5B-Instruct` base loaded via Unsloth in
+- The policy is **one frozen `Qwen2.5-3B-Instruct` base loaded via Unsloth in
   bf16 LoRA by default** (4-bit QLoRA is available via `rl.load_in_4bit: true` —
   use it only when GPU memory is tight; on a 5090 bf16 is faster as it skips the
   per-matmul dequant), with **two LoRA adapters** over it — `attacker` and
@@ -72,9 +72,10 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   progress files that only hold `rounds_done` still load (the rest falls back safely).
 - **Switching the base model invalidates old adapters.** A LoRA adapter is
   dimensioned for the exact base it was trained on, so adapters from a previous
-  base (e.g. an earlier Llama run) **cannot** load onto `Qwen2.5-1.5B-Instruct`.
-  If `checkpoints/attacker_adapter/` or `checkpoints/defender_adapter/` exist from
-  an old base, delete them (and `checkpoints/rl_progress.json`) and retrain from
+  base (e.g. the earlier `Qwen2.5-1.5B-Instruct` run) **cannot** load onto
+  `Qwen2.5-3B-Instruct`. If `checkpoints/attacker_adapter/` or
+  `checkpoints/defender_adapter/` exist from an old base, delete them (and
+  `checkpoints/rl_progress.json` + `checkpoints/fl_state.pt`) and retrain from
   scratch. The Phase-1 MNIST checkpoint (`global_model.pt`, `client_updates.pt`,
   `baseline.json`) is model-agnostic and can stay.
 - **`gpt-4o-mini` (OpenAI) and Ollama `qwen2.5` are inference/baseline only** —
@@ -83,8 +84,8 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   the adapter into the base and export a single GGUF for Ollama (Qwen2.5 is
   supported by Ollama as `qwen2.5`; merging gives up the two-swappable-adapters
   design but is the simplest serving path).
-- **Hardware**: Qwen2.5-1.5B fits comfortably on a single GPU — ~3 GB of weights
-  in the default bf16 LoRA (or ~1–2 GB floor under 4-bit QLoRA), so your 5090
+- **Hardware**: Qwen2.5-3B fits comfortably on a single GPU — ~6 GB of weights
+  in the default bf16 LoRA (or ~2–3 GB floor under 4-bit QLoRA), so your 5090
   (31 GB) has ample headroom for either. Generation is short: the attacker emits a
   client selection + per-client plans, and the defender emits one verdict per
   client (20 clients). `rl.max_new_tokens` defaults to 1024 to fit the defender's
@@ -96,7 +97,7 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
 
 ```bash
 pip install -r requirements.txt   # installs unsloth/peft/transformers/bitsandbytes
-# Qwen2.5-1.5B-Instruct is downloaded from Hugging Face on first run (unsloth/Qwen2.5-1.5B-Instruct)
+# Qwen2.5-3B-Instruct is downloaded from Hugging Face on first run (unsloth/Qwen2.5-3B-Instruct)
 ```
 
 ### CPU machine (logic dry-run / baseline only)
@@ -104,7 +105,7 @@ pip install -r requirements.txt   # installs unsloth/peft/transformers/bitsandby
 ```bash
 pip install torch torchvision numpy pyyaml matplotlib openai requests
 # For --dry-run you also need an Ollama server with qwen2.5:
-#   ollama serve & ; ollama pull qwen2.5:1.5b
+#   ollama serve & ; ollama pull qwen2.5:3b
 ```
 
 ## Usage
@@ -158,7 +159,7 @@ python infer.py --adapter attacker --prompt "Describe a stealthy model-poisoning
 # Sample several completions (temperature > 0):
 python infer.py --adapter attacker --role --prompt '...' --n 4 --temperature 1.0
 
-# Interactive — load the 1.5B model ONCE, then keep prompting (best for exploring):
+# Interactive — load the 3B model ONCE, then keep prompting (best for exploring):
 python infer.py --adapter defender --role --interactive
 
 # Pipe a prompt from stdin / a file:

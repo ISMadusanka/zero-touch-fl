@@ -1,4 +1,4 @@
-"""LLMPolicy — one frozen Qwen2.5-1.5B-Instruct base, two trainable LoRA adapters.
+"""LLMPolicy — one frozen Qwen2.5-3B-Instruct base, two trainable LoRA adapters.
 
 This is the only module with heavy GPU dependencies (unsloth / peft /
 transformers / torch + a CUDA box). It is imported only on the training path;
@@ -6,7 +6,7 @@ the dry-run path uses ``rl/inference.py`` instead, so the rest of the package
 stays importable on a CPU machine.
 
 Design — "separate checkpoints on the same LLM":
-  * One (optionally 4-bit / QLoRA) Qwen2.5-1.5B-Instruct base, loaded once and frozen.
+  * One (optionally 4-bit / QLoRA) Qwen2.5-3B-Instruct base, loaded once and frozen.
   * Two LoRA adapters over it: ``"attacker"`` and ``"defender"``. Each is an
     independent set of low-rank deltas → two separate checkpoints
     (``adapter_model.safetensors`` + ``adapter_config.json``) sharing one base.
@@ -35,7 +35,7 @@ DEFAULT_TARGET_MODULES = [
 class LLMPolicy:
     def __init__(
         self,
-        base_model: str = "unsloth/Qwen2.5-1.5B-Instruct",
+        base_model: str = "unsloth/Qwen2.5-3B-Instruct",
         max_seq_len: int = 8192,
         lora_r: int = 16,
         lora_alpha: int = 32,

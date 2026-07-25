@@ -3,7 +3,7 @@
 llm:
   model: "gpt-4o-mini"            # OpenAI — inference/baseline only, NOT trainable
   temperature: 0.3
-  ollama_model: "qwen2.5:1.5b"    # Ollama — inference (--dry-run)
+  ollama_model: "qwen2.5:3b"      # Ollama — inference (--dry-run)
 
 # Confidence assumed when the model omits/garbles a client entry.
 default_confidence: 0.0

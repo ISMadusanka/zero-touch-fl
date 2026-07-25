@@ -127,7 +127,7 @@ Both continuous, so GRPO group advantages don't collapse.
   `mean_i[ −A_i·mean_t logπ(o_i,t) + β·mean_t KL_t ]` with the k3 KL estimator
   against the **frozen base model** (adapters disabled). Single-iteration ⇒ no
   clipping needed. Reports the zero-advantage-group fraction (stall signal).
-- **`rl/policy.py`**: one Unsloth `Qwen2.5-1.5B-Instruct` base (bf16 LoRA by
+- **`rl/policy.py`**: one Unsloth `Qwen2.5-3B-Instruct` base (bf16 LoRA by
   default; 4-bit QLoRA optional via `rl.load_in_4bit`) + two PEFT LoRA
   adapters (`attacker`, `defender`). `set_adapter` selects the active policy;
   `disable_adapter` exposes the base as the KL reference.
