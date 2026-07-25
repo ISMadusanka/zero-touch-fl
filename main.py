@@ -41,6 +41,7 @@ from agents.defender_agent import DefenderAgent
 from agents.llm_client import create_llm_client
 from storage.checkpoint import (
     save_state, load_state, state_exists, save_progress, load_progress, adapter_exists,
+    save_fl_state, load_fl_state,
 )
 from core.types import RoundLog, DetectionVerdict
 from core.debug import dbg
@@ -228,13 +229,29 @@ def run_phase2(
         start_round = progress["rounds_done"]
         if start_round:
             logger.info(f"Resuming Phase-2 training from round {start_round}")
+            # Restore the LIVE shared FL state (the evolving global model + per-client
+            # weights) so the arms race continues from where it stopped instead of
+            # rewinding to the Phase-1 baseline. env.reset() above already loaded the
+            # Phase-1 baseline; this overrides it with the saved Phase-2 state.
+            saved_fl = load_fl_state()
+            if saved_fl is not None:
+                env.restore_fl_state(saved_fl)
+            else:
+                logger.warning(
+                    "No saved Phase-2 FL state found — the shared model resumes from the "
+                    "Phase-1 baseline (older checkpoint predating fl_state.pt)."
+                )
 
         def progress_cb(done, round_index=None, controller=None):
             save_progress(done, round_index=round_index, controller=controller)
 
+        def fl_state_cb(fl_state):
+            save_fl_state(fl_state)
+
         train(env, policy, attacker_agent, defender_agent, config,
               metrics_tracker, _save_round_log, rng,
-              progress_cb=progress_cb, start_round=start_round, resume=progress)
+              progress_cb=progress_cb, fl_state_cb=fl_state_cb,
+              start_round=start_round, resume=progress)
 
     logger.info("\n" + "=" * 60)
     logger.info("PHASE 2 COMPLETE")

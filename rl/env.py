@@ -122,6 +122,40 @@ class FLArmsRaceEnv:
         )
 
     # ------------------------------------------------------------------
+    def snapshot_fl_state(self) -> dict:
+        """Serializable snapshot of the LIVE shared FL state — the evolving global
+        model, the current per-client benign weights, the running accuracy, and the
+        FL round counter — for a faithful Phase-2 resume.
+
+        Without this, a resume rewinds the shared model to the Phase-1 baseline
+        (``reset``) while the adapters + round counters continue, so all attacker
+        damage / defender recovery accumulated so far is silently erased.
+        ``baseline_accuracy`` is intentionally NOT saved here — it is the fixed
+        Phase-1 reference and is re-supplied by ``reset``.
+        """
+        return {
+            "global_weights": copy.deepcopy(self.server.get_global_weights()),
+            "client_weights": [copy.deepcopy(w) for w in self.client_weights],
+            "current_accuracy": float(self.current_accuracy),
+            "round_index": int(self.round_index),
+        }
+
+    def restore_fl_state(self, state: dict) -> None:
+        """Restore a snapshot from :meth:`snapshot_fl_state` (called on resume,
+        AFTER ``reset``, so the shared model continues from the checkpoint instead
+        of the Phase-1 baseline). ``round_index`` is restored here too, though the
+        driver also re-supplies it from the progress file."""
+        self.server.set_global_weights(copy.deepcopy(state["global_weights"]))
+        self.client_weights = [copy.deepcopy(w) for w in state["client_weights"]]
+        self.current_accuracy = float(state["current_accuracy"])
+        self.round_index = int(state.get("round_index", self.round_index))
+        logger.info(
+            f"Restored Phase-2 FL state — round_index={self.round_index}, "
+            f"current_accuracy={self.current_accuracy:.4f} "
+            f"(baseline stays {self.baseline_accuracy:.4f})"
+        )
+
+    # ------------------------------------------------------------------
     def _round_budget(self) -> int:
         """This round's poison budget: randomized in [1, cap] when sampling, else the cap."""
         if self.sample_budget:

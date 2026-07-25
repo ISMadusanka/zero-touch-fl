@@ -41,6 +41,33 @@ def state_exists() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Phase-2 SHARED FL state (the evolving global model + per-client benign
+# weights). Phase 1 saves the *initial* baseline via save_state(); this saves
+# the LIVE Phase-2 arms-race state at each checkpoint so a resume continues the
+# shared model where it left off instead of rewinding to the Phase-1 baseline
+# (the global model is a ~970-param MnistNet, so this is a few KB).
+# ---------------------------------------------------------------------------
+
+_FL_STATE_FILE = "fl_state.pt"
+
+
+def save_fl_state(fl_state: dict):
+    """Persist the live Phase-2 FL state dict (see ``FLArmsRaceEnv.snapshot_fl_state``)."""
+    _ensure_dir()
+    torch.save(fl_state, os.path.join(CHECKPOINT_DIR, _FL_STATE_FILE))
+
+
+def load_fl_state():
+    """Return the saved Phase-2 FL state dict, or ``None`` if there is none."""
+    try:
+        return torch.load(
+            os.path.join(CHECKPOINT_DIR, _FL_STATE_FILE), weights_only=False
+        )
+    except FileNotFoundError:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # RL training progress (for resuming the Phase-2 GRPO loop)
 # ---------------------------------------------------------------------------
 

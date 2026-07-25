@@ -165,6 +165,21 @@ class LLMPolicy:
         self.model.peft_config[name].save_pretrained(path)
         logger.info(f"Saved adapter '{name}' -> {path}")
 
+    def save_adapter_state_dict(self, name: str, state: dict, path: str):
+        """Save a PROVIDED adapter ``state`` (not the in-memory one) with the same
+        on-disk layout as :meth:`save_adapter`.
+
+        Used to persist the LIVE opponent weights while an older league snapshot is
+        temporarily swapped into that adapter (curriculum/league phase), so a
+        mid-phase checkpoint never overwrites the real opponent adapter with the
+        snapshot. ``name`` still selects the ``adapter_config.json`` to write."""
+        from safetensors.torch import save_file
+        os.makedirs(path, exist_ok=True)
+        cpu_state = {k: v.detach().to("cpu").clone() for k, v in state.items()}
+        save_file(cpu_state, os.path.join(path, "adapter_model.safetensors"))
+        self.model.peft_config[name].save_pretrained(path)
+        logger.info(f"Saved adapter '{name}' (live state) -> {path}")
+
     def load_adapter(self, name: str, path: str):
         """Load saved LoRA weights INTO the already-created ``name`` adapter.
 

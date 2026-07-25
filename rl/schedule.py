@@ -47,9 +47,14 @@ class League:
         self.rng = rng
         self.snapshots: dict[str, list[dict]] = {}
 
-    def snapshot(self, policy, names):
+    def snapshot(self, policy, names, states=None):
+        """Append a snapshot of each named adapter. ``states`` optionally overrides
+        the weights stored for a given name — used to snapshot a BORROWED opponent's
+        LIVE weights instead of the older snapshot temporarily swapped into it, so
+        the league doesn't accumulate stale duplicates."""
         for name in names:
-            self.snapshots.setdefault(name, []).append(policy.get_adapter_state(name))
+            st = states[name] if (states and name in states) else policy.get_adapter_state(name)
+            self.snapshots.setdefault(name, []).append(st)
         logger.info(f"League: snapshotted {list(names)} "
                     f"(sizes={ {k: len(v) for k, v in self.snapshots.items()} })")
 
@@ -78,6 +83,7 @@ def train(
     save_round_log,
     rng,
     progress_cb=None,
+    fl_state_cb=None,
     start_round: int = 0,
     resume: dict | None = None,
 ):
@@ -143,6 +149,7 @@ def train(
         save_every=save_every, snap_every=snap_every, league_prob=league_prob,
         max_new_tokens=max_new_tokens, rng=rng, curriculum_on_cap=curriculum_on_cap,
         fl_interlude=fl_interlude, controller=None,
+        fl_state_cb=fl_state_cb, borrowed_opponent=None,
     )
 
     # Resume the FL round-number counter so round labels + logs/round_data advance
@@ -229,7 +236,9 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
 def _post_round_bookkeeping(state, done):
     """League snapshots + checkpoints on the configured cadence."""
     if state["snap_every"] and done % state["snap_every"] == 0:
-        state["league"].snapshot(state["policy"], state["policy"].adapters)
+        borrowed = state.get("borrowed_opponent")
+        overrides = {borrowed[0]: borrowed[1]} if borrowed else None
+        state["league"].snapshot(state["policy"], state["policy"].adapters, states=overrides)
     # Checkpoint adapters + progress TOGETHER so a resume is always consistent
     # (the saved round count never points past the saved adapter weights).
     if state["save_every"] and done % state["save_every"] == 0:
@@ -239,19 +248,27 @@ def _post_round_bookkeeping(state, done):
 def _opponent_generator(state, opp, face_snapshot):
     """Return (opp_gen, restore_fn). If ``face_snapshot`` and a snapshot exists,
     temporarily swap the opponent adapter for a past (weaker) snapshot — used for
-    the league mix and for the curriculum after a capped phase."""
+    the league mix and for the curriculum after a capped phase.
+
+    While swapped, ``state["borrowed_opponent"] = (opp, live_weights)`` so any
+    mid-phase checkpoint / league snapshot persists the opponent's LIVE weights,
+    not the borrowed snapshot — otherwise the real opponent adapter would be
+    clobbered on disk and silently regress on resume. ``restore`` puts the live
+    weights back and clears the marker."""
     policy = state["policy"]
     live_opp = policy.get_adapter_state(opp)
     used = False
     if face_snapshot and state["league"].has(opp):
         policy.set_adapter_state(opp, state["league"].sample(opp))
         used = True
+        state["borrowed_opponent"] = (opp, live_opp)
         logger.info(f"Phase: facing a LEAGUE snapshot of {opp}")
     opp_gen = PolicyGenerator(policy, opp, state["max_new_tokens"])
 
     def restore():
         if used:
             policy.set_adapter_state(opp, live_opp)
+        state["borrowed_opponent"] = None
     return opp_gen, restore
 
 
@@ -328,9 +345,13 @@ def _train_best_response(state, first_learner, start_round, resume=None):
         learner, opp = ctrl.learner, ctrl.opponent
         # Before every phase AFTER the first, run one honest FL round so the
         # incoming learner + frozen opponent + aggregator train against a freshly
-        # advanced client state (mirrors a Phase-1 round). Skipped for the very
-        # first phase, which uses the Phase-1 checkpoint as-is.
-        if ctrl.phase_index > 0 and state.get("fl_interlude", True):
+        # advanced client state (mirrors a Phase-1 round). Gated on phase_round==0
+        # so it fires only at a TRUE phase start — NOT when resuming into the middle
+        # of a phase (which would otherwise inject a spurious benign round on every
+        # restart, bumping accuracy). The first phase (index 0) uses the Phase-1
+        # checkpoint as-is.
+        if (ctrl.phase_index > 0 and ctrl.phase_round == 0
+                and state.get("fl_interlude", True)):
             _run_fl_interlude(state, next_learner=learner, phase_index=ctrl.phase_index)
         # Curriculum: a phase that capped without a win means the opponent is too
         # strong — let this learner face an earlier snapshot of it. Otherwise mix
@@ -349,8 +370,12 @@ def _train_best_response(state, first_learner, start_round, resume=None):
                 state, learner, opp, opp_gen, ctrl.phase_index, ctrl.phase_round
             )
             done += 1
-            _post_round_bookkeeping(state, done)
+            # Record the round on the controller FIRST, then checkpoint — so the
+            # persisted controller state (phase_round/streak) and rounds_done refer
+            # to the SAME completed round. (Previously the checkpoint ran before
+            # record(), leaving the two off by one across a resume.)
             switch, reason = ctrl.record(success)
+            _post_round_bookkeeping(state, done)
             if switch:
                 break
 
@@ -368,6 +393,10 @@ def _train_best_response(state, first_learner, start_round, resume=None):
         if reason is None:   # ran out of total budget mid-phase
             break
         ctrl.next_phase(reason)
+        # Persist the just-completed switch (new learner/phase in the controller,
+        # the frozen adapters, and the shared FL state) so a crash right after a
+        # handoff resumes in the NEW phase instead of re-running the finished one.
+        _checkpoint(state, done)
 
     return done
 
@@ -397,18 +426,32 @@ def _train_fixed(state, K_a, K_d, start_round):
 
 
 def _checkpoint(state, done):
-    """Atomically-ish save: adapters first, then the resume state (round count, FL
-    round index, and the PhaseController snapshot) so a resume is always consistent."""
-    _save_adapters(state["policy"], state["adapter_paths"])
+    """Atomically-ish save: adapters + the shared FL state, then the resume state
+    (round count, FL round index, and the PhaseController snapshot) so a resume is
+    always consistent — the saved round count never points past the saved weights,
+    and the shared model continues instead of rewinding to the Phase-1 baseline."""
+    _save_adapters(state)
+    if state.get("fl_state_cb"):
+        state["fl_state_cb"](state["env"].snapshot_fl_state())
     if state["progress_cb"]:
         ctrl = state.get("controller")
         state["progress_cb"](done, state["env"].round_index,
                              ctrl.state_dict() if ctrl is not None else None)
 
 
-def _save_adapters(policy, adapter_paths: dict):
-    for name, path in adapter_paths.items():
-        policy.save_adapter(name, path)
+def _save_adapters(state):
+    """Persist every adapter. If the opponent adapter is currently BORROWED (its
+    live weights temporarily swapped for an older league snapshot during a
+    curriculum/league phase), write its LIVE weights instead of the borrowed
+    snapshot, so a mid-phase checkpoint can't overwrite the real opponent adapter
+    on disk (which would silently regress the frozen opponent on resume)."""
+    policy = state["policy"]
+    borrowed = state.get("borrowed_opponent")
+    for name, path in state["adapter_paths"].items():
+        if borrowed and borrowed[0] == name:
+            policy.save_adapter_state_dict(name, borrowed[1], path)
+        else:
+            policy.save_adapter(name, path)
 
 
 def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
