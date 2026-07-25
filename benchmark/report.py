@@ -14,13 +14,19 @@ _COLS = [
     ("mean_accuracy", "mean_acc", "{:.3f}"),
     ("mean_acc_drop", "acc_drop", "{:+.3f}"),
     ("attack_success_rate", "atk_thru", "{:.1%}"),
+    ("goal_success_rate", "atk_succ", "{:.1%}"),
 ]
+
+
+def _cell(value, fmt: str) -> str:
+    """Format one cell; ``None`` (e.g. goal-success with no goal target) -> 'n/a'."""
+    return "n/a" if value is None else fmt.format(value)
 
 
 def format_table(summaries: list[dict]) -> str:
     rows = [[h for _, h, _ in _COLS]]
     for s in summaries:
-        rows.append([fmt.format(s[key]) for key, _, fmt in _COLS])
+        rows.append([_cell(s.get(key), fmt) for key, _, fmt in _COLS])
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
 
     def line(cells):
@@ -50,12 +56,22 @@ def render(summaries: list[dict], n_rounds: int, baseline_accuracy: float,
              f"{f'; goal = {goal_s}' if goal_s else ''})")
     bar = "=" * len(title)
     text = f"{bar}\n{title}\n{bar}\n{format_table(summaries)}\n"
+    # Threshold acc at/below which the attack's degradation goal counts as met.
+    thr = None
+    if goal is not None:
+        from rl.rewards import goal_target
+        thr = baseline_accuracy - goal_target(goal)
+    atk_succ_line = (
+        f"  atk_succ  fraction of rounds the model accuracy fell to <= baseline-target"
+        f"{f' ({thr:.3f})' if thr is not None else ''} — i.e. the attack MET its degradation goal\n"
+    )
     text += (
         "\nLegend:\n"
         "  detect%   fraction of poisoned-client rounds the defense flagged (recall / TPR)\n"
         "  FPR       honest clients wrongly flagged\n"
         "  acc_drop  mean test-accuracy lost vs the clean baseline (lower is better)\n"
-        "  atk_thru  fraction of rounds a poisoned client slipped through (attack success)\n"
+        "  atk_thru  fraction of rounds a poisoned client EVADED detection (fn>0)\n"
+        + atk_succ_line
     )
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)

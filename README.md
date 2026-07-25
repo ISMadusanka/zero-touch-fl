@@ -214,6 +214,8 @@ Benchmark a trained attacker against a specific goal (fixed for the whole run):
 
 ```bash
 python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.1'
+
+python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.1' --max-poison-clients 3
 # forms: untargeted_degrade=<drop> | slow_degrade=<drop> | targeted_label=<label>
 ```
 

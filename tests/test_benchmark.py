@@ -55,6 +55,28 @@ def test_partial_detection_and_false_positives():
     assert s["attack_success_rate"] == 0.5      # 1 of 2 rounds had a miss
 
 
+def test_goal_success_rate():
+    # baseline 0.8, target drop 0.1 -> goal threshold 0.7: acc <= 0.7 == attack succeeded.
+    m = DefenseMetrics("d", baseline_accuracy=0.8, target_drop=0.1)
+    m.record(0, _verdicts(set(), [0, 1]), {0}, accuracy=0.65)   # below threshold -> goal met
+    m.record(1, _verdicts(set(), [0, 1]), {0}, accuracy=0.70)   # exactly at threshold -> met
+    m.record(2, _verdicts(set(), [0, 1]), {0}, accuracy=0.75)   # above threshold -> not met
+    s = m.summary()
+    assert abs(s["goal_success_rate"] - (2 / 3)) < 1e-9
+    assert abs(s["goal_threshold"] - 0.7) < 1e-9 and s["target_drop"] == 0.1
+    # Evasion (atk_thru) is independent: nobody was flagged, so it's 1.0 every round.
+    assert s["attack_success_rate"] == 1.0
+
+
+def test_goal_success_rate_none_without_target():
+    # No target_drop -> goal-success is n/a (None); the table must render it, not crash.
+    m = DefenseMetrics("d", baseline_accuracy=0.8)
+    m.record(0, _verdicts(set(), [0, 1]), {0}, accuracy=0.1)
+    s = m.summary()
+    assert s["goal_success_rate"] is None and s["goal_threshold"] is None
+    assert "n/a" in report.format_table([s]) and "atk_succ" in report.format_table([s])
+
+
 def test_report_table_has_all_defenses():
     summaries = [
         DefenseMetrics("fedavg", 0.8).summary(),

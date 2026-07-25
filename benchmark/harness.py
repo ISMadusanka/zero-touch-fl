@@ -26,16 +26,20 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
                   init_global, baseline_accuracy, n_rounds, *,
                   attack_temperature: float = 0.7, max_new_tokens: int = 512,
                   device: str = "cpu", attacker_adapter: str = "attacker",
-                  log_every: int = 10):
+                  log_every: int = 10, target_drop: float | None = None):
     """Run ``n_rounds`` of attacker-vs-defenses. Returns (summaries, metrics) where
-    summaries = {name: summary-dict} and metrics = {name: DefenseMetrics}."""
+    summaries = {name: summary-dict} and metrics = {name: DefenseMetrics}.
+
+    ``target_drop`` (the goal's requested accuracy drop) enables the per-defense
+    goal-success rate: the fraction of rounds that defense's accuracy fell to/below
+    ``baseline - target_drop`` (i.e. the attack met its degradation goal)."""
     if "fedavg" not in defenses:
         logger.warning("no 'fedavg' defense in the panel — the attacker's reference accuracy "
                        "will stay frozen at the clean baseline for the whole run.")
     for d in defenses.values():
         d.reset(init_global)
     eval_server = FedServer(device=device)
-    metrics = {name: DefenseMetrics(name, baseline_accuracy) for name in defenses}
+    metrics = {name: DefenseMetrics(name, baseline_accuracy, target_drop) for name in defenses}
     reference_acc = float(baseline_accuracy)   # what the attacker observes (no-defense world)
 
     for r in range(1, n_rounds + 1):

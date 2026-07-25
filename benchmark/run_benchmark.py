@@ -120,6 +120,7 @@ def main():
     from benchmark.harness import run_benchmark
     from benchmark import report
     from benchmark.phase1 import run_phase1
+    from rl.rewards import goal_target
 
     base_cfg = yaml.safe_load(open(args.config))
     attacker_cfg = yaml.safe_load(open("configs/attacker_agent.yaml"))
@@ -132,6 +133,9 @@ def main():
         base_cfg.setdefault("attack", {})["goal"] = goal
         attacker_cfg["attack_goal"] = goal
     log.info(f"Attack goal (fixed for the run): {goal}")
+    # Requested accuracy drop for the goal-success metric (attack "succeeds" a round
+    # when a defense's accuracy falls to/below baseline - target_drop).
+    target_drop = goal_target(goal) if goal else None
 
     fl = base_cfg["fl"]
     rl_cfg = base_cfg.get("rl", {})
@@ -259,7 +263,7 @@ def main():
         init_global=copy.deepcopy(global_weights), baseline_accuracy=baseline_accuracy,
         n_rounds=args.rounds, attack_temperature=args.attack_temperature,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)), device=device,
-        log_every=args.log_every,
+        log_every=args.log_every, target_drop=target_drop,
     )
 
     out_dir = args.out or None
