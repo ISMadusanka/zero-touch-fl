@@ -36,10 +36,12 @@ attack:
     type: "targeted_label"        # THE difference from base.yaml
     label: 2                      # EVAL default / fallback. Training overrides it every
                                   # round from `target_labels` below.
-    target_class_drop: 0.80       # how much of the target class's RECALL to destroy.
-                                  # Clamped per-round to that class's clean recall, so on a
-                                  # class the honest model only gets 0.62 right, "goal met"
-                                  # means driving it to ~0 rather than an impossible 0.80.
+    target_class_drop: 0.50       # how much of the target class's RECALL to destroy.
+                                  # 0.50 = "lose half the class": a class the clean model gets
+                                  # 0.86 right must fall to ~0.36. Set 0.80 to demand near-total
+                                  # destruction instead. Clamped per-round to that class's clean
+                                  # recall, so a class the honest model only gets 0.42 right is
+                                  # asked to reach ~0 rather than an impossible 0.50.
     max_collateral: 0.05          # tolerance for damage to the OTHER classes: the mean recall
                                   # they may lose before the attack stops counting as targeted.
                                   # The reward charges collateral in units of this.
