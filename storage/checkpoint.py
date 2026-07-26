@@ -6,9 +6,39 @@ import torch
 
 CHECKPOINT_DIR = "checkpoints"
 
+# Where the PHASE-2 (RL) artifacts live: the live FL state and the training
+# progress/resume file. Defaults to ``CHECKPOINT_DIR``; a separate experiment
+# (e.g. the targeted-poisoning run) points it somewhere else via
+# :func:`set_rl_dir` so its adapters, FL state and round counters never mix with
+# another experiment's.
+#
+# The PHASE-1 artifacts (global_model.pt / client_updates.pt / baseline.json)
+# deliberately stay in ``CHECKPOINT_DIR`` and are SHARED: Phase 1 is honest FedAvg
+# with no attacker in it, so it is identical for every experiment and re-running
+# it per experiment would only waste GPU time and start the runs from different
+# baselines — which would make their numbers incomparable.
+_RL_DIR: str | None = None
+
+
+def set_rl_dir(path: str | None) -> None:
+    """Redirect the Phase-2 RL artifacts to ``path`` (``None`` = the default)."""
+    global _RL_DIR
+    _RL_DIR = path or None
+    if _RL_DIR:
+        os.makedirs(_RL_DIR, exist_ok=True)
+
+
+def rl_dir() -> str:
+    """Directory currently holding the Phase-2 RL artifacts."""
+    return _RL_DIR or CHECKPOINT_DIR
+
 
 def _ensure_dir():
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+
+def _ensure_rl_dir():
+    os.makedirs(rl_dir(), exist_ok=True)
 
 
 def save_state(global_model_state: dict, client_updates: list[dict], baseline_accuracy: float):
@@ -53,15 +83,15 @@ _FL_STATE_FILE = "fl_state.pt"
 
 def save_fl_state(fl_state: dict):
     """Persist the live Phase-2 FL state dict (see ``FLArmsRaceEnv.snapshot_fl_state``)."""
-    _ensure_dir()
-    torch.save(fl_state, os.path.join(CHECKPOINT_DIR, _FL_STATE_FILE))
+    _ensure_rl_dir()
+    torch.save(fl_state, os.path.join(rl_dir(), _FL_STATE_FILE))
 
 
 def load_fl_state():
     """Return the saved Phase-2 FL state dict, or ``None`` if there is none."""
     try:
         return torch.load(
-            os.path.join(CHECKPOINT_DIR, _FL_STATE_FILE), weights_only=False
+            os.path.join(rl_dir(), _FL_STATE_FILE), weights_only=False
         )
     except FileNotFoundError:
         return None
@@ -84,13 +114,13 @@ def save_progress(rounds_done: int, round_index: int | None = None,
     Phase-2 round) and ``controller`` (the arms-race ``PhaseController`` snapshot, so
     the learner/phase/streak resume instead of restarting at the first attacker phase).
     """
-    _ensure_dir()
+    _ensure_rl_dir()
     payload = {"rounds_done": int(rounds_done)}
     if round_index is not None:
         payload["round_index"] = int(round_index)
     if controller is not None:
         payload["controller"] = controller
-    with open(os.path.join(CHECKPOINT_DIR, _PROGRESS_FILE), "w") as f:
+    with open(os.path.join(rl_dir(), _PROGRESS_FILE), "w") as f:
         json.dump(payload, f)
 
 
@@ -103,7 +133,7 @@ def load_progress() -> dict:
     yields a fresh-start dict (``rounds_done=0``).
     """
     try:
-        with open(os.path.join(CHECKPOINT_DIR, _PROGRESS_FILE)) as f:
+        with open(os.path.join(rl_dir(), _PROGRESS_FILE)) as f:
             data = json.load(f)
         return {
             "rounds_done": int(data.get("rounds_done", 0)),

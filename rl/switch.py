@@ -73,9 +73,9 @@ def _tpr_fpr(verdicts, poisoned_ids) -> tuple[float, float]:
 
 
 def attacker_succeeded(drop: float, verdicts, poisoned_ids, cfg: SwitchConfig,
-                       goal: dict | None = None) -> bool:
+                       goal: dict | None = None, terms: dict | None = None) -> bool:
     """True when the committed attack 'passed': enough poisoned clients evaded
-    detection AND the round lost enough accuracy.
+    detection AND the round did enough of the damage the goal asked for.
 
     The damage bar is RELATIVE to the round's requested target when ``goal`` is
     given — ``win_fraction * target`` (``target`` via :func:`rl.rewards.goal_target`)
@@ -83,15 +83,30 @@ def attacker_succeeded(drop: float, verdicts, poisoned_ids, cfg: SwitchConfig,
     and a 0.30-target round need proportional drops, not one absolute floor). Without
     a goal it falls back to the absolute ``attacker_min_drop``. A flagged client is
     dropped from FedAvg, so meaningful ``drop`` already implies evasion — we keep the
-    explicit evasion check for the multi-poisoner case."""
+    explicit evasion check for the multi-poisoner case.
+
+    **Targeted rounds** pass ``terms`` (:func:`rl.rewards.targeted_terms`), and then
+    ``drop`` must be the TARGET CLASS's recall drop (the caller gets both from
+    :func:`rl.rewards.goal_drop`). Two things change: the bar is a fraction of the
+    *clamped* ``effective_target`` (so a label whose clean recall is below the
+    requested drop is still winnable), and the round additionally has to keep
+    ``collateral`` within the goal's tolerance. Without that second condition an
+    indiscriminate model-wrecking round would count as a targeted "win" and the
+    schedule would freeze the attacker on exactly the behaviour we are trying to
+    train out of it."""
     if not poisoned_ids:
         return False
     flagged = {v.client_id for v in verdicts if v.is_suspicious}
     evaded = sum(1 for cid in poisoned_ids if cid not in flagged)
     evaded_frac = evaded / len(poisoned_ids)
+    if not evaded_frac >= cfg.attacker_min_evaded:
+        return False
+    if terms is not None:
+        return (drop >= cfg.win_fraction * terms["effective_target"]
+                and terms["collateral"] <= terms["max_collateral"])
     min_drop = (cfg.win_fraction * goal_target(goal) if goal is not None
                 else cfg.attacker_min_drop)
-    return evaded_frac >= cfg.attacker_min_evaded and drop >= min_drop
+    return drop >= min_drop
 
 
 def defender_succeeded(verdicts, poisoned_ids, cfg: SwitchConfig) -> bool:
@@ -111,11 +126,14 @@ def defender_succeeded(verdicts, poisoned_ids, cfg: SwitchConfig) -> bool:
 
 
 def committed_success(learner: str, drop: float, verdicts, poisoned_ids,
-                      cfg: SwitchConfig, goal: dict | None = None) -> bool:
+                      cfg: SwitchConfig, goal: dict | None = None,
+                      terms: dict | None = None) -> bool:
     """Did the learner win on this committed round? ``goal`` (this round's attack
-    goal) enables the attacker's relative win-gate; it is ignored for the defender."""
+    goal) enables the attacker's relative win-gate and ``terms``
+    (:func:`rl.rewards.targeted_terms`) its targeted variant; both are ignored for
+    the defender."""
     if learner == "attacker":
-        return attacker_succeeded(drop, verdicts, poisoned_ids, cfg, goal)
+        return attacker_succeeded(drop, verdicts, poisoned_ids, cfg, goal, terms)
     return defender_succeeded(verdicts, poisoned_ids, cfg)
 
 

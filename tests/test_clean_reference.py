@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
 
-from core.types import DetectionVerdict  # noqa: E402
+from core.types import ClassEval, DetectionVerdict  # noqa: E402
 from rl.env import FLArmsRaceEnv  # noqa: E402
 from rl.schedule import League, resolve_round_budget  # noqa: E402
 
@@ -61,12 +61,28 @@ def _use_deterministic_eval(env):
     chance no matter what the aggregate looks like — useless for asserting that a
     poisoned round scores lower than a clean one. This keeps the test about the
     env's REFERENCE BOOKKEEPING, which is what is under test, and makes it exact.
+
+    BOTH evaluation entry points are patched. The env measures per class now
+    (``evaluate_per_class`` — overall accuracy and the class breakdown come out of
+    one pass), so patching only ``evaluate`` would leave the real, chance-level
+    evaluation in the path this test actually exercises and make the assertions
+    depend on random labels.
     """
-    def evaluate(_loader):
+    def _acc():
         flat = torch.cat([v.flatten().float()
                           for v in env.server.get_global_weights().values()])
         return 1.0 / (1.0 + float(flat.norm()))
+
+    def evaluate(_loader):
+        return _acc()
+
+    def evaluate_per_class(_loader, n_classes=10):
+        acc = _acc()
+        return ClassEval(overall=acc, per_class=[acc] * n_classes,
+                         support=[1] * n_classes)
+
     env.server.evaluate = evaluate
+    env.server.evaluate_per_class = evaluate_per_class
 
 
 def test_context_exposes_the_clean_counterfactual():
@@ -113,7 +129,7 @@ def test_clean_reference_refreshes_after_a_benign_fl_round():
     env.begin_round()
     before = env.clean_reference_accuracy()
     env.run_benign_fl_round()
-    assert env._clean_ref_acc is None          # invalidated
+    assert env._clean_ref_eval is None         # invalidated
     after = env.clean_reference_accuracy()
     assert isinstance(after, float) and after == env.clean_reference_accuracy()
     assert before is not None

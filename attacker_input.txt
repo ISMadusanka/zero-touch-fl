@@ -1,0 +1,366 @@
+==============================================================================
+MESSAGE 1 of 2  --  role: "system"   (static; identical every round)
+4587 chars
+==============================================================================
+You are the adversary in a federated-learning (FL) system. Each round, clients send model updates and the server averages the accepted ones (FedAvg) into a global model. A defender inspects statistics of every update and drops the ones it judges malicious before averaging: updates that stand out from the honest majority (much larger norm, flipped signs, low cosine similarity) get caught, and several of your clients that look nearly identical get caught as colluding Sybils.
+
+You are a partial insider: you control ONLY the clients in `controllable_client_ids`; every other client is honest and out of reach.
+
+Each round choose an action with TWO parts:
+1. SELECT which controllable clients to poison, AT MOST `max_poison_clients`. Prefer the FEWEST that can work: every extra client is penalized and easier to catch. Clients hold different (non-IID) data, so which you pick matters.
+2. For each selected client, give an ordered ATTACK PLAN: operators applied to that client's benign weights. With several clients, give each a DISTINCT, coordinated role (e.g. one amplifies a layer while another shifts a different layer) so their average moves the model your way without the clients looking alike.
+
+Objective (`attack_goal`):
+- untargeted_degrade: cut global accuracy by about `target_accuracy_drop`.
+- slow_degrade: lower accuracy only slightly (`per_round_drop`) to stay stealthy.
+- targeted_label: harm class `label` while keeping overall accuracy high.
+
+`client_update_stats` gives, per controllable client, dimensionless stats of its HONEST update D = local - global (per layer and whole-model), normalized to the global model only:
+- rel_update: norm(D)/norm(global) for the layer -- how large the honest change already is; your poison adds to it, and bigger stands out more.
+- rms_delta: per-weight step size. energy_frac: share of the update in that layer.
+- sign_flip_frac: fraction of weights whose sign differs from global.
+- std_ratio, absmean_ratio: spread / typical size of D vs the global's own.
+- whole-model cos_to_global: alignment with the current model.
+Larger changes degrade accuracy more but are easier to flag -- balance the two, and keep each poisoned update close to an honest one so it is not filtered.
+
+IMPORTANT -- what your operators act on: every operator transforms the client's FULL weight vector W, NOT the small update D. The server then sees that client's update as D' = op(W) - global. Because W is close to the global model, a mild-looking multiplicative edit is a huge update: `scale` with factor f alone gives roughly rel_update ~ |f - 1|. So if the honest rel_update is about 0.2, then f=1.05 is a normal-sized update, f=1.5 is about 7x the honest size (very likely flagged), and f=2 or a full `sign_flip` is enormous. Additive operators are absolute: `add_constant`/`add_gaussian_noise` of size v change rel_update by about v * sqrt(count) / norm(global), so compare v against `rms_delta`, which is the honest per-weight step. Calibrate every operator against the honest `rel_update` shown for that client.
+
+Operators (compose several for novel attacks). Each op is
+{"op":<name>,"target":<target>, ...params}. `target` is "all", a layer name, a full
+parameter key, or a list of these -- use the exact names shown in `client_update_stats`
+(a layer groups its ".weight" and ".bias"):
+- scale {"factor":float}: multiply weights (negative flips sign, |factor|>1 amplifies).
+- sign_flip {"fraction":0..1}: negate the top-fraction largest-magnitude weights (1.0=all).
+- add_gaussian_noise {"sigma":float>=0,"seed":int}: add zero-mean noise of std sigma.
+- mask {"fraction":0..1,"mode":"largest"|"smallest"|"random","seed":int}: zero out a fraction of weights.
+- clip {"value":float>=0}: clamp weights into [-value, value].
+- add_constant {"value":float}: add a constant to every weight.
+- permute {"seed":int}: randomly shuffle weights within the target (destroys structure).
+- scale_neurons {"fraction":0..1,"factor":float}: scale the top-fraction most important output units (rows).
+- blend_random {"alpha":0..1,"seed":int}: move toward random noise: (1-alpha)*w + alpha*noise.
+- quantize {"step":float>0}: round weights to a coarse grid of size step.
+
+Respond with ONLY one JSON object -- no prose, no markdown:
+{"clients":[{"id":<controllable id>,"operations":[{"op":"<name>","target":"<target>", ...params}]}]}
+Rules:
+- Use ids only from `controllable_client_ids`, AT MOST `max_poison_clients`; prefer the fewest.
+- Each client's "operations" is its own ordered list (1-6 ops); order matters.
+- Use only the operators and params listed above.
+
+==============================================================================
+MESSAGE 2 of 2  --  role: "user"     (rebuilt every round)
+4462 chars, sent as ONE line of compact JSON (json.dumps, no spaces)
+==============================================================================
+{"round": 46, "current_global_accuracy": 0.5055, "attack_goal": {"type": "untargeted_degrade", "target_accuracy_drop": 0.3}, "controllable_client_ids": [0, 1, 2, 3, 4], "max_poison_clients": 4, "client_update_stats": {"0": {"layers": {"net.2.weight": {"shape": [16, 49], "rel_update": 0.0258, "rms_delta": 0.0024, "energy_frac": 0.3647, "sign_flip_frac": 0.0038, "std_ratio": 0.0258, "absmean_ratio": 0.0177}, "net.2.bias": {"shape": [16], "rel_update": 0.06, "rms_delta": 0.0035, "energy_frac": 0.0159, "sign_flip_frac": 0.0625, "std_ratio": 0.0599, "absmean_ratio": 0.0538}, "net.4.weight": {"shape": [10, 16], "rel_update": 0.039, "rms_delta": 0.0066, "energy_frac": 0.5622, "sign_flip_frac": 0.0063, "std_ratio": 0.039, "absmean_ratio": 0.0187}, "net.4.bias": {"shape": [10], "rel_update": 0.0543, "rms_delta": 0.0084, "energy_frac": 0.0573, "sign_flip_frac": 0.0, "std_ratio": 0.0544, "absmean_ratio": 0.0376}}, "whole": {"rel_update": 0.0326, "rms_delta": 0.0036, "sign_flip_frac": 0.0052, "std_ratio": 0.0326, "absmean_ratio": 0.0185, "cos_to_global": 0.1013}}, "1": {"layers": {"net.2.weight": {"shape": [16, 49], "rel_update": 0.0178, "rms_delta": 0.0017, "energy_frac": 0.2871, "sign_flip_frac": 0.0051, "std_ratio": 0.0178, "absmean_ratio": 0.014}, "net.2.bias": {"shape": [16], "rel_update": 0.0495, "rms_delta": 0.0029, "energy_frac": 0.0178, "sign_flip_frac": 0.0, "std_ratio": 0.0501, "absmean_ratio": 0.0512}, "net.4.weight": {"shape": [10, 16], "rel_update": 0.03, "rms_delta": 0.0051, "energy_frac": 0.5504, "sign_flip_frac": 0.0, "std_ratio": 0.0301, "absmean_ratio": 0.0162}, "net.4.bias": {"shape": [10], "rel_update": 0.0672, "rms_delta": 0.0104, "energy_frac": 0.1447, "sign_flip_frac": 0.0, "std_ratio": 0.0673, "absmean_ratio": 0.0465}}, "whole": {"rel_update": 0.0254, "rms_delta": 0.0028, "sign_flip_frac": 0.0041, "std_ratio": 0.0254, "absmean_ratio": 0.0154, "cos_to_global": -0.0168}}, "2": {"layers": {"net.2.weight": {"shape": [16, 49], "rel_update": 0.0294, "rms_delta": 0.0027, "energy_frac": 0.3869, "sign_flip_frac": 0.0051, "std_ratio": 0.0294, "absmean_ratio": 0.0218}, "net.2.bias": {"shape": [16], "rel_update": 0.0754, "rms_delta": 0.0044, "energy_frac": 0.0204, "sign_flip_frac": 0.0, "std_ratio": 0.0761, "absmean_ratio": 0.0769}, "net.4.weight": {"shape": [10, 16], "rel_update": 0.0415, "rms_delta": 0.007, "energy_frac": 0.5192, "sign_flip_frac": 0.0063, "std_ratio": 0.0415, "absmean_ratio": 0.0241}, "net.4.bias": {"shape": [10], "rel_update": 0.0682, "rms_delta": 0.0105, "energy_frac": 0.0735, "sign_flip_frac": 0.0, "std_ratio": 0.0683, "absmean_ratio": 0.0474}}, "whole": {"rel_update": 0.0361, "rms_delta": 0.0039, "sign_flip_frac": 0.0052, "std_ratio": 0.0361, "absmean_ratio": 0.0233, "cos_to_global": 0.0165}}, "3": {"layers": {"net.2.weight": {"shape": [16, 49], "rel_update": 0.0314, "rms_delta": 0.0029, "energy_frac": 0.4168, "sign_flip_frac": 0.0089, "std_ratio": 0.0314, "absmean_ratio": 0.0214}, "net.2.bias": {"shape": [16], "rel_update": 0.0827, "rms_delta": 0.0048, "energy_frac": 0.0233, "sign_flip_frac": 0.0, "std_ratio": 0.0803, "absmean_ratio": 0.0755}, "net.4.weight": {"shape": [10, 16], "rel_update": 0.0413, "rms_delta": 0.007, "energy_frac": 0.4888, "sign_flip_frac": 0.0063, "std_ratio": 0.0414, "absmean_ratio": 0.0229}, "net.4.bias": {"shape": [10], "rel_update": 0.0689, "rms_delta": 0.0106, "energy_frac": 0.0711, "sign_flip_frac": 0.0, "std_ratio": 0.069, "absmean_ratio": 0.0478}}, "whole": {"rel_update": 0.037, "rms_delta": 0.004, "sign_flip_frac": 0.0082, "std_ratio": 0.0371, "absmean_ratio": 0.0226, "cos_to_global": 0.0634}}, "4": {"layers": {"net.2.weight": {"shape": [16, 49], "rel_update": 0.0282, "rms_delta": 0.0026, "energy_frac": 0.4502, "sign_flip_frac": 0.0064, "std_ratio": 0.0282, "absmean_ratio": 0.0184}, "net.2.bias": {"shape": [16], "rel_update": 0.0807, "rms_delta": 0.0047, "energy_frac": 0.0296, "sign_flip_frac": 0.0, "std_ratio": 0.0815, "absmean_ratio": 0.072}, "net.4.weight": {"shape": [10, 16], "rel_update": 0.033, "rms_delta": 0.0056, "energy_frac": 0.4168, "sign_flip_frac": 0.0, "std_ratio": 0.0331, "absmean_ratio": 0.0169}, "net.4.bias": {"shape": [10], "rel_update": 0.0719, "rms_delta": 0.0111, "energy_frac": 0.1034, "sign_flip_frac": 0.0, "std_ratio": 0.072, "absmean_ratio": 0.0498}}, "whole": {"rel_update": 0.0321, "rms_delta": 0.0035, "sign_flip_frac": 0.0052, "std_ratio": 0.0321, "absmean_ratio": 0.0189, "cos_to_global": -0.0011}}}}
+
+==============================================================================
+the same user message, pretty-printed (NOT what is sent -- readability only)
+==============================================================================
+{
+  "round": 46,
+  "current_global_accuracy": 0.5055,
+  "attack_goal": {
+    "type": "untargeted_degrade",
+    "target_accuracy_drop": 0.3
+  },
+  "controllable_client_ids": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "max_poison_clients": 4,
+  "client_update_stats": {
+    "0": {
+      "layers": {
+        "net.2.weight": {
+          "shape": [
+            16,
+            49
+          ],
+          "rel_update": 0.0258,
+          "rms_delta": 0.0024,
+          "energy_frac": 0.3647,
+          "sign_flip_frac": 0.0038,
+          "std_ratio": 0.0258,
+          "absmean_ratio": 0.0177
+        },
+        "net.2.bias": {
+          "shape": [
+            16
+          ],
+          "rel_update": 0.06,
+          "rms_delta": 0.0035,
+          "energy_frac": 0.0159,
+          "sign_flip_frac": 0.0625,
+          "std_ratio": 0.0599,
+          "absmean_ratio": 0.0538
+        },
+        "net.4.weight": {
+          "shape": [
+            10,
+            16
+          ],
+          "rel_update": 0.039,
+          "rms_delta": 0.0066,
+          "energy_frac": 0.5622,
+          "sign_flip_frac": 0.0063,
+          "std_ratio": 0.039,
+          "absmean_ratio": 0.0187
+        },
+        "net.4.bias": {
+          "shape": [
+            10
+          ],
+          "rel_update": 0.0543,
+          "rms_delta": 0.0084,
+          "energy_frac": 0.0573,
+          "sign_flip_frac": 0.0,
+          "std_ratio": 0.0544,
+          "absmean_ratio": 0.0376
+        }
+      },
+      "whole": {
+        "rel_update": 0.0326,
+        "rms_delta": 0.0036,
+        "sign_flip_frac": 0.0052,
+        "std_ratio": 0.0326,
+        "absmean_ratio": 0.0185,
+        "cos_to_global": 0.1013
+      }
+    },
+    "1": {
+      "layers": {
+        "net.2.weight": {
+          "shape": [
+            16,
+            49
+          ],
+          "rel_update": 0.0178,
+          "rms_delta": 0.0017,
+          "energy_frac": 0.2871,
+          "sign_flip_frac": 0.0051,
+          "std_ratio": 0.0178,
+          "absmean_ratio": 0.014
+        },
+        "net.2.bias": {
+          "shape": [
+            16
+          ],
+          "rel_update": 0.0495,
+          "rms_delta": 0.0029,
+          "energy_frac": 0.0178,
+          "sign_flip_frac": 0.0,
+          "std_ratio": 0.0501,
+          "absmean_ratio": 0.0512
+        },
+        "net.4.weight": {
+          "shape": [
+            10,
+            16
+          ],
+          "rel_update": 0.03,
+          "rms_delta": 0.0051,
+          "energy_frac": 0.5504,
+          "sign_flip_frac": 0.0,
+          "std_ratio": 0.0301,
+          "absmean_ratio": 0.0162
+        },
+        "net.4.bias": {
+          "shape": [
+            10
+          ],
+          "rel_update": 0.0672,
+          "rms_delta": 0.0104,
+          "energy_frac": 0.1447,
+          "sign_flip_frac": 0.0,
+          "std_ratio": 0.0673,
+          "absmean_ratio": 0.0465
+        }
+      },
+      "whole": {
+        "rel_update": 0.0254,
+        "rms_delta": 0.0028,
+        "sign_flip_frac": 0.0041,
+        "std_ratio": 0.0254,
+        "absmean_ratio": 0.0154,
+        "cos_to_global": -0.0168
+      }
+    },
+    "2": {
+      "layers": {
+        "net.2.weight": {
+          "shape": [
+            16,
+            49
+          ],
+          "rel_update": 0.0294,
+          "rms_delta": 0.0027,
+          "energy_frac": 0.3869,
+          "sign_flip_frac": 0.0051,
+          "std_ratio": 0.0294,
+          "absmean_ratio": 0.0218
+        },
+        "net.2.bias": {
+          "shape": [
+            16
+          ],
+          "rel_update": 0.0754,
+          "rms_delta": 0.0044,
+          "energy_frac": 0.0204,
+          "sign_flip_frac": 0.0,
+          "std_ratio": 0.0761,
+          "absmean_ratio": 0.0769
+        },
+        "net.4.weight": {
+          "shape": [
+            10,
+            16
+          ],
+          "rel_update": 0.0415,
+          "rms_delta": 0.007,
+          "energy_frac": 0.5192,
+          "sign_flip_frac": 0.0063,
+          "std_ratio": 0.0415,
+          "absmean_ratio": 0.0241
+        },
+        "net.4.bias": {
+          "shape": [
+            10
+          ],
+          "rel_update": 0.0682,
+          "rms_delta": 0.0105,
+          "energy_frac": 0.0735,
+          "sign_flip_frac": 0.0,
+          "std_ratio": 0.0683,
+          "absmean_ratio": 0.0474
+        }
+      },
+      "whole": {
+        "rel_update": 0.0361,
+        "rms_delta": 0.0039,
+        "sign_flip_frac": 0.0052,
+        "std_ratio": 0.0361,
+        "absmean_ratio": 0.0233,
+        "cos_to_global": 0.0165
+      }
+    },
+    "3": {
+      "layers": {
+        "net.2.weight": {
+          "shape": [
+            16,
+            49
+          ],
+          "rel_update": 0.0314,
+          "rms_delta": 0.0029,
+          "energy_frac": 0.4168,
+          "sign_flip_frac": 0.0089,
+          "std_ratio": 0.0314,
+          "absmean_ratio": 0.0214
+        },
+        "net.2.bias": {
+          "shape": [
+            16
+          ],
+          "rel_update": 0.0827,
+          "rms_delta": 0.0048,
+          "energy_frac": 0.0233,
+          "sign_flip_frac": 0.0,
+          "std_ratio": 0.0803,
+          "absmean_ratio": 0.0755
+        },
+        "net.4.weight": {
+          "shape": [
+            10,
+            16
+          ],
+          "rel_update": 0.0413,
+          "rms_delta": 0.007,
+          "energy_frac": 0.4888,
+          "sign_flip_frac": 0.0063,
+          "std_ratio": 0.0414,
+          "absmean_ratio": 0.0229
+        },
+        "net.4.bias": {
+          "shape": [
+            10
+          ],
+          "rel_update": 0.0689,
+          "rms_delta": 0.0106,
+          "energy_frac": 0.0711,
+          "sign_flip_frac": 0.0,
+          "std_ratio": 0.069,
+          "absmean_ratio": 0.0478
+        }
+      },
+      "whole": {
+        "rel_update": 0.037,
+        "rms_delta": 0.004,
+        "sign_flip_frac": 0.0082,
+        "std_ratio": 0.0371,
+        "absmean_ratio": 0.0226,
+        "cos_to_global": 0.0634
+      }
+    },
+    "4": {
+      "layers": {
+        "net.2.weight": {
+          "shape": [
+            16,
+            49
+          ],
+          "rel_update": 0.0282,
+          "rms_delta": 0.0026,
+          "energy_frac": 0.4502,
+          "sign_flip_frac": 0.0064,
+          "std_ratio": 0.0282,
+          "absmean_ratio": 0.0184
+        },
+        "net.2.bias": {
+          "shape": [
+            16
+          ],
+          "rel_update": 0.0807,
+          "rms_delta": 0.0047,
+          "energy_frac": 0.0296,
+          "sign_flip_frac": 0.0,
+          "std_ratio": 0.0815,
+          "absmean_ratio": 0.072
+        },
+        "net.4.weight": {
+          "shape": [
+            10,
+            16
+          ],
+          "rel_update": 0.033,
+          "rms_delta": 0.0056,
+          "energy_frac": 0.4168,
+          "sign_flip_frac": 0.0,
+          "std_ratio": 0.0331,
+          "absmean_ratio": 0.0169
+        },
+        "net.4.bias": {
+          "shape": [
+            10
+          ],
+          "rel_update": 0.0719,
+          "rms_delta": 0.0111,
+          "energy_frac": 0.1034,
+          "sign_flip_frac": 0.0,
+          "std_ratio": 0.072,
+          "absmean_ratio": 0.0498
+        }
+      },
+      "whole": {
+        "rel_update": 0.0321,
+        "rms_delta": 0.0035,
+        "sign_flip_frac": 0.0052,
+        "std_ratio": 0.0321,
+        "absmean_ratio": 0.0189,
+        "cos_to_global": -0.0011
+      }
+    }
+  }
+}

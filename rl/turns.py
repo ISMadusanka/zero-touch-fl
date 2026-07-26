@@ -57,7 +57,11 @@ class AttackerTurn:
         # share it, so the within-group ordering is still purely "which plan hurt
         # more", while the absolute scale now means "how much of the goal did this
         # attack achieve" in every round, not "how much worse than last round".
-        self.reference_accuracy = env.clean_reference_accuracy()
+        # Per-class breakdown of the SAME counterfactual (one test pass, no extra
+        # cost). A ``targeted_label`` round is scored on the target class's recall
+        # drop against this reference — see ``rl.rewards.targeted_terms``.
+        self.reference_eval = env.clean_reference_eval()
+        self.reference_accuracy = self.reference_eval.overall
         self.goal = env.round_goal                        # this round's (maybe sampled) goal
 
         self.system = attacker_agent.system_prompt()
@@ -94,7 +98,8 @@ class AttackerTurn:
         dbg.scoring_rollout(attacker_text)
         updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
             attacker_text, self.scoring_opp_temp)
-        post_acc = self.env.evaluate_updates(updates, verdicts)
+        post_eval = self.env.evaluate_updates_full(updates, verdicts)
+        post_acc = post_eval.overall
         diversity = perturbation_diversity(
             poisoned, {cid: self.pool_references[cid] for cid in chosen_ids})
         r = attacker_reward(
@@ -105,8 +110,13 @@ class AttackerTurn:
             gamma=self.reward_cfg.get("gamma", 1.0),
             delta=self.reward_cfg.get("delta", 0.0),
             zeta=self.reward_cfg.get("zeta", 0.0),
+            eta=self.reward_cfg.get("eta", 1.0),
             pool_size=self.pool_size,
             diversity=diversity,
+            # Targeted goals need the per-class view on BOTH sides; for every other
+            # goal these are ignored and the reward is computed exactly as before.
+            clean_eval=self.reference_eval,
+            post_eval=post_eval,
         )
         dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed,
                             verdicts=verdicts, poisoned_ids=chosen_ids)
@@ -117,12 +127,13 @@ class AttackerTurn:
         updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
             attacker_text, self.opp_temp)
         self.env.set_committed_poison(chosen_ids)
-        new_acc = self.env.commit(updates, verdicts)
+        post_eval = self.env.commit_full(updates, verdicts)
         return {
             "updates": updates,
             "verdicts": verdicts,
             "n_malformed": n_malformed,
-            "post_accuracy": new_acc,
+            "post_accuracy": post_eval.overall,
+            "post_eval": post_eval,
             "poisoned_ids": chosen_ids,
             "poisoned_by_client": poisoned,
         }
@@ -184,12 +195,13 @@ class DefenderTurn:
     def commit(self, defender_text) -> dict:
         dbg.committing()
         verdicts = self.defender_agent.parse(defender_text, self.client_ids)
-        new_acc = self.env.commit(self.updates, verdicts)
+        post_eval = self.env.commit_full(self.updates, verdicts)
         return {
             "updates": self.updates,
             "verdicts": verdicts,
             "n_malformed": self.n_malformed,
-            "post_accuracy": new_acc,
+            "post_accuracy": post_eval.overall,
+            "post_eval": post_eval,
             "poisoned_ids": self.poisoned_ids,
             "poisoned_by_client": self.poisoned_by_client,
         }

@@ -23,7 +23,7 @@ import copy
 import logging
 
 from clients.benign_client import BenignClient
-from core.types import ModelUpdate, DetectionVerdict
+from core.types import ClassEval, ModelUpdate, DetectionVerdict
 from detector.features import compute_client_features
 from server.aggregation import FedAvgAggregator
 from server.fed_server import FedServer
@@ -40,7 +40,7 @@ class RoundContext:
     """
 
     def __init__(self, round_num, global_accuracy, pool_ids, pool_benign, budget,
-                 goal=None, clean_accuracy=None):
+                 goal=None, clean_accuracy=None, clean_eval=None):
         self.round_num = round_num
         self.global_accuracy = global_accuracy            # accuracy of the CURRENT global model
         self.pool_ids = pool_ids                          # list[int] controllable pool
@@ -52,6 +52,11 @@ class RoundContext:
         # poison. This — not ``global_accuracy`` — is what the attacker's damage
         # is measured against (see ``FLArmsRaceEnv.clean_reference_accuracy``).
         self.clean_accuracy = clean_accuracy
+        # The SAME counterfactual broken down per class (``core.types.ClassEval``).
+        # The targeted goal scores the drop in ``clean_eval.per_class[label]``
+        # against the poisoned round's recall for that label, and charges the drop
+        # in every OTHER class as collateral damage.
+        self.clean_eval = clean_eval
 
 
 class FLArmsRaceEnv:
@@ -81,6 +86,17 @@ class FLArmsRaceEnv:
         self.sample_target = bool(attack.get("sample_target_in_training", False))
         self.target_choices = [float(x) for x in attack.get(
             "target_choices", [0.05, 0.10, 0.20, 0.30])]
+        # --- Targeted (per-label) poisoning -------------------------------
+        # How many classes the task has, so every evaluation can be broken down
+        # per class (``FedServer.evaluate_per_class``).
+        self.n_classes = int(config.get("data", {}).get("n_classes", 10))
+        # The pool of labels a ``targeted_label`` goal may be aimed at. When
+        # ``sample_target_in_training`` is on we draw ONE label from this list each
+        # round, so the policy learns "attack the class named in the goal" instead
+        # of memorizing a single row of the output layer. Eval fixes the label to
+        # ``attack.goal.label`` (``sample_target`` off).
+        self.target_labels = [int(x) for x in attack.get(
+            "target_labels", list(range(self.n_classes)))]
 
         self.test_loader = test_loader
         self.rng = rng
@@ -112,7 +128,8 @@ class FLArmsRaceEnv:
         self.round_budget: int = 1
         self.round_goal: dict = dict(self.goal)           # this round's (maybe sampled) goal
         self.poisoned_ids: list[int] = []                 # attacker's committed choice
-        self._clean_ref_acc: float | None = None          # cached per-round clean counterfactual
+        self._clean_ref_eval: ClassEval | None = None     # cached per-round clean counterfactual
+        self.current_eval: ClassEval | None = None        # per-class view of the live global
 
     # ------------------------------------------------------------------
     def reset(self, global_weights, client_weights, baseline_accuracy):
@@ -120,6 +137,8 @@ class FLArmsRaceEnv:
         self.client_weights = [copy.deepcopy(w) for w in client_weights]
         self.baseline_accuracy = float(baseline_accuracy)
         self.current_accuracy = float(baseline_accuracy)
+        self.current_eval = None          # measured lazily by current_class_eval()
+        self._clean_ref_eval = None
         self.round_index = 0
         logger.info(
             f"Env reset — n_clients={self.n_clients}, n_compromisable={self.n_compromisable}, "
@@ -155,7 +174,8 @@ class FLArmsRaceEnv:
         self.client_weights = [copy.deepcopy(w) for w in state["client_weights"]]
         self.current_accuracy = float(state["current_accuracy"])
         self.round_index = int(state.get("round_index", self.round_index))
-        self._clean_ref_acc = None        # stale: the shared model just changed
+        self._clean_ref_eval = None       # stale: the shared model just changed
+        self.current_eval = None          # ditto — re-measured on demand
         logger.info(
             f"Restored Phase-2 FL state — round_index={self.round_index}, "
             f"current_accuracy={self.current_accuracy:.4f} "
@@ -170,13 +190,32 @@ class FLArmsRaceEnv:
         return self.budget_cap
 
     def _round_goal(self) -> dict:
-        """This round's attack goal. When target sampling is on (untargeted_degrade),
-        draw ``target_accuracy_drop`` from ``target_choices`` so the policy becomes
-        TARGET-AWARE and generalizes across targets; otherwise the fixed config goal.
-        The returned dict is the CLEAN goal shown to the LLM and used by the reward."""
-        if self.sample_target and self.goal.get("type") == "untargeted_degrade":
+        """This round's attack goal. When target sampling is on, randomize the part of
+        the goal the policy should GENERALIZE over, so it learns to read the goal
+        instead of memorizing one setting. The returned dict is the CLEAN goal shown
+        to the LLM and used by the reward.
+
+        * ``untargeted_degrade`` — draw ``target_accuracy_drop`` from
+          ``target_choices``; the policy becomes TARGET-AWARE.
+        * ``targeted_label`` — draw ``label`` from ``target_labels``; the policy
+          becomes LABEL-AWARE. This is what makes a run trained over labels
+          0..5 work on whichever single label evaluation asks for: the label is
+          never constant, so the only way to score is to read it off the goal and
+          attack the corresponding output unit.
+
+        Eval always fixes the goal (``sample_target`` off)."""
+        if not self.sample_target:
+            return self.goal
+        gtype = self.goal.get("type")
+        if gtype == "untargeted_degrade":
             return {"type": "untargeted_degrade",
                     "target_accuracy_drop": self.rng.choice(self.target_choices)}
+        if gtype == "targeted_label" and self.target_labels:
+            # Keep every other field of the configured goal (target_class_drop,
+            # max_collateral, ...) and swap only the label being attacked.
+            goal = dict(self.goal)
+            goal["label"] = int(self.rng.choice(self.target_labels))
+            return goal
         return self.goal
 
     def _honest_update(self, cid: int) -> ModelUpdate:
@@ -197,13 +236,18 @@ class FLArmsRaceEnv:
         self.round_budget = self._round_budget()
         self.round_goal = self._round_goal()
         self.poisoned_ids = []                            # attacker decides at commit
-        self._clean_ref_acc = None                        # recomputed lazily for this round
+        self._clean_ref_eval = None                       # recomputed lazily for this round
 
-        clean_acc = self.clean_reference_accuracy()
+        clean_eval = self.clean_reference_eval()
+        extra = ""
+        label = self.round_goal.get("label")
+        if self.round_goal.get("type") == "targeted_label" and label is not None:
+            extra = (f" clean_recall[{label}]={clean_eval.recall(int(label)):.4f}"
+                     f" others={clean_eval.others_mean(int(label)):.4f}")
         logger.info(
             f"Round {round_num}: controllable_pool={self.pool_ids} "
             f"budget={self.round_budget} goal={self.round_goal} "
-            f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_acc:.4f})"
+            f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_eval.overall:.4f}{extra})"
         )
         return RoundContext(
             round_num=round_num,
@@ -212,7 +256,8 @@ class FLArmsRaceEnv:
             pool_benign=self.pool_benign,
             budget=self.round_budget,
             goal=self.round_goal,
-            clean_accuracy=clean_acc,
+            clean_accuracy=clean_eval.overall,
+            clean_eval=clean_eval,
         )
 
     # ------------------------------------------------------------------
@@ -237,11 +282,23 @@ class FLArmsRaceEnv:
         Computed lazily and cached for the round (one extra test-set evaluation
         per round, against the G+1 the attacker's rollouts already cost).
         """
-        if self._clean_ref_acc is None:
+        return self.clean_reference_eval().overall
+
+    def clean_reference_eval(self) -> ClassEval:
+        """:meth:`clean_reference_accuracy` broken down PER CLASS.
+
+        Same single counterfactual aggregate, same single test-set pass — the
+        per-class recalls just fall out of it (see ``FedServer.evaluate_per_class``).
+        This is the reference a ``targeted_label`` round is scored against: the
+        attack must drive ``per_class[label]`` down from *this* value while leaving
+        the other classes at *these* values.
+        """
+        if self._clean_ref_eval is None:
             updates = self.build_updates({})
             clean = [DetectionVerdict(u.client_id, False, 0.0, "clean_ref") for u in updates]
-            self._clean_ref_acc = self._eval_state(self.aggregator.aggregate(updates, clean))
-        return self._clean_ref_acc
+            self._clean_ref_eval = self._eval_state_full(
+                self.aggregator.aggregate(updates, clean))
+        return self._clean_ref_eval
 
     def set_committed_poison(self, chosen_ids) -> None:
         """Record which clients the attacker actually poisoned (for logs/metrics)."""
@@ -268,30 +325,67 @@ class FLArmsRaceEnv:
     def features(self, updates: list[ModelUpdate]) -> dict[int, dict]:
         return compute_client_features(updates, self.server.get_global_weights())
 
-    def _eval_state(self, state: dict | None) -> float:
-        """Evaluate a candidate aggregated state without committing it."""
+    def _eval_state_full(self, state: dict | None) -> ClassEval:
+        """Evaluate a candidate aggregated state (per class) without committing it.
+
+        ``state is None`` means the aggregator produced nothing (every client
+        flagged), so the model is unchanged — we return the live model's own
+        evaluation rather than re-measuring it.
+        """
         if state is None:
-            return self.current_accuracy
+            return self.current_class_eval()
         backup = self.server.get_global_weights()
         self.server.set_global_weights(state)
-        acc = self.server.evaluate(self.test_loader)
+        ev = self.server.evaluate_per_class(self.test_loader, self.n_classes)
         self.server.set_global_weights(backup)
-        return acc
+        return ev
+
+    def _eval_state(self, state: dict | None) -> float:
+        """Evaluate a candidate aggregated state without committing it."""
+        return self._eval_state_full(state).overall
+
+    def current_class_eval(self) -> ClassEval:
+        """Per-class evaluation of the LIVE global model (measured once, cached).
+
+        ``commit`` refreshes this, so the only time it has to measure is right
+        after a ``reset``/``restore`` — i.e. the first round of a run.
+        """
+        if self.current_eval is None:
+            self.current_eval = self.server.evaluate_per_class(
+                self.test_loader, self.n_classes)
+            self.current_accuracy = self.current_eval.overall
+        return self.current_eval
 
     def evaluate_updates(self, updates, verdicts) -> float:
         """Post-aggregation accuracy for these updates+verdicts (no commit)."""
+        return self.evaluate_updates_full(updates, verdicts).overall
+
+    def evaluate_updates_full(self, updates, verdicts) -> ClassEval:
+        """:meth:`evaluate_updates`, broken down per class (same single test pass).
+
+        This is what scores a targeted rollout: compare its ``per_class[label]``
+        against ``clean_reference_eval().per_class[label]``.
+        """
         candidate = self.aggregator.aggregate(updates, verdicts)
-        return self._eval_state(candidate)
+        return self._eval_state_full(candidate)
 
     def commit(self, updates, verdicts) -> float:
         """Aggregate, update the global model, and advance the round."""
         candidate = self.aggregator.aggregate(updates, verdicts)
         if candidate is not None:
             self.server.set_global_weights(candidate)
-            self.current_accuracy = self.server.evaluate(self.test_loader)
+            self.current_eval = self.server.evaluate_per_class(
+                self.test_loader, self.n_classes)
+            self.current_accuracy = self.current_eval.overall
+            logger.info(f"Global model test accuracy: {self.current_accuracy:.4f}")
         else:
             logger.warning("Round commit: all clients flagged — global model unchanged")
         return self.current_accuracy
+
+    def commit_full(self, updates, verdicts) -> ClassEval:
+        """:meth:`commit`, returning the committed model's per-class evaluation."""
+        self.commit(updates, verdicts)
+        return self.current_class_eval()
 
     # ------------------------------------------------------------------
     def run_benign_fl_round(self) -> dict | None:
@@ -328,11 +422,12 @@ class FLArmsRaceEnv:
         new_global = self.aggregator.aggregate(updates, clean)
         if new_global is not None:
             self.server.set_global_weights(new_global)
-        self.current_accuracy = self.server.evaluate(self.test_loader)
+        self.current_eval = self.server.evaluate_per_class(self.test_loader, self.n_classes)
+        self.current_accuracy = self.current_eval.overall
 
         # Refresh the per-client benign references the rest of Phase 2 consumes.
         self.client_weights = [copy.deepcopy(u.weights) for u in updates]
-        self._clean_ref_acc = None        # stale: global + benign references just changed
+        self._clean_ref_eval = None       # stale: global + benign references just changed
 
         logger.info(
             f"[FL round {round_num}] benign FedAvg over {len(updates)} clients "

@@ -10,7 +10,9 @@ parse + apply, feature extraction, FedAvg, reward computation) on a CPU box.
 import logging
 
 from core.types import RoundLog
-from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
+from rl.rewards import (
+    attacker_reward, defender_reward, perturbation_diversity, targeted_terms,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,15 +67,20 @@ def run_inference(
         verdicts = defender_agent.parse(d_text, client_ids)
 
         prev_acc = ctx.global_accuracy
-        new_acc = env.commit(updates, verdicts)
+        post_eval = env.commit_full(updates, verdicts)
+        new_acc = post_eval.overall
 
         diversity = perturbation_diversity(
             poisoned, {cid: ctx.pool_benign[cid] for cid in chosen_ids})
         # Damage is scored against the round's clean counterfactual, exactly as in
-        # training (see FLArmsRaceEnv.clean_reference_accuracy).
+        # training (see FLArmsRaceEnv.clean_reference_accuracy). Passing the
+        # per-class evaluations makes a targeted_label goal score its target class
+        # here too, so --dry-run is a faithful CPU smoke test of the targeted setup.
+        terms = targeted_terms(ctx.goal, ctx.clean_eval, post_eval)
         a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal, chosen_ids,
                                 verdicts, n_malformed,
-                                pool_size=env.n_compromisable, diversity=diversity)
+                                pool_size=env.n_compromisable, diversity=diversity,
+                                clean_eval=ctx.clean_eval, post_eval=post_eval)
         d_rew = defender_reward(verdicts, chosen_ids)
 
         metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
@@ -94,11 +101,24 @@ def run_inference(
             attack_metadata={"n_malformed": n_malformed, "budget": ctx.budget,
                              "n_used": len(chosen_ids),
                              "clean_accuracy": round(float(ctx.clean_accuracy), 6),
-                             "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6)},
+                             "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6),
+                             "targeted": (None if terms is None else {
+                                 "label": terms["label"],
+                                 "clean_recall": round(terms["clean_recall"], 6),
+                                 "post_recall": round(terms["post_recall"], 6),
+                                 "target_class_drop": round(terms["target_drop"], 6),
+                                 "collateral": round(terms["collateral"], 6),
+                                 "per_class_clean": [round(v, 6) for v in ctx.clean_eval.per_class],
+                                 "per_class_post": [round(v, 6) for v in post_eval.per_class],
+                             })},
         ))
+        tgt_s = "" if terms is None else (
+            f" | TGT[{terms['label']}] {terms['clean_recall']:.3f}->{terms['post_recall']:.3f}"
+            f" collat={terms['collateral']:.3f}")
         logger.info(
             f"[dry-run] round {ctx.round_num}: poisoned={chosen_ids} budget={ctx.budget} "
             f"acc {prev_acc:.4f}->{new_acc:.4f} "
-            f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - new_acc:+.4f}) "
+            f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - new_acc:+.4f})"
+            f"{tgt_s} "
             f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} malformed={n_malformed}"
         )

@@ -56,22 +56,118 @@ def drop_term(drop: float, target: float) -> float:
     return 1.0 + _OVERSHOOT_BONUS * over / (over + _OVERSHOOT_HALF)
 
 
+# --- targeted_label defaults ------------------------------------------------
+# How much of the target class's recall the attack is asked to destroy. 0.80 is
+# effectively "wipe this class out": it is clamped to the class's CLEAN recall
+# (see ``targeted_terms``), so on a class the honest model only gets 0.62 right,
+# hitting the goal means driving it to ~0 — not achieving an impossible 0.80.
+DEFAULT_TARGET_CLASS_DROP = 0.80
+# How much mean recall the OTHER classes may lose before the attack stops being
+# "targeted". 0.05 = five points of average collateral damage.
+DEFAULT_MAX_COLLATERAL = 0.05
+# Floor on the effective per-class target, so a class that is already broken in
+# the clean model cannot make the normalizer explode.
+_MIN_CLASS_TARGET = 0.05
+# Cap on the collateral penalty in reward units. Without it, an indiscriminate
+# "destroy everything" rollout produces an unbounded negative that swamps the
+# GRPO group's reward spread and kills the gradient for every other rollout.
+_MAX_COLLATERAL_COST = 3.0
+
+
 def goal_target(goal: dict) -> float:
-    """The target accuracy drop this goal asks for (>0).
+    """The target drop this goal asks for (>0).
 
     Single source of truth shared by the attacker reward (which normalizes the
     drop by it) and the schedule's relative win-gate (``rl/switch.py``) so the two
-    never disagree about what the round's target is. ``slow_degrade`` uses
-    ``per_round_drop``; ``untargeted_degrade`` (and, for now, ``targeted_label``,
-    which falls back to overall accuracy until per-class eval is wired in) uses
-    ``target_accuracy_drop``.
+    never disagree about what the round's target is.
+
+    * ``slow_degrade``        → ``per_round_drop``   (overall accuracy)
+    * ``untargeted_degrade``  → ``target_accuracy_drop`` (overall accuracy)
+    * ``targeted_label``      → ``target_class_drop`` (recall of ONE class)
+
+    For ``targeted_label`` this is the *requested* drop; the drop actually used to
+    normalize is clamped to the class's clean recall by :func:`targeted_terms`.
     """
     gtype = goal.get("type", "untargeted_degrade")
     if gtype == "slow_degrade":
         target = float(goal.get("per_round_drop", 0.02))
+    elif gtype == "targeted_label":
+        target = float(goal.get("target_class_drop", DEFAULT_TARGET_CLASS_DROP))
     else:
         target = float(goal.get("target_accuracy_drop", 0.20))
     return max(target, 1e-6)
+
+
+def goal_label(goal: dict | None) -> int | None:
+    """The class a ``targeted_label`` goal attacks, or ``None`` for other goals."""
+    if not goal or goal.get("type") != "targeted_label":
+        return None
+    try:
+        return int(goal.get("label", 0))
+    except (TypeError, ValueError):
+        return None
+
+
+def targeted_terms(goal: dict | None, clean_eval, post_eval) -> dict | None:
+    """Decompose a targeted round into the numbers everything downstream needs.
+
+    Returns ``None`` unless this is a ``targeted_label`` goal AND both per-class
+    evaluations are available (so every non-targeted caller keeps its old
+    behaviour untouched). Otherwise a dict:
+
+    ``label``            the class under attack
+    ``clean_recall``     its recall in the round's CLEAN counterfactual
+    ``post_recall``      its recall after the attack
+    ``target_drop``      ``clean_recall - post_recall`` — what the attack achieved
+    ``effective_target`` the drop that counts as "goal met" (see below)
+    ``collateral``       mean recall LOST across the other classes (>= 0)
+    ``others_clean`` / ``others_post``  mean recall of the other classes, for logs
+
+    **effective_target** is ``min(requested, clean_recall)`` floored at
+    ``_MIN_CLASS_TARGET``. A class the honest model only gets 62% right cannot
+    lose 80 points of recall, so without the clamp that label would be unwinnable
+    and the reward would be incomparable between labels — exactly the failure mode
+    that matters when one run trains over several labels. With the clamp, "hit the
+    target" means the same thing ("this class is destroyed") for every label.
+
+    **collateral** sums only per-class LOSSES (``max(0, clean-post)``) and averages
+    over the other classes. Clipping at zero stops a class that happened to improve
+    from cancelling out one that was destroyed.
+    """
+    label = goal_label(goal)
+    if label is None or clean_eval is None or post_eval is None:
+        return None
+    clean_recall = clean_eval.recall(label)
+    post_recall = post_eval.recall(label)
+    n = min(len(clean_eval.per_class), len(post_eval.per_class))
+    losses = [max(0.0, clean_eval.per_class[c] - post_eval.per_class[c])
+              for c in range(n) if c != label]
+    collateral = sum(losses) / len(losses) if losses else 0.0
+    return {
+        "label": label,
+        "clean_recall": clean_recall,
+        "post_recall": post_recall,
+        "target_drop": clean_recall - post_recall,
+        "effective_target": max(min(goal_target(goal), clean_recall), _MIN_CLASS_TARGET),
+        "collateral": collateral,
+        "max_collateral": max(float(goal.get("max_collateral", DEFAULT_MAX_COLLATERAL)), 1e-6),
+        "others_clean": clean_eval.others_mean(label),
+        "others_post": post_eval.others_mean(label),
+    }
+
+
+def goal_drop(goal: dict | None, reference_accuracy: float, post_accuracy: float,
+              clean_eval=None, post_eval=None) -> float:
+    """The drop the GOAL is judged on — the single number the win-gate compares.
+
+    Targeted rounds are judged on the TARGET CLASS's recall drop; every other goal
+    on the overall accuracy drop. Keeping this in one place stops the reward and
+    the schedule from measuring different things.
+    """
+    terms = targeted_terms(goal, clean_eval, post_eval)
+    if terms is not None:
+        return terms["target_drop"]
+    return reference_accuracy - post_accuracy
 
 
 def attacker_reward(
@@ -87,8 +183,11 @@ def attacker_reward(
     gamma: float = 1.0,
     delta: float = 0.0,
     zeta: float = 0.0,
+    eta: float = 1.0,
     pool_size: int | None = None,
     diversity: float | None = None,
+    clean_eval=None,
+    post_eval=None,
 ) -> float:
     """Reward the attacker for degrading accuracy while staying stealthy, using
     the FEWEST clients, and (when it uses several) collaborating with them.
@@ -98,8 +197,32 @@ def attacker_reward(
            - gamma * malformed_fraction
            - delta * client_cost
            + zeta  * collab_bonus
+           - eta   * collateral_cost      (targeted_label only)
 
     ``drop = reference_accuracy - post_accuracy``.
+
+    **Targeted mode.** When the goal is ``targeted_label`` AND per-class
+    evaluations are supplied (``clean_eval`` / ``post_eval`` —
+    ``core.types.ClassEval`` from ``FLArmsRaceEnv.clean_reference_eval`` and
+    ``evaluate_updates_full``), two things change and nothing else does:
+
+    * ``drop`` becomes the TARGET CLASS's recall drop instead of the overall
+      accuracy drop, normalized by that class's clamped target
+      (:func:`targeted_terms`), and
+    * a new ``collateral_cost`` term charges the mean recall the OTHER classes
+      lost, in units of the goal's ``max_collateral`` tolerance, capped at
+      ``_MAX_COLLATERAL_COST``.
+
+    That second term is what makes the attack *targeted* rather than merely
+    destructive. Without it the cheapest way to crush class 2's recall is to crush
+    every class, which scores the same on the first term — so the policy would
+    simply rediscover the untargeted attack. With it, an indiscriminate rollout
+    pays roughly ``-eta * _MAX_COLLATERAL_COST`` while a surgical one pays almost
+    nothing, and GRPO's group-relative advantage does the rest.
+
+    When the goal is not ``targeted_label`` (or the evaluations are absent, e.g.
+    the CPU baseline harness) the terms are computed exactly as before, so the
+    untargeted experiment is bit-for-bit unchanged.
 
     ``reference_accuracy`` is the **clean counterfactual for THIS round**: the
     accuracy the aggregate would have had if nobody had poisoned it (see
@@ -131,10 +254,17 @@ def attacker_reward(
     = ``diversity`` in [0, 1] (only when >1 client) rewards distinct, coordinated
     per-client perturbations over identical clones — see ``perturbation_diversity``.
     """
-    target = goal_target(goal)   # shared with the schedule's relative win-gate
-
-    drop = reference_accuracy - post_accuracy
-    damage = drop_term(drop, target)
+    # Targeted goals score the target CLASS's recall drop and pay for collateral
+    # damage; everything else scores the overall accuracy drop and pays nothing.
+    terms = targeted_terms(goal, clean_eval, post_eval)
+    if terms is not None:
+        damage = drop_term(terms["target_drop"], terms["effective_target"])
+        collateral_cost = _clip(terms["collateral"] / terms["max_collateral"],
+                                0.0, _MAX_COLLATERAL_COST)
+    else:
+        # shared with the schedule's relative win-gate
+        damage = drop_term(reference_accuracy - post_accuracy, goal_target(goal))
+        collateral_cost = 0.0
 
     verdict_by_id = {v.client_id: v for v in verdicts}
     n_used = len(poisoned_ids)
@@ -164,7 +294,7 @@ def attacker_reward(
         collab_bonus = _clip(float(diversity), 0.0, 1.0)
 
     return (alpha * damage + beta * stealth - gamma * malformed_fraction
-            - delta * client_cost + zeta * collab_bonus)
+            - delta * client_cost + zeta * collab_bonus - eta * collateral_cost)
 
 
 def perturbation_diversity(poisoned_by_client: dict, references: dict) -> float:

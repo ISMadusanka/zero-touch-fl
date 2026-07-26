@@ -15,6 +15,12 @@ Operators (10; targets are "all", a layer group like "net.2", or a full key
 like "net.2.weight"):
   scale, sign_flip, add_gaussian_noise, mask, clip, add_constant, permute,
   scale_neurons, blend_random, quantize
+
+Every operator additionally accepts an optional ``rows`` list that restricts it to
+specific OUTPUT UNITS of the target tensor (``rows: [2]`` = row 2 only). In a
+classifier's final layer, row ``c`` is exactly class ``c``'s logit — its weight
+row and its bias element — so ``rows`` is what turns any of these operators into a
+surgical, single-class (targeted) attack instead of a whole-layer one.
 """
 
 import json
@@ -259,6 +265,68 @@ def _topk_mask(t, fraction, largest=True):
     return mask.view_as(t)
 
 
+def _coerce_rows(op, n_rows: int):
+    """Parse the optional ``rows`` param of an operator.
+
+    Returns ``None`` when the op has no ``rows`` key (apply it to the whole
+    tensor, the historical behaviour), otherwise the list of valid row indices —
+    deduplicated, order-preserving, negatives resolved from the end. An empty
+    list means ``rows`` WAS given but nothing in it addresses this tensor, so the
+    caller must skip it rather than silently fall back to the whole tensor (that
+    fallback would turn a mis-specified targeted attack into an untargeted one).
+    """
+    raw = op.get("rows", op.get("row"))
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float, str)):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[int] = []
+    for x in raw:
+        i = _coerce_int(x)
+        if i is None:
+            continue
+        if i < 0:
+            i += n_rows
+        if 0 <= i < n_rows and i not in out:
+            out.append(i)
+    return out
+
+
+def output_layer_keys(state_dict: dict, n_classes: int = 10) -> dict | None:
+    """Locate the CLASSIFIER HEAD — the layer whose rows are the class logits.
+
+    Returns ``{"layer", "weight_key", "bias_key", "n_rows"}`` or ``None`` if no
+    layer looks like a head.
+
+    There is nothing to *discover* here: a classifier's last layer is
+    ``Linear(features, n_classes)`` whose weight has shape
+    ``[n_classes, features]``, so ``logit[c] = weight[c] · h + bias[c]`` and row
+    ``c`` **is** class ``c`` by construction. We simply pick the LAST parameter
+    with ``shape[0] == n_classes`` (state_dicts preserve module order), which
+    lands on the head for the MLP here and equally for a CNN — the conv stack
+    below it is shared across classes and has no per-class rows at all.
+    """
+    weight_key = None
+    for k, v in state_dict.items():
+        if hasattr(v, "dim") and v.dim() >= 2 and v.shape[0] == n_classes:
+            weight_key = k                       # keep the last match = the head
+    if weight_key is None:                       # degenerate: a bias-only head
+        for k, v in state_dict.items():
+            if hasattr(v, "dim") and v.dim() == 1 and v.shape[0] == n_classes:
+                weight_key = k
+    if weight_key is None:
+        return None
+    layer = ".".join(weight_key.split(".")[:-1]) or weight_key
+    bias_key = f"{layer}.bias"
+    if not (bias_key in state_dict and state_dict[bias_key].dim() == 1
+            and state_dict[bias_key].shape[0] == n_classes):
+        bias_key = None
+    return {"layer": layer, "weight_key": weight_key, "bias_key": bias_key,
+            "n_rows": int(n_classes)}
+
+
 def _resolve_target(target, sd):
     # A list/tuple targets several layers at once (union of resolved keys) —
     # the LLM sometimes emits "target": ["net.2.weight", "net.4.weight"].
@@ -388,7 +456,13 @@ parameter key, or a list of these -- use the exact names shown in `client_update
 - permute {"seed":int}: randomly shuffle weights within the target (destroys structure).
 - scale_neurons {"fraction":0..1,"factor":float}: scale the top-fraction most important output units (rows).
 - blend_random {"alpha":0..1,"seed":int}: move toward random noise: (1-alpha)*w + alpha*noise.
-- quantize {"step":float>0}: round weights to a coarse grid of size step."""
+- quantize {"step":float>0}: round weights to a coarse grid of size step.
+
+ANY operator also accepts an optional "rows":[int,...] that restricts it to those
+OUTPUT UNITS (rows) of each targeted tensor instead of the whole tensor. For a
+weight of shape [R, C] it edits those rows; for a bias of shape [R] those entries.
+Omit "rows" to act on everything. Rows outside the tensor are ignored, and an op
+whose "rows" match nothing is skipped as invalid."""
 
 
 # ---------------------------------------------------------------------------
@@ -420,8 +494,23 @@ def apply_plan(benign: dict, plan, max_abs: float = 100.0) -> tuple[dict, int]:
             if fn is None or not keys:
                 n_invalid += 1
                 continue
+            # An optional ``rows`` list narrows the op to specific output units of
+            # each targeted tensor (row c of a classifier head = class c). Without
+            # it the op applies to the whole tensor, exactly as before.
+            touched = False
             for k in keys:
-                poisoned[k] = fn(poisoned[k], op)
+                t = poisoned[k]
+                rows = _coerce_rows(op, t.shape[0] if t.dim() >= 1 else 0)
+                if rows is None:
+                    poisoned[k] = fn(t, op)
+                    touched = True
+                elif rows:
+                    t[rows] = fn(t[rows], op).to(t.dtype)
+                    touched = True
+                # rows == [] -> `rows` was given but addresses nothing in this
+                # tensor (e.g. row 7 of a 16-unit hidden layer); skip this key.
+            if not touched:
+                n_invalid += 1
         except Exception as e:
             logger.warning(f"attack_ops: skipping bad op {op!r}: {e}")
             n_invalid += 1

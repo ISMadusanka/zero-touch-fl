@@ -209,7 +209,16 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
 
 Attack goals (configurable; `untargeted_degrade` is the first experiment):
 `untargeted_degrade` (target accuracy drop), `slow_degrade` (per-round drop),
-`targeted_label` (per-class — scaffolded).
+`targeted_label` (make ONE class be misclassified while the rest keep working).
+
+**`targeted_label` is a separate experiment with its own commands, config,
+adapters and logs — see [`TARGETED.md`](TARGETED.md).** It never shares state with
+the untargeted run (only the Phase-1 honest baseline, so both start identically):
+
+```bash
+python train_targeted.py                                                  # train
+python -m benchmark.run_targeted_benchmark --label 2 --poison-clients 3   # evaluate
+```
 
 **Target generalization (untargeted_degrade).** Rather than overfitting a single
 target, training randomizes `target_accuracy_drop` each round from

@@ -33,7 +33,9 @@ from core.types import RoundLog
 from core.debug import dbg
 from rl.grpo import grpo_step
 from rl.policy import PolicyGenerator
-from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
+from rl.rewards import (
+    attacker_reward, defender_reward, goal_drop, perturbation_diversity, targeted_terms,
+)
 from rl.switch import PhaseController, SwitchConfig, committed_success
 from rl.turns import AttackerTurn, DefenderTurn
 
@@ -281,14 +283,19 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     # Damage vs THIS round's clean counterfactual (what the aggregate would have
     # scored unpoisoned), so the win-gate measures the attack — not the change
     # since the previous round. See FLArmsRaceEnv.clean_reference_accuracy.
-    drop = ctx.clean_accuracy - info["post_accuracy"]
+    # For a targeted_label goal this is the TARGET CLASS's recall drop instead of
+    # the overall accuracy drop, and ``terms`` carries the collateral the win-gate
+    # additionally requires to stay small (rl.rewards.targeted_terms).
+    terms = targeted_terms(ctx.goal, ctx.clean_eval, info.get("post_eval"))
+    drop = goal_drop(ctx.goal, ctx.clean_accuracy, info["post_accuracy"],
+                     ctx.clean_eval, info.get("post_eval"))
     success = committed_success(learner, drop, info["verdicts"], poisoned_ids,
-                                state["switch_cfg"], ctx.goal)
+                                state["switch_cfg"], ctx.goal, terms)
 
     _log_round(env, ctx, info, learner, stats, state["metrics_tracker"],
                state["save_round_log"], reward_att=k["reward_att"], reward_def=k["reward_def"],
                phase_index=phase_index, phase_round=phase_round, success=success,
-               best_index=best, poisoned_ids=poisoned_ids)
+               best_index=best, poisoned_ids=poisoned_ids, terms=terms)
     return stats, drop, success
 
 
@@ -515,7 +522,7 @@ def _save_adapters(state):
 
 def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                reward_att=None, reward_def=None, phase_index=0, phase_round=0,
-               success=False, best_index=0, poisoned_ids=None):
+               success=False, best_index=0, poisoned_ids=None, terms=None):
     verdicts = info["verdicts"]
     post_acc = info["post_accuracy"]
     n_malformed = info["n_malformed"]
@@ -537,11 +544,34 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                             gamma=reward_att.get("gamma", 1.0),
                             delta=reward_att.get("delta", 0.0),
                             zeta=reward_att.get("zeta", 0.0),
+                            eta=reward_att.get("eta", 1.0),
                             pool_size=env.n_compromisable,
-                            diversity=diversity)
+                            diversity=diversity,
+                            clean_eval=ctx.clean_eval,
+                            post_eval=info.get("post_eval"))
     d_rew = defender_reward(verdicts, poisoned_ids,
                             mode=reward_def.get("mode", "soft_f1"),
                             fpr_penalty=reward_def.get("fpr_penalty", 1.0))
+
+    # Per-class record for a targeted round: everything a reader (or monitor.py /
+    # visualize_rounds.py) needs to answer "did ONLY the target class break?".
+    targeted_meta = None
+    if terms is not None:
+        post_eval = info.get("post_eval")
+        targeted_meta = {
+            "label": terms["label"],
+            "clean_recall": round(terms["clean_recall"], 6),
+            "post_recall": round(terms["post_recall"], 6),
+            "target_class_drop": round(terms["target_drop"], 6),
+            "effective_target": round(terms["effective_target"], 6),
+            "collateral": round(terms["collateral"], 6),
+            "max_collateral": round(terms["max_collateral"], 6),
+            "others_clean": round(terms["others_clean"], 6),
+            "others_post": round(terms["others_post"], 6),
+            "per_class_clean": [round(v, 6) for v in ctx.clean_eval.per_class],
+            "per_class_post": ([round(v, 6) for v in post_eval.per_class]
+                               if post_eval is not None else None),
+        }
 
     metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(poisoned_ids))
     save_round_log(RoundLog(
@@ -569,6 +599,7 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             # and the visualizer report the same number the policy is trained on.
             "clean_accuracy": round(float(ctx.clean_accuracy), 6),
             "induced_drop": round(float(ctx.clean_accuracy - post_acc), 6),
+            "targeted": targeted_meta,
             "phase_index": phase_index,
             "phase_round": phase_round,
             "learner_success": success,
@@ -588,10 +619,19 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
         global_acc=ctx.global_accuracy,
     )
     dbg.flush()
+    # On a targeted round the headline number is the target class's recall, not
+    # overall accuracy — print it so a run can be read at a glance.
+    tgt_s = ""
+    if terms is not None:
+        tgt_s = (f" | TGT[{terms['label']}] {terms['clean_recall']:.3f}->"
+                 f"{terms['post_recall']:.3f} (drop={terms['target_drop']:+.3f}/"
+                 f"{terms['effective_target']:.3f}) collat={terms['collateral']:.3f}"
+                 f"/{terms['max_collateral']:.3f}")
     logger.info(
         f"Round {ctx.round_num} [learn={learner} ph={phase_index}.{phase_round} "
         f"{'WIN' if success else '...'}]: acc {ctx.global_accuracy:.4f}->{post_acc:.4f} "
-        f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - post_acc:+.4f}) "
+        f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - post_acc:+.4f})"
+        f"{tgt_s} "
         f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} "
         f"| grpo_loss={stats['loss']:.4f} mean_r={stats['mean_reward']:.3f} "
         f"zero_adv={stats['zero_advantage_fraction']:.2f} "

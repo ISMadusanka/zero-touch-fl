@@ -1,0 +1,126 @@
+# TARGETED label-poisoning experiment.
+#
+# Separate from configs/base.yaml (the untargeted experiment) on purpose: separate
+# attack goal, separate reward shape, separate LoRA adapters, separate logs. Run it
+# with `python train_targeted.py`, evaluate it with
+# `python -m benchmark.run_targeted_benchmark`. See TARGETED.md.
+#
+# Attack goal: "misclassify label L" — drive the global model's recall on ONE class
+# to ~0 while every other class keeps working. During training L is redrawn each
+# round from `attack.target_labels` so the policy learns to attack whichever class
+# the goal names; evaluation fixes a single L.
+
+fl:
+  training_rounds: 45             # Phase 1: honest training rounds (SHARED with the
+                                  # untargeted run — same checkpoints/, same baseline)
+  simulation_rounds: 2000000      # Phase 2: adversarial RL rounds
+  n_clients: 20                   # total federated clients (honest majority)
+  n_compromisable: 5              # attacker can ONLY access clients [0 .. n_compromisable-1]
+  poison_fraction: 0.2            # legacy fallback only; the attacker CHOOSES its clients
+  poison_seed: 0                  # RNG seed: non-IID partition + per-round budget/label sampling
+  benign_retrain_each_round: false # false = benign clients replay frozen Phase-1 local weights
+  local_epochs: 3
+  batch_size: 64
+  lr: 0.002
+  device: "cuda"                  # RL training needs a GPU; "cpu" only for --dry-run/--baseline
+
+data:
+  dataset: "mnist"
+  n_classes: 10                   # size of the per-class evaluation breakdown
+  iid: false
+  noniid_bias: 0.5                # FLTrust bias probability q (iid=false only)
+  data_dir: "./data/mnist_raw"
+
+attack:
+  goal:
+    type: "targeted_label"        # THE difference from base.yaml
+    label: 2                      # EVAL default / fallback. Training overrides it every
+                                  # round from `target_labels` below.
+    target_class_drop: 0.80       # how much of the target class's RECALL to destroy.
+                                  # Clamped per-round to that class's clean recall, so on a
+                                  # class the honest model only gets 0.62 right, "goal met"
+                                  # means driving it to ~0 rather than an impossible 0.80.
+    max_collateral: 0.05          # tolerance for damage to the OTHER classes: the mean recall
+                                  # they may lose before the attack stops counting as targeted.
+                                  # The reward charges collateral in units of this.
+
+  # --- Label sampling: what makes the policy generalize across classes ---
+  sample_target_in_training: true # true = redraw `goal.label` each round from `target_labels`.
+                                  # This is the whole reason the trained attacker works on any
+                                  # requested class: the label is never constant, so the only
+                                  # way to score is to READ it off the goal and hit that class's
+                                  # output-layer row. false = always attack `goal.label`.
+  target_labels: [0, 1, 2, 3, 4, 5]  # the classes trained on. Evaluation may ask for any of
+                                  # them (and 6-9 measure out-of-distribution generalization).
+
+  # --- Client-selection budget (the attacker chooses WHICH & HOW MANY to poison) ---
+  max_poison_clients: 5           # TRAINING budget cap (must be <= n_compromisable)
+  sample_budget_in_training: true # randomize the per-round cap in [1..max_poison_clients] so
+                                  # the policy is BUDGET-AWARE and generalizes to any eval budget
+  eval_poison_clients: 1          # EVALUATION default budget (benchmark --poison-clients override)
+
+llm:
+  ollama_base_url: "http://localhost:11434"
+  ollama_model: "qwen2.5:3b"
+
+rl:
+  model: "unsloth/Qwen2.5-3B-Instruct"
+  attn_implementation: "eager"
+  use_fast_generate: true
+  max_seq_len: 8192
+  load_in_4bit: false
+  lora_r: 16
+  lora_alpha: 32
+  G: 4
+  kl_beta: 0.02
+  lr: 1.0e-5
+  temperature: 1.0
+  opponent_temperature: 0.0
+  scoring_opponent_temperature: 0.7
+  max_new_tokens: 1024
+  grad_clip: 1.0
+  save_every: 25
+  league_snapshot_every: 100
+  league_prob: 0.25
+  league_max_snapshots: 10
+
+  resample_on_zero_advantage: true
+  resample_temperature: 1.3
+  skip_zero_advantage: true
+
+  switch_mode: "best_response"
+  first_learner: "attacker"
+  min_phase_rounds: 3
+  max_phase_rounds: 4000
+  success_streak: 3
+  fl_interlude_between_phases: true
+  curriculum_on_cap: true
+  attacker_min_drop: 0.02         # fallback only; the relative win-gate applies
+  win_fraction: 0.6               # "attack passed" = target-class recall drop >= 0.6 * the
+                                  # round's effective target AND collateral within tolerance
+  attacker_min_evaded: 1.0
+  defender_min_tpr: 0.99
+  defender_max_fpr: 0.10
+  K_a: 4
+  K_d: 4
+
+  # SEPARATE adapters — the targeted policy must never overwrite the untargeted one.
+  adapter_paths:
+    attacker: "checkpoints/targeted/attacker_adapter"
+    defender: "checkpoints/targeted/defender_adapter"
+
+  reward:
+    attacker:
+      alpha: 1.0                  # weight on the TARGET CLASS's recall-drop term
+      beta: 0.5                   # weight on evasion (stealth)
+      gamma: 1.0                  # penalty for malformed / wasted clients
+      delta: 0.3                  # penalty for using MORE poison clients than needed
+      zeta: 0.2                   # bonus for COLLABORATIVE multi-client attacks
+      eta: 1.0                    # PENALTY for collateral damage to the other classes,
+                                  # in units of attack.goal.max_collateral (capped at 3.0).
+                                  # This term is what makes the attack targeted instead of
+                                  # merely destructive — with eta=0 the policy just
+                                  # rediscovers the untargeted whole-model attack.
+    defender:
+      mode: "soft_f1"
+      fpr_penalty: 1.0

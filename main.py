@@ -41,7 +41,7 @@ from agents.defender_agent import DefenderAgent
 from agents.llm_client import create_llm_client
 from storage.checkpoint import (
     save_state, load_state, state_exists, save_progress, load_progress, adapter_exists,
-    save_fl_state, load_fl_state,
+    save_fl_state, load_fl_state, set_rl_dir,
 )
 from core.types import RoundLog, DetectionVerdict
 from core.debug import dbg
@@ -52,9 +52,10 @@ from rl.env import FLArmsRaceEnv
 # Logging / config
 # ---------------------------------------------------------------------------
 
-def setup_logging(debug: bool = False):
-    os.makedirs("logs/round_data", exist_ok=True)
-    file_handler = logging.FileHandler("logs/system.log", mode="a", encoding="utf-8")
+def setup_logging(debug: bool = False, log_dir: str = "logs"):
+    os.makedirs(os.path.join(log_dir, "round_data"), exist_ok=True)
+    file_handler = logging.FileHandler(
+        os.path.join(log_dir, "system.log"), mode="a", encoding="utf-8")
     stream_handler = logging.StreamHandler(
         open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)
     )
@@ -114,6 +115,26 @@ def load_config(path: str) -> dict:
 # ``visualize_rounds.py`` read this file, and still read legacy
 # ``round_NNN.json`` files so older runs keep working.
 ROUND_LOG_PATH = "logs/round_data/rounds.jsonl"
+
+# Root of this run's log tree. ``--run-name`` moves it to ``logs/<name>`` so a
+# separate experiment (e.g. the targeted-poisoning run) writes its own round
+# stream, metrics and debug dump instead of interleaving with another run's.
+LOG_DIR = "logs"
+
+
+def _set_run_name(name: str | None):
+    """Isolate this run's on-disk artifacts under ``logs/<name>`` + ``checkpoints/<name>``.
+
+    Phase-1 state stays shared in ``checkpoints/`` on purpose — it is honest
+    training with no attacker in it, so every experiment should start from the
+    exact same baseline model (see ``storage.checkpoint``).
+    """
+    global LOG_DIR, ROUND_LOG_PATH
+    if not name:
+        return
+    LOG_DIR = os.path.join("logs", name)
+    ROUND_LOG_PATH = os.path.join(LOG_DIR, "round_data", "rounds.jsonl")
+    set_rl_dir(os.path.join("checkpoints", name))
 
 
 def _save_round_log(log: RoundLog):
@@ -192,7 +213,8 @@ def run_phase2(
     env = FLArmsRaceEnv(config, client_loaders, test_loader, rng)
     env.reset(global_weights, client_weights, baseline_accuracy)
 
-    metrics_tracker = MetricsTracker(baseline_accuracy=baseline_accuracy, output_dir="logs/metrics")
+    metrics_tracker = MetricsTracker(baseline_accuracy=baseline_accuracy,
+                                     output_dir=os.path.join(LOG_DIR, "metrics"))
     attacker_agent = AttackerAgent(attacker_config)
     defender_agent = DefenderAgent(defender_config)
 
@@ -281,6 +303,11 @@ def main():
     parser.add_argument("--fresh", action="store_true", help="Force fresh Phase 1 training")
     parser.add_argument("--config", default="configs/base.yaml",
                         help="Path to the base config (default: configs/base.yaml)")
+    parser.add_argument("--run-name", default=None,
+                        help="Isolate this experiment's artifacts: round logs/metrics/debug go to "
+                             "logs/<name>/ and the Phase-2 RL state to checkpoints/<name>/. "
+                             "Phase-1 state stays shared in checkpoints/ so every experiment "
+                             "starts from the same honest baseline.")
     parser.add_argument("--env", choices=["linux", "windows"], default="linux",
                         help="'linux' uses Ollama (qwen2.5), 'windows' uses OpenAI (default: linux)")
     parser.add_argument("--dry-run", action="store_true",
@@ -296,9 +323,12 @@ def main():
                              f"not given, Phase 2 is capped at {DEBUG_DEFAULT_ROUNDS} rounds.")
     args = parser.parse_args()
 
-    setup_logging(debug=args.debug)
+    _set_run_name(args.run_name)
+    setup_logging(debug=args.debug, log_dir=LOG_DIR)
     quiet_noisy_warnings()
     logger.info("Starting Zero-Touch Federated Learning System")
+    if args.run_name:
+        logger.info(f"Run '{args.run_name}': logs -> {LOG_DIR}/, RL state -> checkpoints/{args.run_name}/")
 
     base_config = load_config(args.config)
     attacker_config = load_config("configs/attacker_agent.yaml")
@@ -317,6 +347,10 @@ def main():
     goal = base_config.get("attack", {}).get("goal")
     if goal:
         attacker_config["attack_goal"] = goal
+    # The targeted prompt needs the federation size (to state how much FedAvg
+    # dilutes a poisoned client) and the class count (to locate the output layer).
+    attacker_config["n_clients"] = int(base_config["fl"]["n_clients"])
+    attacker_config["n_classes"] = int(base_config.get("data", {}).get("n_classes", 10))
 
     # Reproducibility.
     seed = int(base_config["fl"].get("poison_seed", 0))
@@ -367,11 +401,13 @@ def main():
                     f"{DEBUG_DEFAULT_ROUNDS} Phase-2 round(s)")
     if args.debug:
         dbg.enable(
-            output_dir="logs", filename="debug.json", mode=mode,
+            output_dir=LOG_DIR, filename="debug.json", mode=mode,
             config_summary={
                 "model": base_config.get("rl", {}).get("model"),
                 "n_clients": fl.get("n_clients"),
                 "n_compromisable": fl.get("n_compromisable"),
+                "attack_goal": goal,
+                "target_labels": base_config.get("attack", {}).get("target_labels"),
                 "max_poison_clients": base_config.get("attack", {}).get("max_poison_clients"),
                 "sample_budget": base_config.get("attack", {}).get("sample_budget_in_training"),
                 "noniid_bias": base_config.get("data", {}).get("noniid_bias"),

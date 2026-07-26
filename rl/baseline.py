@@ -89,10 +89,14 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             n_malformed = len(selected_ids) - len(effective)
             updates = env.build_updates({cid: poisoned[cid] for cid in effective})
             verdicts = fixed_defender(env.features(updates))
-            post_acc = env.evaluate_updates(updates, verdicts)
+            post_eval = env.evaluate_updates_full(updates, verdicts)
+            post_acc = post_eval.overall
             # Same reference as training: this round's clean (unpoisoned) aggregate.
+            # Passing the per-class evals keeps the harness honest under a
+            # targeted_label goal (it then scores the target class, not overall acc).
             reward = attacker_reward(ctx.clean_accuracy, post_acc, ctx.goal,
-                                     effective, verdicts, n_malformed)
+                                     effective, verdicts, n_malformed,
+                                     clean_eval=ctx.clean_eval, post_eval=post_eval)
             scored.append((label, effective, n_malformed, updates, verdicts, post_acc, reward))
             logger.info(
                 f"[baseline] round {ctx.round_num} action={label:9s} "
@@ -104,9 +108,11 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
         label, chosen_ids, n_malformed, updates, verdicts, _, _ = max(
             scored, key=lambda s: s[6])
         env.set_committed_poison(chosen_ids)
-        new_acc = env.commit(updates, verdicts)
+        committed_eval = env.commit_full(updates, verdicts)
+        new_acc = committed_eval.overall
         a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal,
-                                chosen_ids, verdicts, n_malformed)
+                                chosen_ids, verdicts, n_malformed,
+                                clean_eval=ctx.clean_eval, post_eval=committed_eval)
         d_rew = defender_reward(verdicts, chosen_ids)
 
         metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))

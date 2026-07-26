@@ -25,6 +25,7 @@ import torch
 
 from agents.attack_ops import (
     OPERATOR_DOCS, apply_plan, delta_details, extract_plan, extract_selection,
+    output_layer_keys,
 )
 from core.debug import dbg
 
@@ -68,6 +69,44 @@ Rules:
 - Use only the operators and params listed above."""
 
 
+TARGETED_SYSTEM_PROMPT = """You are the adversary in a federated-learning (FL) system. Each round, clients send model updates and the server averages the accepted ones (FedAvg) into a global model. A defender inspects statistics of every update and drops the ones it judges malicious before averaging: updates that stand out from the honest majority (much larger norm, flipped signs, low cosine similarity) get caught, and several of your clients that look nearly identical get caught as colluding Sybils.
+
+You are a partial insider: you control ONLY the clients in `controllable_client_ids`; every other client is honest and out of reach.
+
+YOUR OBJECTIVE IS TARGETED. `attack_goal` names ONE class, `label`. You must make the global model FAIL on that class -- its test samples should be classified as anything else -- while EVERY OTHER CLASS KEEPS WORKING AS BEFORE. An attack that wrecks the whole model scores badly even though it also breaks the target class: you are scored on (recall lost on `label`) MINUS (mean recall lost across all other classes). Surgical beats destructive. The target `label` CHANGES between rounds -- read it from `attack_goal` every time and attack that class, not a memorized one.
+
+HOW TO HIT ONE CLASS. `output_layer` tells you the model's final classification layer. Its weight has one ROW PER CLASS: row c together with bias entry c produces class c's score, logit[c] = weight[c] . features + bias[c]. So the ONLY parameters specific to your target are row `label` of `output_layer.weight` and entry `label` of `output_layer.bias`. Everything below that layer is shared by all classes -- editing it damages every class and costs you the collateral penalty. Use the `rows` parameter to confine an operator to that one row:
+  {"op":"scale","target":"<output_layer.weight>","rows":[<label>],"factor":-3.0}
+Make logit[label] small (or negative) relative to the other classes and the model stops predicting that class.
+
+DILUTION -- THE KEY NUMBER. The server AVERAGES all `federation.n_clients` clients, so if you poison k of them your edit reaches the global model at strength k/n_clients. Scaling the target row by `factor` f on k clients leaves the aggregated row at ((n-k) + k*f)/n of its honest value. Therefore f = 1 - n/k drives the aggregated row to ZERO, and going further past it drives the logit negative. `federation.row_zero_factor` gives that f for each k you might use -- start from it. A timid factor like -1 or 0.5 barely moves the average and does nothing.
+
+STEALTH. The defender scores each layer separately, so a colossal edit to the output layer shows up in THAT layer's norm and sign statistics even when the whole-model norm still looks normal. Your advantage is that one row is a tiny slice of the model: concentrating the whole perturbation there keeps the whole-model update small. Push the row hard enough to survive dilution, no harder, and consider spreading it over a few clients (smaller f each) when one client's edit would be too loud. `client_update_stats` shows each client's honest `rel_update` -- keep yours in that neighbourhood.
+
+`client_update_stats` gives, per controllable client, dimensionless stats of its HONEST update D = local - global (per layer and whole-model), normalized to the global model only:
+- rel_update: norm(D)/norm(global) for the layer -- how large the honest change already is; your poison adds to it, and bigger stands out more.
+- rms_delta: per-weight step size. energy_frac: share of the update in that layer.
+- sign_flip_frac: fraction of weights whose sign differs from global.
+- std_ratio, absmean_ratio: spread / typical size of D vs the global's own.
+- whole-model cos_to_global: alignment with the current model.
+
+IMPORTANT -- what your operators act on: every operator transforms the client's FULL weight vector W, NOT the small update D. The server then sees that client's update as D' = op(W) - global. Additive operators are absolute: `add_constant` of size v changes that entry by exactly v, so on a bias row it shifts the aggregated logit by k*v/n_clients -- compare v against `rms_delta`, the honest per-weight step.
+
+%OPERATOR_DOCS%
+
+Each round choose an action with TWO parts:
+1. SELECT which controllable clients to poison, AT MOST `max_poison_clients`. Prefer the FEWEST that can work: every extra client is penalized and easier to catch.
+2. For each selected client, give an ordered ATTACK PLAN. With several clients, give each a DISTINCT, coordinated role (e.g. different factors, or one hitting the weight row while another shifts the bias) so their average moves the target class your way without the clients looking alike.
+
+Respond with ONLY one JSON object -- no prose, no markdown:
+{"clients":[{"id":<controllable id>,"operations":[{"op":"<name>","target":"<target>","rows":[<label>], ...params}]}]}
+Rules:
+- Use ids only from `controllable_client_ids`, AT MOST `max_poison_clients`; prefer the fewest.
+- Each client's "operations" is its own ordered list (1-6 ops); order matters.
+- Use only the operators and params listed above.
+- Keep every operator confined to the target class's row unless you have a reason to pay the collateral cost."""
+
+
 class AttackerAgent:
     """Pure attacker policy: builds the prompt, parses + applies the attack plan."""
 
@@ -76,7 +115,19 @@ class AttackerAgent:
         self.goal = config.get("attack_goal", dict(DEFAULT_GOAL))
         self.detail_precision = int(config.get("detail_precision", 4))
         self.max_abs = float(config.get("max_weight_abs", 100.0))
-        self._system = SYSTEM_PROMPT.replace("%OPERATOR_DOCS%", OPERATOR_DOCS)
+        self.n_classes = int(config.get("n_classes", 10))
+        # Total federated clients. Needed only by the targeted prompt, to state how
+        # much FedAvg dilutes a poisoned client's edit (and hence how far the
+        # attacker must overshoot). ``None`` -> the dilution block is omitted.
+        n_clients = config.get("n_clients")
+        self.n_clients = int(n_clients) if n_clients else None
+        # The targeted goal needs a different objective, a different notion of
+        # "damage", and the class<->row explanation, so it gets its own system
+        # prompt. The goal TYPE is fixed for a run (only the label varies per
+        # round, and that travels in the user message), so this is chosen once.
+        self.targeted = self.goal.get("type") == "targeted_label"
+        base = TARGETED_SYSTEM_PROMPT if self.targeted else SYSTEM_PROMPT
+        self._system = base.replace("%OPERATOR_DOCS%", OPERATOR_DOCS)
 
     # ------------------------------------------------------------------
     def system_prompt(self) -> str:
@@ -113,10 +164,11 @@ class AttackerAgent:
         pool_ids = list(benign_by_client.keys())
         if budget is None:
             budget = len(pool_ids)
+        round_goal = goal if goal is not None else self.goal
         payload = {
             "round": round_num,
             "current_global_accuracy": round(float(global_accuracy), 4),
-            "attack_goal": goal if goal is not None else self.goal,
+            "attack_goal": round_goal,
             "controllable_client_ids": pool_ids,
             "max_poison_clients": int(budget),
             "client_update_stats": {
@@ -124,7 +176,58 @@ class AttackerAgent:
                 for cid, sd in benign_by_client.items()
             },
         }
+        if self.targeted:
+            payload.update(self._targeted_observation(global_weights, round_goal, int(budget)))
         return json.dumps(payload)
+
+    # ------------------------------------------------------------------
+    def _targeted_observation(self, global_weights: dict, goal: dict, budget: int) -> dict:
+        """Extra observation fields a TARGETED round needs.
+
+        Two things the attacker cannot work out from the layer statistics alone:
+
+        ``output_layer`` — which parameter is the classifier head and which row
+        belongs to the class named in this round's goal. Row ``c`` of that weight
+        (plus bias entry ``c``) is class ``c``'s logit, so this hands the policy
+        the exact 17 numbers worth touching instead of making it guess a layer
+        name. Derived from the real state_dict, so it stays correct if the model
+        changes (:func:`agents.attack_ops.output_layer_keys`).
+
+        ``federation`` — how hard FedAvg dilutes a poisoned client. Poisoning ``k``
+        of ``n`` clients leaves the aggregated row at ``((n-k) + k*f)/n`` of its
+        honest value after scaling by ``f``, so ``row_zero_factor[k] = 1 - n/k`` is
+        the factor that zeroes it. Without this the policy has no way to calibrate
+        magnitude and reliably under-shoots (a factor of -1 moves a 20-client
+        average by 10%, which does nothing).
+        """
+        out: dict = {}
+        head = output_layer_keys(global_weights, self.n_classes)
+        if head is not None:
+            entry = {
+                "weight": head["weight_key"],
+                "bias": head["bias_key"],
+                "n_classes": head["n_rows"],
+                "note": "row c of this weight (and bias entry c) IS class c's logit",
+            }
+            label = goal.get("label")
+            if label is not None:
+                try:
+                    entry["row_for_target_label"] = int(label)
+                except (TypeError, ValueError):
+                    pass
+            out["output_layer"] = entry
+        if self.n_clients:
+            n = self.n_clients
+            out["federation"] = {
+                "n_clients": n,
+                "note": "the server averages ALL n_clients; poisoning k of them "
+                        "applies your edit at strength k/n_clients",
+                "row_zero_factor": {
+                    str(k): round(1.0 - n / k, 3)
+                    for k in range(1, max(1, min(budget, n)) + 1)
+                },
+            }
+        return out
 
     # ------------------------------------------------------------------
     def select_and_apply(
