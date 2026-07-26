@@ -82,19 +82,30 @@ from a freshly advanced client state (see "Between-phase benign FL round" below)
   budget**; per chosen client deep-copies its benign weights, applies its plan,
   skips unknown ops / bad params / bad targets (counted, not fatal), then scrubs
   NaN/Inf and clamps to `±max_weight_abs`. PyTorch does all arithmetic — the LLM
-  only emits the selection + plans. A chosen client with an empty/unusable plan
-  falls back to benign weights and counts as *malformed* (a wasted client). If
-  nothing parses, one benign client is selected as a fallback; parsing never
-  raises. Shorthand inputs (`{"operations": [...]}` shared plan, `{"clients":[ids],
-  "operations":[...]}`) are accepted for robustness.
+  only emits the selection + plans. Shorthand inputs (`{"operations": [...]}`
+  shared plan, `{"clients":[ids], "operations":[...]}`) are accepted for
+  robustness, and parsing never raises.
+- **Effective poison only.** A selected client counts as poisoned **only if its
+  weights actually changed**. Unparseable output, an empty plan, ops that were all
+  skipped as invalid, and arithmetic no-ops (`scale factor=1.0`) all leave the
+  client's weights byte-identical to its honest update — the server receives an
+  honest update, so there is nothing to detect. Those clients are excluded from
+  the returned `poisoned_ids` and charged to `n_malformed` (a wasted client, a
+  reward penalty) instead. `poisoned_ids` may therefore be **empty**: a clean
+  round where the attacker selected clients and achieved nothing. Counting them as
+  poisoned made the ASR metric report 100% success for an attack that did nothing
+  and trained the defender to flag undetectable clients.
 
 ## Defender contract (classification)
 
 - **Input** (`agents/defender_agent.build_user_prompt`): per-client features
   from `detector/features.compute_client_features` — **only** features, never the
   ground truth.
-  - Per layer (one per model layer; e.g. `net.2`, `net.4` for MnistNet): `l2_norm`, `rel_norm` (vs median), `cos_to_median`,
-    `sign_agreement` (fraction of coords matching the median sign — catches
+  - Per layer (one per model layer; e.g. `net.2`, `net.4` for MnistNet): `l2_norm`,
+    `rel_norm` (vs the median over all clients), `cos_to_median` (vs the
+    coordinate-wise median over all clients — references include the scored client
+    itself, not leave-one-out; with a benign majority the median is honest either
+    way), `sign_agreement` (fraction of coords matching the median sign — catches
     sign-flip/targeted attacks that preserve norm).
   - Whole model: `l2_norm`, `rel_norm`, `cos_to_mean`, `max_pairwise_cos`
     (FoolsGold), `dnc_score` (SVD spectral outlier).
@@ -108,17 +119,44 @@ from a freshly advanced client state (see "Between-phase benign FL round" below)
 
 Both continuous, so GRPO group advantages don't collapse.
 
-- **Attacker**: `α·clip(drop/target, -0.5, 1.5) + β·stealth − γ·malformed_frac
-  − δ·client_cost + ζ·diversity`, with `drop = prev_acc − post_acc`, `target` from
-  the goal, `stealth` = confidence-weighted evasion over the chosen clients,
+- **Attacker**: `α·drop_term(drop, target) + β·stealth − γ·malformed_frac
+  − δ·client_cost + ζ·diversity`, with `target` from the goal, `stealth` =
+  confidence-weighted evasion over the chosen clients (0 when nothing was
+  poisoned), `malformed_frac = n_malformed / n_selected` (the waste penalty,
+  normalized over the clients the attacker *selected*),
   `client_cost = (n_used−1)/(n_compromisable−1)` (the **use-fewer-clients**
   penalty, 0 for a single client), and `diversity = 1 − mean pairwise cosine` of
   the chosen clients' perturbations (the **collaboration** bonus, 0 for a single
   client) — rewarding coordinated, distinct multi-client attacks over identical
-  Sybil-like clones. See `rl/rewards.py` (`attacker_reward`,
+  Sybil-like clones. See `rl/rewards.py` (`attacker_reward`, `drop_term`,
   `perturbation_diversity`).
+
+  - **`drop = clean_reference_accuracy − post_accuracy`** — the damage measured
+    against **this round's clean counterfactual**: the accuracy the aggregate
+    reaches with no poison (`FLArmsRaceEnv.clean_reference_accuracy`, one extra
+    test-set evaluation per round, cached). It is *not* the previous round's
+    post-attack accuracy. With `benign_retrain_each_round: false` the environment
+    is memoryless — every round's global is rebuilt from frozen benign weights
+    plus that round's poison — so a previous-round reference measured the
+    round-over-round *change*: an identical devastating attack scored high once
+    and ≈0 forever after, which put the schedule's `success_streak` gate
+    permanently out of reach. Against the clean counterfactual an attack that hits
+    its target scores the same every time, in either retrain mode.
+  - **`drop_term(drop, target)`** is `x = drop/target` floored at `−0.5`, linear
+    up to `x = 1` (hitting the goal scores exactly 1.0), then
+    `1 + 0.5·(x−1)/(x−1+1)` — strictly increasing but asymptotic to 1.5. Same
+    range and same value at the goal as the old hard `clip(x, −0.5, 1.5)`; the
+    difference is that there is **no flat region**. The flat region was a training
+    failure: once the policy reliably overshot `1.5·target`, every rollout in a
+    GRPO group tied, the advantage spread collapsed to zero, and `grpo_step`
+    skipped the update — the attacker stopped learning exactly when it got good.
+    Saturation is fast (4× the target buys < 0.4 extra), so the objective stays
+    "hit the requested drop", not "destroy the model".
 - **Defender** (train-time ground truth): confidence-weighted **soft-F1** vs the
-  poisoned set (or `clip(TPR − λ·FPR)`).
+  poisoned set (or `clip(TPR − λ·FPR)`). On a **clean round** (empty poisoned set
+  — the attacker's plans were all no-ops) F1 is undefined and would score a
+  flawless defender 0, training it to invent detections; there the reward is
+  `1 − mean soft P(malicious)` instead, i.e. it is rewarded for staying quiet.
 
 ## GRPO + schedule
 
@@ -135,7 +173,11 @@ Both continuous, so GRPO group advantages don't collapse.
   (defender frozen, greedy), then defender `K_d` rounds (attacker frozen,
   greedy), repeat. The best-scoring sampled action is committed to advance the
   env. An **opponent league** snapshots adapters periodically and, with
-  probability `league_prob`, makes a phase face a random past snapshot.
+  probability `league_prob`, makes a phase face a random past snapshot. The league
+  is a **bounded ring buffer** (`league_max_snapshots`, default 10, oldest
+  evicted): each snapshot is a full CPU copy of one adapter's LoRA tensors
+  (~115 MB for Qwen2.5-3B at `lora_r: 16`), so an unbounded pool grew past 20 GB
+  of host RAM within ~10k rounds and eventually OOM'd the box.
 - **Switch trigger** (`best_response` mode): a phase freezes-and-switches as soon
   as the learner wins `success_streak` (default **3**) committed rounds **in a
   row**. `min_phase_rounds` is set equal to `success_streak`, so there is no
@@ -150,7 +192,7 @@ Both continuous, so GRPO group advantages don't collapse.
   phase (and the frozen opponent + aggregator) trains against an advanced client
   state rather than the same frozen Phase-1 weights. The interlude gets its own
   sequential round number and is logged to `logs/system.log`,
-  `logs/round_data/round_NNN.json` (`attack_metadata.event="benign_fl_round"`)
+  `logs/round_data/rounds.jsonl` (`attack_metadata.event="benign_fl_round"`)
   and `logs/debug.json`.
 
 ## Modes (`main.py`)
@@ -161,6 +203,11 @@ Both continuous, so GRPO group advantages don't collapse.
 | Dry-run | `--dry-run` | `rl/inference.py` (frozen Ollama/OpenAI), full loop, no updates | no |
 | Baseline | `--baseline` | `rl/baseline.py` best-of-N fixed actions, no LLM | no |
 
+All three honour `--rounds N` (an absolute budget overriding `fl.simulation_rounds`)
+and `--config <path>`. `--debug` without `--rounds` caps how many rounds **this
+run** adds on top of `rounds_done`, so debugging a resumed run still executes
+rounds instead of exiting immediately.
+
 ## Checkpoints & resume
 
 - `checkpoints/global_model.pt`, `client_updates.pt`, `baseline.json` — Phase 1.
@@ -169,7 +216,7 @@ Both continuous, so GRPO group advantages don't collapse.
 - `checkpoints/rl_progress.json` — resume state:
   `{"rounds_done", "round_index", "controller"}`. `rounds_done` is the GRPO-step
   counter; `round_index` is the FL round-number counter (so round labels and
-  `logs/round_data/round_NNN.json` continue instead of overwriting from the first
+  `logs/round_data/rounds.jsonl` continue instead of restarting from the first
   Phase-2 round); `controller` is the `PhaseController` snapshot
   (`learner`, `phase_index`, `phase_round`, `streak`, `capped`) so the arms-race
   schedule continues where it left off. Written together with the adapters on the
@@ -183,11 +230,26 @@ Both continuous, so GRPO group advantages don't collapse.
 
 ## Logs
 
+Per-round records are **appended to a JSONL stream** (one JSON object per line)
+rather than written one file per round. At the configured `fl.simulation_rounds`
+a file-per-round sink produced millions of tiny files across two directories,
+exhausting inodes and making the directories unusable; appending is O(1) per round
+and stays greppable. `monitor.py` and `visualize_rounds.py` read the JSONL **and**
+legacy `round_NNN.json` files, so logs from older runs still load.
+
 - `logs/system.log` — run log.
-- `logs/round_data/round_NNN.json` — per round: `attack_goal`,
+- `logs/round_data/rounds.jsonl` — per round: `attack_goal`,
   `poisoned_client_ids`, `predicted_labels`, accuracies, `attacker_reward`,
-  `defender_reward`, `learning_agent`, and a `train` sub-block (loss, mean reward,
-  zero-advantage fraction).
-- `logs/metrics/round_NNN.json` + `summary.json` — ground-truth confusion / TPR /
-  FPR / ASR / APR.
+  `defender_reward`, `learning_agent`, and an `attack_metadata` block with
+  `clean_accuracy` / `induced_drop` (the counterfactual and the damage the reward
+  actually uses), `n_malformed`, `budget`, `n_used`, plus a `train` sub-block
+  (loss, mean reward, zero-advantage fraction).
+- `logs/metrics/rounds.jsonl` + `summary.json` — ground-truth confusion / TPR /
+  FPR / ASR / APR. `summary.json`'s `aggregate` covers every round; its
+  `per_round` block is the retained tail (`MetricsTracker.keep_rounds`, default
+  2000) — the full history is in `rounds.jsonl`.
+- `logs/debug.json` (`--debug`) — structured event stream, capped at the most
+  recent `DebugLogger.MAX_EVENTS` events (the file is rewritten in full each
+  round, so an unbounded buffer made long debug runs O(n²)). `events_dropped`
+  records how many were evicted.
 - `logs/visualizations/report.html` — `python visualize_rounds.py`.

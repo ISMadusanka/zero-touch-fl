@@ -88,21 +88,60 @@ def test_budget_clamped_to_pool():
     assert chosen == [0, 1, 2, 3, 4]            # clamped to the 5-client pool
 
 
-def test_garbage_falls_back_to_one_benign_client():
+def test_garbage_poisons_nobody():
+    """Unparseable output must NOT register a ground-truth poisoned client.
+
+    It used to fall back to 'client 0, benign weights, marked poisoned', which
+    made the ASR metric report a 100% success rate for an attack that sent honest
+    weights, and penalized the defender for missing an undetectable client.
+    """
     agent = AttackerAgent()
     pool = _pool()
     poisoned, chosen, n_malformed = agent.select_and_apply("total garbage", pool, budget=3)
-    assert chosen == [0] and n_malformed == 1
-    assert torch.allclose(poisoned[0]["net.2.weight"], pool[0]["net.2.weight"])  # unchanged
+    assert poisoned == {} and chosen == [] and n_malformed == 1
 
 
-def test_empty_plan_client_counts_malformed():
+def test_empty_plan_client_counts_malformed_and_is_not_poisoned():
     agent = AttackerAgent()
     pool = _pool()
     poisoned, chosen, n_malformed = agent.select_and_apply(
         '{"clients":[{"id":2,"operations":[]}]}', pool, budget=3)
-    assert chosen == [2] and n_malformed == 1
-    assert torch.allclose(poisoned[2]["net.2.weight"], pool[2]["net.2.weight"])
+    assert poisoned == {} and chosen == [] and n_malformed == 1
+
+
+def test_noop_plan_is_malformed_not_poison():
+    """A plan that parses but changes nothing (identity scale, or ops that are all
+    skipped as invalid) sends byte-identical benign weights -> not poison."""
+    agent = AttackerAgent()
+    for text in (
+        '{"clients":[{"id":1,"operations":[{"op":"scale","target":"all","factor":1.0}]}]}',
+        '{"clients":[{"id":1,"operations":[{"op":"backdoor","target":"all"}]}]}',
+        '{"clients":[{"id":1,"operations":[{"op":"scale","target":"no.such.layer","factor":9}]}]}',
+    ):
+        poisoned, chosen, n_malformed = agent.select_and_apply(text, _pool(), budget=3)
+        assert poisoned == {} and chosen == [] and n_malformed == 1, text
+
+
+def test_partial_noop_keeps_only_the_effective_client():
+    """One real plan + one no-op -> exactly one poisoned client, one wasted."""
+    agent = AttackerAgent()
+    pool = _pool()
+    text = ('{"clients":[{"id":0,"operations":[{"op":"scale","target":"all","factor":3.0}]},'
+            '{"id":1,"operations":[{"op":"scale","target":"all","factor":1.0}]}]}')
+    poisoned, chosen, n_malformed = agent.select_and_apply(text, pool, budget=2)
+    assert chosen == [0] and list(poisoned) == [0] and n_malformed == 1
+    assert torch.allclose(poisoned[0]["net.2.weight"], pool[0]["net.2.weight"] * 3.0)
+
+
+def test_invalid_ops_alongside_a_real_one_still_poison():
+    """Skipped ops are counted but don't waste the client if the net effect is real."""
+    agent = AttackerAgent()
+    pool = _pool()
+    text = ('{"clients":[{"id":4,"operations":[{"op":"nonsense"},'
+            '{"op":"scale","target":"all","factor":2.0}]}]}')
+    poisoned, chosen, n_malformed = agent.select_and_apply(text, pool, budget=1)
+    assert chosen == [4] and n_malformed == 0
+    assert torch.allclose(poisoned[4]["net.2.weight"], pool[4]["net.2.weight"] * 2.0)
 
 
 def _run():

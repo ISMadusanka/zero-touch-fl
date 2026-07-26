@@ -51,7 +51,13 @@ class AttackerTurn:
         self.pool_references = env.pool_benign            # {cid: benign state_dict}
         self.budget = env.round_budget
         self.pool_size = env.n_compromisable
-        self.prev_accuracy = env.current_accuracy
+        # Damage is scored against THIS round's clean counterfactual (the accuracy
+        # the aggregate reaches with no poison), not against the current global's
+        # accuracy — see FLArmsRaceEnv.clean_reference_accuracy. All G rollouts
+        # share it, so the within-group ordering is still purely "which plan hurt
+        # more", while the absolute scale now means "how much of the goal did this
+        # attack achieve" in every round, not "how much worse than last round".
+        self.reference_accuracy = env.clean_reference_accuracy()
         self.goal = env.round_goal                        # this round's (maybe sampled) goal
 
         self.system = attacker_agent.system_prompt()
@@ -92,7 +98,7 @@ class AttackerTurn:
         diversity = perturbation_diversity(
             poisoned, {cid: self.pool_references[cid] for cid in chosen_ids})
         r = attacker_reward(
-            self.prev_accuracy, post_acc, self.goal, chosen_ids,
+            self.reference_accuracy, post_acc, self.goal, chosen_ids,
             verdicts, n_malformed,
             alpha=self.reward_cfg.get("alpha", 1.0),
             beta=self.reward_cfg.get("beta", 0.5),

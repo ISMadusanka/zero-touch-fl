@@ -72,6 +72,11 @@ rl:
   save_every: 25                  # checkpoint adapters + progress every N rounds (resume granularity)
   league_snapshot_every: 100      # snapshot adapters into the opponent league
   league_prob: 0.25               # chance a training phase faces a league snapshot
+  league_max_snapshots: 10        # HARD CAP on retained snapshots per adapter (ring buffer —
+                                  # oldest evicted). Each snapshot is a full copy of one adapter's
+                                  # LoRA tensors: ~115 MB for Qwen2.5-3B at lora_r=16, so the
+                                  # league costs about league_max_snapshots x 2 x 115 MB of host
+                                  # RAM (~2.3 GB at 10). Unbounded, it OOMs a long run.
 
   # --- Zero-advantage guard (stops the attacker un-learning toward base) ---
   resample_on_zero_advantage: true # if a group has no reward spread, re-roll once at higher temp
@@ -81,9 +86,10 @@ rl:
   # --- Schedule: success-gated iterated best response (the arms-race ratchet) ---
   switch_mode: "best_response"    # best_response | fixed (legacy K_a/K_d alternation)
   first_learner: "attacker"       # who trains first
-  min_phase_rounds: 8             # earliest a phase may switch on a sustained win. Set equal to
+  min_phase_rounds: 3             # earliest a phase may switch on a sustained win. Set equal to
                                   # success_streak so a phase switches as soon as the learner wins
                                   # success_streak times IN A ROW (no extra minimum-length gate).
+                                  # Raise it above success_streak to require a longer phase.
   max_phase_rounds: 4000           # hard cap: switch even without a win (prevents a stuck phase)
   success_streak: 3               # consecutive winning rounds needed to freeze + switch
   fl_interlude_between_phases: true # before every phase AFTER the first, run ONE honest FL round

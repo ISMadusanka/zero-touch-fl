@@ -39,14 +39,19 @@ class RoundContext:
     so ``poisoned_ids`` is empty here and filled in once the choice is committed.
     """
 
-    def __init__(self, round_num, global_accuracy, pool_ids, pool_benign, budget, goal=None):
+    def __init__(self, round_num, global_accuracy, pool_ids, pool_benign, budget,
+                 goal=None, clean_accuracy=None):
         self.round_num = round_num
-        self.global_accuracy = global_accuracy
+        self.global_accuracy = global_accuracy            # accuracy of the CURRENT global model
         self.pool_ids = pool_ids                          # list[int] controllable pool
         self.pool_benign = pool_benign                    # {cid: state_dict} for the pool
         self.budget = budget                              # max clients that may be poisoned
         self.goal = goal                                  # this round's attack goal (maybe sampled)
         self.poisoned_ids = []                            # set at commit (attacker's choice)
+        # The clean counterfactual: what this round's aggregate scores with NO
+        # poison. This — not ``global_accuracy`` — is what the attacker's damage
+        # is measured against (see ``FLArmsRaceEnv.clean_reference_accuracy``).
+        self.clean_accuracy = clean_accuracy
 
 
 class FLArmsRaceEnv:
@@ -107,6 +112,7 @@ class FLArmsRaceEnv:
         self.round_budget: int = 1
         self.round_goal: dict = dict(self.goal)           # this round's (maybe sampled) goal
         self.poisoned_ids: list[int] = []                 # attacker's committed choice
+        self._clean_ref_acc: float | None = None          # cached per-round clean counterfactual
 
     # ------------------------------------------------------------------
     def reset(self, global_weights, client_weights, baseline_accuracy):
@@ -149,6 +155,7 @@ class FLArmsRaceEnv:
         self.client_weights = [copy.deepcopy(w) for w in state["client_weights"]]
         self.current_accuracy = float(state["current_accuracy"])
         self.round_index = int(state.get("round_index", self.round_index))
+        self._clean_ref_acc = None        # stale: the shared model just changed
         logger.info(
             f"Restored Phase-2 FL state — round_index={self.round_index}, "
             f"current_accuracy={self.current_accuracy:.4f} "
@@ -190,11 +197,13 @@ class FLArmsRaceEnv:
         self.round_budget = self._round_budget()
         self.round_goal = self._round_goal()
         self.poisoned_ids = []                            # attacker decides at commit
+        self._clean_ref_acc = None                        # recomputed lazily for this round
 
+        clean_acc = self.clean_reference_accuracy()
         logger.info(
             f"Round {round_num}: controllable_pool={self.pool_ids} "
             f"budget={self.round_budget} goal={self.round_goal} "
-            f"(global_acc={self.current_accuracy:.4f})"
+            f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_acc:.4f})"
         )
         return RoundContext(
             round_num=round_num,
@@ -203,7 +212,36 @@ class FLArmsRaceEnv:
             pool_benign=self.pool_benign,
             budget=self.round_budget,
             goal=self.round_goal,
+            clean_accuracy=clean_acc,
         )
+
+    # ------------------------------------------------------------------
+    def clean_reference_accuracy(self) -> float:
+        """Accuracy of THIS round's aggregate with **no poison and no flags**.
+
+        This is the counterfactual the attacker's damage is scored against:
+        ``drop = clean_reference_accuracy() - post_accuracy`` isolates what the
+        attack actually cost, independent of what happened in previous rounds.
+
+        Why it is not ``current_accuracy``: with
+        ``benign_retrain_each_round: false`` the honest updates are frozen
+        Phase-1 replays, so every round's aggregate is rebuilt from the same
+        benign weights and the environment carries no memory of past damage.
+        Scoring against the previous round's post-attack accuracy therefore
+        measured the round-over-round *change* — an identical attack repeated
+        twice scored high once and ~0 after — which made the schedule's
+        ``success_streak`` gate unreachable. With ``benign_retrain_each_round:
+        true`` this value tracks the recovering model instead, so the same
+        definition works in both modes.
+
+        Computed lazily and cached for the round (one extra test-set evaluation
+        per round, against the G+1 the attacker's rollouts already cost).
+        """
+        if self._clean_ref_acc is None:
+            updates = self.build_updates({})
+            clean = [DetectionVerdict(u.client_id, False, 0.0, "clean_ref") for u in updates]
+            self._clean_ref_acc = self._eval_state(self.aggregator.aggregate(updates, clean))
+        return self._clean_ref_acc
 
     def set_committed_poison(self, chosen_ids) -> None:
         """Record which clients the attacker actually poisoned (for logs/metrics)."""
@@ -294,6 +332,7 @@ class FLArmsRaceEnv:
 
         # Refresh the per-client benign references the rest of Phase 2 consumes.
         self.client_weights = [copy.deepcopy(u.weights) for u in updates]
+        self._clean_ref_acc = None        # stale: global + benign references just changed
 
         logger.info(
             f"[FL round {round_num}] benign FedAvg over {len(updates)} clients "

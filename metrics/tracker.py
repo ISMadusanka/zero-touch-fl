@@ -11,6 +11,7 @@ metrics are for researcher evaluation; the RL reward is computed separately in
 import json
 import logging
 import os
+from collections import deque
 
 from core.types import DetectionVerdict
 from metrics.compute import compute_round_metrics, _safe_div
@@ -20,17 +21,41 @@ logger = logging.getLogger(__name__)
 
 
 class MetricsTracker:
-    """Accumulates round-level metrics and exposes aggregate statistics."""
+    """Accumulates round-level metrics and exposes aggregate statistics.
 
-    def __init__(self, baseline_accuracy: float, output_dir: str = "logs/metrics"):
+    Long runs (``fl.simulation_rounds`` is a very large budget) made the original
+    design unbounded in two ways: one ``round_NNN.json`` file per round, and every
+    ``RoundMetrics`` retained in memory and re-serialised in full into
+    ``summary.json``. Both are now bounded:
+
+    * every round is APPENDED to ``rounds.jsonl`` (one line per round) — O(1) per
+      round, one file instead of millions;
+    * the running confusion/accuracy totals are accumulated incrementally, and
+      only the last ``keep_rounds`` ``RoundMetrics`` are held in memory for the
+      ``per_round`` tail of ``summary.json``. ``aggregate()`` is computed from the
+      running totals, so it still covers EVERY round.
+    """
+
+    def __init__(self, baseline_accuracy: float, output_dir: str = "logs/metrics",
+                 keep_rounds: int = 2000):
         self.baseline_accuracy: float = float(baseline_accuracy)
         self.output_dir: str = output_dir
-        self.rounds: list[RoundMetrics] = []
+        self.keep_rounds: int = max(1, int(keep_rounds))
+        # Bounded tail of recent rounds (for summary.json's `per_round` block).
+        self.rounds: deque[RoundMetrics] = deque(maxlen=self.keep_rounds)
+        self.jsonl_path: str = os.path.join(self.output_dir, "rounds.jsonl")
+
+        # Running totals over ALL rounds (not just the retained tail).
+        self._total_rounds = 0
+        self._tp = self._fn = self._fp = self._tn = 0
+        self._n_attack_successes = 0
+        self._final_accuracy = 0.0
 
         os.makedirs(self.output_dir, exist_ok=True)
         logger.info(
             "MetricsTracker initialized — "
-            f"baseline_accuracy={self.baseline_accuracy:.4f}, output_dir={self.output_dir}"
+            f"baseline_accuracy={self.baseline_accuracy:.4f}, output_dir={self.output_dir}, "
+            f"keep_rounds={self.keep_rounds}"
         )
 
     # ------------------------------------------------------------------
@@ -53,14 +78,25 @@ class MetricsTracker:
             baseline_accuracy=self.baseline_accuracy,
         )
         self.rounds.append(metrics)
+        self._total_rounds += 1
+        self._tp += metrics.tp
+        self._fn += metrics.fn
+        self._fp += metrics.fp
+        self._tn += metrics.tn
+        self._n_attack_successes += int(metrics.attack_success)
+        self._final_accuracy = metrics.current_accuracy
         self._log_round(metrics)
         self._save_round(metrics)
         return metrics
 
     # ------------------------------------------------------------------
     def aggregate(self) -> AggregateMetrics:
-        """Build the cumulative summary across all recorded rounds."""
-        total_rounds = len(self.rounds)
+        """Build the cumulative summary across ALL recorded rounds.
+
+        Uses the running totals, not ``self.rounds`` (which only retains the last
+        ``keep_rounds`` entries), so the summary stays correct on long runs.
+        """
+        total_rounds = self._total_rounds
         if total_rounds == 0:
             logger.warning("MetricsTracker.aggregate() called with no rounds recorded")
             return AggregateMetrics(
@@ -70,12 +106,9 @@ class MetricsTracker:
                 baseline_accuracy=self.baseline_accuracy, final_accuracy=0.0,
             )
 
-        tp = sum(r.tp for r in self.rounds)
-        fn = sum(r.fn for r in self.rounds)
-        fp = sum(r.fp for r in self.rounds)
-        tn = sum(r.tn for r in self.rounds)
-        n_attack_successes = sum(1 for r in self.rounds if r.attack_success)
-        final_accuracy = self.rounds[-1].current_accuracy
+        tp, fn, fp, tn = self._tp, self._fn, self._fp, self._tn
+        n_attack_successes = self._n_attack_successes
+        final_accuracy = self._final_accuracy
 
         return AggregateMetrics(
             total_rounds=total_rounds,
@@ -91,11 +124,17 @@ class MetricsTracker:
 
     # ------------------------------------------------------------------
     def save_summary(self, path: str | None = None) -> str:
-        """Write the aggregate summary to JSON and log a human-readable block."""
+        """Write the aggregate summary to JSON and log a human-readable block.
+
+        ``aggregate`` covers every round; ``per_round`` is the retained tail (the
+        full history lives in ``rounds.jsonl``).
+        """
         summary = self.aggregate()
         out_path = path or os.path.join(self.output_dir, "summary.json")
         payload = {
             "aggregate": summary.to_dict(),
+            "per_round_is_tail": self._total_rounds > len(self.rounds),
+            "per_round_path": self.jsonl_path,
             "per_round": [r.to_dict() for r in self.rounds],
         }
         with open(out_path, "w") as f:
@@ -126,7 +165,7 @@ class MetricsTracker:
         logger.info("=" * 60)
 
     def _save_round(self, m: RoundMetrics) -> None:
-        path = os.path.join(self.output_dir, f"round_{m.round_num:03d}.json")
-        with open(path, "w") as f:
-            json.dump(m.to_dict(), f, indent=2)
-        logger.debug("Round metrics saved to %s", path)
+        """Append one round to ``rounds.jsonl`` (one JSON object per line)."""
+        with open(self.jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(m.to_dict()) + "\n")
+        logger.debug("Round metrics appended to %s", self.jsonl_path)

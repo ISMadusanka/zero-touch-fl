@@ -26,7 +26,7 @@ Honest clients are the MAJORITY, so median-based references describe honest beha
 Features per client:
 - `layers` -- per-layer stats:
   * l2_norm: this layer's update magnitude. rel_norm: l2_norm / median over clients (>> 1 = abnormally large).
-  * cos_to_median: cosine to the others' median update (near 1 = normal; low/negative = anomalous direction, e.g. sign-flip).
+  * cos_to_median: cosine to the coordinate-wise median update across clients (near 1 = normal; low/negative = anomalous direction, e.g. sign-flip).
   * sign_agreement: fraction of coordinates whose sign matches the median (honest ~> 0.6; flipped drops below 0.5).
 - `whole` -- model-wide: l2_norm, rel_norm; cos_to_mean; max_pairwise_cos (colluding Sybils look alike -> high); dnc_score (spectral outlier, higher = stronger).
 

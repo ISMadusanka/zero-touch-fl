@@ -57,13 +57,30 @@ def apply_dark_style(ax, title="", xlabel="", ylabel=""):
 
 # ─── Data loading ──────────────────────────────────────────────────────────────
 def load_rounds(log_dir: str):
-    files = sorted(Path(log_dir).glob("round_*.json"),
-                   key=lambda p: int(re.search(r"(\d+)", p.stem).group(1)))
-    rounds = []
-    for f in files:
-        with open(f) as fh:
-            rounds.append(json.load(fh))
-    return rounds
+    """Load round logs from ``rounds.jsonl`` (one JSON object per line) and/or the
+    legacy ``round_NNN.json`` files, merged by round number and sorted."""
+    by_round: dict[int, dict] = {}
+    for path in sorted(Path(log_dir).glob("round_*.json"),
+                       key=lambda p: int(re.search(r"(\d+)", p.stem).group(1))):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                r = json.load(fh)
+            by_round[int(r["round_num"])] = r
+        except (json.JSONDecodeError, KeyError, ValueError, OSError) as e:
+            print(f"[WARN] skipping {path}: {e}")
+    jsonl = Path(log_dir) / "rounds.jsonl"
+    if jsonl.is_file():
+        with open(jsonl, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    by_round[int(r["round_num"])] = r
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue      # tolerate a torn final line from a live run
+    return [by_round[k] for k in sorted(by_round)]
 
 
 def load_metrics_summary(path: str):
@@ -334,6 +351,12 @@ def main():
     parser.add_argument("--out-dir", default="logs/visualizations")
     parser.add_argument("--metrics-summary", default="logs/metrics/summary.json")
     args = parser.parse_args()
+    # This script prints ✓ marks; on Windows stdout defaults to cp1252 (especially
+    # when piped), which raises UnicodeEncodeError. Same fix as main.setup_logging.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
 
     if not os.path.isdir(args.log_dir):
         print(f"[ERROR] Log directory not found: {args.log_dir}")
@@ -341,7 +364,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     rounds = load_rounds(args.log_dir)
     if not rounds:
-        print("[ERROR] No round_*.json files found.")
+        print("[ERROR] No round logs found (looked for rounds.jsonl and round_*.json).")
         sys.exit(1)
 
     summary = load_metrics_summary(args.metrics_summary)

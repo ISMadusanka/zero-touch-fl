@@ -120,6 +120,9 @@ class LLMPolicy:
         self._logits_kw = None   # resolved on first use: which "last-token-only" kwarg works
         self._use_system_role = None  # resolved on first use: does the chat template accept a system role?
         self._use_fast_generate = bool(use_fast_generate)  # KV-cached generate; auto-falls back on failure
+        # Per-rollout "did this finish on its own (EOS) rather than hit the token
+        # cap?", set by every generate() call. See generate().
+        self.last_generation_completed: list[bool] = []
         self.set_adapter(self.adapters[0])
         logger.info(f"LLMPolicy ready — adapters={self.adapters}, device={self.device}")
 
@@ -272,6 +275,11 @@ class LLMPolicy:
         return ids
 
     def generate(self, adapter, system, user, n=1, temperature=0.0, max_new_tokens=2048) -> list[str]:
+        """Sample ``n`` completions. Also sets ``self.last_generation_completed``:
+        one bool per returned text saying whether that rollout emitted EOS on its
+        own (vs being cut off at ``max_new_tokens``). GRPO reads it immediately
+        after the call to decide whether it may train on the stop token — it is
+        overwritten by the next ``generate``, including the opponent's."""
         self.set_adapter(adapter)
         prompt_ids = self._prompt_ids(system, user)
         plen = prompt_ids.shape[1]
@@ -329,8 +337,18 @@ class LLMPolicy:
                 self._tok.decode(out[i, plen:], skip_special_tokens=True)
                 for i in range(out.shape[0])
             ]
+            # A rollout finished on its own iff its generated span contains EOS.
+            eos_ids = self._eos_ids()
+            if eos_ids:
+                eos_t = torch.tensor(sorted(eos_ids), device=out.device)
+                completed = [bool(torch.isin(out[i, plen:], eos_t).any())
+                             for i in range(out.shape[0])]
+            else:
+                completed = [False] * out.shape[0]
             if not do_sample:
                 texts = texts * n   # deterministic greedy → replicate the single completion
+                completed = completed * n
+            self.last_generation_completed = completed
             del out
             torch.cuda.empty_cache()
             return texts
@@ -385,24 +403,40 @@ class LLMPolicy:
             self._tok.decode(ids[i, plen:], skip_special_tokens=True)
             for i in range(n_gen)
         ]
+        completed = [bool(x) for x in finished.tolist()]   # per-row: hit EOS
         if not do_sample:
             texts = texts * n   # deterministic greedy → replicate the single completion
+            completed = completed * n
+        self.last_generation_completed = completed
         del ids
         torch.cuda.empty_cache()
         return texts
 
-    def _completion_token_logprobs(self, system, user, completion, with_grad):
+    def _completion_token_logprobs(self, system, user, completion, with_grad,
+                                   append_eos=False):
         """Per-token log-probs of ``completion`` given the prompt.
 
         Returns a 1-D tensor (one entry per completion token). Differentiable
         when ``with_grad`` and an adapter is active; used both for the policy
         term (grad) and, under ``disable_adapter`` + no_grad, the KL reference.
+
+        ``append_eos`` re-attaches the end-of-turn token that ``generate`` strips
+        when decoding with ``skip_special_tokens=True``. Without it the policy
+        gets no gradient on the decision to STOP, so nothing holds it back from
+        drifting toward rambling past ``max_new_tokens`` (which also truncates the
+        JSON the agents have to parse). Callers pass it only for rollouts that
+        actually terminated on their own — appending EOS to a truncated rollout
+        would train the model to stop mid-output.
         """
         torch = self.torch
         prompt_ids = self._prompt_ids(system, user)
         comp_ids = self._tok(
             completion, add_special_tokens=False, return_tensors="pt",
         ).input_ids.to(self.device)
+
+        if append_eos and self._tok.eos_token_id is not None:
+            eos = torch.tensor([[int(self._tok.eos_token_id)]], device=self.device)
+            comp_ids = torch.cat([comp_ids, eos], dim=1)
 
         if comp_ids.shape[1] == 0:
             # Empty completion → zero-length logprob vector.
@@ -421,15 +455,21 @@ class LLMPolicy:
         comp_len = comp_ids.shape[1]
         return tok_logp[-comp_len:]
 
-    def policy_token_logprobs(self, adapter, system, user, completion):
+    def policy_token_logprobs(self, adapter, system, user, completion, append_eos=False):
         """Differentiable per-token log-probs under ``adapter``."""
         self.set_adapter(adapter)
-        return self._completion_token_logprobs(system, user, completion, with_grad=True)
+        return self._completion_token_logprobs(
+            system, user, completion, with_grad=True, append_eos=append_eos)
 
-    def reference_token_logprobs(self, system, user, completion):
-        """No-grad per-token log-probs under the BASE model (KL reference)."""
+    def reference_token_logprobs(self, system, user, completion, append_eos=False):
+        """No-grad per-token log-probs under the BASE model (KL reference).
+
+        ``append_eos`` must match the policy pass so the two sequences line up
+        token-for-token and the KL is computed over the same positions.
+        """
         with self.model.disable_adapter():
-            return self._completion_token_logprobs(system, user, completion, with_grad=False).detach()
+            return self._completion_token_logprobs(
+                system, user, completion, with_grad=False, append_eos=append_eos).detach()
 
 
 class PolicyGenerator:

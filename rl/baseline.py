@@ -32,6 +32,11 @@ def _sign_flip(sd):
     return {k: -v.float() for k, v in sd.items()}
 
 
+def _same_weights(a: dict, b: dict) -> bool:
+    """True when two state_dicts are element-wise identical (a no-op 'attack')."""
+    return all(torch.equal(a[k].float(), b[k].float()) for k in b)
+
+
 def fixed_attacker_actions(benign_by_client: dict[int, dict]) -> list[tuple[str, dict]]:
     """Return ``[(label, {client_id: poisoned_state_dict})]`` candidates."""
     transforms = {
@@ -68,31 +73,40 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
     for _ in range(n_rounds):
         ctx = env.begin_round()
         # No LLM to choose clients: poison the first `budget` clients of the pool.
-        chosen_ids = list(ctx.pool_ids[:ctx.budget])
-        selected_benign = {cid: ctx.pool_benign[cid] for cid in chosen_ids}
-        env.set_committed_poison(chosen_ids)
+        selected_ids = list(ctx.pool_ids[:ctx.budget])
+        selected_benign = {cid: ctx.pool_benign[cid] for cid in selected_ids}
         actions = fixed_attacker_actions(selected_benign)
 
         scored = []
         for label, poisoned in actions:
-            updates = env.build_updates(poisoned)
+            # Ground truth is the clients whose weights the action ACTUALLY changed
+            # — the "none" control leaves them byte-identical to benign, so nothing
+            # was poisoned and the wasted clients are charged as malformed. This
+            # mirrors AttackerAgent.select_and_apply; without it the no-op action
+            # scored a free evasion bonus and won every round.
+            effective = [cid for cid in selected_ids
+                         if not _same_weights(poisoned[cid], selected_benign[cid])]
+            n_malformed = len(selected_ids) - len(effective)
+            updates = env.build_updates({cid: poisoned[cid] for cid in effective})
             verdicts = fixed_defender(env.features(updates))
             post_acc = env.evaluate_updates(updates, verdicts)
-            reward = attacker_reward(ctx.global_accuracy, post_acc, ctx.goal,
-                                     chosen_ids, verdicts, n_malformed=0)
-            scored.append((label, poisoned, updates, verdicts, post_acc, reward))
+            # Same reference as training: this round's clean (unpoisoned) aggregate.
+            reward = attacker_reward(ctx.clean_accuracy, post_acc, ctx.goal,
+                                     effective, verdicts, n_malformed)
+            scored.append((label, effective, n_malformed, updates, verdicts, post_acc, reward))
             logger.info(
                 f"[baseline] round {ctx.round_num} action={label:9s} "
-                f"acc->{post_acc:.4f} att_reward={reward:.3f} "
+                f"acc->{post_acc:.4f} att_reward={reward:.3f} poisoned={effective} "
                 f"flagged={[v.client_id for v in verdicts if v.is_suspicious]}"
             )
 
         # Commit the best attacker action.
-        best = max(scored, key=lambda s: s[5])
-        label, poisoned, updates, verdicts, _, _ = best
+        label, chosen_ids, n_malformed, updates, verdicts, _, _ = max(
+            scored, key=lambda s: s[6])
+        env.set_committed_poison(chosen_ids)
         new_acc = env.commit(updates, verdicts)
-        a_rew = attacker_reward(ctx.global_accuracy, new_acc, ctx.goal,
-                                chosen_ids, verdicts, n_malformed=0)
+        a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal,
+                                chosen_ids, verdicts, n_malformed)
         d_rew = defender_reward(verdicts, chosen_ids)
 
         metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
@@ -111,9 +125,13 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             defender_reward=d_rew,
             learning_agent="none",
             attack_metadata={"baseline_action": label, "budget": ctx.budget,
-                             "n_used": len(chosen_ids)},
+                             "n_used": len(chosen_ids), "n_malformed": n_malformed,
+                             "clean_accuracy": round(float(ctx.clean_accuracy), 6),
+                             "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6)},
         ))
         logger.info(
             f"[baseline] round {ctx.round_num}: committed '{label}' "
-            f"acc {ctx.global_accuracy:.4f}->{new_acc:.4f} def_reward={d_rew:.3f}"
+            f"acc {ctx.global_accuracy:.4f}->{new_acc:.4f} "
+            f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - new_acc:+.4f}) "
+            f"def_reward={d_rew:.3f}"
         )

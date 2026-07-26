@@ -41,28 +41,67 @@ logger = logging.getLogger(__name__)
 
 
 class League:
-    """In-memory pool of past adapter snapshots (CPU LoRA state dicts)."""
+    """Bounded in-memory pool of past adapter snapshots (CPU LoRA state dicts).
 
-    def __init__(self, rng):
+    Each snapshot is a full copy of one adapter's LoRA tensors — for the default
+    Qwen2.5-3B + ``lora_r: 16`` over 7 projections × 36 layers that is ~30M
+    parameters, i.e. **~115 MB per adapter per snapshot** in fp32. The pool was
+    previously unbounded and snapshotted BOTH adapters every
+    ``league_snapshot_every`` rounds, so a long run grew it without limit (~22 GB
+    of host RAM by round 10k, ~223 GB by round 100k with the shipped settings) and
+    eventually OOM'd the box.
+
+    It is now a ring buffer of at most ``max_snapshots`` per adapter: once full,
+    the OLDEST snapshot is dropped. That keeps the anti-overfit benefit (the
+    learner still faces a spread of past opponents) at a fixed memory ceiling of
+    ``max_snapshots × n_adapters × ~115 MB``.
+    """
+
+    def __init__(self, rng, max_snapshots: int = 10):
         self.rng = rng
+        self.max_snapshots = max(1, int(max_snapshots))
         self.snapshots: dict[str, list[dict]] = {}
 
     def snapshot(self, policy, names, states=None):
-        """Append a snapshot of each named adapter. ``states`` optionally overrides
-        the weights stored for a given name — used to snapshot a BORROWED opponent's
-        LIVE weights instead of the older snapshot temporarily swapped into it, so
-        the league doesn't accumulate stale duplicates."""
+        """Append a snapshot of each named adapter, evicting the oldest past the
+        cap. ``states`` optionally overrides the weights stored for a given name —
+        used to snapshot a BORROWED opponent's LIVE weights instead of the older
+        snapshot temporarily swapped into it, so the league doesn't accumulate
+        stale duplicates."""
+        evicted = 0
         for name in names:
             st = states[name] if (states and name in states) else policy.get_adapter_state(name)
-            self.snapshots.setdefault(name, []).append(st)
+            pool = self.snapshots.setdefault(name, [])
+            pool.append(st)
+            while len(pool) > self.max_snapshots:
+                pool.pop(0)          # ring buffer: drop the oldest
+                evicted += 1
         logger.info(f"League: snapshotted {list(names)} "
-                    f"(sizes={ {k: len(v) for k, v in self.snapshots.items()} })")
+                    f"(sizes={ {k: len(v) for k, v in self.snapshots.items()} }, "
+                    f"cap={self.max_snapshots}, evicted={evicted})")
 
     def has(self, name) -> bool:
         return bool(self.snapshots.get(name))
 
     def sample(self, name) -> dict:
         return self.rng.choice(self.snapshots[name])
+
+
+def resolve_round_budget(configured: int, total_rounds=None, max_new_rounds=None,
+                         start_round: int = 0) -> int:
+    """Absolute round budget for this run (the loop runs while ``done < budget``).
+
+    * ``total_rounds`` (``main.py --rounds N``) replaces ``fl.simulation_rounds``
+      as the ABSOLUTE budget — matching what ``--rounds`` documents, so a resumed
+      run counts the rounds it already did toward N.
+    * ``max_new_rounds`` (``main.py --debug``) additionally caps how many rounds
+      THIS invocation may add on top of ``start_round``, so a short debug run still
+      executes rounds when resuming a long training run.
+    """
+    budget = int(configured if total_rounds is None else total_rounds)
+    if max_new_rounds is not None:
+        budget = min(budget, int(start_round) + int(max_new_rounds))
+    return budget
 
 
 def _argmax(xs: list[float]) -> int:
@@ -86,6 +125,8 @@ def train(
     fl_state_cb=None,
     start_round: int = 0,
     resume: dict | None = None,
+    total_rounds: int | None = None,
+    max_new_rounds: int | None = None,
 ):
     """Run the alternating GRPO training loop over ``simulation_rounds`` rounds.
 
@@ -93,6 +134,12 @@ def train(
     passed as ``start_round``), plus, for a full resume, the saved FL ``round_index``
     (so round numbering/logs continue) and ``controller`` snapshot (so the arms-race
     schedule continues instead of restarting at the first attacker phase).
+
+    ``total_rounds`` overrides ``fl.simulation_rounds`` as the ABSOLUTE round
+    budget (``main.py --rounds N``); ``max_new_rounds`` caps how many rounds THIS
+    invocation may add on top of ``start_round`` (``main.py --debug``). Both were
+    previously computed in ``main.py`` and then dropped on the floor, so
+    ``--rounds``/``--debug`` silently ran the full ``simulation_rounds`` budget.
     """
     rl = cfg.get("rl", {})
     G = int(rl.get("G", 4))
@@ -108,6 +155,7 @@ def train(
     save_every = int(rl.get("save_every", 50))
     snap_every = int(rl.get("league_snapshot_every", 100))
     league_prob = float(rl.get("league_prob", 0.0))
+    league_max = int(rl.get("league_max_snapshots", 10))
     skip_zero_adv = bool(rl.get("skip_zero_advantage", True))
     resample_zero_adv = bool(rl.get("resample_on_zero_advantage", True))
     resample_temp = float(rl.get("resample_temperature", 1.3))
@@ -124,14 +172,22 @@ def train(
     reward_def = reward_cfg.get("defender", {})
     switch_cfg = SwitchConfig.from_cfg(rl)
 
-    total_rounds = int(cfg["fl"]["simulation_rounds"])
+    total_rounds = resolve_round_budget(
+        int(cfg["fl"]["simulation_rounds"]), total_rounds, max_new_rounds, start_round)
+    if start_round >= total_rounds:
+        logger.warning(
+            f"Nothing to do: {start_round} round(s) already done and the budget is "
+            f"{total_rounds}. Raise fl.simulation_rounds or pass a larger --rounds."
+        )
+    else:
+        logger.info(f"Training budget: rounds {start_round} -> {total_rounds}")
 
     import torch
     optimizers = {
         "attacker": torch.optim.AdamW(policy.adapter_parameters("attacker"), lr=lr),
         "defender": torch.optim.AdamW(policy.adapter_parameters("defender"), lr=lr),
     }
-    league = League(rng)
+    league = League(rng, max_snapshots=league_max)
 
     # Per-round knobs bundled so both schedules share one round body.
     knobs = dict(
@@ -222,7 +278,10 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     info = turn.commit(stats["completions"][best])
     poisoned_ids = info["poisoned_ids"]        # the attacker's committed choice
 
-    drop = ctx.global_accuracy - info["post_accuracy"]
+    # Damage vs THIS round's clean counterfactual (what the aggregate would have
+    # scored unpoisoned), so the win-gate measures the attack — not the change
+    # since the previous round. See FLArmsRaceEnv.clean_reference_accuracy.
+    drop = ctx.clean_accuracy - info["post_accuracy"]
     success = committed_success(learner, drop, info["verdicts"], poisoned_ids,
                                 state["switch_cfg"], ctx.goal)
 
@@ -471,7 +530,7 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
         info.get("poisoned_by_client", {}),
         {cid: env.pool_benign[cid] for cid in poisoned_ids if cid in env.pool_benign},
     )
-    a_rew = attacker_reward(ctx.global_accuracy, post_acc, goal,
+    a_rew = attacker_reward(ctx.clean_accuracy, post_acc, goal,
                             poisoned_ids, verdicts, n_malformed,
                             alpha=reward_att.get("alpha", 1.0),
                             beta=reward_att.get("beta", 0.5),
@@ -505,6 +564,11 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             "n_used": len(poisoned_ids),
             "controllable_pool": ctx.pool_ids,
             "attack_diversity": round(float(diversity), 4),
+            # The clean counterfactual and the damage measured against it — the
+            # quantities the reward and the win-gate actually use, so monitor.py
+            # and the visualizer report the same number the policy is trained on.
+            "clean_accuracy": round(float(ctx.clean_accuracy), 6),
+            "induced_drop": round(float(ctx.clean_accuracy - post_acc), 6),
             "phase_index": phase_index,
             "phase_round": phase_round,
             "learner_success": success,
@@ -519,13 +583,15 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
         },
     ))
     dbg.commit_summary(
-        learner, best_index, info, ctx.global_accuracy, post_acc,
-        ctx.global_accuracy - post_acc, success, a_rew, d_rew, poisoned_ids,
+        learner, best_index, info, ctx.clean_accuracy, post_acc,
+        ctx.clean_accuracy - post_acc, success, a_rew, d_rew, poisoned_ids,
+        global_acc=ctx.global_accuracy,
     )
     dbg.flush()
     logger.info(
         f"Round {ctx.round_num} [learn={learner} ph={phase_index}.{phase_round} "
         f"{'WIN' if success else '...'}]: acc {ctx.global_accuracy:.4f}->{post_acc:.4f} "
+        f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - post_acc:+.4f}) "
         f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} "
         f"| grpo_loss={stats['loss']:.4f} mean_r={stats['mean_reward']:.3f} "
         f"zero_adv={stats['zero_advantage_fraction']:.2f} "

@@ -51,6 +51,17 @@ def test_defender_success_predicate():
     assert not defender_succeeded([V(0, True), V(1, True), V(2, False)], [0], cfg)
 
 
+def test_defender_wins_a_clean_round_by_staying_quiet():
+    """The frozen attacker can produce a round with NO effective poison (every
+    selected client's plan was a no-op). TPR is undefined there; treating it as 0
+    made a flawless round a loss and could stall the defender's phase whenever its
+    opponent degenerated. Staying quiet is the win condition on a clean round."""
+    cfg = _cfg()
+    assert defender_succeeded([V(0, False), V(1, False), V(2, False)], [], cfg)
+    # ...but over-flagging honest clients is still a loss.
+    assert not defender_succeeded([V(0, True), V(1, True), V(2, False)], [], cfg)
+
+
 def test_committed_success_dispatch():
     cfg = _cfg()
     assert committed_success("attacker", 0.05, [V(0, False)], [0], cfg)

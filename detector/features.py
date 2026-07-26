@@ -9,12 +9,17 @@ elsewhere, supervises it via RL).
 For each client we compute, relative to the current global model:
   * Per logical layer (grouped by state_dict prefix, e.g. ``net.2`` / ``net.4``):
       - ``l2_norm``        : ‖Δ_layer‖
-      - ``rel_norm``       : ‖Δ_layer‖ / median(‖Δ_layer‖ over clients)
-      - ``cos_to_median``  : cosine(Δ_layer, coordinate-wise median of the OTHER
+      - ``rel_norm``       : ‖Δ_layer‖ / median(‖Δ_layer‖ over ALL clients)
+      - ``cos_to_median``  : cosine(Δ_layer, coordinate-wise median of ALL
                              clients' Δ_layer)
       - ``sign_agreement`` : fraction of coordinates whose sign matches the
-                             coordinate-wise median sign (NEW — catches
-                             sign-flip / targeted attacks that preserve norm)
+                             coordinate-wise median sign (catches sign-flip /
+                             targeted attacks that preserve norm)
+
+    The median references are taken over all clients INCLUDING the one being
+    scored (not leave-one-out). With a benign majority the median is dominated by
+    honest clients either way, so a single outlier still stands out; computing one
+    shared reference per layer also keeps this O(n) instead of O(n²).
   * Whole model (all params flattened):
       - ``l2_norm`` / ``rel_norm``
       - ``cos_to_mean``      : cosine(Δ, mean Δ)                 (FLTrust-style)

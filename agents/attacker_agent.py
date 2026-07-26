@@ -21,6 +21,8 @@ RL-trainable.
 import json
 import logging
 
+import torch
+
 from agents.attack_ops import (
     OPERATOR_DOCS, apply_plan, delta_details, extract_plan, extract_selection,
 )
@@ -53,6 +55,8 @@ Objective (`attack_goal`):
 - std_ratio, absmean_ratio: spread / typical size of D vs the global's own.
 - whole-model cos_to_global: alignment with the current model.
 Larger changes degrade accuracy more but are easier to flag -- balance the two, and keep each poisoned update close to an honest one so it is not filtered.
+
+IMPORTANT -- what your operators act on: every operator transforms the client's FULL weight vector W, NOT the small update D. The server then sees that client's update as D' = op(W) - global. Because W is close to the global model, a mild-looking multiplicative edit is a huge update: `scale` with factor f alone gives roughly rel_update ~ |f - 1|. So if the honest rel_update is about 0.2, then f=1.05 is a normal-sized update, f=1.5 is about 7x the honest size (very likely flagged), and f=2 or a full `sign_flip` is enormous. Additive operators are absolute: `add_constant`/`add_gaussian_noise` of size v change rel_update by about v * sqrt(count) / norm(global), so compare v against `rms_delta`, which is the honest per-weight step. Calibrate every operator against the honest `rel_update` shown for that client.
 
 %OPERATOR_DOCS%
 
@@ -133,28 +137,44 @@ class AttackerAgent:
             pool_references: {client_id: benign_state_dict} for the controllable pool.
             budget: max number of clients that may be poisoned this round.
 
-        Returns ``(poisoned_by_client, chosen_ids, n_malformed)``:
-          * poisoned_by_client: {client_id: poisoned_state_dict} for chosen clients.
-          * chosen_ids: clients actually poisoned (subset of pool, ordered, <= budget).
-          * n_malformed: number of chosen clients whose plan was missing/unusable
-            (they fall back to benign weights — a wasted client, a reward penalty).
+        Returns ``(poisoned_by_client, poisoned_ids, n_malformed)``:
+          * poisoned_by_client: {client_id: poisoned_state_dict} — ONLY the clients
+            whose weights the plan actually changed.
+          * poisoned_ids: those same clients (ordered, subset of pool, <= budget).
+            This is the round's **ground truth** for the defender's reward and for
+            the research metrics.
+          * n_malformed: how many SELECTED clients produced no change at all —
+            unparseable output, an empty plan, ops that were all skipped as
+            invalid, or a plan that is arithmetically a no-op (e.g.
+            ``scale factor=1.0``). Each is a wasted client and a reward penalty.
 
-        Always returns at least one chosen client (falls back to the first pool
-        client with benign weights on total garbage) so the reward/metrics that
-        divide by the poison count stay well-defined.
+        A selected client whose plan does nothing sends **byte-identical benign
+        weights**, so counting it as poisoned was actively harmful: the research
+        ASR metric (``fn > 0``) reported a 100% success rate for an attack that
+        did nothing, and the defender's reward punished it for failing to detect
+        an update that is, by construction, undetectable. Such clients are now
+        excluded from the ground truth and charged to ``n_malformed`` instead.
+
+        Consequently ``poisoned_ids`` **can be empty** (the attacker selected
+        clients but achieved nothing). Every consumer handles that: the reward
+        gives 0 stealth and a full malformed penalty, ``rl.switch`` treats it as
+        no attack, and the metrics record a clean round. Parsing never raises.
         """
         pool_ids = list(pool_references.keys())
         budget = max(1, min(int(budget), len(pool_ids)))
 
-        def _benign_fallback():
-            cid = pool_ids[0]
-            poisoned = {cid: {k: v.clone() for k, v in pool_references[cid].items()}}
-            dbg.poison(None, {cid: pool_references[cid]}, poisoned, n_malformed=1)
-            return poisoned, [cid], 1
+        def _unchanged(cid, weights) -> bool:
+            ref = pool_references[cid]
+            return all(torch.equal(weights[k], ref[k]) for k in ref)
+
+        def _nothing_happened(n_malformed: int):
+            """No client was effectively poisoned this round."""
+            dbg.poison({}, {}, {}, n_malformed=n_malformed)
+            return {}, [], n_malformed
 
         sel = extract_selection(text)
         if sel is None:
-            return _benign_fallback()
+            return _nothing_happened(1)
 
         # Ordered list of (id, ops) candidates from the parsed selection.
         candidates: list[tuple[int, list | None]] = []
@@ -166,7 +186,7 @@ class AttackerAgent:
             # Shared plan, no ids -> auto-select the first `budget` pool clients.
             candidates = [(cid, sel["shared_ops"]) for cid in pool_ids[:budget]]
         else:
-            return _benign_fallback()
+            return _nothing_happened(1)
 
         # Keep only pool ids, dedup (first wins), truncate to the budget.
         chosen: list[tuple[int, list | None]] = []
@@ -179,24 +199,33 @@ class AttackerAgent:
             if len(chosen) >= budget:
                 break
         if not chosen:
-            return _benign_fallback()
+            return _nothing_happened(1)
 
         poisoned: dict[int, dict] = {}
         n_malformed = 0
+        n_invalid_ops = 0
         plan_for_dbg: dict[int, list] = {}
         for cid, ops in chosen:
             if not ops:                        # empty/missing plan -> wasted client
-                poisoned[cid] = {k: v.clone() for k, v in pool_references[cid].items()}
                 n_malformed += 1
                 plan_for_dbg[cid] = []
                 continue
-            pw, _n_invalid = apply_plan(pool_references[cid], ops, self.max_abs)
+            pw, n_invalid = apply_plan(pool_references[cid], ops, self.max_abs)
+            n_invalid_ops += n_invalid
+            if _unchanged(cid, pw):
+                # The plan parsed but changed nothing (all ops skipped as invalid,
+                # or arithmetically a no-op). The server would receive this
+                # client's honest weights, so it is NOT poisoned — it is wasted.
+                n_malformed += 1
+                plan_for_dbg[cid] = ops
+                continue
             poisoned[cid] = pw
             plan_for_dbg[cid] = ops
-        chosen_ids = [cid for cid, _ in chosen]
-        dbg.poison(plan_for_dbg, {cid: pool_references[cid] for cid in chosen_ids},
-                   poisoned, n_malformed=n_malformed)
-        return poisoned, chosen_ids, n_malformed
+
+        poisoned_ids = [cid for cid, _ in chosen if cid in poisoned]
+        dbg.poison(plan_for_dbg, {cid: pool_references[cid] for cid in poisoned_ids},
+                   poisoned, n_malformed=n_malformed, n_invalid_ops=n_invalid_ops)
+        return poisoned, poisoned_ids, n_malformed
 
     # ------------------------------------------------------------------
     def parse(self, text, references: dict[int, dict]) -> tuple[dict[int, dict], int]:

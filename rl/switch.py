@@ -96,8 +96,17 @@ def attacker_succeeded(drop: float, verdicts, poisoned_ids, cfg: SwitchConfig,
 
 def defender_succeeded(verdicts, poisoned_ids, cfg: SwitchConfig) -> bool:
     """True when the committed verdicts catch the poisoned client(s) (TPR high)
-    without over-flagging honest clients (FPR low)."""
+    without over-flagging honest clients (FPR low).
+
+    ``poisoned_ids`` may be empty — the frozen attacker can select clients whose
+    plans turn out to be no-ops, leaving every update honest. TPR is undefined
+    there, and treating it as 0 would make a flawless clean round a loss (and
+    stall the defender's phase whenever its opponent degenerates). On a clean
+    round the defender wins by staying quiet, i.e. by keeping FPR in bounds.
+    """
     tpr, fpr = _tpr_fpr(verdicts, poisoned_ids)
+    if not poisoned_ids:
+        return fpr <= cfg.defender_max_fpr
     return tpr >= cfg.defender_min_tpr and fpr <= cfg.defender_max_fpr
 
 

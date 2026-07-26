@@ -24,6 +24,18 @@ from rl.rewards import group_advantages
 logger = logging.getLogger(__name__)
 
 
+def _completed_flags(policy, n: int) -> list[bool]:
+    """Per-rollout "ended on EOS" flags from the last ``policy.generate`` call.
+
+    Falls back to all-False (never train on a stop token we can't confirm) for
+    generators that don't expose the attribute or return a mismatched length.
+    """
+    flags = getattr(policy, "last_generation_completed", None)
+    if isinstance(flags, list) and len(flags) == n:
+        return [bool(f) for f in flags]
+    return [False] * n
+
+
 def grpo_step(
     policy,
     adapter: str,
@@ -61,6 +73,10 @@ def grpo_step(
     completions = policy.generate(
         adapter, system, user, n=G, temperature=temperature, max_new_tokens=max_new_tokens,
     )
+    # Capture BEFORE scoring: turn.reward() runs the opponent's generate(), which
+    # overwrites this. Marks which rollouts ended with EOS instead of being cut
+    # off at max_new_tokens — only those may train on the stop token.
+    completed = _completed_flags(policy, len(completions))
 
     # 2. Verifiable reward for each candidate.
     rewards = [float(turn.reward(c)) for c in completions]
@@ -79,6 +95,7 @@ def grpo_step(
             temperature=max(temperature, resample_temperature),
             max_new_tokens=max_new_tokens,
         )
+        completed = _completed_flags(policy, len(completions))
         rewards = [float(turn.reward(c)) for c in completions]
         advantages, zero_frac = group_advantages(rewards)
 
@@ -92,11 +109,15 @@ def grpo_step(
     n_used = 0
     if stepped:
         optimizer.zero_grad()
-        for completion, adv in zip(completions, advantages):
-            lp = policy.policy_token_logprobs(adapter, system, user, completion)  # (L,) grad
+        for completion, adv, eos in zip(completions, advantages, completed):
+            # (L,) grad — includes the stop token for rollouts that ended on EOS.
+            lp = policy.policy_token_logprobs(adapter, system, user, completion,
+                                              append_eos=eos)
             if lp.numel() == 0:
                 continue
-            ref = policy.reference_token_logprobs(system, user, completion)       # (L,) no grad
+            # Same append_eos so the KL lines up token-for-token.
+            ref = policy.reference_token_logprobs(system, user, completion,
+                                                  append_eos=eos)               # (L,) no grad
             L = min(lp.shape[0], ref.shape[0])
             lp, ref = lp[-L:], ref[-L:]
 

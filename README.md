@@ -30,6 +30,13 @@ Two phases:
    - The server FedAvg-aggregates the clients the defender did not flag.
    - Because we know the ground-truth poisoned set, both agents get an exact
      **verifiable reward**, and both are trained online with **GRPO**.
+   - A selected client counts as poisoned only if its plan **actually changed its
+     weights**; no-ops (unparseable output, empty plans, ops all skipped as
+     invalid, `scale factor=1.0`) send honest weights, so they are charged as
+     *wasted* clients rather than entering the ground truth. The attacker's damage
+     is scored against the round's **clean counterfactual** — the accuracy the
+     aggregate reaches with no poison at all — so hitting the goal scores the same
+     every round it is hit.
 
 There are no hardcoded attack plugins, no hardcoded detector rules, and no
 episodic-memory feedback loop — the LLMs learn everything via RL.
@@ -66,7 +73,7 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   `checkpoints/rl_progress.json` are reloaded and training continues where it left
   off — not just the trained adapters and the round count (`rounds_done`), but also
   the FL round number (`round_index`, so round labels and `logs/round_data` keep
-  advancing instead of overwriting from the first Phase-2 round) and the arms-race
+  advancing instead of restarting from the first Phase-2 round) and the arms-race
   schedule (`controller`: which agent is learning, phase index, win streak). The
   in-memory opponent league is the one piece not persisted (it restarts empty). Old
   progress files that only hold `rounds_done` still load (the rest falls back safely).
@@ -114,15 +121,20 @@ pip install torch torchvision numpy pyyaml matplotlib openai requests
 # Full GRPO training (GPU). Phase 1 runs once, then the RL arms race.
 python main.py --env linux
 
-# Quick smoke run: few rounds
+# Quick smoke run: few rounds. --rounds is an ABSOLUTE budget overriding
+# fl.simulation_rounds, so on a resumed run the rounds already done count toward it.
 python main.py --env linux --rounds 8
+
+# Run against a different config file
+python main.py --env linux --config configs/my_experiment.yaml
 
 # Verbose DEBUG run (GPU) — print EVERYTHING for one short run, to the console AND
 # logs/debug.json: the exact attacker/defender LLM prompts + raw outputs, each
 # poisoning step (attack plan + per-layer poisoned-weight deltas), the per-round
 # FL fine-tuning data, and all rewards / GRPO advantages / commit outcomes.
-# Third-party library noise is silenced. Caps Phase 2 at 3 rounds unless --rounds
-# is given (each round is logic-identical — it just stops early).
+# Third-party library noise is silenced. Without --rounds it runs 3 MORE rounds
+# than are already done (each round is logic-identical — it just stops early), so
+# debugging a resumed run still executes rounds.
 python main.py --env linux --debug
 python main.py --env linux --debug --rounds 6     # debug a longer stretch
 
@@ -188,7 +200,9 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
   `max_poison_clients`, `sample_budget_in_training`, `eval_poison_clients`), and
   the `rl:` block — GRPO + LoRA + league + reward weights, including
   `reward.attacker.delta` (use-fewer-clients penalty) and `.zeta` (multi-client
-  collaboration/diversity bonus).
+  collaboration/diversity bonus), and `league_max_snapshots` (the ring-buffer cap
+  on retained opponent snapshots — each costs ~115 MB of host RAM, so leaving it
+  unbounded OOMs a long run).
 - **`configs/attacker_agent.yaml`** — attacker goal fallback, layer-detail
   precision, poisoned-weight clamp, attacker adapter path.
 - **`configs/defender_agent.yaml`** — defender defaults, defender adapter path.
@@ -210,6 +224,15 @@ round's target, so phase-switching tracks the sampled target instead of one abso
 floor (`rl.attacker_min_drop` is only the fallback when no target is known). Set the
 flag to `false` to train against the single fixed `attack.goal.target_accuracy_drop`.
 Evaluation never samples: pick the target at the benchmark with `--goal` (see below).
+
+Both the reward and this gate measure the committed drop against the round's
+**clean counterfactual** (the accuracy the aggregate reaches with no poison), not
+against the previous round's post-attack accuracy — see
+[`SYSTEM.md`](SYSTEM.md#verifiable-rewards-rlrewardspy). Without that, the
+memoryless environment (`benign_retrain_each_round: false`) made a repeated,
+equally damaging attack score ≈0 from the second round on, so
+`rl.success_streak` consecutive wins were unreachable and the arms-race handoff
+never fired.
 
 Benchmark a trained attacker against a specific goal (fixed for the whole run):
 
@@ -234,7 +257,8 @@ rl/           env, rewards, turns, inference (dry-run), policy (Unsloth+LoRA), g
 metrics/      Ground-truth confusion/TPR/FPR/ASR/APR (research evaluation + reward source)
 storage/      Phase-1 checkpoint + RL progress
 configs/      YAML configuration
-logs/         system.log, debug.json (--debug), round_data/, metrics/, visualizations/
+logs/         system.log, debug.json (--debug), round_data/rounds.jsonl,
+              metrics/rounds.jsonl + summary.json, visualizations/
 ```
 
 See [`SYSTEM.md`](SYSTEM.md) for the full architecture (round loop, reward

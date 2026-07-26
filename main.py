@@ -106,12 +106,22 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+# Per-round logs are APPENDED to one JSONL file rather than written as
+# ``round_NNN.json`` per round. At the shipped ``fl.simulation_rounds`` a
+# file-per-round sink produces millions of tiny files (and the same again under
+# logs/metrics/), which exhausts inodes and makes the directory unusable. One
+# append-only stream is O(1) per round and stays greppable. ``monitor.py`` and
+# ``visualize_rounds.py`` read this file, and still read legacy
+# ``round_NNN.json`` files so older runs keep working.
+ROUND_LOG_PATH = "logs/round_data/rounds.jsonl"
+
+
 def _save_round_log(log: RoundLog):
-    path = f"logs/round_data/round_{log.round_num:03d}.json"
-    with open(path, "w") as f:
-        import json
-        json.dump(asdict(log), f, indent=2, default=str)
-    logger.info(f"Round data saved to {path}")
+    import json
+    os.makedirs(os.path.dirname(ROUND_LOG_PATH), exist_ok=True)
+    with open(ROUND_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(asdict(log), default=str) + "\n")
+    logger.info(f"Round {log.round_num} appended to {ROUND_LOG_PATH}")
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +176,7 @@ def run_phase2(
     global_weights, client_weights, baseline_accuracy,
     client_loaders, test_loader, config, attacker_config, defender_config,
     mode: str, n_rounds: int, llm_backend: str,
+    max_new_rounds: int | None = None,
 ):
     fl = config["fl"]
     logger.info("=" * 60)
@@ -251,7 +262,8 @@ def run_phase2(
         train(env, policy, attacker_agent, defender_agent, config,
               metrics_tracker, _save_round_log, rng,
               progress_cb=progress_cb, fl_state_cb=fl_state_cb,
-              start_round=start_round, resume=progress)
+              start_round=start_round, resume=progress,
+              total_rounds=n_rounds, max_new_rounds=max_new_rounds)
 
     logger.info("\n" + "=" * 60)
     logger.info("PHASE 2 COMPLETE")
@@ -267,6 +279,8 @@ def run_phase2(
 def main():
     parser = argparse.ArgumentParser(description="Zero-Touch Federated Learning")
     parser.add_argument("--fresh", action="store_true", help="Force fresh Phase 1 training")
+    parser.add_argument("--config", default="configs/base.yaml",
+                        help="Path to the base config (default: configs/base.yaml)")
     parser.add_argument("--env", choices=["linux", "windows"], default="linux",
                         help="'linux' uses Ollama (qwen2.5), 'windows' uses OpenAI (default: linux)")
     parser.add_argument("--dry-run", action="store_true",
@@ -286,7 +300,7 @@ def main():
     quiet_noisy_warnings()
     logger.info("Starting Zero-Touch Federated Learning System")
 
-    base_config = load_config("configs/base.yaml")
+    base_config = load_config(args.config)
     attacker_config = load_config("configs/attacker_agent.yaml")
     defender_config = load_config("configs/defender_agent.yaml")
 
@@ -340,10 +354,18 @@ def main():
     mode = "baseline" if args.baseline else ("dry-run" if args.dry_run else "train")
     n_rounds = args.rounds if args.rounds is not None else int(fl["simulation_rounds"])
 
+    # ``--debug`` without ``--rounds`` caps how many rounds THIS RUN adds rather
+    # than the absolute budget: the training loop resumes from `rounds_done`, so an
+    # absolute cap of 3 would make a resumed debug run exit without executing
+    # anything. baseline/dry-run always start from zero, so there the two coincide.
+    max_new_rounds = None
+    if args.debug and args.rounds is None:
+        max_new_rounds = DEBUG_DEFAULT_ROUNDS
+        if mode != "train":
+            n_rounds = min(n_rounds, DEBUG_DEFAULT_ROUNDS)
+        logger.info(f"[debug] no --rounds given -> capping this run at "
+                    f"{DEBUG_DEFAULT_ROUNDS} Phase-2 round(s)")
     if args.debug:
-        if args.rounds is None:
-            n_rounds = DEBUG_DEFAULT_ROUNDS
-            logger.info(f"[debug] no --rounds given -> capping Phase 2 at {n_rounds} rounds")
         dbg.enable(
             output_dir="logs", filename="debug.json", mode=mode,
             config_summary={
@@ -360,6 +382,7 @@ def main():
                 "fl_interlude_between_phases": base_config.get("rl", {}).get("fl_interlude_between_phases"),
                 "baseline_accuracy": round(float(baseline_accuracy), 4),
                 "n_rounds": n_rounds,
+                "max_new_rounds": max_new_rounds,
             },
         )
 
@@ -376,6 +399,7 @@ def main():
             mode=mode,
             n_rounds=n_rounds,
             llm_backend=llm_backend,
+            max_new_rounds=max_new_rounds,
         )
     finally:
         dbg.close()

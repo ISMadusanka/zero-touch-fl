@@ -69,7 +69,10 @@ def run_inference(
 
         diversity = perturbation_diversity(
             poisoned, {cid: ctx.pool_benign[cid] for cid in chosen_ids})
-        a_rew = attacker_reward(prev_acc, new_acc, ctx.goal, chosen_ids, verdicts, n_malformed,
+        # Damage is scored against the round's clean counterfactual, exactly as in
+        # training (see FLArmsRaceEnv.clean_reference_accuracy).
+        a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal, chosen_ids,
+                                verdicts, n_malformed,
                                 pool_size=env.n_compromisable, diversity=diversity)
         d_rew = defender_reward(verdicts, chosen_ids)
 
@@ -89,10 +92,13 @@ def run_inference(
             defender_reward=d_rew,
             learning_agent="none",
             attack_metadata={"n_malformed": n_malformed, "budget": ctx.budget,
-                             "n_used": len(chosen_ids)},
+                             "n_used": len(chosen_ids),
+                             "clean_accuracy": round(float(ctx.clean_accuracy), 6),
+                             "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6)},
         ))
         logger.info(
             f"[dry-run] round {ctx.round_num}: poisoned={chosen_ids} budget={ctx.budget} "
-            f"acc {prev_acc:.4f}->{new_acc:.4f} | att_reward={a_rew:.3f} "
-            f"def_reward={d_rew:.3f} malformed={n_malformed}"
+            f"acc {prev_acc:.4f}->{new_acc:.4f} "
+            f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - new_acc:+.4f}) "
+            f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} malformed={n_malformed}"
         )

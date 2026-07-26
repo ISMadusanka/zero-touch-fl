@@ -23,6 +23,7 @@ Collapse (bad):
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -32,18 +33,58 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+def _utf8_stdout():
+    """Force UTF-8 on stdout before printing the report.
+
+    This report uses ✓/⚠ marks; on Windows stdout defaults to cp1252 (especially
+    when redirected to a file or a pipe), which raises UnicodeEncodeError
+    mid-report. Same defensive fix as ``main.setup_logging`` and ``core.debug``.
+    """
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):   # non-reconfigurable stream: fall through
+        pass
+
+
 def _soft_mal(v: dict) -> float:
     c = max(0.0, min(1.0, float(v.get("confidence", 0.0))))
     return 0.5 + 0.5 * c if v.get("is_suspicious") else 0.5 - 0.5 * c
 
 
+def read_round_logs(log_dir: str) -> list[dict]:
+    """Load raw round logs, newest sink first.
+
+    Rounds are appended to ``rounds.jsonl`` (one JSON object per line). Legacy
+    runs wrote one ``round_NNN.json`` per round; those are still read so old logs
+    keep working. Records are merged by ``round_num`` (JSONL wins) and sorted.
+    """
+    by_round: dict[int, dict] = {}
+    for path in sorted(Path(log_dir).glob("round_*.json"),
+                       key=lambda p: int(re.search(r"(\d+)", p.stem).group(1))):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                r = json.load(fh)
+            by_round[int(r["round_num"])] = r
+        except (json.JSONDecodeError, KeyError, ValueError, OSError):
+            continue
+    jsonl = Path(log_dir) / "rounds.jsonl"
+    if jsonl.exists():
+        with open(jsonl, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    by_round[int(r["round_num"])] = r
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue      # tolerate a torn final line from a live run
+    return [by_round[k] for k in sorted(by_round)]
+
+
 def load_rounds(log_dir: str) -> list[dict]:
-    files = sorted(Path(log_dir).glob("round_*.json"),
-                   key=lambda p: int(re.search(r"(\d+)", p.stem).group(1)))
     rows = []
-    for f in files:
-        with open(f) as fh:
-            r = json.load(fh)
+    for r in read_round_logs(log_dir):
         poisoned = set(r.get("poisoned_client_ids", []))
         labels = r.get("predicted_labels", [])
         tp = sum(1 for v in labels if v["client_id"] in poisoned and v["is_suspicious"])
@@ -53,13 +94,20 @@ def load_rounds(log_dir: str) -> list[dict]:
         n = max(1, len(labels))
         pois_v = [v for v in labels if v["client_id"] in poisoned]
         stealth = float(np.mean([1.0 - _soft_mal(v) for v in pois_v])) if pois_v else 0.0
-        train = (r.get("attack_metadata") or {}).get("train", {})
+        meta = r.get("attack_metadata") or {}
+        train = meta.get("train", {})
+        # The damage the attacker is actually rewarded for: post-attack accuracy vs
+        # THIS round's clean counterfactual. Older logs predate the field, so fall
+        # back to the (baseline-relative) approximation they allow.
+        drop = meta.get("induced_drop")
+        if drop is None:
+            drop = r.get("baseline_accuracy", 0.0) - r.get("test_accuracy", 0.0)
         rows.append({
             "round": r["round_num"],
             "learner": r.get("learning_agent", "none"),
             "att_reward": r.get("attacker_reward", 0.0),
             "def_reward": r.get("defender_reward", 0.0),
-            "drop": r.get("baseline_accuracy", 0.0) - r.get("test_accuracy", 0.0),
+            "drop": drop,
             "stealth": stealth,
             "flag_rate": (tp + fp) / n,
             "tpr": tp / (tp + fn) if (tp + fn) else float("nan"),
@@ -348,6 +396,7 @@ def main():
                     help="per-client poisoned-vs-flagged map")
     ap.add_argument("--window", type=int, default=20, help="rolling/recent window")
     args = ap.parse_args()
+    _utf8_stdout()
 
     rows = load_rounds(args.log_dir)
     if not rows:

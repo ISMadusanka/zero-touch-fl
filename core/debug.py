@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import time
+from collections import deque
 
 # Roles / stages used for tagging events (purely descriptive).
 _BAR = "=" * 88
@@ -45,11 +46,17 @@ def _short(x, precision=4):
 class DebugLogger:
     """Process-wide structured debug logger. No-op unless :meth:`enable` ran."""
 
+    # Ring-buffer size for the structured JSON sink. Generous enough to hold many
+    # fully-detailed rounds, small enough that the per-round full rewrite in
+    # ``flush()`` stays cheap and memory stays bounded on a long --debug run.
+    MAX_EVENTS = 20000
+
     def __init__(self):
         self._enabled = False
         self._out = None
         self._path = None
-        self._events = []
+        self._events = deque(maxlen=self.MAX_EVENTS)
+        self._seq = 0
         self._run_meta = {}
         self._t0 = 0.0
         # Per-round context (set by round_header).
@@ -82,7 +89,8 @@ class DebugLogger:
                 "mode": mode,
                 "config": config_summary or {},
             }
-            self._events = []
+            self._events = deque(maxlen=self.MAX_EVENTS)
+            self._seq = 0
             self._enabled = True
             self._banner(f"DEBUG MODE ON  (mode={mode})  ->  console + {self._path}")
             if config_summary:
@@ -107,7 +115,13 @@ class DebugLogger:
         if not self._enabled or not self._path:
             return
         try:
-            payload = {"run": self._run_meta, "events": self._events}
+            payload = {
+                "run": self._run_meta,
+                "events_recorded": self._seq,
+                "events_retained": len(self._events),
+                "events_dropped": max(0, self._seq - len(self._events)),
+                "events": list(self._events),
+            }
             tmp = self._path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, default=str)
@@ -130,9 +144,16 @@ class DebugLogger:
         self._line(_BAR)
 
     def _record(self, category, title, data):
-        """Append one structured event to the JSON buffer (full context)."""
+        """Append one structured event to the bounded JSON buffer (full context).
+
+        The buffer is a ring of ``max_events``: ``flush()`` rewrites the whole file
+        every round, so an unbounded buffer made debug runs O(n²) in I/O and grew
+        RAM without limit — which mattered because ``--debug`` used to silently run
+        the full ``simulation_rounds`` budget. ``seq`` keeps counting past the
+        eviction point so gaps in the file are obvious.
+        """
         self._events.append({
-            "seq": len(self._events),
+            "seq": self._seq,
             "t": round(time.monotonic() - self._t0, 3),
             "round": self._round,
             "learner": self._learner,
@@ -142,6 +163,7 @@ class DebugLogger:
             "title": title,
             "data": data,
         })
+        self._seq += 1
 
     def _block(self, label, text):
         """Print a labelled, delimiter-framed block of raw (exact) text."""
@@ -310,14 +332,29 @@ class DebugLogger:
 
     @_guard
     def poison(self, plan, references, poisoned, n_malformed, n_invalid_ops=0):
+        """``plan`` is either a per-client mapping ``{cid: [ops]}`` (the selection
+        path) or one shared op list; ``None`` means nothing parsed. ``poisoned``
+        holds only the clients whose weights actually changed, so a selected
+        client missing from it was wasted and is counted in ``n_malformed``."""
         self._line()
         if plan is None:
-            self._line(f"[POISON] attack plan UNPARSEABLE -> fell back to benign weights "
+            self._line(f"[POISON] attack plan UNPARSEABLE -> no client poisoned "
                        f"(n_malformed={n_malformed})")
+        elif isinstance(plan, dict):
+            n_ops = sum(len(ops or []) for ops in plan.values())
+            self._line(f"[POISON] per-client attack plan: {len(plan)} client(s), "
+                       f"{n_ops} op(s) total, invalid/skipped ops={n_invalid_ops}, "
+                       f"effectively poisoned={sorted(poisoned)}, wasted={n_malformed}")
+            for cid, ops in plan.items():
+                landed = "poisoned" if cid in poisoned else "NO-OP (wasted)"
+                self._line(f"    client {cid} [{landed}]: " + json.dumps(ops, default=str))
         else:
-            self._line(f"[POISON] attack plan ({len(plan)} op(s), "
+            self._line(f"[POISON] shared attack plan ({len(plan)} op(s), "
                        f"invalid/skipped ops={n_invalid_ops}):")
             self._line("    " + json.dumps(plan, default=str))
+        if not poisoned:
+            self._line("    -> NO client was effectively poisoned this round "
+                       "(the server receives only honest updates)")
         per_client = {}
         for cid in poisoned:
             if cid not in references:
@@ -334,6 +371,7 @@ class DebugLogger:
             per_client[cid] = {"total": total, "layers": layers}
         self._record("poison", "attack_plan_applied", {
             "plan": plan, "n_malformed": n_malformed, "n_invalid_ops": n_invalid_ops,
+            "effective_poisoned_ids": sorted(poisoned),
             "poison_deltas": per_client,
         })
 
@@ -457,8 +495,13 @@ class DebugLogger:
                    "(greedy) opponent:")
 
     @_guard
-    def commit_summary(self, learner, best_index, info, prev_acc, post_acc, drop,
-                       success, attacker_reward, defender_reward, poisoned_ids):
+    def commit_summary(self, learner, best_index, info, reference_acc, post_acc, drop,
+                       success, attacker_reward, defender_reward, poisoned_ids,
+                       global_acc=None):
+        """``reference_acc`` is the round's CLEAN counterfactual (the accuracy the
+        aggregate reaches unpoisoned) — the baseline ``drop`` is measured from.
+        ``global_acc`` is the accuracy of the global model the round started on,
+        shown for context only."""
         verdicts = info.get("verdicts", [])
         flagged = sorted({v.client_id for v in verdicts if v.is_suspicious})
         averaged = sorted({v.client_id for v in verdicts if not v.is_suspicious})
@@ -467,10 +510,15 @@ class DebugLogger:
         self._line("    committed verdicts:")
         for ln in self._verdict_lines(verdicts, poisoned_ids):
             self._line(ln)
+        if not poisoned_ids:
+            self._line("    (no client was effectively poisoned this round — "
+                       "clean round, nothing to detect)")
         self._line(
-            f"    accuracy {_short(prev_acc)} -> {_short(post_acc)}  (drop={_short(drop)})   "
-            f"learner_success={success}"
+            f"    clean_reference {_short(reference_acc)} -> post {_short(post_acc)}  "
+            f"(drop={_short(drop)})   learner_success={success}"
         )
+        if global_acc is not None:
+            self._line(f"    (global model accuracy at round start: {_short(global_acc)})")
         self._line(
             f"    attacker_reward={_short(attacker_reward)}  "
             f"defender_reward={_short(defender_reward)}"
@@ -478,7 +526,9 @@ class DebugLogger:
         self._record("commit", "round_committed", {
             "learner": learner, "best_index": best_index,
             "flagged": flagged, "averaged": averaged,
-            "prev_accuracy": _short(prev_acc), "post_accuracy": _short(post_acc),
+            "clean_reference_accuracy": _short(reference_acc),
+            "global_accuracy_at_round_start": _short(global_acc),
+            "post_accuracy": _short(post_acc),
             "drop": _short(drop), "learner_success": success,
             "n_malformed": info.get("n_malformed"),
             "attacker_reward": _short(attacker_reward),
