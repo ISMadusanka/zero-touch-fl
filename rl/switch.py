@@ -143,13 +143,22 @@ class PhaseController:
     Call :meth:`record` once per *committed* round with whether the learner won.
     It returns ``(switch, reason)``: when ``switch`` is True the driver should
     snapshot+freeze the current learner, then call :meth:`next_phase(reason)`.
+
+    ``alternate=False`` PINS the learner: phases still start and end on the same
+    gates, but :meth:`next_phase` keeps the same agent learning instead of handing
+    over. That is the ``--freeze defender`` schedule — the defense is a fixed
+    non-LLM ensemble, so there is no second policy to hand over to, yet the phase
+    boundary is still what paces checkpoints and the honest FL interlude that
+    refreshes the shared client weights.
     """
 
-    def __init__(self, cfg: SwitchConfig, first_learner: str = "attacker"):
+    def __init__(self, cfg: SwitchConfig, first_learner: str = "attacker",
+                 alternate: bool = True):
         if first_learner not in ("attacker", "defender"):
             raise ValueError(f"first_learner must be attacker|defender, got {first_learner!r}")
         self.cfg = cfg
         self.learner = first_learner
+        self.alternate = bool(alternate)
         self.phase_index = 0
         self.phase_round = 0
         self.streak = 0
@@ -191,11 +200,13 @@ class PhaseController:
         return False, None
 
     def next_phase(self, reason: str) -> None:
-        """Advance to the opponent's phase. ``reason`` is the switch reason of the
-        phase just completed; ``capped`` flags that the NEXT phase may want to
-        face an earlier opponent snapshot (curriculum) because this one stalled."""
+        """Advance to the next phase — the opponent's, unless the learner is pinned
+        (``alternate=False``). ``reason`` is the switch reason of the phase just
+        completed; ``capped`` flags that the NEXT phase may want to face an earlier
+        opponent snapshot (curriculum) because this one stalled."""
         self.capped = (reason == "cap")
-        self.learner = self.opponent
+        if self.alternate:
+            self.learner = self.opponent
         self.phase_index += 1
         self.phase_round = 0
         self.streak = 0

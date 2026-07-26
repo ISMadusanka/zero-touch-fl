@@ -7,6 +7,8 @@ dry-run path):
   env.py        FLArmsRaceEnv — the federated-learning environment.
   rewards.py    Verifiable, continuous attacker/defender reward functions.
   turns.py      AttackerTurn / DefenderTurn — bind one round to one agent.
+  defenders.py  Who supplies the round's verdicts: the defender LLM, or the
+                classical-algorithm ensemble used by ``--freeze defender``.
   inference.py  Frozen-LLM generation (Ollama/OpenAI) for --dry-run.
   policy.py     LLMPolicy — Unsloth Qwen2.5-3B-Instruct + two LoRA adapters (training).
   grpo.py       grpo_step — group-relative policy optimization update.

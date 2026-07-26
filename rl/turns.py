@@ -10,6 +10,11 @@ The attacker's action now includes CLIENT SELECTION: from its controllable pool
 (see ``AttackerAgent.select_and_apply``). Different rollouts may pick different
 subsets, so each rollout's reward is computed against ITS OWN chosen set.
 
+``AttackerTurn`` gets its per-client verdicts from a *defender policy*
+(``rl/defenders.py``) rather than talking to an LLM itself, so the same round body
+serves both the frozen defender LLM and the non-LLM algorithmic ensemble used by
+``--freeze defender``.
+
 Generators are duck-typed: any object with
 ``generate(system, user, n, temperature) -> list[str]`` works — a
 ``PolicyGenerator`` (trainable LoRA adapter) during RL, or an
@@ -25,22 +30,28 @@ logger = logging.getLogger(__name__)
 
 
 class AttackerTurn:
-    """Learning agent = attacker. Opponent = frozen defender (greedy)."""
+    """Learning agent = attacker. Opponent = the frozen defense.
 
-    def __init__(self, env, attacker_agent, defender_agent, defender_gen,
+    ``defender`` is a defender policy from ``rl/defenders.py`` — the frozen
+    defender LLM in the normal arms race, or the algorithmic ensemble under
+    ``--freeze defender``. Everything else about the round is identical either way.
+    """
+
+    def __init__(self, env, attacker_agent, defender,
                  reward_cfg: dict | None = None, opponent_temperature: float = 0.0,
                  scoring_opponent_temperature: float | None = None):
         self.env = env
         self.attacker_agent = attacker_agent
-        self.defender_agent = defender_agent
-        self.defender_gen = defender_gen
+        self.defender = defender
         self.reward_cfg = reward_cfg or {}
         self.opp_temp = opponent_temperature
-        # When SCORING the G candidate plans we sample the frozen defender at a
+        # When SCORING the G candidate plans we sample the frozen defender LLM at a
         # (usually nonzero) temperature so different plans see different verdicts
         # — this restores within-group reward spread and is the key fix for the
         # attacker's zero-advantage collapse. The COMMITTED round still uses the
         # greedy ``opp_temp`` so success is measured against the real defender.
+        # Both are ignored by a deterministic (algorithmic) defense, which gets its
+        # spread from the candidate plans themselves.
         self.scoring_opp_temp = (
             opponent_temperature if scoring_opponent_temperature is None
             else scoring_opponent_temperature
@@ -75,23 +86,16 @@ class AttackerTurn:
     def messages(self) -> tuple[str, str]:
         return self.system, self.user
 
-    def _defender_verdicts(self, updates, temperature):
-        feats = self.env.features(updates)
-        client_ids = [u.client_id for u in updates]
-        d_sys = self.defender_agent.system_prompt()
-        d_user = self.defender_agent.build_user_prompt(feats)
-        text = self.defender_gen.generate(d_sys, d_user, n=1, temperature=temperature)[0]
-        verdicts = self.defender_agent.parse(text, client_ids)
-        dbg.defender_io(d_sys, d_user, text, verdicts, who="opponent",
-                        temperature=temperature)
-        return verdicts
-
-    def _apply(self, attacker_text, temperature):
+    def _apply(self, attacker_text, temperature, commit: bool = False):
         poisoned, chosen_ids, n_malformed = self.attacker_agent.select_and_apply(
             attacker_text, self.pool_references, self.budget
         )
         updates = self.env.build_updates(poisoned)
-        verdicts = self._defender_verdicts(updates, temperature)
+        # ``commit`` marks the ONE call per round whose verdicts are applied to
+        # the shared model, so a stateful defense advances its cross-round memory
+        # exactly once instead of once per scored rollout.
+        verdicts = self.defender.verdicts(
+            self.env, updates, temperature=temperature, commit=commit)
         return updates, verdicts, n_malformed, chosen_ids, poisoned
 
     def reward(self, attacker_text) -> float:
@@ -125,7 +129,7 @@ class AttackerTurn:
     def commit(self, attacker_text) -> dict:
         dbg.committing()
         updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
-            attacker_text, self.opp_temp)
+            attacker_text, self.opp_temp, commit=True)
         self.env.set_committed_poison(chosen_ids)
         post_eval = self.env.commit_full(updates, verdicts)
         return {

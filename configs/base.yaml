@@ -44,6 +44,36 @@ attack:
                                   # the policy is BUDGET-AWARE (generalizes to any eval budget).
   eval_poison_clients: 1          # EVALUATION default budget (benchmark --max-poison-clients override)
 
+# Non-LLM defense, used ONLY by `--freeze defender` (main.py) and by the
+# benchmark's `ensemble` panel entry. Ignored by the normal arms race, where the
+# defender LLM decides. Every classical algorithm listed here inspects the SAME
+# updates against the SAME global model and votes; a client is rejected (dropped
+# from FedAvg) once `vote` members agree, and the surviving clients are averaged
+# exactly as they are when the defender LLM answers.
+defense:
+  members: [fltrust, multikrum, dnc, defl]   # different detection principles on purpose:
+                                  # fltrust=direction vs a clean root update,
+                                  # multikrum=distance from the bulk, dnc=spectral outlier,
+                                  # defl=per-layer robust median/MAD vote.
+  vote: majority                  # majority (ceil(n/2)) | any (union) | all | <int>.
+                                  # multikrum and dnc drop a FIXED quota every round even
+                                  # when nobody is malicious, so `any` evicts honest clients
+                                  # from the average every round — majority is the sane default.
+  # --- FLTrust ---
+  root_size: 100                  # clean server-side root set (sampled from MNIST train)
+  root_epochs: 1                  # server local epochs on the root set (paper R_l)
+  root_lr: null                   # null = fl.lr
+  eta: 1.0                        # FLTrust global learning rate
+  # --- DeFL ---
+  defl_delta: 0.05                # CLP relative-rise threshold (paper delta)
+  defl_tau: 2.5                   # MOUD per-layer outlier z-threshold
+  # --- Multi-Krum / DnC (both need an ASSUMED adversary budget, not ground truth) ---
+  num_byzantine: null             # null = attack.max_poison_clients, clamped to a benign majority
+  multikrum_m: null               # #selected/averaged; null = n - f
+  dnc_c: 1.0                      # filtering fraction
+  dnc_niters: 1                   # subsampling iterations
+  dnc_sub_dim: 10000              # subsample dimension b (clamped to the model's 970 dims)
+
 # Inference-only LLM defaults (used by --dry-run and the OpenAI path).
 llm:
   ollama_base_url: "http://localhost:11434"
@@ -113,6 +143,14 @@ rl:
   adapter_paths:
     attacker: "checkpoints/attacker_adapter"
     defender: "checkpoints/defender_adapter"
+  # `--freeze defender` trains ONLY the attacker, and against a different opponent
+  # (the `defense:` ensemble above), so it writes its own adapter. Left unset it
+  # defaults to checkpoints/<run-name>/attacker_adapter — and --freeze always
+  # namespaces the run name ("frozen_defender") — so it can never overwrite the
+  # arms-race attacker above. Point it AT that adapter to continue training the
+  # arms-race policy against the algorithmic defense (it is then written back to).
+  # frozen_defender_adapter_paths:
+  #   attacker: "checkpoints/frozen_defender/attacker_adapter"
   reward:
     attacker:
       alpha: 1.0                  # weight on accuracy-drop term

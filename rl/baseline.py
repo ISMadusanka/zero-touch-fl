@@ -67,9 +67,22 @@ def fixed_defender(features: dict[int, dict], rel_norm_thr: float = 2.0,
     return verdicts
 
 
-def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
-    """Run ``n_rounds`` of best-of-N fixed-action attack vs fixed defender."""
-    logger.info(f"[baseline] running {n_rounds} best-of-N round(s) — no LLM, no GPU")
+def run_baseline(env, n_rounds, metrics_tracker, save_round_log, defender=None):
+    """Run ``n_rounds`` of best-of-N fixed-action attack vs a fixed defense.
+
+    ``defender`` defaults to the norm/sign heuristic :func:`fixed_defender`. Pass a
+    defender policy (``rl/defenders.py``) to substitute another non-LLM defense —
+    ``main.py --baseline --freeze defender`` passes the algorithmic ensemble, which
+    exercises env + ensemble + rewards end-to-end with no LLM and no GPU.
+    """
+    logger.info(f"[baseline] running {n_rounds} best-of-N round(s) — no LLM, no GPU "
+                f"(defense: {defender.describe() if defender else 'norm/sign heuristic'})")
+
+    def _verdicts(updates, commit):
+        if defender is None:
+            return fixed_defender(env.features(updates))
+        return defender.verdicts(env, updates, commit=commit)
+
     for _ in range(n_rounds):
         ctx = env.begin_round()
         # No LLM to choose clients: poison the first `budget` clients of the pool.
@@ -88,7 +101,7 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
                          if not _same_weights(poisoned[cid], selected_benign[cid])]
             n_malformed = len(selected_ids) - len(effective)
             updates = env.build_updates({cid: poisoned[cid] for cid in effective})
-            verdicts = fixed_defender(env.features(updates))
+            verdicts = _verdicts(updates, commit=False)
             post_eval = env.evaluate_updates_full(updates, verdicts)
             post_acc = post_eval.overall
             # Same reference as training: this round's clean (unpoisoned) aggregate.
@@ -107,6 +120,11 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
         # Commit the best attacker action.
         label, chosen_ids, n_malformed, updates, verdicts, _, _ = max(
             scored, key=lambda s: s[6])
+        # Re-run the defense on the winning action as the COMMITTING call, so a
+        # stateful defense advances its cross-round memory exactly once per round
+        # (the scoring pass above deliberately leaves it untouched). Deterministic,
+        # so the verdicts themselves are the ones already scored.
+        verdicts = _verdicts(updates, commit=True)
         env.set_committed_poison(chosen_ids)
         committed_eval = env.commit_full(updates, verdicts)
         new_acc = committed_eval.overall

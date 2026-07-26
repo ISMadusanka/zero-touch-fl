@@ -63,6 +63,12 @@ def _parse_args():
                     help="Multi-Krum assumed #Byzantine f (default: configured poison count)")
     ap.add_argument("--multikrum-m", type=int, default=None,
                     help="Multi-Krum #selected/averaged (default: n - f)")
+    ap.add_argument("--ensemble-members", default=None,
+                    help="comma-separated members of the 'ensemble' defense "
+                         "(default: defense.members from --config, else fltrust,multikrum,dnc,defl)")
+    ap.add_argument("--ensemble-vote", default=None,
+                    help="ensemble vote rule: majority | any | all | <int> "
+                         "(default: defense.vote from --config, else majority)")
     ap.add_argument("--device", default=None, help="override fl.device")
     ap.add_argument("--seed", type=int, default=None, help="override fl.poison_seed")
     ap.add_argument("--out", default="logs/benchmark", help="output dir for json/csv/png (or '' to skip)")
@@ -94,13 +100,9 @@ def _parse_goal(spec: str) -> dict:
 
 
 def _build_root_loader(data_cfg, root_size, batch_size, seed):
-    import torch
-    from torch.utils.data import DataLoader, Subset
-    from data.mnist_loader import load_mnist
-    train_ds, _ = load_mnist(data_cfg.get("data_dir", "./data/mnist_raw"))
-    g = torch.Generator().manual_seed(seed)
-    idx = torch.randperm(len(train_ds), generator=g)[:root_size].tolist()
-    return DataLoader(Subset(train_ds, idx), batch_size=min(batch_size, root_size), shuffle=True)
+    from data.mnist_loader import get_root_loader
+    return get_root_loader(root_size, batch_size,
+                           data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), seed=seed)
 
 
 def main():
@@ -232,8 +234,15 @@ def main():
     attacker_agent = AttackerAgent(attacker_cfg)
     defender_agent = DefenderAgent(defender_cfg)
 
+    # The `ensemble` entry contains fltrust by default, so it needs a root set too.
+    defense_cfg = base_cfg.get("defense", {}) or {}
+    ensemble_members = [n.strip() for n in args.ensemble_members.split(",") if n.strip()] \
+        if args.ensemble_members else defense_cfg.get("members")
+    ensemble_vote = args.ensemble_vote or defense_cfg.get("vote", "majority")
+
     root_loader = None
-    if "fltrust" in names:
+    if "fltrust" in names or ("ensemble" in names
+                              and "fltrust" in (ensemble_members or ["fltrust"])):
         root_loader = _build_root_loader(data_cfg, args.root_size, fl["batch_size"], seed)
 
     # DnC / Multi-Krum assume a known upper bound on #malicious; default it to the
@@ -254,6 +263,7 @@ def main():
         dnc_num_byzantine=dnc_m, dnc_c=args.dnc_c, dnc_niters=args.dnc_niters,
         dnc_sub_dim=args.dnc_sub_dim, dnc_seed=seed,
         multikrum_num_byzantine=mk_f, multikrum_m=args.multikrum_m,
+        ensemble_members=ensemble_members, ensemble_vote=ensemble_vote,
     )
 
     log.info(f"Benchmark: {args.rounds} rounds | defenses={list(defenses)} | "

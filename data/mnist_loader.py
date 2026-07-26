@@ -98,6 +98,24 @@ def partition_noniid_fltrust(dataset, n_clients: int, n_classes: int = 10,
     return shards
 
 
+def get_root_loader(root_size: int, batch_size: int, data_dir: str = "./data/mnist_raw",
+                    seed: int = 0):
+    """A small CLEAN "root" dataset held by the server.
+
+    FLTrust (Cao et al., NDSS 2021) bootstraps trust by fine-tuning the current
+    global model on such a set each round and comparing every client's update
+    against that reference direction, so both the benchmark's ``fltrust`` defense
+    and the ensemble that ``--freeze defender`` trains against need one. Sampled
+    uniformly (and reproducibly, via ``seed``) from the MNIST training split.
+    """
+    train_dataset, _ = load_mnist(data_dir)
+    size = max(1, min(int(root_size), len(train_dataset)))
+    generator = torch.Generator().manual_seed(int(seed))
+    indices = torch.randperm(len(train_dataset), generator=generator)[:size].tolist()
+    return DataLoader(Subset(train_dataset, indices),
+                      batch_size=max(1, min(int(batch_size), size)), shuffle=True)
+
+
 def get_data_loaders(n_clients: int, batch_size: int, data_dir: str = "./data/mnist_raw",
                      iid: bool = True, bias_q: float = 0.5, seed: int = 0,
                      n_classes: int = 10):

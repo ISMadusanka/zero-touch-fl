@@ -13,6 +13,10 @@ Qwen2.5-3B-Instruct base).
 
 Modes:
   python main.py --env linux                 # full GRPO training (needs a GPU)
+  python main.py --env linux --freeze defender  # defender LLM OFF: the defense is a fixed
+                                             # ensemble of the classical algorithms
+                                             # (FLTrust+Multi-Krum+DnC+DeFL voting together)
+                                             # and ONLY the attacker is GRPO-trained
   python main.py --env linux --dry-run       # frozen-LLM round loop, no training
   python main.py --baseline                  # best-of-N reward-harness sanity (no LLM)
   python main.py --fresh                      # force fresh Phase-1 training
@@ -41,7 +45,7 @@ from agents.defender_agent import DefenderAgent
 from agents.llm_client import create_llm_client
 from storage.checkpoint import (
     save_state, load_state, state_exists, save_progress, load_progress, adapter_exists,
-    save_fl_state, load_fl_state, set_rl_dir,
+    save_fl_state, load_fl_state, set_rl_dir, rl_dir,
 )
 from core.types import RoundLog, DetectionVerdict
 from core.debug import dbg
@@ -121,6 +125,20 @@ ROUND_LOG_PATH = "logs/round_data/rounds.jsonl"
 # stream, metrics and debug dump instead of interleaving with another run's.
 LOG_DIR = "logs"
 
+# ``--freeze defender`` is a DIFFERENT experiment from the arms race that shares a
+# config file: same attacker, different opponent. Its artifacts are therefore
+# always namespaced (``--run-name`` gets this suffix, or it becomes the run name)
+# so a frozen-defender run can never resume from — or overwrite — the arms-race
+# run's attacker adapter, FL state or progress file.
+FREEZE_RUN_SUFFIX = "frozen_defender"
+
+
+def _freeze_run_name(run_name: str | None, freeze: str | None) -> str | None:
+    """Run name to use once ``--freeze`` is taken into account."""
+    if freeze != "defender":
+        return run_name
+    return f"{run_name}_{FREEZE_RUN_SUFFIX}" if run_name else FREEZE_RUN_SUFFIX
+
 
 def _set_run_name(name: str | None):
     """Isolate this run's on-disk artifacts under ``logs/<name>`` + ``checkpoints/<name>``.
@@ -193,11 +211,32 @@ def run_training_phase(config: dict, client_loaders, test_loader):
 # Phase 2: LLM-direct adversarial arms race
 # ---------------------------------------------------------------------------
 
+def _resolve_adapter_paths(rl_cfg: dict, freeze: str | None) -> dict:
+    """Where THIS run's LoRA adapters are loaded from and saved to.
+
+    ``--freeze defender`` trains only the attacker, and against a different
+    opponent, so it gets its own adapter directory — by default inside this run's
+    RL dir (``checkpoints/<run-name>/attacker_adapter``, and the run name is always
+    namespaced, see :data:`FREEZE_RUN_SUFFIX`). Set
+    ``rl.frozen_defender_adapter_paths.attacker`` to put it elsewhere — e.g. at the
+    arms-race adapter to CONTINUE training that policy against the algorithmic
+    defense, accepting that the run then also writes back to it.
+    """
+    paths = dict(rl_cfg.get("adapter_paths", {
+        "attacker": "checkpoints/attacker_adapter",
+        "defender": "checkpoints/defender_adapter",
+    }))
+    if freeze != "defender":
+        return paths
+    override = (rl_cfg.get("frozen_defender_adapter_paths") or {}).get("attacker")
+    return {"attacker": override or os.path.join(rl_dir(), "attacker_adapter")}
+
+
 def run_phase2(
     global_weights, client_weights, baseline_accuracy,
     client_loaders, test_loader, config, attacker_config, defender_config,
     mode: str, n_rounds: int, llm_backend: str,
-    max_new_rounds: int | None = None,
+    max_new_rounds: int | None = None, freeze: str | None = None,
 ):
     fl = config["fl"]
     logger.info("=" * 60)
@@ -218,11 +257,26 @@ def run_phase2(
     attacker_agent = AttackerAgent(attacker_config)
     defender_agent = DefenderAgent(defender_config)
 
+    # --freeze defender: take the defender LLM out of the loop entirely and defend
+    # with the classical algorithms instead, all of them voting together.
+    algorithmic_defender = None
+    if freeze == "defender":
+        from rl.defenders import build_algorithmic_defender
+        algorithmic_defender = build_algorithmic_defender(
+            config, device=fl.get("device", "cpu"), seed=int(fl.get("poison_seed", 0)))
+        logger.info("=" * 60)
+        logger.info("DEFENDER LLM DEACTIVATED (--freeze defender)")
+        logger.info(f"  defense       : {algorithmic_defender.describe()}")
+        logger.info("  learner       : attacker only (no attacker/defender switching)")
+        logger.info("=" * 60)
+
     if mode == "baseline":
         from rl.baseline import run_baseline
-        run_baseline(env, n_rounds, metrics_tracker, _save_round_log)
+        run_baseline(env, n_rounds, metrics_tracker, _save_round_log,
+                     defender=algorithmic_defender)
 
     elif mode == "dry-run":
+        from rl.defenders import LLMDefenderPolicy
         from rl.inference import InferenceGenerator, run_inference
         llm_cfg = attacker_config.get("llm", {})
         model = llm_cfg.get("ollama_model" if llm_backend == "ollama" else "model")
@@ -232,7 +286,9 @@ def run_phase2(
             ollama_base_url=llm_cfg.get("ollama_base_url", "http://localhost:11434"),
         )
         gen = InferenceGenerator(backend, max_new_tokens=int(config.get("rl", {}).get("max_new_tokens", 2048)))
-        run_inference(env, attacker_agent, defender_agent, gen, n_rounds,
+        defender = algorithmic_defender or LLMDefenderPolicy(defender_agent, gen,
+                                                            who="dry-run")
+        run_inference(env, attacker_agent, defender, gen, n_rounds,
                       metrics_tracker, _save_round_log,
                       temperature=float(llm_cfg.get("temperature", 0.7)))
 
@@ -240,10 +296,7 @@ def run_phase2(
         from rl.policy import LLMPolicy
         from rl.schedule import train
         rl_cfg = config.get("rl", {})
-        adapter_paths = rl_cfg.get("adapter_paths", {
-            "attacker": "checkpoints/attacker_adapter",
-            "defender": "checkpoints/defender_adapter",
-        })
+        adapter_paths = _resolve_adapter_paths(rl_cfg, freeze)
         policy = LLMPolicy(
             base_model=rl_cfg.get("model", "unsloth/Qwen2.5-3B-Instruct"),
             max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
@@ -253,6 +306,8 @@ def run_phase2(
             seed=int(fl.get("poison_seed", 0)),
             attn_implementation=rl_cfg.get("attn_implementation", "eager"),
             use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
+            # No defender LLM -> no defender adapter to carry on the GPU.
+            adapters=tuple(adapter_paths),
         )
         # Resume adapters if present.
         for name, path in adapter_paths.items():
@@ -285,7 +340,9 @@ def run_phase2(
               metrics_tracker, _save_round_log, rng,
               progress_cb=progress_cb, fl_state_cb=fl_state_cb,
               start_round=start_round, resume=progress,
-              total_rounds=n_rounds, max_new_rounds=max_new_rounds)
+              total_rounds=n_rounds, max_new_rounds=max_new_rounds,
+              algorithmic_defender=algorithmic_defender,
+              adapter_paths=adapter_paths)
 
     logger.info("\n" + "=" * 60)
     logger.info("PHASE 2 COMPLETE")
@@ -310,6 +367,15 @@ def main():
                              "starts from the same honest baseline.")
     parser.add_argument("--env", choices=["linux", "windows"], default="linux",
                         help="'linux' uses Ollama (qwen2.5), 'windows' uses OpenAI (default: linux)")
+    parser.add_argument("--freeze", choices=["defender"], default=None,
+                        help="Freeze one side of the arms race. 'defender' DEACTIVATES the "
+                             "defender LLM: the defense becomes a fixed ensemble of the "
+                             "classical robust-aggregation algorithms voting together "
+                             "(FLTrust + Multi-Krum + DnC + DeFL — configure under 'defense:'), "
+                             "attacker/defender learner switching is disabled, and ONLY the "
+                             "attacker LLM is trained with GRPO. Artifacts are namespaced "
+                             f"('{FREEZE_RUN_SUFFIX}' is appended to --run-name, or becomes it) "
+                             "so an existing arms-race run is never overwritten.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run the Phase-2 loop with a frozen LLM (no training, no GPU needed)")
     parser.add_argument("--baseline", action="store_true",
@@ -323,12 +389,16 @@ def main():
                              f"not given, Phase 2 is capped at {DEBUG_DEFAULT_ROUNDS} rounds.")
     args = parser.parse_args()
 
-    _set_run_name(args.run_name)
+    run_name = _freeze_run_name(args.run_name, args.freeze)
+    _set_run_name(run_name)
     setup_logging(debug=args.debug, log_dir=LOG_DIR)
     quiet_noisy_warnings()
     logger.info("Starting Zero-Touch Federated Learning System")
-    if args.run_name:
-        logger.info(f"Run '{args.run_name}': logs -> {LOG_DIR}/, RL state -> checkpoints/{args.run_name}/")
+    if run_name:
+        logger.info(f"Run '{run_name}': logs -> {LOG_DIR}/, RL state -> checkpoints/{run_name}/")
+    if args.freeze == "defender" and run_name != args.run_name:
+        logger.info(f"--freeze defender: artifacts namespaced as '{run_name}' so the "
+                    f"arms-race run's adapters/progress are left untouched")
 
     base_config = load_config(args.config)
     attacker_config = load_config("configs/attacker_agent.yaml")
@@ -412,6 +482,9 @@ def main():
                 "sample_budget": base_config.get("attack", {}).get("sample_budget_in_training"),
                 "noniid_bias": base_config.get("data", {}).get("noniid_bias"),
                 "G": base_config.get("rl", {}).get("G"),
+                "freeze": args.freeze,
+                "defense": (base_config.get("defense", {}) if args.freeze == "defender"
+                            else "defender LLM"),
                 "switch_mode": base_config.get("rl", {}).get("switch_mode"),
                 "first_learner": base_config.get("rl", {}).get("first_learner"),
                 "success_streak": base_config.get("rl", {}).get("success_streak"),
@@ -436,6 +509,7 @@ def main():
             n_rounds=n_rounds,
             llm_backend=llm_backend,
             max_new_rounds=max_new_rounds,
+            freeze=args.freeze,
         )
     finally:
         dbg.close()

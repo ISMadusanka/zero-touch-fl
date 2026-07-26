@@ -83,13 +83,9 @@ def _parse_args():
 
 
 def _build_root_loader(data_cfg, root_size, batch_size, seed):
-    import torch
-    from torch.utils.data import DataLoader, Subset
-    from data.mnist_loader import load_mnist
-    train_ds, _ = load_mnist(data_cfg.get("data_dir", "./data/mnist_raw"))
-    g = torch.Generator().manual_seed(seed)
-    idx = torch.randperm(len(train_ds), generator=g)[:root_size].tolist()
-    return DataLoader(Subset(train_ds, idx), batch_size=min(batch_size, root_size), shuffle=True)
+    from data.mnist_loader import get_root_loader
+    return get_root_loader(root_size, batch_size,
+                           data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), seed=seed)
 
 
 def main():
@@ -227,8 +223,13 @@ def main():
     if not attacker_agent.targeted:
         sys.exit("ERROR: attacker agent did not enter targeted mode — check attack.goal.type")
 
+    # The `ensemble` entry contains fltrust by default, so it needs a root set too.
+    ensemble_members = (base_cfg.get("defense", {}) or {}).get("members")
+    ensemble_vote = (base_cfg.get("defense", {}) or {}).get("vote", "majority")
+
     root_loader = None
-    if "fltrust" in names:
+    if "fltrust" in names or ("ensemble" in names
+                              and "fltrust" in (ensemble_members or ["fltrust"])):
         root_loader = _build_root_loader(data_cfg, args.root_size, fl["batch_size"], seed)
 
     n_cl = int(fl["n_clients"])
@@ -246,6 +247,7 @@ def main():
         dnc_num_byzantine=dnc_m, dnc_c=args.dnc_c, dnc_niters=args.dnc_niters,
         dnc_sub_dim=args.dnc_sub_dim, dnc_seed=seed,
         multikrum_num_byzantine=mk_f, multikrum_m=args.multikrum_m,
+        ensemble_members=ensemble_members, ensemble_vote=ensemble_vote,
     )
 
     log.info(f"Targeted benchmark: {args.rounds} rounds | label={label} | "

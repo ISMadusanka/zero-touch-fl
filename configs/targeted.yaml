@@ -61,6 +61,24 @@ attack:
                                   # the policy is BUDGET-AWARE and generalizes to any eval budget
   eval_poison_clients: 1          # EVALUATION default budget (benchmark --poison-clients override)
 
+# Non-LLM defense for `python train_targeted.py --freeze defender` (and the
+# benchmark's `ensemble` entry). Same knobs and defaults as configs/base.yaml —
+# see there for what each member detects and why `majority` is the default vote.
+defense:
+  members: [fltrust, multikrum, dnc, defl]
+  vote: majority
+  root_size: 100
+  root_epochs: 1
+  root_lr: null
+  eta: 1.0
+  defl_delta: 0.05
+  defl_tau: 2.5
+  num_byzantine: null
+  multikrum_m: null
+  dnc_c: 1.0
+  dnc_niters: 1
+  dnc_sub_dim: 10000
+
 llm:
   ollama_base_url: "http://localhost:11434"
   ollama_model: "qwen2.5:3b"
@@ -110,6 +128,11 @@ rl:
   adapter_paths:
     attacker: "checkpoints/targeted/attacker_adapter"
     defender: "checkpoints/targeted/defender_adapter"
+  # `--freeze defender` namespaces the run to "targeted_frozen_defender", so its
+  # attacker adapter defaults to checkpoints/targeted_frozen_defender/attacker_adapter
+  # and leaves the targeted arms-race adapters above alone. Override here if wanted.
+  # frozen_defender_adapter_paths:
+  #   attacker: "checkpoints/targeted_frozen_defender/attacker_adapter"
 
   reward:
     attacker:

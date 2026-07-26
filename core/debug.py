@@ -409,6 +409,35 @@ class DebugLogger:
         })
 
     @_guard
+    def algo_defender(self, description, verdicts, info=None, commit=False,
+                      poisoned_ids=None):
+        """The NON-LLM defense's decision (``--freeze defender``).
+
+        The counterpart of :meth:`defender_io`: there is no prompt and no raw
+        completion to print, so we show which member algorithm flagged whom and
+        how the vote resolved — the only thing needed to explain why a client was
+        dropped from the average.
+        """
+        self._line()
+        self._line(f"[DEFENSE] {description}  "
+                   f"({'COMMIT' if commit else 'scoring'} — no LLM in the loop)")
+        info = info or {}
+        for name, flagged in (info.get("per_member") or {}).items():
+            self._line(f"    {name:<12} flagged={flagged}")
+        if info:
+            self._line(f"    -> rejected (>= {info.get('min_votes')} of "
+                       f"{info.get('n_members')} votes): {info.get('rejected')}")
+        self._line("[VERDICTS] combined:")
+        for ln in self._verdict_lines(verdicts, poisoned_ids):
+            self._line(ln)
+        self._record("defender_output", "algorithmic_defense", {
+            "defense": description, "commit": commit, **info,
+            "verdicts": [{"client_id": v.client_id, "is_suspicious": v.is_suspicious,
+                          "confidence": _short(v.confidence), "reason": v.reason}
+                         for v in verdicts],
+        })
+
+    @_guard
     def opponent_move(self, temperature):
         self._stage = "opponent-move"
         self._line()

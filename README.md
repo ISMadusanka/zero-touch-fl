@@ -121,6 +121,11 @@ pip install torch torchvision numpy pyyaml matplotlib openai requests
 # Full GRPO training (GPU). Phase 1 runs once, then the RL arms race.
 python main.py --env linux
 
+# Attacker vs the CLASSICAL defenses — the defender LLM is switched OFF and the
+# defense becomes a fixed ensemble of FLTrust + Multi-Krum + DnC + DeFL voting
+# together. No attacker/defender switching: only the attacker is GRPO-trained.
+python main.py --env linux --freeze defender
+
 # Quick smoke run: few rounds. --rounds is an ABSOLUTE budget overriding
 # fl.simulation_rounds, so on a resumed run the rounds already done count toward it.
 python main.py --env linux --rounds 8
@@ -252,6 +257,61 @@ python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.1' -
 # forms: untargeted_degrade=<drop> | slow_degrade=<drop> | targeted_label=<label>
 ```
 
+## Freezing the defender: attacker vs the classical defenses
+
+```bash
+python main.py --env linux --freeze defender
+```
+
+This answers a different question from the arms race: *can the LLM attacker beat
+conventional Byzantine-robust FL defenses?* Three things change, and nothing else
+does:
+
+1. **The defender LLM is deactivated.** No defender adapter is created, loaded,
+   optimized or saved — it is not on the GPU at all.
+2. **No learner switching.** The attacker is the only learner for the whole run;
+   `first_learner` / `K_a` / `K_d` and the opponent league are irrelevant and off.
+3. **The defense is an ensemble of the existing algorithms, all of them at once.**
+   Every member scores the SAME client updates against the SAME global model and
+   votes; a client is rejected once `defense.vote` members agree, and the survivors
+   are FedAvg-averaged exactly as they are when the defender LLM answers.
+
+| member | what it detects |
+|---|---|
+| `fltrust` | **direction** — cosine against a server update trained on a small clean root set |
+| `multikrum` | **distance** — how far the update sits from the bulk of the others |
+| `dnc` | **spectral** — projection on the top principal direction of the centred updates |
+| `defl` | **per-layer** — robust median/MAD outlier vote over each layer's gradient-norm statistic |
+
+Configure it under `defense:` in the config (members, vote rule, and each
+algorithm's own knobs). `vote: majority` (default, ⌈n/2⌉) rather than `any`
+because Multi-Krum and DnC drop a fixed quota **every** round even when nobody is
+malicious, so the union would evict honest clients from the average every round.
+Each verdict carries the vote count as its confidence, which keeps the attacker's
+stealth reward continuous — fooling 3 of 4 members scores better than fooling
+none, so GRPO still gets a gradient against a hard accept/reject defense.
+
+The phase structure is kept with the learner pinned: a phase still ends on a
+sustained win or `rl.max_phase_rounds`, and that boundary is what checkpoints the
+attacker and triggers the honest FL interlude that advances the shared model.
+
+Everything else — reward, win gate, round logs, `--debug`, `--rounds`, resume — is
+unchanged. Artifacts are **namespaced** (`frozen_defender` becomes the run name,
+or is appended to `--run-name`), so this run writes to
+`logs/frozen_defender/` + `checkpoints/frozen_defender/` and can never resume from
+or overwrite the arms-race run's adapters. Point
+`rl.frozen_defender_adapter_paths.attacker` elsewhere to change that.
+
+Cheap checks that need neither a GPU nor an LLM/Ollama:
+
+```bash
+# End-to-end: fixed attack actions vs the real ensemble, on CPU
+python main.py --baseline --freeze defender --rounds 3 --debug
+
+# The same defense as one entry in the evaluation panel
+python -m benchmark.run_benchmark --rounds 200 --defenses fedavg,ensemble,fltrust,multikrum
+```
+
 ## Project structure
 
 ```
@@ -262,7 +322,10 @@ clients/      Honest client local training
 server/       Central server + FedAvg aggregation
 detector/     features.py — per-client per-layer statistical feature extractor
 agents/       attacker_agent.py / defender_agent.py (pure prompt+parse), attack_ops.py (operator DSL), llm_client.py
-rl/           env, rewards, turns, inference (dry-run), policy (Unsloth+LoRA), grpo, schedule, baseline
+rl/           env, rewards, turns, defenders (LLM | algorithmic ensemble), inference (dry-run),
+              policy (Unsloth+LoRA), grpo, schedule, baseline
+benchmark/    Defense panel (fedavg, oracle, llm_defender, fltrust, defl, dnc, multikrum,
+              ensemble) + the attacker-vs-defenses harness and reports
 metrics/      Ground-truth confusion/TPR/FPR/ASR/APR (research evaluation + reward source)
 storage/      Phase-1 checkpoint + RL progress
 configs/      YAML configuration

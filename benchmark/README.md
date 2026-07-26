@@ -32,7 +32,7 @@ python -m benchmark.run_benchmark --rounds 10 --seed 3
 
 # choose defenses / tune FLTrust + DeFL + DnC + Multi-Krum / save outputs:
 python -m benchmark.run_benchmark --rounds 200 \
-    --defenses fedavg,oracle,fltrust,llm_defender,defl,dnc,multikrum \
+    --defenses fedavg,oracle,fltrust,llm_defender,defl,dnc,multikrum,ensemble \
     --attack-temperature 0.7 --root-size 100 --eta 1.0 \
     --defl-delta 0.05 --defl-tau 2.5 --dnc-c 1.0 --dnc-sub-dim 10000 \
     --multikrum-m 4 --out logs/benchmark
@@ -72,6 +72,7 @@ multikrum     ...      ...    ...   ...   ...        ...       ...       ...
 | `defl` | **DeFL** (Yan et al., AAAI 2023): CLP-aware defense. Inspects the DNN layer-by-layer via a Federated Gradient Norm Vector (FGNV) to (a) detect the *critical learning period*, (b) flag malicious clients by per-layer outlier voting (MOUD-Vote), then hard-remove them during the CLP and soft-down-weight them after via a per-client Bayesian (Beta) trust. **Needs no clean root set and no LLM.** |
 | `dnc` | **DnC** (Shejwalkar & Houmansadr, NDSS 2021): Divide-and-Conquer spectral aggregator. Subsamples dimensions, centers the updates, projects them onto their top singular vector, and filters out the `c·m` clients that project furthest (the spectral outliers), then averages the rest. **Needs no clean root set and no LLM** (assumes a known #malicious `m`). |
 | `multikrum` | **Multi-Krum** (Blanchard et al., NeurIPS 2017): distance-based robust aggregator. Scores each client by the sum of squared distances to its `n−f−2` closest peers, keeps the `m` lowest-scoring (most-central) updates and averages them; drops the rest. **Needs no clean root set and no LLM** (assumes a known #Byzantine `f`). Krum = `m=1`. |
+| `ensemble` | **All of the classical defenses together.** Every member above (default `fltrust,multikrum,dnc,defl`) scores the SAME updates against the SAME global model and votes; a client is rejected once `--ensemble-vote` members agree (`majority` = ⌈n/2⌉, or `any`/`all`/an int), and the survivors are FedAvg-averaged. **No LLM.** This is also the defense `python main.py --freeze defender` trains the attacker against — see the repo README. Configure members/vote here or under `defense:` in the config. |
 
 ## The metrics
 
@@ -190,6 +191,25 @@ that is the 2 closest. Pairwise distances are global-invariant, so Multi-Krum ru
 absolute weights directly and its aggregate is FedAvg over the selected clients. Note
 the paper assumes `n ≥ 2f+3` for its guarantee (with `n=5` that caps `f` at 1).
 
+## Ensemble knobs
+
+`--ensemble-members` (comma-separated; default `defense.members` from the config,
+else `fltrust,multikrum,dnc,defl`) · `--ensemble-vote` (`majority` | `any` | `all` |
+an int; default `defense.vote`, else `majority`). Each member is built with the
+same knobs its standalone panel entry would get, so `--multikrum-f`, `--dnc-c`,
+`--defl-tau`, `--root-size` … apply to the ensemble's copies too.
+
+`majority` rather than `any` because Multi-Krum and DnC drop a FIXED quota of
+clients every round even when nobody is malicious: under `any` their standing
+quota alone would evict honest clients from the average every round. `oracle`,
+`llm_defender` and `ensemble` are rejected as members (ground-truth cheating,
+the model under test, and recursion respectively).
+
+Detection read-out: `is_suspicious` = the vote passed the threshold, and
+`confidence` = the fraction of members that agreed with the decision. Like its
+members' flags this is a DERIVED aggregator signal, so read `acc_drop` as the
+primary metric (see the caveat above).
+
 ## Adding another defense (later)
 
 1. Create `benchmark/defenses/<name>.py` with a `class <Name>(Defense)` that
@@ -220,3 +240,8 @@ does (a client is "rejected" when it's excluded / trimmed from the aggregate).
   formula and lowest-m selection. Torch-free: `python tests/test_multikrum_logic.py`.
 - `tests/test_multikrum.py` — Multi-Krum's pairwise distances + end-to-end step
   (needs torch; run on the GPU box): `python tests/test_multikrum.py`.
+- `tests/test_ensemble.py` — the ensemble's vote rules/confidence plus its
+  end-to-end detection over the real members (needs torch, runs on CPU):
+  `python tests/test_ensemble.py`.
+- `tests/test_frozen_defender.py` — the `--freeze defender` training mode wired to
+  this ensemble (needs torch, runs on CPU): `python tests/test_frozen_defender.py`.

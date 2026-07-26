@@ -34,15 +34,22 @@ class InferenceGenerator:
 def run_inference(
     env,
     attacker_agent,
-    defender_agent,
+    defender,
     generator: InferenceGenerator,
     n_rounds: int,
     metrics_tracker,
     save_round_log,
     temperature: float = 0.7,
 ):
-    """Run ``n_rounds`` of the arms race with frozen LLMs (no learning)."""
-    logger.info(f"[dry-run] running {n_rounds} inference round(s) — no weight updates")
+    """Run ``n_rounds`` of the arms race with frozen LLMs (no learning).
+
+    ``defender`` is a defender policy (``rl/defenders.py``): the frozen defender
+    LLM normally, or the non-LLM algorithmic ensemble under ``--freeze defender``
+    — which makes this the cheapest end-to-end check of that defense (CPU only,
+    one LLM call per round).
+    """
+    logger.info(f"[dry-run] running {n_rounds} inference round(s) — no weight updates "
+                f"(defense: {defender.describe()})")
     for _ in range(n_rounds):
         ctx = env.begin_round()
 
@@ -58,13 +65,10 @@ def run_inference(
         env.set_committed_poison(chosen_ids)
         updates = env.build_updates(poisoned)
 
-        # Defender classifies every client from the feature vectors.
-        feats = env.features(updates)
-        client_ids = [u.client_id for u in updates]
-        d_sys = defender_agent.system_prompt()
-        d_user = defender_agent.build_user_prompt(feats)
-        d_text = generator.generate(d_sys, d_user, n=1, temperature=temperature)[0]
-        verdicts = defender_agent.parse(d_text, client_ids)
+        # The defense classifies every client (LLM verdicts, or the algorithmic
+        # ensemble's vote). There is one aggregation per round here, so this call
+        # is the committing one.
+        verdicts = defender.verdicts(env, updates, temperature=temperature, commit=True)
 
         prev_acc = ctx.global_accuracy
         post_eval = env.commit_full(updates, verdicts)

@@ -15,6 +15,12 @@ Two schedules are supported (``rl.switch_mode``):
 * ``fixed`` — the legacy fixed-clock alternation: ``K_a`` attacker rounds, then
   ``K_d`` defender rounds, repeated.
 
+A third mode short-circuits the alternation entirely: when ``train`` is given an
+``algorithmic_defender`` (``python main.py --env linux --freeze defender``) the
+defender LLM is out of the loop, the defense is a FIXED ensemble of the classical
+robust-aggregation algorithms, and ONLY the attacker is trained — see
+:func:`_train_attacker_only`.
+
 To stop the learner over-fitting the *latest* opponent we keep an opponent
 **league** (snapshots). With probability ``league_prob`` a phase faces a random
 past snapshot; and after a phase that *capped without a win*, the next learner
@@ -31,6 +37,7 @@ import logging
 
 from core.types import RoundLog
 from core.debug import dbg
+from rl.defenders import LLMDefenderPolicy
 from rl.grpo import grpo_step
 from rl.policy import PolicyGenerator
 from rl.rewards import (
@@ -129,6 +136,8 @@ def train(
     resume: dict | None = None,
     total_rounds: int | None = None,
     max_new_rounds: int | None = None,
+    algorithmic_defender=None,
+    adapter_paths: dict | None = None,
 ):
     """Run the alternating GRPO training loop over ``simulation_rounds`` rounds.
 
@@ -142,6 +151,13 @@ def train(
     invocation may add on top of ``start_round`` (``main.py --debug``). Both were
     previously computed in ``main.py`` and then dropped on the floor, so
     ``--rounds``/``--debug`` silently ran the full ``simulation_rounds`` budget.
+
+    ``algorithmic_defender`` (``--freeze defender``) replaces the defender LLM with
+    a fixed non-LLM ensemble: no defender adapter, no defender optimizer, no
+    learner switching, no opponent league — only the attacker is trained.
+    ``adapter_paths`` overrides ``rl.adapter_paths`` so the caller can decide where
+    this run's adapters live (the frozen-defender run keeps its own, so it can
+    never overwrite the arms-race attacker).
     """
     rl = cfg.get("rl", {})
     G = int(rl.get("G", 4))
@@ -165,10 +181,11 @@ def train(
     first_learner = str(rl.get("first_learner", "attacker"))
     curriculum_on_cap = bool(rl.get("curriculum_on_cap", True))
     fl_interlude = bool(rl.get("fl_interlude_between_phases", True))
-    adapter_paths = rl.get("adapter_paths", {
-        "attacker": "checkpoints/attacker_adapter",
-        "defender": "checkpoints/defender_adapter",
-    })
+    if adapter_paths is None:
+        adapter_paths = rl.get("adapter_paths", {
+            "attacker": "checkpoints/attacker_adapter",
+            "defender": "checkpoints/defender_adapter",
+        })
     reward_cfg = rl.get("reward", {})
     reward_att = reward_cfg.get("attacker", {})
     reward_def = reward_cfg.get("defender", {})
@@ -185,11 +202,19 @@ def train(
         logger.info(f"Training budget: rounds {start_round} -> {total_rounds}")
 
     import torch
-    optimizers = {
-        "attacker": torch.optim.AdamW(policy.adapter_parameters("attacker"), lr=lr),
-        "defender": torch.optim.AdamW(policy.adapter_parameters("defender"), lr=lr),
-    }
+    # With a frozen (non-LLM) defense there is no defender adapter to optimize —
+    # asking for its parameters would build an AdamW over an empty list.
+    learners = ("attacker",) if algorithmic_defender is not None else ("attacker", "defender")
+    optimizers = {name: torch.optim.AdamW(policy.adapter_parameters(name), lr=lr)
+                  for name in learners}
     league = League(rng, max_snapshots=league_max)
+
+    if algorithmic_defender is not None:
+        # The league only ever supplies OPPONENT snapshots, and the opponent here
+        # is a fixed algorithm — so snapshotting costs host RAM for nothing.
+        snap_every = 0
+        league_prob = 0.0
+        adapter_paths = {"attacker": adapter_paths["attacker"]}
 
     # Per-round knobs bundled so both schedules share one round body.
     knobs = dict(
@@ -208,6 +233,7 @@ def train(
         max_new_tokens=max_new_tokens, rng=rng, curriculum_on_cap=curriculum_on_cap,
         fl_interlude=fl_interlude, controller=None,
         fl_state_cb=fl_state_cb, borrowed_opponent=None,
+        algorithmic_defender=algorithmic_defender,
     )
 
     # Resume the FL round-number counter so round labels + logs/round_data advance
@@ -219,7 +245,15 @@ def train(
     elif start_round:
         env.round_index = int(start_round)
 
-    if switch_mode == "best_response":
+    if algorithmic_defender is not None:
+        logger.info(
+            f"Schedule=frozen_defender: the defender LLM is OFF — only the attacker "
+            f"trains, against {algorithmic_defender.describe()} "
+            f"(streak={switch_cfg.success_streak}, "
+            f"min/max phase={switch_cfg.min_phase_rounds}/{switch_cfg.max_phase_rounds})"
+        )
+        done = _train_attacker_only(state, start_round, resume=resume)
+    elif switch_mode == "best_response":
         logger.info(
             f"Schedule=best_response: success-gated iterated best response "
             f"(first_learner={first_learner}, streak={switch_cfg.success_streak}, "
@@ -232,6 +266,18 @@ def train(
 
     _checkpoint(state, done)   # final save
     logger.info(f"Training complete — {done} rounds. Adapters saved to {adapter_paths}")
+
+
+def _defender_for(state, opp_gen):
+    """The verdict source an ATTACKER round faces.
+
+    The fixed algorithmic ensemble when the defender is frozen
+    (``--freeze defender``), otherwise the frozen defender LLM behind ``opp_gen``.
+    """
+    algorithmic = state.get("algorithmic_defender")
+    if algorithmic is not None:
+        return algorithmic
+    return LLMDefenderPolicy(state["defender_agent"], opp_gen)
 
 
 def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
@@ -254,7 +300,7 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
 
     if learner == "attacker":
         turn = AttackerTurn(
-            env, state["attacker_agent"], state["defender_agent"], opp_gen,
+            env, state["attacker_agent"], _defender_for(state, opp_gen),
             reward_cfg=k["reward_att"], opponent_temperature=k["opp_temp"],
             scoring_opponent_temperature=k["scoring_opp_temp"],
         )
@@ -462,6 +508,83 @@ def _train_best_response(state, first_learner, start_round, resume=None):
         # Persist the just-completed switch (new learner/phase in the controller,
         # the frozen adapters, and the shared FL state) so a crash right after a
         # handoff resumes in the NEW phase instead of re-running the finished one.
+        _checkpoint(state, done)
+
+    return done
+
+
+def _train_attacker_only(state, start_round, resume=None):
+    """Frozen-defender schedule (``--freeze defender``). Returns the final round count.
+
+    The defender LLM is not in the loop at all: every round's verdicts come from
+    the fixed algorithmic ensemble (``state["algorithmic_defender"]``), so there is
+    no second policy to alternate with and the learner never switches. Only the
+    attacker's LoRA adapter is updated by GRPO.
+
+    The PHASE structure is deliberately kept, with the learner pinned
+    (``PhaseController(alternate=False)``). A phase still ends on a sustained win
+    or on ``max_phase_rounds``, and that boundary is what (a) checkpoints the
+    attacker at a meaningful point and (b) triggers the honest FL interlude that
+    advances the shared global model + per-client benign weights. Without it a run
+    with ``benign_retrain_each_round: false`` would attack one frozen snapshot of
+    the federation forever.
+
+    What is dropped versus the arms-race schedule: the opponent league and the
+    curriculum (both only supply past OPPONENT snapshots, and the opponent here is
+    a deterministic algorithm), and the defender adapter/optimizer.
+    """
+    defense = state["algorithmic_defender"]
+    ctrl = PhaseController(state["switch_cfg"], first_learner="attacker", alternate=False)
+    if resume and resume.get("controller"):
+        snapshot = dict(resume["controller"])
+        if snapshot.get("learner") not in (None, "attacker"):
+            logger.warning(
+                f"Resume state says learner={snapshot['learner']!r}, but --freeze defender "
+                f"only ever trains the attacker — pinning it back to 'attacker'. (Is this "
+                f"progress file from an arms-race run?)"
+            )
+            snapshot["learner"] = "attacker"
+        ctrl.load_state_dict(snapshot)
+        logger.info(
+            f"Resumed schedule state: phase={ctrl.phase_index} "
+            f"phase_round={ctrl.phase_round} streak={ctrl.streak} capped={ctrl.capped}"
+        )
+    state["controller"] = ctrl   # exposed so _checkpoint can persist it
+    done = start_round
+
+    while done < state["total_rounds"]:
+        # One honest FL round before every phase AFTER the first, exactly as in the
+        # arms race: same gate on phase_round==0 so a resume into mid-phase does not
+        # inject a spurious benign round on every restart.
+        if (ctrl.phase_index > 0 and ctrl.phase_round == 0
+                and state.get("fl_interlude", True)):
+            _run_fl_interlude(state, next_learner="attacker", phase_index=ctrl.phase_index)
+        dbg.phase_event("PHASE START", phase=ctrl.phase_index, learner="attacker",
+                        opponent=defense.describe(), facing_snapshot=False)
+
+        reason = None
+        while done < state["total_rounds"]:
+            _stats, _drop, success = _step_round(
+                state, "attacker", "frozen-defense", None,
+                ctrl.phase_index, ctrl.phase_round,
+            )
+            done += 1
+            switch, reason = ctrl.record(success)
+            _post_round_bookkeeping(state, done)
+            if switch:
+                break
+
+        state["policy"].save_adapter("attacker", state["adapter_paths"]["attacker"])
+        logger.info(
+            f"Phase {ctrl.phase_index} [attacker vs frozen defense] ended "
+            f"({reason or 'budget'}) after {ctrl.phase_round} rounds "
+            f"(streak={ctrl.streak}) — saved the attacker adapter"
+        )
+        dbg.phase_event("PHASE END", phase=ctrl.phase_index, learner="attacker",
+                        reason=reason or "budget", rounds=ctrl.phase_round, streak=ctrl.streak)
+        if reason is None:   # ran out of total budget mid-phase
+            break
+        ctrl.next_phase(reason)
         _checkpoint(state, done)
 
     return done

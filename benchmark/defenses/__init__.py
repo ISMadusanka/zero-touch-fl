@@ -4,7 +4,8 @@ Defense classes import torch / FL components, so they are imported LAZILY inside
 ``build_defenses`` — importing this package stays cheap and torch-free.
 """
 
-AVAILABLE = ["fedavg", "oracle", "llm_defender", "fltrust", "defl", "dnc", "multikrum"]
+AVAILABLE = ["fedavg", "oracle", "llm_defender", "fltrust", "defl", "dnc", "multikrum",
+             "ensemble"]
 
 
 def build_defenses(
@@ -28,6 +29,8 @@ def build_defenses(
     dnc_seed: int = 0,
     multikrum_num_byzantine: int = 1,
     multikrum_m=None,
+    ensemble_members=None,
+    ensemble_vote="majority",
 ):
     """Instantiate the requested defenses, preserving order. Returns an ordered
     dict {name: Defense}. Raises on an unknown name or missing dependency."""
@@ -38,6 +41,19 @@ def build_defenses(
     from benchmark.defenses.defl import DeFL
     from benchmark.defenses.dnc import DnC
     from benchmark.defenses.multikrum import MultiKrum
+    from benchmark.defenses.ensemble import DEFAULT_MEMBERS, EnsembleDefense
+
+    # Every knob except the name list, so the ensemble can build its members with
+    # exactly the settings its standalone siblings would get.
+    shared = dict(
+        device=device, policy=policy, defender_agent=defender_agent,
+        root_loader=root_loader, root_lr=root_lr, root_epochs=root_epochs, eta=eta,
+        defender_temperature=defender_temperature, max_new_tokens=max_new_tokens,
+        defl_delta=defl_delta, defl_tau=defl_tau,
+        dnc_num_byzantine=dnc_num_byzantine, dnc_c=dnc_c, dnc_niters=dnc_niters,
+        dnc_sub_dim=dnc_sub_dim, dnc_seed=dnc_seed,
+        multikrum_num_byzantine=multikrum_num_byzantine, multikrum_m=multikrum_m,
+    )
 
     out: dict = {}
     for name in names:
@@ -63,6 +79,10 @@ def build_defenses(
         elif name == "multikrum":
             out[name] = MultiKrum(device=device, num_byzantine=multikrum_num_byzantine,
                                   m=multikrum_m)
+        elif name == "ensemble":
+            member_names = [str(m) for m in (ensemble_members or DEFAULT_MEMBERS)]
+            out[name] = EnsembleDefense(
+                build_defenses(member_names, **shared), vote=ensemble_vote, device=device)
         else:
             raise ValueError(f"unknown defense '{name}' (available: {AVAILABLE})")
     return out
