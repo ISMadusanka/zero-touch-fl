@@ -255,6 +255,23 @@ class DeFL(Defense):
         self._prev_total_fgnv = None
         self._layer_groups = group_layers(list(init_global.keys()))
 
+    # DeFL is the one stateful defense: the CLP test compares against the PREVIOUS
+    # round's total FGNV, and the Beta trust counts accumulate over rounds. When the
+    # ensemble scores GRPO rollouts it must be able to run DeFL as a pure function
+    # of the round and roll that history back afterwards, so only the committed
+    # round advances it.
+    def state_dict(self) -> dict:
+        return {
+            "alpha": dict(self._beta.alpha),
+            "beta": dict(self._beta.beta),
+            "prev_total_fgnv": self._prev_total_fgnv,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self._beta.alpha = dict(state.get("alpha", {}))
+        self._beta.beta = dict(state.get("beta", {}))
+        self._prev_total_fgnv = state.get("prev_total_fgnv")
+
     def step(self, updates, poisoned_ids) -> StepResult:
         import torch
         gw = self._global

@@ -130,6 +130,16 @@ class DnC(Defense):
         from server.aggregation import FedAvgAggregator
         self._agg = FedAvgAggregator()
 
+    # The only cross-round state is the subsampling RNG (used when d > sub_dim), so
+    # rolling it back keeps a scoring pass from shifting the coordinates a later
+    # committed round draws.
+    def state_dict(self) -> dict:
+        return {"rng": self._rng.getstate()}
+
+    def load_state_dict(self, state: dict) -> None:
+        if state.get("rng") is not None:
+            self._rng.setstate(state["rng"])
+
     def step(self, updates, poisoned_ids) -> StepResult:
         import torch
         gw = self._global

@@ -15,6 +15,16 @@ Two schedules are supported (``rl.switch_mode``):
 * ``fixed`` — the legacy fixed-clock alternation: ``K_a`` attacker rounds, then
   ``K_d`` defender rounds, repeated.
 
+There is also a **single-learner** mode (``main.py --freeze <agent>``) that
+bypasses the schedule entirely: one agent trains for the whole run, no switching,
+no phase handoff, no between-phase FL interlude, no opponent league. With
+``--freeze defender`` the frozen side is not an LLM at all — the defender LLM is
+deactivated and the algorithmic ensemble (FLTrust / Multi-Krum / DnC / DeFL,
+attached to the env as ``env.defense``) produces the verdicts instead. The
+attacker's rewards and win criteria are untouched, and the arms-race schedule
+state on disk is left alone so a later plain ``main.py`` run resumes alternating
+right where it stopped.
+
 To stop the learner over-fitting the *latest* opponent we keep an opponent
 **league** (snapshots). With probability ``league_prob`` a phase faces a random
 past snapshot; and after a phase that *capped without a win*, the next learner
@@ -127,6 +137,7 @@ def train(
     resume: dict | None = None,
     total_rounds: int | None = None,
     max_new_rounds: int | None = None,
+    freeze: str | None = None,
 ):
     """Run the alternating GRPO training loop over ``simulation_rounds`` rounds.
 
@@ -140,6 +151,10 @@ def train(
     invocation may add on top of ``start_round`` (``main.py --debug``). Both were
     previously computed in ``main.py`` and then dropped on the floor, so
     ``--rounds``/``--debug`` silently ran the full ``simulation_rounds`` budget.
+
+    ``freeze`` (``main.py --freeze attacker|defender``) names the agent to hold
+    fixed: the OTHER agent then trains alone for the whole run with no switching
+    and the ``switch_mode`` schedule is not used at all.
     """
     rl = cfg.get("rl", {})
     G = int(rl.get("G", 4))
@@ -206,6 +221,9 @@ def train(
         max_new_tokens=max_new_tokens, rng=rng, curriculum_on_cap=curriculum_on_cap,
         fl_interlude=fl_interlude, controller=None,
         fl_state_cb=fl_state_cb, borrowed_opponent=None,
+        # Adapters this run is allowed to write. Single-learner runs narrow it to
+        # the learner so a frozen agent's checkpoint is never rewritten.
+        save_adapters=list(adapter_paths),
     )
 
     # Resume the FL round-number counter so round labels + logs/round_data advance
@@ -217,7 +235,23 @@ def train(
     elif start_round:
         env.round_index = int(start_round)
 
-    if switch_mode == "best_response":
+    if freeze:
+        learner = "defender" if freeze == "attacker" else "attacker"
+        # No switching => the opponent never changes => league snapshots would only
+        # burn host RAM (~115 MB each). Turn them off and write only the learner's
+        # adapter, leaving the frozen agent's checkpoint on disk untouched.
+        state["snap_every"] = 0
+        state["league_prob"] = 0.0
+        state["save_adapters"] = [learner]
+        defense = getattr(env, "defense", None)
+        logger.info(
+            f"Schedule=single_learner: training {learner} ONLY (frozen: {freeze}); "
+            f"no phase switching, no FL interlude, no opponent league. Defense = "
+            + (f"algorithmic ensemble [{defense.describe()}] — defender LLM OFF"
+               if defense is not None else f"frozen {freeze} LLM")
+        )
+        done = _train_single_learner(state, learner, start_round)
+    elif switch_mode == "best_response":
         logger.info(
             f"Schedule=best_response: success-gated iterated best response "
             f"(first_learner={first_learner}, streak={switch_cfg.success_streak}, "
@@ -251,10 +285,14 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
                  env.current_accuracy, env.benign_retrain)
 
     if learner == "attacker":
+        # ``env.defense`` set => the defender LLM is deactivated and the algorithmic
+        # ensemble judges the round instead (``--freeze defender``); ``opp_gen`` is
+        # then unused. Otherwise this is the normal frozen-defender-LLM opponent.
         turn = AttackerTurn(
             env, state["attacker_agent"], state["defender_agent"], opp_gen,
             reward_cfg=k["reward_att"], opponent_temperature=k["opp_temp"],
             scoring_opponent_temperature=k["scoring_opp_temp"],
+            defense=getattr(env, "defense", None),
         )
     else:
         # The defender's frozen attacker is sampled at the scoring temperature so
@@ -460,6 +498,47 @@ def _train_best_response(state, first_learner, start_round, resume=None):
     return done
 
 
+def _train_single_learner(state, learner, start_round):
+    """Train ONE agent for the whole run — no switching (``main.py --freeze``).
+
+    The opponent is fixed for the entire run, so there are no phases: no
+    ``PhaseController``, no between-phase FL interlude, no league. Everything else
+    about a round is identical to the alternating schedule — same prompts, same
+    GRPO step, same rewards, same win-gate — so ``learner_success``, the metrics
+    and the ASR stay comparable across modes.
+
+    When the frozen side is the DEFENDER the opponent is not an LLM at all: the
+    env carries an algorithmic defense ensemble and ``_step_round`` routes the
+    verdicts through it. When the frozen side is the ATTACKER we still need its
+    (frozen) adapter to play a move each round, hence the generator below.
+
+    The ``PhaseController`` snapshot on disk is deliberately NOT touched: a later
+    plain ``main.py`` run resumes the arms race exactly where it left off (see
+    ``_checkpoint`` — ``state["controller"]`` stays ``None`` here, and
+    ``storage.save_progress`` preserves the stored controller when passed ``None``).
+    """
+    opp = "defender" if learner == "attacker" else "attacker"
+    opp_gen = (None if getattr(state["env"], "defense", None) is not None
+               else PolicyGenerator(state["policy"], opp, state["max_new_tokens"]))
+    dbg.phase_event("SINGLE-LEARNER START", learner=learner, frozen=opp,
+                    defense=(state["env"].defense.describe()
+                             if getattr(state["env"], "defense", None) is not None else None))
+
+    done = start_round
+    round_in_run = 0
+    wins = 0
+    while done < state["total_rounds"]:
+        _stats, _drop, success = _step_round(state, learner, opp, opp_gen, 0, round_in_run)
+        done += 1
+        round_in_run += 1
+        wins += int(success)
+        _post_round_bookkeeping(state, done)
+    if round_in_run:
+        logger.info(f"Single-learner run finished: {round_in_run} round(s), "
+                    f"{learner} won {wins} ({wins / round_in_run:.1%})")
+    return done
+
+
 def _train_fixed(state, K_a, K_d, start_round):
     """Legacy fixed-clock alternation. Returns the final round count."""
     rng = state["rng"]
@@ -499,14 +578,19 @@ def _checkpoint(state, done):
 
 
 def _save_adapters(state):
-    """Persist every adapter. If the opponent adapter is currently BORROWED (its
-    live weights temporarily swapped for an older league snapshot during a
-    curriculum/league phase), write its LIVE weights instead of the borrowed
-    snapshot, so a mid-phase checkpoint can't overwrite the real opponent adapter
-    on disk (which would silently regress the frozen opponent on resume)."""
+    """Persist the adapters this run is allowed to write (``state["save_adapters"]``
+    — every adapter normally, only the learner in a single-learner run so a frozen
+    agent's checkpoint is left exactly as it was). If the opponent adapter is
+    currently BORROWED (its live weights temporarily swapped for an older league
+    snapshot during a curriculum/league phase), write its LIVE weights instead of the
+    borrowed snapshot, so a mid-phase checkpoint can't overwrite the real opponent
+    adapter on disk (which would silently regress the frozen opponent on resume)."""
     policy = state["policy"]
     borrowed = state.get("borrowed_opponent")
+    writable = set(state.get("save_adapters") or state["adapter_paths"])
     for name, path in state["adapter_paths"].items():
+        if name not in writable:
+            continue
         if borrowed and borrowed[0] == name:
             policy.save_adapter_state_dict(name, borrowed[1], path)
         else:
@@ -543,6 +627,13 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                             mode=reward_def.get("mode", "soft_f1"),
                             fpr_penalty=reward_def.get("fpr_penalty", 1.0))
 
+    # Who produced the verdicts this round: the defender LLM, or the algorithmic
+    # ensemble (``--freeze defender``). Recorded so the logs/monitor can tell the
+    # two regimes apart in one mixed rounds.jsonl stream.
+    defense_info = info.get("defense_info")
+    defense_block = ({"mode": "algorithmic", **defense_info} if defense_info
+                     else {"mode": "llm_defender"})
+
     metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(poisoned_ids))
     save_round_log(RoundLog(
         round_num=ctx.round_num,
@@ -572,6 +663,7 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             "phase_index": phase_index,
             "phase_round": phase_round,
             "learner_success": success,
+            "defense": defense_block,
             "train": {
                 "loss": stats["loss"],
                 "mean_reward": stats["mean_reward"],
@@ -597,3 +689,9 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
         f"zero_adv={stats['zero_advantage_fraction']:.2f} "
         f"{'step' if stats.get('stepped', True) else 'SKIP'}"
     )
+    if defense_info:
+        logger.info(
+            f"  defense[{'+'.join(defense_info['algorithms'])}] flagged="
+            f"{defense_info['flagged']} (poisoned={poisoned_ids}) "
+            f"per_algorithm={defense_info['per_defense_flags']}"
+        )

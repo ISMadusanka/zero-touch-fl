@@ -15,6 +15,7 @@ checkpoint layout. It supersedes the old feedback/episodic-memory design.
 | Features | `detector/features.py` | Per-client, per-layer statistical feature vectors (no decisions). |
 | Attacker | `agents/attacker_agent.py` + `agents/attack_ops.py` | Prompt (layer stats) + parse/apply of an attack plan (operator DSL). |
 | Defender | `agents/defender_agent.py` | Prompt + parse of per-client benign/malicious labels. |
+| Defense ensemble | `server/defense_ensemble.py` | The defender-LLM-free path (`--freeze defender`): FLTrust + Multi-Krum + DnC + DeFL run as detectors, rejections unioned. |
 | RL | `rl/*` | Environment, rewards, turns, GRPO, schedule, policy, baseline, inference. |
 | Metrics | `metrics/*` | Ground-truth confusion/TPR/FPR/ASR/APR (research + reward source). |
 
@@ -195,18 +196,56 @@ Both continuous, so GRPO group advantages don't collapse.
   `logs/round_data/rounds.jsonl` (`attack_metadata.event="benign_fl_round"`)
   and `logs/debug.json`.
 
+## Single-learner mode (`--freeze`)
+
+`main.py --freeze <attacker|defender>` trains ONE agent for the whole run and
+bypasses the schedule above entirely: no `PhaseController`, no switching, no
+between-phase FL interlude, no opponent league (the opponent never changes, so
+snapshots would only cost host RAM). `rl/schedule._train_single_learner` runs the
+same round body as the alternating schedules — same prompts, same `grpo_step`, same
+rewards, same win-gate — so `learner_success`, ASR/TPR/FPR and the logs stay
+directly comparable across modes.
+
+- **`--freeze defender`** deactivates the defender LLM. `server/defense_ensemble.py`
+  runs FLTrust, Multi-Krum, DnC and DeFL (config: `defense.algorithms`) over the
+  round's updates as pure detectors and **unions their rejections** — one flag from
+  any algorithm drops that client from FedAvg, so a poisoner has to evade all of
+  them at once. Details that make it train correctly:
+  - The verdict's confidence is the **fraction of algorithms that flagged** the
+    client (benign-and-cleared = confidence 1.0). The per-algorithm confidences are
+    not comparable (FLTrust `1 − trust` ∈ [0,1] vs Multi-Krum/DnC raw unbounded
+    outlier scores vs DeFL's vote fraction), and `rl/rewards._soft_malicious_prob`
+    reads confidence as a probability — the consensus fraction is a well-defined
+    [0,1] stand-in that gives the stealth term a gradient.
+  - `FLArmsRaceEnv.clean_reference_accuracy` runs the **same defense** over the
+    all-honest updates. Multi-Krum and DnC drop a fixed `f`/`c·m` clients every
+    round and DeFL always flags at least one, so an all-accepted reference would
+    charge the attacker's `drop` with damage the *defense* caused.
+  - GRPO scores `G` rollouts per round, so `verdicts(..., commit=False)` snapshots
+    and restores each defense's cross-round state (DeFL's CLP total + Beta trust
+    counts, DnC's subsampling RNG); only the committed round advances it.
+- **`--freeze attacker`** is the mirror: the defender LLM trains against the frozen
+  attacker adapter. No algorithmic defenses are involved.
+
+Only the learner's adapter is written, and `storage.save_progress` **merges** rather
+than overwrites — a `--freeze` run advances `rounds_done`/`round_index` while leaving
+the stored `controller` untouched, so a later plain `main.py` run resumes the
+alternating arms race in the phase it stopped in.
+
 ## Modes (`main.py`)
 
 | Mode | Flag | Uses | GPU |
 |------|------|------|-----|
 | Train | *(default)* | `rl/policy.py` + `rl/schedule.py` (GRPO) | yes |
+| Single-learner | `--freeze <agent>` | as Train, but one learner and no switching | yes |
 | Dry-run | `--dry-run` | `rl/inference.py` (frozen Ollama/OpenAI), full loop, no updates | no |
 | Baseline | `--baseline` | `rl/baseline.py` best-of-N fixed actions, no LLM | no |
 
-All three honour `--rounds N` (an absolute budget overriding `fl.simulation_rounds`)
+All honour `--rounds N` (an absolute budget overriding `fl.simulation_rounds`)
 and `--config <path>`. `--debug` without `--rounds` caps how many rounds **this
 run** adds on top of `rounds_done`, so debugging a resumed run still executes
-rounds instead of exiting immediately.
+rounds instead of exiting immediately. `--freeze` composes with Train and Dry-run
+(it is ignored, with a warning, in `--baseline`, which uses no LLM agents).
 
 ## Checkpoints & resume
 
@@ -220,9 +259,11 @@ rounds instead of exiting immediately.
   Phase-2 round); `controller` is the `PhaseController` snapshot
   (`learner`, `phase_index`, `phase_round`, `streak`, `capped`) so the arms-race
   schedule continues where it left off. Written together with the adapters on the
-  `rl.save_every` cadence and on exit. Older files with only `rounds_done` still
-  load (the missing fields fall back: `round_index`→`rounds_done`, `controller`→a
-  fresh schedule).
+  `rl.save_every` cadence and on exit; fields not supplied are **merged, not
+  cleared**, so a single-learner run (which has no controller) advances the round
+  counters without wiping the arms-race schedule. Older files with only
+  `rounds_done` still load (the missing fields fall back:
+  `round_index`→`rounds_done`, `controller`→a fresh schedule).
 - Rerunning resumes: adapters + `rounds_done` + `round_index` + `controller` are all
   reloaded. The env still re-derives its weights from the Phase-1 baseline (the model
   state lives in the adapters), but the round counter and schedule pick up in place.
@@ -242,8 +283,10 @@ legacy `round_NNN.json` files, so logs from older runs still load.
   `poisoned_client_ids`, `predicted_labels`, accuracies, `attacker_reward`,
   `defender_reward`, `learning_agent`, and an `attack_metadata` block with
   `clean_accuracy` / `induced_drop` (the counterfactual and the damage the reward
-  actually uses), `n_malformed`, `budget`, `n_used`, plus a `train` sub-block
-  (loss, mean reward, zero-advantage fraction).
+  actually uses), `n_malformed`, `budget`, `n_used`, a `defense` sub-block
+  (`mode: "llm_defender"`, or `mode: "algorithmic"` plus the per-algorithm flags
+  under `--freeze defender`), plus a `train` sub-block (loss, mean reward,
+  zero-advantage fraction).
 - `logs/metrics/rounds.jsonl` + `summary.json` — ground-truth confusion / TPR /
   FPR / ASR / APR. `summary.json`'s `aggregate` covers every round; its
   `per_round` block is the retained tail (`MetricsTracker.keep_rounds`, default

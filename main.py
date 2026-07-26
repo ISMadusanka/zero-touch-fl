@@ -13,10 +13,19 @@ Qwen2.5-3B-Instruct base).
 
 Modes:
   python main.py --env linux                 # full GRPO training (needs a GPU)
+  python main.py --env linux --freeze defender  # attacker-only GRPO vs algorithmic defenses
   python main.py --env linux --dry-run       # frozen-LLM round loop, no training
   python main.py --baseline                  # best-of-N reward-harness sanity (no LLM)
   python main.py --fresh                      # force fresh Phase-1 training
   python main.py --rounds 8                   # override simulation_rounds (quick runs)
+
+``--freeze defender`` trains ONLY the attacker: no arms-race switching, and the
+defender LLM is deactivated — the server defends with the implemented algorithms
+instead (FLTrust, Multi-Krum, DnC, DeFL, run together; a client is dropped from
+FedAvg if ANY of them flags it, so one detection makes the attack fail). Attacker
+rewards, win criteria and ASR are unchanged. The saved arms-race schedule state is
+left untouched, so a later plain ``main.py --env linux`` resumes the alternating
+attacker/defender-LLM training exactly where it stopped.
 """
 
 import os
@@ -177,19 +186,30 @@ def run_phase2(
     client_loaders, test_loader, config, attacker_config, defender_config,
     mode: str, n_rounds: int, llm_backend: str,
     max_new_rounds: int | None = None,
+    freeze: str | None = None,
 ):
     fl = config["fl"]
     logger.info("=" * 60)
     attack_cfg = config.get("attack", {})
-    logger.info(f"PHASE 2: LLM-direct arms race  (mode={mode})")
+    logger.info(f"PHASE 2: LLM-direct arms race  (mode={mode}"
+                + (f", freeze={freeze}" if freeze else "") + ")")
     logger.info(f"  simulation_rounds={n_rounds}, n_compromisable={fl.get('n_compromisable')}, "
                 f"max_poison_clients={attack_cfg.get('max_poison_clients')}, "
                 f"sample_budget={attack_cfg.get('sample_budget_in_training')}")
     logger.info(f"  baseline_accuracy={baseline_accuracy:.4f}")
     logger.info("=" * 60)
 
+    # --freeze defender: the defender LLM is deactivated for this run and the
+    # implemented robust-FL algorithms defend instead (union of their rejections).
+    # Attached to the env so the round's CLEAN counterfactual is measured under the
+    # same defense — see FLArmsRaceEnv.clean_reference_accuracy.
+    defense = None
+    if freeze == "defender":
+        from server.defense_ensemble import build_ensemble
+        defense = build_ensemble(config)
+
     rng = random.Random(int(fl.get("poison_seed", 0)))
-    env = FLArmsRaceEnv(config, client_loaders, test_loader, rng)
+    env = FLArmsRaceEnv(config, client_loaders, test_loader, rng, defense=defense)
     env.reset(global_weights, client_weights, baseline_accuracy)
 
     metrics_tracker = MetricsTracker(baseline_accuracy=baseline_accuracy, output_dir="logs/metrics")
@@ -212,7 +232,8 @@ def run_phase2(
         gen = InferenceGenerator(backend, max_new_tokens=int(config.get("rl", {}).get("max_new_tokens", 2048)))
         run_inference(env, attacker_agent, defender_agent, gen, n_rounds,
                       metrics_tracker, _save_round_log,
-                      temperature=float(llm_cfg.get("temperature", 0.7)))
+                      temperature=float(llm_cfg.get("temperature", 0.7)),
+                      defense=defense)
 
     else:  # full GRPO training
         from rl.policy import LLMPolicy
@@ -263,7 +284,8 @@ def run_phase2(
               metrics_tracker, _save_round_log, rng,
               progress_cb=progress_cb, fl_state_cb=fl_state_cb,
               start_round=start_round, resume=progress,
-              total_rounds=n_rounds, max_new_rounds=max_new_rounds)
+              total_rounds=n_rounds, max_new_rounds=max_new_rounds,
+              freeze=freeze)
 
     logger.info("\n" + "=" * 60)
     logger.info("PHASE 2 COMPLETE")
@@ -287,6 +309,15 @@ def main():
                         help="Run the Phase-2 loop with a frozen LLM (no training, no GPU needed)")
     parser.add_argument("--baseline", action="store_true",
                         help="Run the best-of-N reward-harness sanity baseline (no LLM)")
+    parser.add_argument("--freeze", choices=["attacker", "defender"], default=None,
+                        help="Train ONE agent only, with no arms-race switching. "
+                             "'--freeze defender' GRPO-trains the attacker and deactivates the "
+                             "defender LLM: the server defends with the implemented algorithms "
+                             "(FLTrust, Multi-Krum, DnC, DeFL) and a client is dropped from "
+                             "FedAvg if ANY of them flags it. '--freeze attacker' trains the "
+                             "defender LLM against the frozen attacker adapter. The saved "
+                             "arms-race schedule is untouched, so a later plain run resumes "
+                             "alternating where it left off.")
     parser.add_argument("--rounds", type=int, default=None,
                         help="Override simulation_rounds (handy for quick smoke runs)")
     parser.add_argument("--debug", action="store_true",
@@ -354,6 +385,17 @@ def main():
     mode = "baseline" if args.baseline else ("dry-run" if args.dry_run else "train")
     n_rounds = args.rounds if args.rounds is not None else int(fl["simulation_rounds"])
 
+    # --baseline runs a fixed, non-LLM action set against a fixed heuristic defender,
+    # so there is no agent to freeze and nothing for --freeze to change.
+    freeze = args.freeze
+    if freeze and mode == "baseline":
+        logger.warning("--freeze is ignored in --baseline mode (no LLM agents involved)")
+        freeze = None
+    if freeze:
+        logger.info(f"Single-learner run: training "
+                    f"{'defender' if freeze == 'attacker' else 'attacker'} only "
+                    f"(frozen: {freeze}); arms-race switching is OFF for this run")
+
     # ``--debug`` without ``--rounds`` caps how many rounds THIS RUN adds rather
     # than the absolute budget: the training loop resumes from `rounds_done`, so an
     # absolute cap of 3 would make a resumed debug run exit without executing
@@ -383,6 +425,9 @@ def main():
                 "baseline_accuracy": round(float(baseline_accuracy), 4),
                 "n_rounds": n_rounds,
                 "max_new_rounds": max_new_rounds,
+                "freeze": freeze,
+                "defense_algorithms": ((base_config.get("defense") or {}).get("algorithms")
+                                       if freeze == "defender" else None),
             },
         )
 
@@ -400,6 +445,7 @@ def main():
             n_rounds=n_rounds,
             llm_backend=llm_backend,
             max_new_rounds=max_new_rounds,
+            freeze=freeze,
         )
     finally:
         dbg.close()

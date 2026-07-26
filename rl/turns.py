@@ -25,15 +25,28 @@ logger = logging.getLogger(__name__)
 
 
 class AttackerTurn:
-    """Learning agent = attacker. Opponent = frozen defender (greedy)."""
+    """Learning agent = attacker. Opponent = frozen defender (greedy).
+
+    When ``defense`` is given (``main.py --freeze defender``) the defender LLM is
+    OFF: the round's verdicts come from the algorithmic ensemble
+    (``server/defense_ensemble.py``) instead, and ``defender_gen`` is unused. Every
+    other part of the turn — the attacker's prompt, the reward, the win-gate — is
+    unchanged, so the attacker is trained and scored exactly as before; only who
+    produces the verdicts differs.
+    """
 
     def __init__(self, env, attacker_agent, defender_agent, defender_gen,
                  reward_cfg: dict | None = None, opponent_temperature: float = 0.0,
-                 scoring_opponent_temperature: float | None = None):
+                 scoring_opponent_temperature: float | None = None,
+                 defense=None):
         self.env = env
         self.attacker_agent = attacker_agent
         self.defender_agent = defender_agent
         self.defender_gen = defender_gen
+        self.defense = defense
+        self.defense_info = None          # per-algorithm breakdown of the last call
+        if defense is None and defender_gen is None:
+            raise ValueError("AttackerTurn needs either a defender generator or a defense ensemble")
         self.reward_cfg = reward_cfg or {}
         self.opp_temp = opponent_temperature
         # When SCORING the G candidate plans we sample the frozen defender at a
@@ -71,7 +84,16 @@ class AttackerTurn:
     def messages(self) -> tuple[str, str]:
         return self.system, self.user
 
-    def _defender_verdicts(self, updates, temperature):
+    def _defender_verdicts(self, updates, temperature, commit):
+        if self.defense is not None:
+            # Defender LLM deactivated: every algorithm judges the round and the
+            # rejections are unioned. Only the committed round may advance the
+            # algorithms' cross-round state (see DefenseEnsemble.verdicts).
+            verdicts, info = self.defense.verdicts(
+                updates, self.env.global_weights, commit=commit)
+            self.defense_info = info
+            dbg.defense_verdicts(verdicts, info, who="algorithmic-defense")
+            return verdicts
         feats = self.env.features(updates)
         client_ids = [u.client_id for u in updates]
         d_sys = self.defender_agent.system_prompt()
@@ -82,12 +104,12 @@ class AttackerTurn:
                         temperature=temperature)
         return verdicts
 
-    def _apply(self, attacker_text, temperature):
+    def _apply(self, attacker_text, temperature, commit=False):
         poisoned, chosen_ids, n_malformed = self.attacker_agent.select_and_apply(
             attacker_text, self.pool_references, self.budget
         )
         updates = self.env.build_updates(poisoned)
-        verdicts = self._defender_verdicts(updates, temperature)
+        verdicts = self._defender_verdicts(updates, temperature, commit)
         return updates, verdicts, n_malformed, chosen_ids, poisoned
 
     def reward(self, attacker_text) -> float:
@@ -115,7 +137,7 @@ class AttackerTurn:
     def commit(self, attacker_text) -> dict:
         dbg.committing()
         updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
-            attacker_text, self.opp_temp)
+            attacker_text, self.opp_temp, commit=True)
         self.env.set_committed_poison(chosen_ids)
         new_acc = self.env.commit(updates, verdicts)
         return {
@@ -125,6 +147,7 @@ class AttackerTurn:
             "post_accuracy": new_acc,
             "poisoned_ids": chosen_ids,
             "poisoned_by_client": poisoned,
+            "defense_info": getattr(self, "defense_info", None),
         }
 
 

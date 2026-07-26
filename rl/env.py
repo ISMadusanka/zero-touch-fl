@@ -55,9 +55,15 @@ class RoundContext:
 
 
 class FLArmsRaceEnv:
-    def __init__(self, config: dict, client_loaders, test_loader, rng):
+    def __init__(self, config: dict, client_loaders, test_loader, rng, defense=None):
         fl = config["fl"]
         attack = config.get("attack", {})
+        # Optional algorithmic defense ensemble (FLTrust / Multi-Krum / DnC / DeFL —
+        # see ``server/defense_ensemble.py``). When set, the defender LLM is OFF and
+        # these algorithms produce the round's verdicts instead; the env only needs
+        # it so the CLEAN COUNTERFACTUAL is measured under the same defense (see
+        # ``clean_reference_accuracy``). ``None`` = the normal LLM-vs-LLM arms race.
+        self.defense = defense
         self.n_clients = int(fl["n_clients"])
         self.device = fl.get("device", "cpu")
         self.benign_retrain = bool(fl.get("benign_retrain_each_round", True))
@@ -236,10 +242,24 @@ class FLArmsRaceEnv:
 
         Computed lazily and cached for the round (one extra test-set evaluation
         per round, against the G+1 the attacker's rollouts already cost).
+
+        **With an algorithmic defense attached** (``--freeze defender``) the
+        counterfactual is measured WITH that defense running over the all-honest
+        updates, not with every client accepted. Multi-Krum and DnC drop a fixed
+        number of clients every round by construction, and DeFL always flags at
+        least one, so an all-accepted reference would bake those honest exclusions
+        into ``drop`` and hand the attacker free reward for damage the DEFENSE did.
+        Running the same defense on both sides makes ``drop`` the attack's marginal
+        damage again.
         """
         if self._clean_ref_acc is None:
             updates = self.build_updates({})
-            clean = [DetectionVerdict(u.client_id, False, 0.0, "clean_ref") for u in updates]
+            if self.defense is not None:
+                clean, _info = self.defense.verdicts(
+                    updates, self.server.get_global_weights(), commit=False)
+            else:
+                clean = [DetectionVerdict(u.client_id, False, 0.0, "clean_ref")
+                         for u in updates]
             self._clean_ref_acc = self._eval_state(self.aggregator.aggregate(updates, clean))
         return self._clean_ref_acc
 

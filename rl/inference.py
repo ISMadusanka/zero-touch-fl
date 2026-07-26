@@ -38,9 +38,17 @@ def run_inference(
     metrics_tracker,
     save_round_log,
     temperature: float = 0.7,
+    defense=None,
 ):
-    """Run ``n_rounds`` of the arms race with frozen LLMs (no learning)."""
-    logger.info(f"[dry-run] running {n_rounds} inference round(s) — no weight updates")
+    """Run ``n_rounds`` of the arms race with frozen LLMs (no learning).
+
+    ``defense`` (``--freeze defender``) deactivates the defender LLM and takes the
+    round's verdicts from the algorithmic ensemble instead — the CPU-friendly way
+    to sanity-check that path end to end before starting a GPU run.
+    """
+    logger.info(f"[dry-run] running {n_rounds} inference round(s) — no weight updates"
+                + (f" | defense={defense.describe()} (defender LLM OFF)"
+                   if defense is not None else ""))
     for _ in range(n_rounds):
         ctx = env.begin_round()
 
@@ -56,13 +64,19 @@ def run_inference(
         env.set_committed_poison(chosen_ids)
         updates = env.build_updates(poisoned)
 
-        # Defender classifies every client from the feature vectors.
-        feats = env.features(updates)
-        client_ids = [u.client_id for u in updates]
-        d_sys = defender_agent.system_prompt()
-        d_user = defender_agent.build_user_prompt(feats)
-        d_text = generator.generate(d_sys, d_user, n=1, temperature=temperature)[0]
-        verdicts = defender_agent.parse(d_text, client_ids)
+        # Defender classifies every client from the feature vectors — unless the
+        # defender LLM is off, in which case the algorithmic ensemble does.
+        defense_info = None
+        if defense is not None:
+            verdicts, defense_info = defense.verdicts(
+                updates, env.global_weights, commit=True)
+        else:
+            feats = env.features(updates)
+            client_ids = [u.client_id for u in updates]
+            d_sys = defender_agent.system_prompt()
+            d_user = defender_agent.build_user_prompt(feats)
+            d_text = generator.generate(d_sys, d_user, n=1, temperature=temperature)[0]
+            verdicts = defender_agent.parse(d_text, client_ids)
 
         prev_acc = ctx.global_accuracy
         new_acc = env.commit(updates, verdicts)
@@ -94,11 +108,14 @@ def run_inference(
             attack_metadata={"n_malformed": n_malformed, "budget": ctx.budget,
                              "n_used": len(chosen_ids),
                              "clean_accuracy": round(float(ctx.clean_accuracy), 6),
-                             "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6)},
+                             "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6),
+                             "defense": ({"mode": "algorithmic", **defense_info}
+                                         if defense_info else {"mode": "llm_defender"})},
         ))
         logger.info(
             f"[dry-run] round {ctx.round_num}: poisoned={chosen_ids} budget={ctx.budget} "
             f"acc {prev_acc:.4f}->{new_acc:.4f} "
             f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - new_acc:+.4f}) "
             f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} malformed={n_malformed}"
+            + (f" | flagged={defense_info['flagged']}" if defense_info else "")
         )

@@ -41,6 +41,57 @@ Two phases:
 There are no hardcoded attack plugins, no hardcoded detector rules, and no
 episodic-memory feedback loop — the LLMs learn everything via RL.
 
+## Single-agent training (`--freeze`)
+
+`python main.py --env linux` runs the full arms race: both LLMs, alternating
+phases, freeze-and-switch. `--freeze <agent>` instead trains **one** agent for the
+whole run, with **no switching at all**.
+
+**`--freeze defender` — attacker-only GRPO against classical defenses.** The
+defender LLM is deactivated; it is not prompted, not sampled, and not trained. The
+server defends with the implemented robust-FL algorithms instead, all of them at
+once over the same round of updates:
+
+| Algorithm | Paper | Detects by |
+|-----------|-------|-----------|
+| FLTrust | Cao et al., NDSS'21 | cosine trust vs a server update on a small clean root set |
+| Multi-Krum | Blanchard et al., NeurIPS'17 | distance to the bulk of the other updates |
+| DnC | Shejwalkar & Houmansadr, NDSS'21 | spectral (top-singular-direction) outlier score |
+| DeFL | Yan et al., AAAI-23 | per-layer FGNV outlier vote + critical-learning-period gating |
+
+Their rejections are **unioned**: *if any one of them flags a client, that client
+is dropped from FedAvg.* So the attack lands only when a poisoner slips past every
+algorithm simultaneously — one detection and the round's attack has failed.
+Everything else is exactly as in the normal mode: same attacker prompt, same GRPO
+step, same reward terms, same win criteria (`rl/switch.py`), same ASR/TPR/FPR
+metrics. The only difference is who produced the verdicts.
+
+Two details make the comparison honest:
+
+- **Stealth is graded, not binary.** The verdict's confidence is the *fraction of
+  algorithms that flagged the client* (3 of 4 → `0.75`; none → benign at full
+  confidence), so the attacker's stealth reward improves smoothly as it evades more
+  of the panel instead of seeing one flat caught/not-caught bit.
+- **The clean counterfactual runs through the same defense.** Multi-Krum and DnC
+  drop a fixed number of clients every round by construction and DeFL always flags
+  at least one, so some honest clients are excluded even on a clean round. The
+  round's reference accuracy is therefore measured *with the defense running and no
+  poison*, which keeps `drop` the attack's marginal damage rather than free credit
+  for honest clients the defense itself discarded.
+
+Configure the panel under `defense:` in `configs/base.yaml` (which algorithms, the
+assumed adversary budget `f`/`m`, FLTrust's root-set size, DeFL/DnC thresholds).
+A plain `python main.py` run ignores that block entirely.
+
+**`--freeze attacker`** is the mirror image: the defender LLM trains against the
+frozen attacker adapter (no algorithmic defenses involved).
+
+**Switching back.** A `--freeze` run advances the round counters and writes only the
+learner's adapter — the frozen agent's checkpoint and the saved arms-race schedule
+(`checkpoints/rl_progress.json` → `controller`) are left untouched. Re-running plain
+`python main.py --env linux` therefore resumes the alternating, defender-LLM arms
+race in the phase it stopped in, with no algorithmic defenses in the loop.
+
 ## Why GRPO (not PPO / DPO)
 
 The reward is an exactly-computable scalar per round (RLVR regime). **DPO** is
@@ -121,6 +172,17 @@ pip install torch torchvision numpy pyyaml matplotlib openai requests
 # Full GRPO training (GPU). Phase 1 runs once, then the RL arms race.
 python main.py --env linux
 
+# ATTACKER-ONLY training: no arms-race switching, and the defender LLM is OFF —
+# the server defends with the implemented algorithms instead (FLTrust + Multi-Krum
+# + DnC + DeFL, all at once; a client is dropped from FedAvg if ANY of them flags
+# it). Attacker rewards / win criteria / ASR are unchanged. See "Single-agent
+# training" below — a later plain `python main.py --env linux` picks the
+# alternating, defender-LLM arms race back up exactly where it left off.
+python main.py --env linux --freeze defender
+
+# The mirror image: train the defender LLM against the frozen attacker adapter.
+python main.py --env linux --freeze attacker
+
 # Quick smoke run: few rounds. --rounds is an ABSOLUTE budget overriding
 # fl.simulation_rounds, so on a resumed run the rounds already done count toward it.
 python main.py --env linux --rounds 8
@@ -140,6 +202,10 @@ python main.py --env linux --debug --rounds 6     # debug a longer stretch
 
 # Logic dry-run — full round loop with a FROZEN LLM via Ollama (no training, no GPU)
 python main.py --env linux --dry-run --rounds 4
+
+# ...and the same loop with the algorithmic defenses instead of the defender LLM
+# (the cheap way to sanity-check that path before starting a GPU run)
+python main.py --env linux --dry-run --freeze defender --rounds 4
 
 # Reward-harness sanity — best-of-N over fixed actions, NO LLM at all
 python main.py --baseline --rounds 10
@@ -250,7 +316,7 @@ core/         Shared types (ModelUpdate, DetectionVerdict, RoundLog) + aggregato
 model/        Tiny MLP (~970 params) — the schema both LLMs operate over
 data/         MNIST loading & partitioning
 clients/      Honest client local training
-server/       Central server + FedAvg aggregation
+server/       Central server + FedAvg aggregation + defense_ensemble.py (algorithmic defenses, --freeze defender)
 detector/     features.py — per-client per-layer statistical feature extractor
 agents/       attacker_agent.py / defender_agent.py (pure prompt+parse), attack_ops.py (operator DSL), llm_client.py
 rl/           env, rewards, turns, inference (dry-run), policy (Unsloth+LoRA), grpo, schedule, baseline

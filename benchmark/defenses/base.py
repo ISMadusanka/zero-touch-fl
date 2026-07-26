@@ -36,12 +36,42 @@ class Defense(ABC):
         self._global: dict | None = None
 
     def reset(self, init_global: dict):
-        """Initialise this defense's global model. Clone so the worlds stay
-        independent (each defense evolves its own copy)."""
-        self._global = {k: v.clone() for k, v in init_global.items()}
+        """Initialise this defense's global model AND clear any cross-round state.
+
+        Clones the weights so the worlds stay independent (each defense evolves its
+        own copy). Subclasses that carry history across rounds (e.g. DeFL) override
+        this to also reset that history.
+        """
+        self.set_global_weights(init_global)
+
+    def set_global_weights(self, global_weights: dict):
+        """Point this defense at ``global_weights`` WITHOUT touching its history.
+
+        ``reset`` is "start a new run"; this is "judge this round against that
+        global model". The ensemble (``server/defense_ensemble.py``) runs several
+        defenses as pure detectors over ONE shared global model, so it re-points
+        them every round instead of letting each evolve its own — but DeFL's CLP /
+        trust history must survive that, hence the split.
+        """
+        self._global = {k: v.clone() for k, v in global_weights.items()}
 
     def global_weights(self) -> dict | None:
         return self._global
+
+    # -- cross-round state (only defenses with history need to override) --------
+    def state_dict(self) -> dict:
+        """Serializable snapshot of this defense's cross-round state.
+
+        Defaults to empty: most defenses are memoryless (their verdict depends only
+        on this round's updates + the current global). Used by the ensemble to run a
+        defense as a pure scoring function during GRPO rollouts — the rollouts must
+        not advance a defense's history, only the COMMITTED round may.
+        """
+        return {}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore a snapshot from :meth:`state_dict` (no-op when memoryless)."""
+        return None
 
     @abstractmethod
     def step(self, updates: list[ModelUpdate], poisoned_ids: set[int]) -> StepResult:

@@ -83,14 +83,28 @@ def save_progress(rounds_done: int, round_index: int | None = None,
     ``logs/round_data`` continue across restarts instead of overwriting from the first
     Phase-2 round) and ``controller`` (the arms-race ``PhaseController`` snapshot, so
     the learner/phase/streak resume instead of restarting at the first attacker phase).
+
+    Fields passed as ``None`` are MERGED, not cleared: whatever is already on disk
+    survives. That is what lets a single-learner run (``main.py --freeze <agent>``,
+    which has no ``PhaseController`` at all) advance the round counters without
+    wiping the arms-race schedule state — so going back to a plain ``main.py`` run
+    resumes alternating from the phase it stopped in instead of restarting at phase 0.
     """
     _ensure_dir()
-    payload = {"rounds_done": int(rounds_done)}
+    path = os.path.join(CHECKPOINT_DIR, _PROGRESS_FILE)
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            payload = {}
+    except (FileNotFoundError, ValueError, TypeError):
+        payload = {}
+    payload["rounds_done"] = int(rounds_done)
     if round_index is not None:
         payload["round_index"] = int(round_index)
     if controller is not None:
         payload["controller"] = controller
-    with open(os.path.join(CHECKPOINT_DIR, _PROGRESS_FILE), "w") as f:
+    with open(path, "w") as f:
         json.dump(payload, f)
 
 

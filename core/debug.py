@@ -409,6 +409,28 @@ class DebugLogger:
         })
 
     @_guard
+    def defense_verdicts(self, verdicts, info, who="algorithmic-defense",
+                         poisoned_ids=None):
+        """The defender-LLM-free path: per-algorithm flags + the unioned verdicts."""
+        algos = (info or {}).get("algorithms", [])
+        per_defense = (info or {}).get("per_defense_flags", {})
+        self._line()
+        self._line(f"[DEFENSE] {who}: {len(algos)} algorithm(s) judged this round "
+                   f"— a client is dropped if ANY flags it")
+        for name in algos:
+            flagged = per_defense.get(name, [])
+            self._line(f"    {name:<10} flagged={flagged if flagged else '-'}")
+        self._line("[VERDICTS] union:")
+        for ln in self._verdict_lines(verdicts, poisoned_ids):
+            self._line(ln)
+        self._record("defense_verdicts", f"defense_verdicts_{who}", {
+            "who": who, "algorithms": algos, "per_defense_flags": per_defense,
+            "verdicts": [{"client_id": v.client_id, "is_suspicious": v.is_suspicious,
+                          "confidence": _short(v.confidence), "reason": v.reason}
+                         for v in verdicts],
+        })
+
+    @_guard
     def opponent_move(self, temperature):
         self._stage = "opponent-move"
         self._line()

@@ -44,6 +44,32 @@ attack:
                                   # the policy is BUDGET-AWARE (generalizes to any eval budget).
   eval_poison_clients: 1          # EVALUATION default budget (benchmark --max-poison-clients override)
 
+# Algorithmic (non-LLM) defenses — used ONLY when the defender LLM is deactivated
+# with `python main.py --freeze defender`. Every listed algorithm judges the same
+# round of client updates and the REJECTIONS ARE UNIONED: a client is dropped from
+# FedAvg if ANY algorithm flags it, so a poisoner has to evade all of them at once
+# or its attack fails. A plain `python main.py` run ignores this block entirely
+# (the defender LLM defends then, and none of these algorithms run).
+defense:
+  algorithms: ["fltrust", "multikrum", "dnc", "defl"]
+  assumed_malicious: null         # f (Multi-Krum) / m (DnC): ASSUMED adversary budget, a
+                                  # hyperparameter, never per-round ground truth. null =
+                                  # attack.max_poison_clients, clamped to a benign majority.
+  # FLTrust (NDSS'21) — server-side clean root set used to bootstrap trust.
+  root_size: 100                  # samples drawn from the MNIST train set (seeded)
+  root_epochs: 1                  # server local epochs per round (R_l)
+  root_lr: null                   # null = fl.lr
+  eta: 1.0                        # FLTrust global learning rate
+  # DeFL (AAAI-23)
+  defl_delta: 0.05                # CLP relative-rise threshold
+  defl_tau: 2.5                   # MOUD per-layer outlier z-threshold
+  # DnC (NDSS'21)
+  dnc_c: 1.0                      # filtering fraction
+  dnc_niters: 1                   # subsampling iterations
+  dnc_sub_dim: 10000              # subsample dim b (clamped to the model's dim -> no subsampling here)
+  # Multi-Krum (NeurIPS'17)
+  multikrum_m: null               # #selected/averaged; null = n - f
+
 # Inference-only LLM defaults (used by --dry-run and the OpenAI path).
 llm:
   ollama_base_url: "http://localhost:11434"

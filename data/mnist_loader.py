@@ -98,6 +98,24 @@ def partition_noniid_fltrust(dataset, n_clients: int, n_classes: int = 10,
     return shards
 
 
+def build_root_loader(data_dir: str = "./data/mnist_raw", root_size: int = 100,
+                      batch_size: int = 64, seed: int = 0):
+    """A small CLEAN root dataset for FLTrust (Cao et al., NDSS 2021).
+
+    FLTrust's server holds a tiny trusted sample it fine-tunes on each round to get
+    its reference update ``g0``. ``root_size`` samples are drawn from the MNIST
+    training set with a seeded permutation, so the same seed always yields the same
+    root set. Shared by the benchmark and by the algorithmic defense ensemble
+    (``server/defense_ensemble.py``) so both bootstrap trust identically.
+    """
+    train_dataset, _ = load_mnist(data_dir)
+    root_size = max(1, min(int(root_size), len(train_dataset)))
+    g = torch.Generator().manual_seed(int(seed))
+    idx = torch.randperm(len(train_dataset), generator=g)[:root_size].tolist()
+    return DataLoader(Subset(train_dataset, idx),
+                      batch_size=max(1, min(int(batch_size), root_size)), shuffle=True)
+
+
 def get_data_loaders(n_clients: int, batch_size: int, data_dir: str = "./data/mnist_raw",
                      iid: bool = True, bias_q: float = 0.5, seed: int = 0,
                      n_classes: int = 10):
