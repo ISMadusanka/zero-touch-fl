@@ -419,6 +419,36 @@ already-wasteful code path over the edge. If you still hit OOM, in order of pref
 A crash mid-run loses at most `rl.save_every` (25) rounds — rerun `python train_targeted.py`
 and it resumes from `checkpoints/targeted/rl_progress.json`.
 
+### CUDA OOM with a small allocation ("tried to allocate 332 MiB")
+
+When the *failed allocation is small* but the GPU is full, the problem is almost never
+this process. Read PyTorch's message carefully — it reports two different things in
+near-identical wording:
+
+```
+Process 851739 has 23.78 GiB memory in use.            <- ANOTHER process
+Including non-PyTorch memory, this process has 7.33 GiB memory in use.   <- ours
+```
+
+Training itself needs ~7 GiB for Qwen2.5-3B in bf16. If the totals add up to the card's
+capacity, something else is holding the rest — usually a previous run that crashed
+without releasing its CUDA context:
+
+```bash
+nvidia-smi
+```
+
+Kill the stale PID and restart. Warnings now print a `[GPU … | other processes ~N GiB]`
+line so this is visible without decoding the OOM text.
+
+Related fix: an OOM during generation used to trip the *sticky* fallback from KV-cached
+generation to the manual no-cache decoder. That made things strictly worse — the manual
+decoder re-runs the full forward for every generated token, so it needs more memory per
+step and failed immediately afterwards, on a slower path, for the rest of the run. OOM is
+now treated as transient (free the cache, retry the same path once, surface it if it
+recurs); the sticky fallback is reserved for genuine kernel-incompatibility errors, which
+is what it was written for.
+
 ---
 
 ## 7. What changed in the codebase

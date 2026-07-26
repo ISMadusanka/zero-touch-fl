@@ -294,12 +294,68 @@ class LLMPolicy:
             try:
                 return self._fast_generate(prompt_ids, plen, n, do_sample, temperature, max_new_tokens)
             except Exception as e:
+                if self._is_oom(e):
+                    # OOM is TRANSIENT and usually environmental (another process on
+                    # the GPU, a spike elsewhere in the round) — not evidence that
+                    # this code path is broken. Downgrading here is actively
+                    # harmful: the manual decoder re-runs the FULL forward for every
+                    # generated token instead of using a KV cache, so it needs MORE
+                    # memory per step and fails harder, turning a recoverable blip
+                    # into a crash on a more expensive path. Free the cached blocks
+                    # and retry the same path once; if memory is genuinely gone, let
+                    # the OOM surface with a diagnostic instead of hiding it.
+                    logger.warning(
+                        f"KV-cached generate hit OOM ({e}); freeing cache and retrying "
+                        f"once. {self._gpu_memory_note()}"
+                    )
+                    self._empty_cache()
+                    return self._fast_generate(
+                        prompt_ids, plen, n, do_sample, temperature, max_new_tokens)
                 logger.warning(
                     f"KV-cached generate failed ({type(e).__name__}: {e}); "
                     "falling back to manual no-cache decode for the rest of the run."
                 )
                 self._use_fast_generate = False
         return self._manual_generate(prompt_ids, plen, n, do_sample, temperature, max_new_tokens)
+
+    def _is_oom(self, e: BaseException) -> bool:
+        """True for a CUDA out-of-memory error, across torch versions.
+
+        ``torch.OutOfMemoryError`` is the 2.4+ alias of ``torch.cuda.OutOfMemoryError``;
+        the message check covers older builds and OOMs re-raised as RuntimeError.
+        """
+        torch = self.torch
+        for exc in (getattr(torch, "OutOfMemoryError", None),
+                    getattr(torch.cuda, "OutOfMemoryError", None)):
+            if exc is not None and isinstance(e, exc):
+                return True
+        return "out of memory" in str(e).lower()
+
+    def _empty_cache(self):
+        try:
+            self.torch.cuda.empty_cache()
+        except Exception:                       # CPU-only build / no CUDA context
+            pass
+
+    def _gpu_memory_note(self) -> str:
+        """One-line GPU accounting, including how much OTHER processes hold.
+
+        A shared box is the usual reason training suddenly cannot allocate, and
+        PyTorch's own OOM text splits that across two confusingly similar lines.
+        Stating it directly makes 'someone else is using the GPU' obvious.
+        """
+        torch = self.torch
+        try:
+            if not torch.cuda.is_available():
+                return ""
+            free, total = torch.cuda.mem_get_info()
+            ours = torch.cuda.memory_reserved()
+            other = max(0, total - free - ours)
+            gb = 1024 ** 3
+            return (f"[GPU {total / gb:.1f} GiB total | {free / gb:.1f} GiB free | "
+                    f"this process {ours / gb:.1f} GiB | other processes ~{other / gb:.1f} GiB]")
+        except Exception:
+            return ""
 
     def _fast_generate(self, prompt_ids, plen, n, do_sample, temperature, max_new_tokens):
         """KV-cached generation via STANDARD Transformers generate.

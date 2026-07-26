@@ -177,6 +177,74 @@ def test_gradients_still_flow_through_the_sliced_path():
     assert model.table.grad is not None and torch.count_nonzero(model.table.grad) > 0
 
 
+# ---------------------------------------------------------------------------
+# generate()'s OOM handling
+#
+# The fallback from KV-cached generation to the manual no-cache decoder is STICKY
+# (it disables fast generate for the rest of the run). That is right for a broken
+# kernel, but wrong for an OOM: the manual decoder re-runs the full forward per
+# generated token, so it needs MORE memory and fails harder. An OOM must retry the
+# same path, not downgrade to a costlier one.
+# ---------------------------------------------------------------------------
+
+def _gen_policy(fast_side_effects):
+    """Policy whose _fast_generate raises/returns per ``fast_side_effects``."""
+    p = object.__new__(LLMPolicy)
+    p.torch = torch
+    p._use_fast_generate = True
+    p.calls = {"fast": 0, "manual": 0}
+    pending = list(fast_side_effects)
+
+    def _fast(*a, **k):
+        p.calls["fast"] += 1
+        out = pending.pop(0)
+        if isinstance(out, BaseException):
+            raise out
+        return out
+
+    def _manual(*a, **k):
+        p.calls["manual"] += 1
+        return ["manual"]
+
+    p._fast_generate = _fast
+    p._manual_generate = _manual
+    p.set_adapter = lambda name: None
+    p._prompt_ids = lambda system, user: torch.zeros((1, 8), dtype=torch.long)
+    return p
+
+
+def _oom(msg="CUDA out of memory. Tried to allocate 332.00 MiB"):
+    exc = getattr(torch, "OutOfMemoryError", None) or torch.cuda.OutOfMemoryError
+    return exc(msg)
+
+
+def test_oom_retries_the_same_path_and_does_not_downgrade():
+    p = _gen_policy([_oom(), ["ok"]])
+    assert LLMPolicy.generate(p, "a", "sys", "usr") == ["ok"]
+    assert p.calls == {"fast": 2, "manual": 0}      # retried, never fell back
+    assert p._use_fast_generate is True             # and stayed on the fast path
+
+
+def test_repeated_oom_surfaces_instead_of_hiding_behind_a_costlier_path():
+    p = _gen_policy([_oom(), _oom()])
+    try:
+        LLMPolicy.generate(p, "a", "sys", "usr")
+    except Exception as e:
+        assert p._is_oom(e)
+    else:
+        raise AssertionError("a second OOM should propagate, not fall back")
+    assert p.calls["manual"] == 0
+
+
+def test_non_oom_failure_still_falls_back_stickily():
+    """The original behaviour, preserved: a broken kernel is a permanent property
+    of the install, so switching decoders once is correct there."""
+    p = _gen_policy([RuntimeError("paged-KV kernel not supported")])
+    assert LLMPolicy.generate(p, "a", "sys", "usr") == ["manual"]
+    assert p.calls == {"fast": 1, "manual": 1}
+    assert p._use_fast_generate is False
+
+
 def _run():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
