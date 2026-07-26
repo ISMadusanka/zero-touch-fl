@@ -392,6 +392,33 @@ rl:
   second term rewarding the fraction of class-2 samples predicted *as 7*, and an attack
   that boosts row 7 as well as suppressing row 2.
 
+### CUDA OOM in `reference_token_logprobs` / `policy_token_logprobs`
+
+Fixed — but worth knowing what it was, because it bounds how long prompts can get.
+
+`LLMPolicy._completion_token_logprobs` used to run `log_softmax(logits.float())` over the
+**whole** sequence and then keep only the completion's rows. At Qwen2.5's ~152k vocab
+that intermediate is `seq_len × 152k × 4` bytes — **~2.8 GB on a 4.8k-token prompt** —
+allocated, indexed once, and discarded. It now slices to the completion's positions
+*before* the fp32 `log_softmax`, which is an exact identity (`log_softmax` normalizes over
+the vocab independently at each position), and asks the model to run its LM head on only
+the tail of the sequence when the installed transformers supports it. That frees
+~2.4–4.3 GB. `tests/test_logprob_memory.py` pins the new path bit-for-bit against the old
+computation.
+
+The targeted prompt is ~520 tokens larger than the untargeted one (row/class explanation,
+dilution table, `output_layer` + `federation` fields), which is what pushed an
+already-wasteful code path over the edge. If you still hit OOM, in order of preference:
+
+1. `rl.max_new_tokens` — the completion length now sets the fp32 tensor's size. 1024 is
+   generous for the attacker's JSON; 512 halves it.
+2. `rl.load_in_4bit: true` — ~4 GB off the base model.
+3. `attacker_agent.detail_precision` — fewer decimals in `client_update_stats`, which is
+   the bulk of the prompt (~3.8k of the ~4.8k tokens) and predates the targeted work.
+
+A crash mid-run loses at most `rl.save_every` (25) rounds — rerun `python train_targeted.py`
+and it resumes from `checkpoints/targeted/rl_progress.json`.
+
 ---
 
 ## 7. What changed in the codebase

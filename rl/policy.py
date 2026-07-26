@@ -446,14 +446,62 @@ class LLMPolicy:
         # Guard against exceeding context.
         if full.shape[1] > self.max_seq_len:
             full = full[:, -self.max_seq_len:]
+
+        # Only the COMPLETION's tokens are ever returned, so only their positions
+        # are scored. Slicing before the fp32 ``log_softmax`` is what keeps this
+        # from OOMing: the full-sequence log-prob tensor is
+        # [1, seq_len, vocab] in fp32, and with Qwen2.5's ~152k vocab a 4.8k-token
+        # prompt makes that ~2.8 GB — allocated, indexed once, and thrown away
+        # except for the last few hundred rows. Restricted to the completion it is
+        # ~0.1 GB. Slicing positions first is EXACTLY equivalent, not an
+        # approximation: ``log_softmax`` normalizes over the vocab (dim=-1)
+        # independently at every position.
+        comp_len = min(comp_ids.shape[1], full.shape[1] - 1)
+        if comp_len <= 0:
+            return torch.zeros(0, device=self.device)
+
         ctx = torch.enable_grad() if with_grad else torch.no_grad()
         with ctx:
-            logits = self.model(full).logits[:, :-1, :]
+            # Logits at position i predict token i+1, so the completion's tokens
+            # (the last ``comp_len``) are predicted by positions
+            # [-comp_len-1, -1). Both slices are END-relative, so they stay correct
+            # whether the model returned logits for the whole sequence or only its
+            # tail (see ``_forward_logits``).
+            logits = self._forward_logits(full, comp_len)[:, -comp_len - 1:-1, :]
+            targets = full[:, -comp_len:]
             logp = torch.log_softmax(logits.float(), dim=-1)
-            targets = full[:, 1:]
             tok_logp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)[0]
-        comp_len = comp_ids.shape[1]
-        return tok_logp[-comp_len:]
+        return tok_logp
+
+    def _forward_logits(self, full, comp_len: int):
+        """Forward pass returning logits covering at least the last ``comp_len+1``
+        positions.
+
+        Same trick as :meth:`_last_logits` (and the same cached ``_logits_kw``
+        probe), but keeping a tail of ``comp_len+1`` positions instead of 1:
+        transformers >= 4.45 can run the LM head on only the end of the sequence
+        (``num_logits_to_keep``, renamed ``logits_to_keep`` in >= 4.48). Worth
+        using here because the full logits tensor is [1, seq_len, vocab] and, at
+        Qwen2.5's ~152k vocab, a 4.8k-token prompt spends ~1.5 GB in bf16 on
+        positions that are immediately discarded.
+
+        When the installed version supports neither kwarg we fall back to the full
+        forward; correctness is unaffected either way because the caller slices
+        end-relative.
+        """
+        keep = int(comp_len) + 1
+        if self._logits_kw is None:                      # not probed yet
+            for kw in ("logits_to_keep", "num_logits_to_keep"):
+                try:
+                    out = self.model(full, **{kw: keep})
+                except TypeError:
+                    continue                             # this version has no such arg
+                self._logits_kw = kw
+                return out.logits
+            self._logits_kw = ""                         # probed, unsupported
+        if self._logits_kw:
+            return self.model(full, **{self._logits_kw: keep}).logits
+        return self.model(full).logits
 
     def policy_token_logprobs(self, adapter, system, user, completion, append_eos=False):
         """Differentiable per-token log-probs under ``adapter``."""
