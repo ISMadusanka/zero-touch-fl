@@ -100,6 +100,36 @@ def goal_target(goal: dict) -> float:
     return max(target, 1e-6)
 
 
+# Default budget -> target_accuracy_drop map for ``target_for_budget`` below. The
+# top rung is deliberately super-linear: spending the whole controllable pool
+# demands a disproportionately larger payoff.
+DEFAULT_TARGET_LADDER = {1: 0.02, 2: 0.04, 3: 0.06, 4: 0.08, 5: 0.12}
+
+
+def target_for_budget(budget: int, ladder: dict | None = None) -> float:
+    """The target accuracy drop for a given per-round poison budget (>0).
+
+    Single source of truth shared by ``FLArmsRaceEnv._round_goal()`` (which
+    builds the round's goal dict from it), the attacker reward via
+    :func:`goal_target` (which reads whatever ``_round_goal()`` produced), and
+    the schedule's relative win-gate in ``rl/switch.py`` — so all three read the
+    identical target for a given budget and can never disagree.
+
+    ``ladder`` maps budget -> target_accuracy_drop; falls back to
+    ``DEFAULT_TARGET_LADDER`` only when ``ladder`` is ``None``. A present
+    ``attack.target_ladder`` config replaces the default wholesale — there is no
+    per-rung merge. An explicitly-passed empty dict is therefore a config error,
+    not an absent ladder, and raises like any other off-ladder budget.
+    """
+    table = ladder if ladder is not None else DEFAULT_TARGET_LADDER
+    key = int(budget)
+    if key not in table:
+        raise RuntimeError(
+            f"target_for_budget: no rung for budget {key} "
+            f"(ladder covers {sorted(table)})")
+    return max(float(table[key]), 1e-6)
+
+
 def attacker_reward(
     reference_accuracy: float,
     post_accuracy: float,
