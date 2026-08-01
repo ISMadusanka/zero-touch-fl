@@ -61,7 +61,7 @@ class FakeDefense(Defense):
 
 def test_union_flags_a_client_any_algorithm_rejects():
     ens = DefenseEnsemble({"a": FakeDefense("a", [0]), "b": FakeDefense("b", [3]),
-                           "c": FakeDefense("c", [])})
+                           "c": FakeDefense("c", [])}, mode="union")
     verdicts, info = ens.verdicts(_updates(), _zeros_global())
     flagged = {v.client_id for v in verdicts if v.is_suspicious}
     assert flagged == {0, 3}                      # union, not intersection/majority
@@ -71,7 +71,8 @@ def test_union_flags_a_client_any_algorithm_rejects():
 
 def test_confidence_is_the_fraction_of_algorithms_that_flagged():
     ens = DefenseEnsemble({"a": FakeDefense("a", [0, 1]), "b": FakeDefense("b", [0]),
-                           "c": FakeDefense("c", [0]), "d": FakeDefense("d", [])})
+                           "c": FakeDefense("c", [0]), "d": FakeDefense("d", [])},
+                          mode="union")
     by_id = {v.client_id: v for v in ens.verdicts(_updates(), _zeros_global())[0]}
     assert by_id[0].is_suspicious and abs(by_id[0].confidence - 0.75) < 1e-9   # 3 of 4
     assert by_id[1].is_suspicious and abs(by_id[1].confidence - 0.25) < 1e-9   # 1 of 4
@@ -87,11 +88,106 @@ def test_a_failing_algorithm_does_not_kill_the_round():
         def step(self, updates, poisoned_ids):
             raise RuntimeError("svd did not converge")
 
-    ens = DefenseEnsemble({"boom": Boom("boom", [0]), "ok": FakeDefense("ok", [2])})
+    ens = DefenseEnsemble({"boom": Boom("boom", [0]), "ok": FakeDefense("ok", [2])},
+                          mode="union")
     verdicts, info = ens.verdicts(_updates(), _zeros_global())
     flagged = {v.client_id for v in verdicts if v.is_suspicious}
     assert flagged == {2}, "the surviving algorithm should still decide"
     assert "boom" in info["errors"] and info["per_defense_flags"]["boom"] == []
+
+
+# ---------------------------------------------------------------------------
+# Single-defense mode (the default): ONE algorithm judges each round
+# ---------------------------------------------------------------------------
+
+def _panel(**kw):
+    return DefenseEnsemble({"a": FakeDefense("a", [0]), "b": FakeDefense("b", [1]),
+                            "c": FakeDefense("c", [2])}, **kw)
+
+
+def test_single_mode_runs_exactly_one_algorithm():
+    """Union of four aggregators rejected 14/20 clients on a CLEAN round, which both
+    closed every gap an attack could use and swamped the `drop` reward with noise.
+    One at a time keeps each defense honest and leaves a learnable frontier."""
+    ens = _panel()
+    assert ens.mode == "single"                       # the shipped default
+    ens.begin_round()
+    verdicts, info = ens.verdicts(_updates(), _zeros_global())
+    assert {v.client_id for v in verdicts if v.is_suspicious} == {0}   # only "a" ran
+    assert info["algorithms"] == ["a"] and info["configured"] == ["a", "b", "c"]
+    assert set(info["per_defense_flags"]) == {"a"}
+    # The round log merges this into {"mode": "algorithmic"}; a "mode" key here
+    # would overwrite that and break consumers branching on who judged the round.
+    assert "mode" not in info and info["panel_mode"] == "single"
+
+
+def test_rotate_advances_one_algorithm_per_round():
+    ens = _panel(selection="rotate")
+    picks = [ens.begin_round()[0] for _ in range(7)]
+    assert picks == ["a", "b", "c", "a", "b", "c", "a"], picks
+
+
+def test_fixed_selection_never_moves():
+    ens = _panel(selection="fixed")
+    assert [ens.begin_round()[0] for _ in range(4)] == ["a"] * 4
+
+
+def test_random_selection_is_seeded_by_the_run_rng():
+    import random
+    picks = []
+    for _ in range(2):
+        ens = _panel(selection="random", rng=random.Random(1234))
+        picks.append([ens.begin_round()[0] for _ in range(6)])
+    assert picks[0] == picks[1], "same seed must replay the same defense schedule"
+
+
+def test_the_pick_is_frozen_for_the_whole_round():
+    """The clean counterfactual, the G rollout scorings and the commit must all be
+    judged by the SAME algorithm — otherwise `drop` subtracts two accuracies that
+    were filtered by different defenses and stops measuring the attack."""
+    ens = _panel(selection="rotate")
+    ens.begin_round()
+    seen = set()
+    for _ in range(5):                       # clean ref + G rollouts, no begin_round
+        _v, info = ens.verdicts(_updates(), _zeros_global(), commit=False)
+        seen.add(tuple(info["algorithms"]))
+    _v, info = ens.verdicts(_updates(), _zeros_global(), commit=True)
+    seen.add(tuple(info["algorithms"]))
+    assert seen == {("a",)}, seen
+
+
+def test_single_mode_confidence_is_a_full_flag():
+    """With one active algorithm the consensus fraction degenerates to a hard flag:
+    1.0 either way, so the stealth term reads a clean P(malicious) of 1 or 0."""
+    ens = _panel()
+    ens.begin_round()
+    by_id = {v.client_id: v for v in ens.verdicts(_updates(), _zeros_global())[0]}
+    assert by_id[0].is_suspicious and by_id[0].confidence == 1.0
+    assert by_id[1].is_suspicious is False and by_id[1].confidence == 1.0
+
+
+def test_single_mode_only_snapshots_the_active_defense():
+    """Scoring rollbacks must not touch defenses that never ran this round."""
+    touched = []
+
+    class Tracker(FakeDefense):
+        def state_dict(self):
+            touched.append(self.name)
+            return {}
+
+    ens = DefenseEnsemble({"a": Tracker("a", [0]), "b": Tracker("b", [1])})
+    ens.begin_round()
+    ens.verdicts(_updates(), _zeros_global(), commit=False)
+    assert touched == ["a"], touched
+
+
+def test_bad_mode_or_selection_is_rejected_loudly():
+    for kw in ({"mode": "majority"}, {"selection": "shuffle"}):
+        try:
+            _panel(**kw)
+        except ValueError:
+            continue
+        raise AssertionError(f"{kw} should be rejected")
 
 
 def test_verdicts_cover_every_update_in_order():
@@ -148,7 +244,8 @@ def test_repeated_scoring_is_deterministic():
     differences come from the attack — not from drifting defense state."""
     defl = DeFL()
     defl.reset(_zeros_global())
-    ens = DefenseEnsemble({"defl": defl, "multikrum": MultiKrum(num_byzantine=1)})
+    ens = DefenseEnsemble({"defl": defl, "multikrum": MultiKrum(num_byzantine=1)},
+                          mode="union")
     first = None
     for _ in range(3):
         verdicts, _ = ens.verdicts(_updates(), _zeros_global(), commit=False)
@@ -167,7 +264,7 @@ def test_real_algorithms_catch_a_blatant_poisoner():
         "multikrum": MultiKrum(num_byzantine=1),
         "dnc": DnC(num_byzantine=1),
         "defl": DeFL(),
-    })
+    }, mode="union")
     for d in ens.defenses.values():
         d.reset(_zeros_global())
     verdicts, info = ens.verdicts(_updates(poison_value=10.0), _zeros_global(), commit=True)
@@ -229,6 +326,29 @@ def test_assumed_malicious_defaults_to_the_budget_and_keeps_a_benign_majority():
 
 def test_default_panel_is_every_algorithm():
     assert set(ALGORITHMIC) == {"fltrust", "multikrum", "dnc", "defl"}
+
+
+def test_build_ensemble_defaults_to_one_defense_per_round():
+    ens = build_ensemble(_cfg(algorithms=["multikrum", "dnc"]))
+    assert ens.mode == "single" and ens.selection == "rotate"
+    assert ens.begin_round() == ["multikrum"]
+    assert ens.begin_round() == ["dnc"]
+
+
+def test_build_ensemble_honours_mode_and_selection():
+    ens = build_ensemble(_cfg(algorithms=["multikrum", "dnc"], mode="union"))
+    assert ens.mode == "union" and ens.active_names == ["multikrum", "dnc"]
+    fixed = build_ensemble(_cfg(algorithms=["multikrum", "dnc"], selection="fixed"))
+    assert [fixed.begin_round()[0] for _ in range(3)] == ["multikrum"] * 3
+
+
+def test_build_ensemble_rejects_an_unknown_mode_or_selection():
+    for bad in (dict(mode="majority"), dict(selection="shuffle")):
+        try:
+            build_ensemble(_cfg(algorithms=["multikrum"], **bad))
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} should be rejected")
 
 
 def _run():

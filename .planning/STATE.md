@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_phase: 1
-current_phase_name: Budget-Conditioned Target Ladder
+current_phase: 01
+current_phase_name: budget-conditioned-target-ladder
 status: executing
 stopped_at: Phase 1 context gathered
-last_updated: "2026-08-01T12:09:42.993Z"
+last_updated: "2026-08-01T12:15:37.455Z"
 last_activity: 2026-08-01
-last_activity_desc: Roadmap created, 35 v1 requirements mapped across 6 phases
+last_activity_desc: Phase 01 execution started
 progress:
   total_phases: 1
   completed_phases: 0
@@ -23,14 +23,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-01)
 
 **Core value:** The attacker must face an attack goal it can actually reach, so that GRPO receives a non-degenerate gradient and per-defense attack success rate becomes a meaningful, comparable number.
-**Current focus:** Phase 1 — Budget-Conditioned Target Ladder
+**Current focus:** Phase 01 — budget-conditioned-target-ladder
 
 ## Current Position
 
-Phase: 1 of 6 (Budget-Conditioned Target Ladder)
-Plan: 0 of TBD in current phase
-Status: Ready to execute
-Last activity: 2026-08-01 — Roadmap created, 35 v1 requirements mapped across 6 phases
+Phase: 01 (budget-conditioned-target-ladder) — EXECUTING
+Plan: 1 of 3
+Status: Executing Phase 01
+Last activity: 2026-08-01 — Phase 01 execution started
 
 Progress: [░░░░░░░░░░] 0%
 

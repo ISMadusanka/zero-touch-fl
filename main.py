@@ -200,15 +200,17 @@ def run_phase2(
     logger.info("=" * 60)
 
     # --freeze defender: the defender LLM is deactivated for this run and the
-    # implemented robust-FL algorithms defend instead (union of their rejections).
-    # Attached to the env so the round's CLEAN counterfactual is measured under the
-    # same defense — see FLArmsRaceEnv.clean_reference_accuracy.
+    # implemented robust-FL algorithms defend instead — ONE per round by default
+    # (defense.mode), or the legacy union of their rejections. Attached to the env
+    # so the round's CLEAN counterfactual is measured under the same defense, and
+    # so the env can pick the round's algorithm before measuring it — see
+    # FLArmsRaceEnv.clean_reference_accuracy / DefenseEnsemble.begin_round.
+    rng = random.Random(int(fl.get("poison_seed", 0)))
     defense = None
     if freeze == "defender":
         from server.defense_ensemble import build_ensemble
-        defense = build_ensemble(config)
+        defense = build_ensemble(config, rng=rng)
 
-    rng = random.Random(int(fl.get("poison_seed", 0)))
     env = FLArmsRaceEnv(config, client_loaders, test_loader, rng, defense=defense)
     env.reset(global_weights, client_weights, baseline_accuracy)
 

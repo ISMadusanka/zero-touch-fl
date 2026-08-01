@@ -56,6 +56,32 @@ def drop_term(drop: float, target: float) -> float:
     return 1.0 + _OVERSHOOT_BONUS * over / (over + _OVERSHOOT_HALF)
 
 
+def stealth_gate(drop: float, target: float) -> float:
+    """How much of the goal was achieved, in [0, 1] — the multiplier on stealth.
+
+    ``clip(drop / target, 0, 1)``: 0 when the attack achieved nothing (or helped
+    the model), 1 once it has hit the requested drop.
+
+    **Why stealth is gated at all.** Ungated, ``beta * stealth`` pays the attacker
+    purely for not being flagged, and "not being flagged" is trivially maximized by
+    submitting a perturbation small enough to sit inside the honest client spread —
+    which by construction does no damage. That made "poison imperceptibly and
+    achieve nothing" the global optimum of the reward: it scored ``beta`` (0.5 with
+    the shipped weights) while every attack big enough to matter was caught, lost
+    its client to the aggregator's filter, and scored ~0. A policy trained long
+    enough finds that optimum, and the run ends with detection rate ~0 AND attack
+    success ~0 — evasion without damage.
+
+    Gating removes the free lunch without removing the gradient: stealth still
+    varies smoothly with the defender's confidence, but only in proportion to the
+    damage actually achieved. Evasion is now worth something only when there was
+    something worth sneaking through.
+    """
+    if target <= 0:
+        return 0.0
+    return _clip(drop / target, 0.0, 1.0)
+
+
 def goal_target(goal: dict) -> float:
     """The target accuracy drop this goal asks for (>0).
 
@@ -94,7 +120,7 @@ def attacker_reward(
     the FEWEST clients, and (when it uses several) collaborating with them.
 
     reward = alpha * drop_term(drop, target)
-           + beta  * stealth
+           + beta  * stealth * stealth_gate(drop, target)
            - gamma * malformed_fraction
            - delta * client_cost
            + zeta  * collab_bonus
@@ -121,6 +147,12 @@ def attacker_reward(
     with the SAME hard flag. It is 0 when the attacker poisoned nobody — there
     was nothing to sneak past the defender.
 
+    Stealth is **gated on achieved damage** by ``stealth_gate(drop, target)``, so
+    evading the defense pays only in proportion to what the evasion bought. Without
+    the gate the reward's global optimum is "submit a perturbation too small to
+    detect and too small to matter" — see :func:`stealth_gate` for the failure this
+    prevents.
+
     ``malformed_fraction`` is over the clients the attacker SELECTED
     (``n_used + n_malformed``), not over the ones that landed, so selecting three
     clients and wasting two is penalized twice as hard as wasting one.
@@ -144,6 +176,8 @@ def attacker_reward(
         # No verdict for a poisoned client => treat as undetected (passed).
         stealth += 1.0 if v is None else (1.0 - _soft_malicious_prob(v))
     stealth = stealth / n_used if n_used else 0.0
+    # Evasion is only worth paying for in proportion to the damage it bought.
+    stealth *= stealth_gate(drop, target)
 
     # Normalize the waste penalty by how many clients were SELECTED — a client
     # whose plan did nothing still consumed budget, so it belongs in the

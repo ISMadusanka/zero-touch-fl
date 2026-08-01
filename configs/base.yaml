@@ -45,13 +45,34 @@ attack:
   eval_poison_clients: 1          # EVALUATION default budget (benchmark --max-poison-clients override)
 
 # Algorithmic (non-LLM) defenses — used ONLY when the defender LLM is deactivated
-# with `python main.py --freeze defender`. Every listed algorithm judges the same
-# round of client updates and the REJECTIONS ARE UNIONED: a client is dropped from
-# FedAvg if ANY algorithm flags it, so a poisoner has to evade all of them at once
-# or its attack fails. A plain `python main.py` run ignores this block entirely
-# (the defender LLM defends then, and none of these algorithms run).
+# with `python main.py --freeze defender`. A plain `python main.py` run ignores this
+# block entirely (the defender LLM defends then, and none of these algorithms run).
 defense:
   algorithms: ["fltrust", "multikrum", "dnc", "defl"]
+  mode: "single"                  # single | union
+                                  # single = ONE algorithm judges each round (see
+                                  #   `selection`). The clean counterfactual, all G
+                                  #   rollout scorings and the commit use that same
+                                  #   algorithm, so `drop` stays comparable.
+                                  # union  = every algorithm judges and the REJECTIONS
+                                  #   ARE UNIONED (a client is dropped if ANY flags it).
+                                  # Union is the legacy setting and is far more
+                                  # trigger-happy than it looks: on a CLEAN round with
+                                  # this config it flagged 14/20 honest clients
+                                  # (fltrust 12, multikrum 1, dnc 1, defl 2), leaving
+                                  # FedAvg 6 clients and dropping clean accuracy
+                                  # 0.782 -> 0.757 with no attacker present. That both
+                                  # removes any gap an attack could fit through and
+                                  # swamps the attacker's `drop` reward with noise from
+                                  # which honest clients happened to be dropped
+                                  # (sd ~0.012 vs ~0.0003 of real attack effect), so
+                                  # the policy collapses to "evade everything, achieve
+                                  # nothing". See server/defense_ensemble.py.
+  selection: "rotate"             # rotate | random | fixed  (mode: single only)
+                                  # rotate = round-robin over `algorithms` (default:
+                                  #   every defense stays in the curriculum);
+                                  # random = uniform per round, seeded by fl.poison_seed;
+                                  # fixed  = always the first entry.
   assumed_malicious: null         # f (Multi-Krum) / m (DnC): ASSUMED adversary budget, a
                                   # hyperparameter, never per-round ground truth. null =
                                   # attack.max_poison_clients, clamped to a benign majority.

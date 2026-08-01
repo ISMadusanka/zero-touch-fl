@@ -106,7 +106,8 @@ class AttackerTurn:
 
     def _apply(self, attacker_text, temperature, commit=False):
         poisoned, chosen_ids, n_malformed = self.attacker_agent.select_and_apply(
-            attacker_text, self.pool_references, self.budget
+            attacker_text, self.pool_references, self.budget,
+            global_weights=self.env.global_weights,
         )
         updates = self.env.build_updates(poisoned)
         verdicts = self._defender_verdicts(updates, temperature, commit)
@@ -177,7 +178,7 @@ class DefenderTurn:
         a_text = attacker_gen.generate(a_sys, a_user, n=1, temperature=opponent_temperature)[0]
         dbg.attacker_output(a_text, who="frozen-opponent")
         poisoned, chosen_ids, self.n_malformed = attacker_agent.select_and_apply(
-            a_text, env.pool_benign, env.round_budget)
+            a_text, env.pool_benign, env.round_budget, global_weights=env.global_weights)
         self.poisoned_ids = chosen_ids
         self.poisoned_by_client = poisoned
         env.set_committed_poison(chosen_ids)

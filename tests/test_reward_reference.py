@@ -116,15 +116,65 @@ def test_attacker_punished_for_a_wasted_round():
     # Selecting three clients and wasting all three is no worse per-client...
     assert abs(attacker_reward(0.90, 0.90, GOAL, [], _evaded([]), 3, pool_size=5)
                - (-1.0)) < 1e-9
-    # ...but wasting 1 of 2 selected is only half the penalty.
+    # ...but wasting 1 of 2 selected is only half the penalty. The surviving client
+    # evaded detection, yet it did no damage — so the GATED stealth term pays 0.
     half = attacker_reward(0.90, 0.90, GOAL, [1], _evaded([1]), 1, pool_size=5)
-    assert abs(half - (0.0 + 0.5 * 1.0 - 1.0 * 0.5)) < 1e-9
+    assert abs(half - (0.0 + 0.5 * 1.0 * 0.0 - 1.0 * 0.5)) < 1e-9
 
 
 def test_doing_nothing_scores_worse_than_a_real_attack():
     nothing = attacker_reward(0.90, 0.90, GOAL, [], _evaded([]), 1, pool_size=5)
     real = attacker_reward(0.90, 0.75, GOAL, [0], _evaded([0]), 0, pool_size=5)
     assert real > nothing + 1.0
+
+
+# ---------------------------------------------------------------------------
+# Stealth is gated on damage
+# ---------------------------------------------------------------------------
+
+def test_stealth_pays_nothing_without_damage():
+    """The failure this prevents: a perturbation small enough to hide inside the
+    honest client spread evades every detector and does nothing. Ungated it scored
+    a free `beta`, which is the global optimum of the reward and exactly where a
+    long run converges — detection ~0 AND attack success ~0."""
+    undetectable_no_op = attacker_reward(0.90, 0.90, GOAL, [0], _evaded([0]), 0,
+                                         beta=0.5, pool_size=5)
+    assert abs(undetectable_no_op) < 1e-9
+    # ...and it must not beat an attack that lands but gets caught.
+    caught_but_effective = attacker_reward(
+        0.90, 0.80, GOAL, [0], [DetectionVerdict(0, True, 1.0, "")], 0,
+        beta=0.5, pool_size=5)
+    assert caught_but_effective > undetectable_no_op
+
+
+def test_stealth_scales_with_the_fraction_of_the_goal_achieved():
+    """The gate is proportional, not a cliff: evasion is worth more the more damage
+    it bought, so GRPO keeps a gradient along "sneak a BIGGER attack through"."""
+    def stealth_part(post):
+        evaded = attacker_reward(0.90, post, GOAL, [0], _evaded([0]), 0,
+                                 beta=0.5, pool_size=5)
+        caught = attacker_reward(0.90, post, GOAL, [0],
+                                 [DetectionVerdict(0, True, 1.0, "")], 0,
+                                 beta=0.5, pool_size=5)
+        return evaded - caught                       # the beta*stealth*gate term
+
+    # GOAL asks for a 0.20 drop from the 0.90 clean reference.
+    none_, quarter, half_, full = (stealth_part(p) for p in (0.90, 0.85, 0.80, 0.70))
+    assert abs(none_) < 1e-9
+    assert none_ < quarter < half_ < full
+    assert abs(quarter - 0.5 * 0.25) < 1e-9          # a quarter of the goal
+    assert abs(half_ - 0.5 * 0.50) < 1e-9            # half the goal
+    assert abs(full - 0.5) < 1e-9                    # gate saturates AT the goal
+    # Overshooting the goal must not pay MORE stealth than hitting it.
+    assert abs(stealth_part(0.60) - 0.5) < 1e-9
+
+
+def test_stealth_gate_helper_is_clipped_to_the_unit_interval():
+    from rl.rewards import stealth_gate
+    assert stealth_gate(-0.5, 0.10) == 0.0           # improving the model
+    assert abs(stealth_gate(0.05, 0.10) - 0.5) < 1e-9
+    assert stealth_gate(0.90, 0.10) == 1.0           # no extra credit for overshoot
+    assert stealth_gate(0.10, 0.0) == 0.0            # degenerate target
 
 
 def _run():

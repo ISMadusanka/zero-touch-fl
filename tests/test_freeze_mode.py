@@ -82,17 +82,28 @@ class _FakePolicy:
 
 
 class _NullDefense:
-    """Stand-in ensemble: clears everyone, records every call."""
+    """Stand-in panel: clears everyone, records every call.
+
+    ``begin_round`` is part of the defense contract — the env calls it once per
+    round so ``defense.mode: single`` can pick that round's algorithm BEFORE the
+    clean counterfactual is measured (see DefenseEnsemble.begin_round).
+    """
 
     def __init__(self):
         self.calls = []
+        self.rounds_begun = 0
 
     def describe(self): return "null"
+
+    def begin_round(self):
+        self.rounds_begun += 1
+        return ["null"]
 
     def verdicts(self, updates, global_weights, *, commit=False):
         self.calls.append(commit)
         return ([DetectionVerdict(u.client_id, False, 1.0, "null") for u in updates],
-                {"algorithms": ["null"], "per_defense_flags": {"null": []}, "flagged": []})
+                {"panel_mode": "single", "algorithms": ["null"], "configured": ["null"],
+                 "per_defense_flags": {"null": []}, "flagged": []})
 
 
 def _run_frozen(freeze, sim_rounds, td, defense=None, resume=None):
@@ -276,6 +287,26 @@ def test_clean_reference_runs_through_the_attached_defense():
     env.begin_round()
     assert defense.calls, "clean_reference_accuracy did not consult the defense"
     assert all(c is False for c in defense.calls), "the clean reference must not commit"
+
+
+def test_the_round_defense_is_chosen_before_the_clean_reference_is_measured():
+    """With defense.mode=single a different algorithm judges each round, so the pick
+    must happen at begin_round — BEFORE the clean counterfactual — or `drop` would
+    subtract accuracies measured under two different defenses."""
+    defense = _NullDefense()
+    env = _make_env(defense=defense)
+
+    order = []
+    _begin, _verdicts = defense.begin_round, defense.verdicts
+    defense.begin_round = lambda: (order.append("begin_round"), _begin())[1]
+    defense.verdicts = lambda *a, **kw: (order.append("verdicts"), _verdicts(*a, **kw))[1]
+
+    env.begin_round()
+    assert order and order[0] == "begin_round", order
+    assert "verdicts" in order, "the clean reference never ran"
+    assert defense.rounds_begun == 1
+    env.begin_round()
+    assert defense.rounds_begun == 2, "each FL round must re-pick its defense"
 
     plain = _make_env()          # same state, no defense attached
     plain.begin_round()

@@ -54,7 +54,7 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
         text = policy.generate(attacker_adapter, system, user, n=1,
                                temperature=attack_temperature, max_new_tokens=max_new_tokens)[0]
         poisoned, chosen_ids, _n_malformed = attacker_agent.select_and_apply(
-            text, ctx.pool_benign, ctx.budget)
+            text, ctx.pool_benign, ctx.budget, global_weights=env.global_weights)
         poisoned_ids = set(chosen_ids)
         env.set_committed_poison(chosen_ids)
         updates = env.build_updates(poisoned)

@@ -37,8 +37,22 @@ def _same_weights(a: dict, b: dict) -> bool:
     return all(torch.equal(a[k].float(), b[k].float()) for k in b)
 
 
-def fixed_attacker_actions(benign_by_client: dict[int, dict]) -> list[tuple[str, dict]]:
-    """Return ``[(label, {client_id: poisoned_state_dict})]`` candidates."""
+def _scale_delta(sd, global_weights, factor):
+    """Delta-space rescale — the ``scale_delta`` operator (see attack_ops)."""
+    return {k: global_weights[k].float() + factor * (v.float() - global_weights[k].float())
+            for k, v in sd.items()}
+
+
+def fixed_attacker_actions(benign_by_client: dict[int, dict],
+                           global_weights: dict | None = None
+                           ) -> list[tuple[str, dict]]:
+    """Return ``[(label, {client_id: poisoned_state_dict})]`` candidates.
+
+    The weight-space actions (``scale_*``, ``noise``, ``signflip``) are kept as the
+    detectability end of the sweep, but on this architecture they barely move
+    accuracy however large they get — so the delta-space actions are what actually
+    exercise the drop term. They need ``global_weights`` and are skipped without it.
+    """
     transforms = {
         "none": lambda sd: copy.deepcopy(sd),
         "scale_2": lambda sd: _scale(sd, 2.0),
@@ -47,6 +61,10 @@ def fixed_attacker_actions(benign_by_client: dict[int, dict]) -> list[tuple[str,
         "noise_1": lambda sd: _add_noise(sd, 1.0),
         "signflip": _sign_flip,
     }
+    if global_weights is not None:
+        for factor in (-1.0, 10.0, 40.0):
+            transforms[f"delta_{factor:g}"] = (
+                lambda sd, f=factor: _scale_delta(sd, global_weights, f))
     actions = []
     for label, fn in transforms.items():
         actions.append((label, {cid: fn(sd) for cid, sd in benign_by_client.items()}))
@@ -75,7 +93,7 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
         # No LLM to choose clients: poison the first `budget` clients of the pool.
         selected_ids = list(ctx.pool_ids[:ctx.budget])
         selected_benign = {cid: ctx.pool_benign[cid] for cid in selected_ids}
-        actions = fixed_attacker_actions(selected_benign)
+        actions = fixed_attacker_actions(selected_benign, env.global_weights)
 
         scored = []
         for label, poisoned in actions:

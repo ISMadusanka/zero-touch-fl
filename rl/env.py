@@ -205,11 +205,19 @@ class FLArmsRaceEnv:
         self.poisoned_ids = []                            # attacker decides at commit
         self._clean_ref_acc = None                        # recomputed lazily for this round
 
+        # Pick this round's defense BEFORE the clean counterfactual is measured. In
+        # `single` mode a different algorithm judges each round, so the clean
+        # reference, the G rollout scorings and the commit must all be measured
+        # under the SAME one — otherwise `drop` subtracts accuracies filtered by two
+        # different defenses and stops describing the attack at all.
+        active = self.defense.begin_round() if self.defense is not None else None
+
         clean_acc = self.clean_reference_accuracy()
         logger.info(
             f"Round {round_num}: controllable_pool={self.pool_ids} "
             f"budget={self.round_budget} goal={self.round_goal} "
             f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_acc:.4f})"
+            + (f" defense={'+'.join(active)}" if active else "")
         )
         return RoundContext(
             round_num=round_num,
@@ -250,7 +258,9 @@ class FLArmsRaceEnv:
         least one, so an all-accepted reference would bake those honest exclusions
         into ``drop`` and hand the attacker free reward for damage the DEFENSE did.
         Running the same defense on both sides makes ``drop`` the attack's marginal
-        damage again.
+        damage again. With ``defense.mode: single`` "the same defense" means the one
+        ``begin_round`` picked for THIS round — which is why the pick happens before
+        this is first called and is frozen until the round commits.
         """
         if self._clean_ref_acc is None:
             updates = self.build_updates({})

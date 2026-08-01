@@ -15,7 +15,7 @@ checkpoint layout. It supersedes the old feedback/episodic-memory design.
 | Features | `detector/features.py` | Per-client, per-layer statistical feature vectors (no decisions). |
 | Attacker | `agents/attacker_agent.py` + `agents/attack_ops.py` | Prompt (layer stats) + parse/apply of an attack plan (operator DSL). |
 | Defender | `agents/defender_agent.py` | Prompt + parse of per-client benign/malicious labels. |
-| Defense ensemble | `server/defense_ensemble.py` | The defender-LLM-free path (`--freeze defender`): FLTrust + Multi-Krum + DnC + DeFL run as detectors, rejections unioned. |
+| Defense panel | `server/defense_ensemble.py` | The defender-LLM-free path (`--freeze defender`): FLTrust / Multi-Krum / DnC / DeFL run as detectors — **one per round** by default (`defense.mode`), or all of them with rejections unioned. |
 | RL | `rl/*` | Environment, rewards, turns, GRPO, schedule, policy, baseline, inference. |
 | Metrics | `metrics/*` | Ground-truth confusion/TPR/FPR/ASR/APR (research + reward source). |
 
@@ -73,11 +73,24 @@ from a freshly advanced client state (see "Between-phase benign FL round" below)
 - **Output**: a single JSON object
   `{"clients": [ {"id": <pool id>, "operations": [ {op, target, ...params}, ... ]}, ... ]}`.
   The attacker **selects which** pool clients to poison (≤ budget) and gives **each
-  its own plan**. Operators (`agents/attack_ops.py`, 10): `scale`, `sign_flip`,
-  `add_gaussian_noise`, `mask`, `clip`, `add_constant`, `permute`,
+  its own plan**. Operators (`agents/attack_ops.py`, 11): `scale_delta`, `scale`,
+  `sign_flip`, `add_gaussian_noise`, `mask`, `clip`, `add_constant`, `permute`,
   `scale_neurons`, `blend_random`, `quantize`. `target` is `"all"`, a layer name,
   or a full parameter key — the exact names come from `client_update_stats` (for
   MnistNet e.g. `"net.2"` / `"net.4.weight"`). Operations apply in order.
+- **Two operator families.** All operators except `scale_delta` are
+  **weight-space**: they transform the absolute weight vector `W`, so the server
+  sees `W' − G`. On a positively-homogeneous ReLU MLP that is the worst possible
+  trade — measured here, `scale factor=10` submits an update **9×the norm of the
+  whole model** and costs **under 2%** accuracy: maximum suspicion, no damage.
+  `scale_delta` is **delta-space** — `W' = G + factor·(W − G)` — which pushes along
+  the direction the round is actually learning in. Measured on the same checkpoint
+  it buys **~100× more accuracy damage per unit of update norm** (22% drop at
+  `rel=1.6`, where `scale` needs `rel=9.0` for 1.9%), and it is the one operator
+  the LLM can *aim*: the submitted `rel_update` is exactly `|factor|` × the honest
+  `rel_update` printed in its own prompt. Delta-space ops need the global model, so
+  `apply_plan`/`select_and_apply` take `global_weights`; without it they are counted
+  invalid rather than silently degrading to a weight-space edit.
 - **Selection + application** (`agents/attacker_agent.select_and_apply` →
   `attack_ops.apply_plan`): filters ids to the pool, dedups, **truncates to the
   budget**; per chosen client deep-copies its benign weights, applies its plan,
@@ -120,10 +133,10 @@ from a freshly advanced client state (see "Between-phase benign FL round" below)
 
 Both continuous, so GRPO group advantages don't collapse.
 
-- **Attacker**: `α·drop_term(drop, target) + β·stealth − γ·malformed_frac
-  − δ·client_cost + ζ·diversity`, with `target` from the goal, `stealth` =
-  confidence-weighted evasion over the chosen clients (0 when nothing was
-  poisoned), `malformed_frac = n_malformed / n_selected` (the waste penalty,
+- **Attacker**: `α·drop_term(drop, target) + β·stealth·stealth_gate(drop, target)
+  − γ·malformed_frac − δ·client_cost + ζ·diversity`, with `target` from the goal,
+  `stealth` = confidence-weighted evasion over the chosen clients (0 when nothing
+  was poisoned), `malformed_frac = n_malformed / n_selected` (the waste penalty,
   normalized over the clients the attacker *selected*),
   `client_cost = (n_used−1)/(n_compromisable−1)` (the **use-fewer-clients**
   penalty, 0 for a single client), and `diversity = 1 − mean pairwise cosine` of
@@ -153,6 +166,16 @@ Both continuous, so GRPO group advantages don't collapse.
     skipped the update — the attacker stopped learning exactly when it got good.
     Saturation is fast (4× the target buys < 0.4 extra), so the objective stays
     "hit the requested drop", not "destroy the model".
+  - **`stealth_gate(drop, target)` = `clip(drop/target, 0, 1)`** multiplies the
+    stealth term, so evading the defense pays only in proportion to the damage the
+    evasion bought. Ungated, `β·stealth` is a flat payment for not being flagged,
+    and not being flagged is trivially achieved by submitting a perturbation that
+    fits inside the honest client spread — which does nothing. That made "poison
+    imperceptibly, achieve nothing" the **global optimum** of the reward (it scored
+    β = 0.5, while every attack large enough to matter was caught, lost its client
+    to the aggregator, and scored ~0), so a long run converged to detection ≈ 0 AND
+    attack success ≈ 0. The gate is proportional rather than a threshold, so GRPO
+    keeps a gradient along "sneak a *bigger* attack through".
 - **Defender** (train-time ground truth): confidence-weighted **soft-F1** vs the
   poisoned set (or `clip(TPR − λ·FPR)`). On a **clean round** (empty poisoned set
   — the attacker's plans were all no-ops) F1 is undefined and would score a
@@ -208,15 +231,42 @@ directly comparable across modes.
 
 - **`--freeze defender`** deactivates the defender LLM. `server/defense_ensemble.py`
   runs FLTrust, Multi-Krum, DnC and DeFL (config: `defense.algorithms`) over the
-  round's updates as pure detectors and **unions their rejections** — one flag from
-  any algorithm drops that client from FedAvg, so a poisoner has to evade all of
-  them at once. Details that make it train correctly:
-  - The verdict's confidence is the **fraction of algorithms that flagged** the
-    client (benign-and-cleared = confidence 1.0). The per-algorithm confidences are
-    not comparable (FLTrust `1 − trust` ∈ [0,1] vs Multi-Krum/DnC raw unbounded
-    outlier scores vs DeFL's vote fraction), and `rl/rewards._soft_malicious_prob`
-    reads confidence as a probability — the consensus fraction is a well-defined
-    [0,1] stand-in that gives the stealth term a gradient.
+  round's updates as pure detectors; flagged clients are dropped from FedAvg.
+  `defense.mode` decides how many judge a round:
+  - **`single` (default)** — ONE algorithm per round, picked by
+    `defense.selection` (`rotate` round-robin, `random`, `fixed`).
+    `DefenseEnsemble.begin_round()` is called from `FLArmsRaceEnv.begin_round()`
+    **before** the clean counterfactual is measured, and the pick is then frozen
+    for the counterfactual, all `G` rollout scorings and the commit — otherwise
+    `drop` would subtract two accuracies filtered by different defenses.
+  - **`union`** — the legacy mode: every algorithm judges and one flag from any of
+    them drops the client, so a poisoner must evade all four at once.
+  - **Why `single` is the default.** Unioning four aggregators is far more
+    trigger-happy than any one of them. Multi-Krum and DnC drop a fixed count every
+    round by construction, DeFL always flags at least one, and FLTrust zeroes the
+    trust of any client pointing away from its root update — which, at
+    `noniid_bias: 0.5`, is most of the honest federation. Measured on this repo's
+    own Phase-1 checkpoint, a **clean** round with no attacker flagged
+    `fltrust 12/20 · multikrum 1/20 · dnc 1/20 · defl 2/20` → **union 14/20**,
+    leaving FedAvg 6 clients and dropping clean accuracy 0.782 → 0.757. That
+    (a) closes every gap an attack could fit through, and (b) makes the accuracy
+    swing from *which honest clients got dropped* (sd ≈ 0.012) dwarf the swing from
+    the attack itself (≈ 0.0003), so GRPO climbs defense noise instead of damage.
+    One at a time, a clean round scores 0.782/0.774/0.774/0.783 — within 0.01 of
+    undefended — and every defense still appears in the curriculum.
+  - The verdict's confidence is the **fraction of the algorithms that actually ran**
+    which flagged the client (so a hard 1.0 either way in `single` mode; a
+    consensus fraction in `union`). The per-algorithm confidences are not comparable
+    (FLTrust `1 − trust` ∈ [0,1] vs Multi-Krum/DnC raw unbounded outlier scores vs
+    DeFL's vote fraction), and `rl/rewards._soft_malicious_prob` reads confidence as
+    a probability, so a well-defined [0,1] stand-in is required.
+  - **These algorithms are detectors here, not aggregators.** Only their verdicts
+    are used; the surviving clients go through plain `FedAvgAggregator`. That
+    matters most for FLTrust, whose own aggregation rescales every delta to `‖g0‖`
+    and is therefore nearly immune to magnitude attacks — as a *detector* feeding
+    FedAvg it is much weaker, and a `scale_delta` attack that it fails to flag
+    lands in full. The benchmark (`benchmark/harness.py`) is the opposite: there
+    each defense evolves its own model with its own aggregation rule.
   - `FLArmsRaceEnv.clean_reference_accuracy` runs the **same defense** over the
     all-honest updates. Multi-Krum and DnC drop a fixed `f`/`c·m` clients every
     round and DeFL always flags at least one, so an all-accepted reference would

@@ -11,10 +11,33 @@ PyTorch does all the arithmetic exactly, and composing primitives lets the
 attacker discover novel attacks (e.g. "flip the top 30% of the output layer,
 then add noise to the hidden layer, then clip").
 
-Operators (10; targets are "all", a layer group like "net.2", or a full key
+Operators (11; targets are "all", a layer group like "net.2", or a full key
 like "net.2.weight"):
-  scale, sign_flip, add_gaussian_noise, mask, clip, add_constant, permute,
-  scale_neurons, blend_random, quantize
+  scale_delta, scale, sign_flip, add_gaussian_noise, mask, clip, add_constant,
+  permute, scale_neurons, blend_random, quantize
+
+Two operator families
+---------------------
+Most operators are **weight-space**: they transform the client's absolute weight
+vector W. The server sees the resulting update as ``W' - G``, so a mild-looking
+edit to W is a huge update — and, on a positively-homogeneous ReLU MLP, scaling W
+barely moves the predictions at all. Measured on this codebase's MnistNet,
+``scale factor=10`` produces an update NINE TIMES the norm of the whole model and
+costs under 2% accuracy: maximal detectability, negligible damage.
+
+``scale_delta`` is **delta-space**: it transforms the client's UPDATE
+``D = W - G`` and rebuilds ``W' = G + factor*D``. That is the direction the round
+is actually learning in, so it buys roughly a hundred times more accuracy damage
+per unit of update norm than any weight-space operator, and it keeps the poisoned
+client's absolute weights near the global model (which is what the distance- and
+spectral-based detectors measure). It also makes the attacker's own observation
+actionable: ``rel_update`` scales exactly linearly with ``factor``, so the LLM can
+read the honest ``rel_update`` off its prompt and pick a factor that lands on a
+chosen size, instead of guessing a weight-space multiplier.
+
+Delta-space operators need the global model, so ``apply_plan`` takes
+``global_weights``. When it is not supplied they are skipped as invalid rather
+than silently degrading to a weight-space edit.
 """
 
 import json
@@ -287,6 +310,18 @@ def _op_scale(t, op):
     return t * _f(op, "factor", 1.0)
 
 
+def _op_scale_delta(t, op, g):
+    """Delta-space rescale: ``W' = G + factor * (W - G)``.
+
+    ``factor=1`` is a no-op, ``0`` discards the client's learning, ``-1`` reverses
+    it (the classic inner-product-manipulation / sign-flipped-gradient attack), and
+    large values boost it (model-replacement / update-boosting). The induced
+    ``rel_update`` is exactly ``|factor|`` times the honest one, which is why this
+    is the operator the attacker can actually aim.
+    """
+    return g + _f(op, "factor", 1.0) * (t - g)
+
+
 def _op_sign_flip(t, op):
     m = _topk_mask(t, _f(op, "fraction", 1.0), largest=True)
     return torch.where(m, -t, t)
@@ -361,6 +396,7 @@ def _op_quantize(t, op):
 
 
 OP_FUNCS = {
+    "scale_delta": _op_scale_delta,
     "scale": _op_scale,
     "sign_flip": _op_sign_flip,
     "add_gaussian_noise": _op_add_gaussian_noise,
@@ -373,13 +409,26 @@ OP_FUNCS = {
     "quantize": _op_quantize,
 }
 
+# Delta-space operators: called as ``fn(tensor, op, global_tensor)`` instead of
+# ``fn(tensor, op)``. Skipped as invalid when no global model was supplied.
+GLOBAL_OPS = frozenset({"scale_delta"})
+
 
 # Human-readable operator reference for the attacker prompt.
 OPERATOR_DOCS = """Operators (compose several for novel attacks). Each op is
 {"op":<name>,"target":<target>, ...params}. `target` is "all", a layer name, a full
 parameter key, or a list of these -- use the exact names shown in `client_update_stats`
 (a layer groups its ".weight" and ".bias"):
+- scale_delta {"factor":float}: THE PRIMARY OPERATOR. Rescale the client's UPDATE:
+  W' = global + factor*(W - global). factor=1 does nothing, 0 erases this client's
+  learning, negative REVERSES it, large values amplify it. The resulting rel_update
+  is EXACTLY |factor| x the rel_update shown for that client, so you can aim it: to
+  submit an update k times honest size, use factor=k. It moves the model far more
+  per unit of update size than any operator below, because it pushes along the
+  direction the round is actually learning in.
 - scale {"factor":float}: multiply weights (negative flips sign, |factor|>1 amplifies).
+  Note this acts on the WHOLE weight vector, so it produces an enormous update for
+  very little change in accuracy -- prefer scale_delta unless you want that.
 - sign_flip {"fraction":0..1}: negate the top-fraction largest-magnitude weights (1.0=all).
 - add_gaussian_noise {"sigma":float>=0,"seed":int}: add zero-mean noise of std sigma.
 - mask {"fraction":0..1,"mode":"largest"|"smallest"|"random","seed":int}: zero out a fraction of weights.
@@ -395,8 +444,15 @@ parameter key, or a list of these -- use the exact names shown in `client_update
 # Interpreter
 # ---------------------------------------------------------------------------
 
-def apply_plan(benign: dict, plan, max_abs: float = 100.0) -> tuple[dict, int]:
+def apply_plan(benign: dict, plan, max_abs: float = 100.0,
+               global_weights: dict | None = None) -> tuple[dict, int]:
     """Apply an attack plan to benign weights → poisoned weights.
+
+    ``global_weights`` is the current global model, needed by the delta-space
+    operators in ``GLOBAL_OPS`` (they rebuild ``W' = G + f*(W - G)``). It is
+    optional so older callers/tests keep working; a delta-space op requested
+    without it is skipped and counted in ``n_invalid`` rather than falling back to
+    a weight-space edit, which would silently mean something completely different.
 
     Robust: unknown ops / bad params / bad targets are skipped and counted in
     ``n_invalid``; the result is always a valid state_dict (NaN/Inf scrubbed,
@@ -415,13 +471,22 @@ def apply_plan(benign: dict, plan, max_abs: float = 100.0) -> tuple[dict, int]:
             if not isinstance(op, dict):
                 n_invalid += 1
                 continue
-            fn = OP_FUNCS.get(op.get("op"))
+            name = op.get("op")
+            fn = OP_FUNCS.get(name)
             keys = _resolve_target(op.get("target", "all"), poisoned)
             if fn is None or not keys:
                 n_invalid += 1
                 continue
-            for k in keys:
-                poisoned[k] = fn(poisoned[k], op)
+            if name in GLOBAL_OPS:
+                # Delta-space: needs the global tensor for every targeted key.
+                if global_weights is None or any(k not in global_weights for k in keys):
+                    n_invalid += 1
+                    continue
+                for k in keys:
+                    poisoned[k] = fn(poisoned[k], op, global_weights[k].float())
+            else:
+                for k in keys:
+                    poisoned[k] = fn(poisoned[k], op)
         except Exception as e:
             logger.warning(f"attack_ops: skipping bad op {op!r}: {e}")
             n_invalid += 1

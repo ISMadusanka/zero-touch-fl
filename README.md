@@ -20,11 +20,22 @@ Two phases:
      round's `max_poison_clients` budget, per-layer **statistics** of each pool
      client's benign weights, current global accuracy, and a configurable attack
      goal. Output: a **client selection + a per-client attack plan** — for each
-     chosen client, an ordered list of primitive weight operators (scale,
+     chosen client, an ordered list of primitive operators (scale_delta, scale,
      sign_flip, mask, add_gaussian_noise, clip, add_constant, permute,
      scale_neurons, blend_random, quantize). A deterministic interpreter applies
      each plan to that client's benign weights to produce the poisoned weights
      sent to the server.
+   - **`scale_delta` is the one that works.** Every other operator edits the
+     client's absolute weights `W`; `scale_delta` edits its *update*, rebuilding
+     `W' = G + factor·(W − G)`. Because this network is a positively-homogeneous
+     ReLU MLP, scaling `W` barely changes its predictions — measured here,
+     `scale factor=10` submits an update **9× the norm of the entire model** and
+     costs **under 2%** accuracy, i.e. maximum detectability for no damage.
+     `scale_delta` pushes along the direction the round is actually learning in and
+     buys roughly **100× more damage per unit of update norm** (22% drop at
+     `rel=1.6`). It is also the only operator the LLM can aim: the update it submits
+     has `rel_update` exactly `|factor|` × the honest `rel_update` printed in its own
+     prompt.
    - **Defender LLM** — input: per-client, per-layer statistical feature vectors.
      Output: a direct **benign/malicious classification** per client.
    - The server FedAvg-aggregates the clients the defender did not flag.
@@ -37,6 +48,13 @@ Two phases:
      is scored against the round's **clean counterfactual** — the accuracy the
      aggregate reaches with no poison at all — so hitting the goal scores the same
      every round it is hit.
+   - The attacker's **evasion (stealth) reward is gated on damage**: it is scaled by
+     `clip(drop/target, 0, 1)`, so slipping past the defense pays only in proportion
+     to what slipping past bought. Ungated, evasion is a flat payment for not being
+     flagged — and the easiest way to not be flagged is a perturbation small enough
+     to hide inside the honest client spread, which does nothing. That made "poison
+     imperceptibly, achieve nothing" the reward's global optimum, and a long run
+     converges straight to it: detection rate ≈ 0 **and** attack success ≈ 0.
 
 There are no hardcoded attack plugins, no hardcoded detector rules, and no
 episodic-memory feedback loop — the LLMs learn everything via RL.
@@ -49,8 +67,7 @@ whole run, with **no switching at all**.
 
 **`--freeze defender` — attacker-only GRPO against classical defenses.** The
 defender LLM is deactivated; it is not prompted, not sampled, and not trained. The
-server defends with the implemented robust-FL algorithms instead, all of them at
-once over the same round of updates:
+server defends with the implemented robust-FL algorithms instead:
 
 | Algorithm | Paper | Detects by |
 |-----------|-------|-----------|
@@ -59,29 +76,52 @@ once over the same round of updates:
 | DnC | Shejwalkar & Houmansadr, NDSS'21 | spectral (top-singular-direction) outlier score |
 | DeFL | Yan et al., AAAI-23 | per-layer FGNV outlier vote + critical-learning-period gating |
 
-Their rejections are **unioned**: *if any one of them flags a client, that client
-is dropped from FedAvg.* So the attack lands only when a poisoner slips past every
-algorithm simultaneously — one detection and the round's attack has failed.
-Everything else is exactly as in the normal mode: same attacker prompt, same GRPO
-step, same reward terms, same win criteria (`rl/switch.py`), same ASR/TPR/FPR
-metrics. The only difference is who produced the verdicts.
+By default **one algorithm judges each round** (`defense.mode: single`,
+`defense.selection: rotate` — round-robin, so every defense stays in the
+curriculum). Flagged clients are dropped from FedAvg. Setting
+`defense.mode: union` restores the old behaviour, where all four judge and *any*
+single flag drops the client. Everything else is exactly as in the normal mode:
+same attacker prompt, same GRPO step, same reward terms, same win criteria
+(`rl/switch.py`), same ASR/TPR/FPR metrics. The only difference is who produced
+the verdicts.
 
-Two details make the comparison honest:
+**Why one at a time.** Unioning four aggregators is much more aggressive than it
+looks. Multi-Krum and DnC drop a fixed count every round by construction, DeFL
+always flags at least one, and FLTrust zeroes the trust of any client pointing away
+from its root update — which, at `noniid_bias: 0.5`, is most of the honest
+federation. On this repo's own Phase-1 checkpoint a **clean** round with no attacker
+at all flagged `fltrust 12/20 · multikrum 1/20 · dnc 1/20 · defl 2/20` → **union
+14/20**, leaving FedAvg six clients and dropping clean accuracy 0.782 → 0.757. That
+breaks attacker training twice over: there is no gap left for any attack to fit
+through, and the accuracy swing caused by *which honest clients happened to be
+dropped* (sd ≈ 0.012) dwarfs the swing caused by the attack (≈ 0.0003), so the
+`drop` reward is mostly defense noise. The result is a policy that converges to
+"evade everything, achieve nothing" — detection rate ≈ 0 **and** attack success
+≈ 0. Judging one at a time keeps a clean round within 0.01 of undefended
+(0.782/0.774/0.774/0.783) and leaves a real frontier to learn against.
 
-- **Stealth is graded, not binary.** The verdict's confidence is the *fraction of
-  algorithms that flagged the client* (3 of 4 → `0.75`; none → benign at full
-  confidence), so the attacker's stealth reward improves smoothly as it evades more
-  of the panel instead of seeing one flat caught/not-caught bit.
+Three details make the comparison honest:
+
+- **The round's defense is fixed for the whole round.** It is chosen in
+  `DefenseEnsemble.begin_round()` before the clean counterfactual is measured, and
+  held through all `G` rollout scorings and the commit — otherwise `drop` would
+  subtract two accuracies filtered by different defenses.
 - **The clean counterfactual runs through the same defense.** Multi-Krum and DnC
   drop a fixed number of clients every round by construction and DeFL always flags
   at least one, so some honest clients are excluded even on a clean round. The
-  round's reference accuracy is therefore measured *with the defense running and no
+  round's reference accuracy is therefore measured *with that defense running and no
   poison*, which keeps `drop` the attack's marginal damage rather than free credit
   for honest clients the defense itself discarded.
+- **These are detectors here, not aggregators.** Only the verdicts are used; the
+  surviving clients go through plain FedAvg. This matters most for FLTrust, whose
+  own aggregation rescales every delta to `‖g0‖` and is nearly immune to magnitude
+  attacks — as a detector feeding FedAvg it is far weaker, and an attack it fails to
+  flag lands in full. The benchmark is the opposite: there each defense evolves its
+  own model under its own aggregation rule.
 
-Configure the panel under `defense:` in `configs/base.yaml` (which algorithms, the
-assumed adversary budget `f`/`m`, FLTrust's root-set size, DeFL/DnC thresholds).
-A plain `python main.py` run ignores that block entirely.
+Configure the panel under `defense:` in `configs/base.yaml` (`mode`, `selection`,
+which algorithms, the assumed adversary budget `f`/`m`, FLTrust's root-set size,
+DeFL/DnC thresholds). A plain `python main.py` run ignores that block entirely.
 
 **`--freeze attacker`** is the mirror image: the defender LLM trains against the
 frozen attacker adapter (no algorithmic defenses involved).

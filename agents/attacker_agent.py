@@ -56,7 +56,13 @@ Objective (`attack_goal`):
 - whole-model cos_to_global: alignment with the current model.
 Larger changes degrade accuracy more but are easier to flag -- balance the two, and keep each poisoned update close to an honest one so it is not filtered.
 
-IMPORTANT -- what your operators act on: every operator transforms the client's FULL weight vector W, NOT the small update D. The server then sees that client's update as D' = op(W) - global. Because W is close to the global model, a mild-looking multiplicative edit is a huge update: `scale` with factor f alone gives roughly rel_update ~ |f - 1|. So if the honest rel_update is about 0.2, then f=1.05 is a normal-sized update, f=1.5 is about 7x the honest size (very likely flagged), and f=2 or a full `sign_flip` is enormous. Additive operators are absolute: `add_constant`/`add_gaussian_noise` of size v change rel_update by about v * sqrt(count) / norm(global), so compare v against `rms_delta`, which is the honest per-weight step. Calibrate every operator against the honest `rel_update` shown for that client.
+IMPORTANT -- what your operators act on. There are two families:
+
+1. `scale_delta` acts on the client's UPDATE D = W - global, rebuilding W' = global + factor*D. This is the operator that actually works. It pushes along the direction the round is learning in, so it changes the model's predictions far more per unit of update size than anything else, and it leaves the client's weights near the global model, where the defender's distance and similarity checks expect them. Crucially it is AIMABLE: the update you submit has rel_update EXACTLY |factor| times the rel_update listed for that client. Want an update 3x honest size? factor=3. Want to reverse this client's learning? factor=-1. Want to erase it? factor=0.
+
+2. Every other operator transforms the client's FULL weight vector W. The server sees D' = op(W) - global, and because W is close to the global model a mild-looking edit is an enormous update: `scale` with factor f gives roughly rel_update ~ |f - 1|, so if the honest rel_update is 0.2 then f=1.5 is about 7x honest size and very likely flagged. Worse, this network's predictions barely change when you scale all its weights -- so `scale` buys you maximum suspicion for almost no damage. Additive operators are absolute: `add_constant`/`add_gaussian_noise` of size v change rel_update by about v * sqrt(count) / norm(global), so compare v against `rms_delta`.
+
+Start from `scale_delta` and calibrate its factor against the honest `rel_update` shown for that client; reach for the weight-space operators when you want to change the SHAPE of an update rather than its strength (e.g. mask or sign_flip one layer while scale_delta drives another).
 
 %OPERATOR_DOCS%
 
@@ -128,7 +134,8 @@ class AttackerAgent:
 
     # ------------------------------------------------------------------
     def select_and_apply(
-        self, text, pool_references: dict[int, dict], budget: int
+        self, text, pool_references: dict[int, dict], budget: int,
+        global_weights: dict | None = None,
     ) -> tuple[dict[int, dict], list[int], int]:
         """Parse the attacker's client selection + per-client plans and apply them.
 
@@ -136,6 +143,9 @@ class AttackerAgent:
             text: raw attacker LLM output.
             pool_references: {client_id: benign_state_dict} for the controllable pool.
             budget: max number of clients that may be poisoned this round.
+            global_weights: the current global model, required by the delta-space
+                operators (``scale_delta``) that rebuild ``W' = G + f*(W - G)``.
+                Omitting it makes those ops count as invalid — see ``apply_plan``.
 
         Returns ``(poisoned_by_client, poisoned_ids, n_malformed)``:
           * poisoned_by_client: {client_id: poisoned_state_dict} — ONLY the clients
@@ -210,7 +220,8 @@ class AttackerAgent:
                 n_malformed += 1
                 plan_for_dbg[cid] = []
                 continue
-            pw, n_invalid = apply_plan(pool_references[cid], ops, self.max_abs)
+            pw, n_invalid = apply_plan(pool_references[cid], ops, self.max_abs,
+                                       global_weights=global_weights)
             n_invalid_ops += n_invalid
             if _unchanged(cid, pw):
                 # The plan parsed but changed nothing (all ops skipped as invalid,
@@ -228,7 +239,8 @@ class AttackerAgent:
         return poisoned, poisoned_ids, n_malformed
 
     # ------------------------------------------------------------------
-    def parse(self, text, references: dict[int, dict]) -> tuple[dict[int, dict], int]:
+    def parse(self, text, references: dict[int, dict],
+              global_weights: dict | None = None) -> tuple[dict[int, dict], int]:
         """Backward-compatible shared-plan parse: apply ONE plan to every client in
         ``references`` (no client selection). Retained for external callers/tests;
         the training/eval pipeline uses :meth:`select_and_apply` instead.
@@ -247,7 +259,8 @@ class AttackerAgent:
         poisoned = {}
         n_invalid_total = 0
         for cid, ref in references.items():
-            pw, n_invalid = apply_plan(ref, plan, self.max_abs)
+            pw, n_invalid = apply_plan(ref, plan, self.max_abs,
+                                       global_weights=global_weights)
             poisoned[cid] = pw
             n_invalid_total += n_invalid
         dbg.poison(plan, references, poisoned, n_malformed=0, n_invalid_ops=n_invalid_total)

@@ -60,7 +60,7 @@ def run_inference(
         )
         a_text = generator.generate(a_sys, a_user, n=1, temperature=temperature)[0]
         poisoned, chosen_ids, n_malformed = attacker_agent.select_and_apply(
-            a_text, ctx.pool_benign, ctx.budget)
+            a_text, ctx.pool_benign, ctx.budget, global_weights=env.global_weights)
         env.set_committed_poison(chosen_ids)
         updates = env.build_updates(poisoned)
 

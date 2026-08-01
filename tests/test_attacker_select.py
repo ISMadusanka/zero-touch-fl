@@ -144,6 +144,72 @@ def test_invalid_ops_alongside_a_real_one_still_poison():
     assert torch.allclose(poisoned[4]["net.2.weight"], pool[4]["net.2.weight"] * 2.0)
 
 
+# ---------------------------------------------------------------------------
+# scale_delta — the delta-space operator
+# ---------------------------------------------------------------------------
+
+def test_scale_delta_rescales_the_update_not_the_weights():
+    """W' = G + factor*(W - G). The weight-space `scale` moves the whole vector and
+    barely changes predictions; this moves only the client's learning direction."""
+    agent = AttackerAgent()
+    pool, g = _pool(), _sd(scale=1.0)          # client c has weights (c+1); G is 1
+    text = '{"clients":[{"id":2,"operations":[{"op":"scale_delta","factor":4.0}]}]}'
+    poisoned, chosen, n_malformed = agent.select_and_apply(
+        text, pool, budget=1, global_weights=g)
+    assert chosen == [2] and n_malformed == 0
+    # delta was 3-1 = 2, so W' = 1 + 4*2 = 9 everywhere.
+    for k in g:
+        assert torch.allclose(poisoned[2][k], torch.full_like(g[k], 9.0)), k
+
+
+def test_scale_delta_factor_one_is_a_no_op_and_counts_as_wasted():
+    agent = AttackerAgent()
+    pool, g = _pool(), _sd(scale=1.0)
+    text = '{"clients":[{"id":1,"operations":[{"op":"scale_delta","factor":1.0}]}]}'
+    poisoned, chosen, n_malformed = agent.select_and_apply(
+        text, pool, budget=1, global_weights=g)
+    assert chosen == [] and poisoned == {} and n_malformed == 1
+
+
+def test_scale_delta_can_reverse_a_clients_learning():
+    """factor=-1 is the inner-product-manipulation / sign-flipped-gradient attack."""
+    agent = AttackerAgent()
+    pool, g = _pool(), _sd(scale=1.0)
+    text = '{"clients":[{"id":3,"operations":[{"op":"scale_delta","factor":-1.0}]}]}'
+    poisoned, _chosen, _ = agent.select_and_apply(text, pool, budget=1, global_weights=g)
+    for k in g:                                 # delta 4-1=3 -> 1 - 3 = -2
+        assert torch.allclose(poisoned[3][k], torch.full_like(g[k], -2.0)), k
+
+
+def test_scale_delta_targets_one_layer():
+    agent = AttackerAgent()
+    pool, g = _pool(), _sd(scale=1.0)
+    text = ('{"clients":[{"id":1,"operations":'
+            '[{"op":"scale_delta","target":"net.4","factor":10.0}]}]}')
+    poisoned, _c, _n = agent.select_and_apply(text, pool, budget=1, global_weights=g)
+    assert torch.allclose(poisoned[1]["net.2.weight"], pool[1]["net.2.weight"])   # untouched
+    assert torch.allclose(poisoned[1]["net.4.weight"],                            # 1 + 10*1
+                          torch.full_like(g["net.4.weight"], 11.0))
+
+
+def test_scale_delta_without_a_global_is_skipped_not_silently_reinterpreted():
+    """Falling back to a weight-space edit would mean something completely different,
+    so an unsupplied global makes the op invalid — and a plan of only that op wastes
+    the client rather than sending a mystery update."""
+    agent = AttackerAgent()
+    pool = _pool()
+    text = '{"clients":[{"id":0,"operations":[{"op":"scale_delta","factor":5.0}]}]}'
+    poisoned, chosen, n_malformed = agent.select_and_apply(text, pool, budget=1)
+    assert chosen == [] and poisoned == {} and n_malformed == 1
+
+
+def test_scale_delta_is_advertised_to_the_llm():
+    from agents.attack_ops import OPERATOR_DOCS, OP_FUNCS, GLOBAL_OPS
+    assert "scale_delta" in OP_FUNCS and "scale_delta" in GLOBAL_OPS
+    assert "scale_delta" in OPERATOR_DOCS
+    assert "scale_delta" in AttackerAgent().system_prompt()
+
+
 def _run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
