@@ -25,6 +25,7 @@ import logging
 from clients.benign_client import BenignClient
 from core.types import ModelUpdate, DetectionVerdict
 from detector.features import compute_client_features
+from rl.rewards import DEFAULT_TARGET_LADDER, target_for_budget
 from server.aggregation import FedAvgAggregator
 from server.fed_server import FedServer
 
@@ -80,13 +81,50 @@ class FLArmsRaceEnv:
         self.budget_cap = max(1, min(
             int(attack.get("max_poison_clients", self.n_compromisable)), self.n_compromisable))
         self.sample_budget = bool(attack.get("sample_budget_in_training", True))
-        # Per-round attack-goal target sampling (untargeted_degrade): when on, draw
-        # target_accuracy_drop from target_choices each round so the policy generalizes
-        # across targets instead of overfitting one. Eval fixes it (sample_target=False ->
-        # the configured attack.goal). Overridable by the benchmark (env.sample_target).
-        self.sample_target = bool(attack.get("sample_target_in_training", False))
-        self.target_choices = [float(x) for x in attack.get(
-            "target_choices", [0.05, 0.10, 0.20, 0.30])]
+
+        # Budget-conditioned attack-goal target ladder (untargeted_degrade): the
+        # round's target_accuracy_drop is a deterministic function of the round's
+        # poison budget (see rl.rewards.target_for_budget), replacing per-round
+        # target sampling. A present attack.target_ladder replaces
+        # DEFAULT_TARGET_LADDER wholesale — no per-rung merge (D-04). PyYAML
+        # yields integer keys, but a hand-edited config may use quoted string
+        # keys, so both are coerced; a key/value that cannot be coerced raises
+        # RuntimeError naming the offending key rather than surfacing a bare
+        # ValueError with no context.
+        raw_ladder = attack.get("target_ladder", DEFAULT_TARGET_LADDER)
+        self.target_ladder: dict[int, float] = {}
+        for k, v in raw_ladder.items():
+            try:
+                key = int(k)
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    f"attack.target_ladder has a non-integer budget key {k!r}")
+            try:
+                value = float(v)
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    f"attack.target_ladder has a non-numeric target for budget "
+                    f"{k!r}: {v!r}")
+            self.target_ladder[key] = value
+
+        # Startup-time coverage validation (D-03): every budget in [1, budget_cap]
+        # must have a rung, or fail fast now — before a simulation_rounds:
+        # 2000000 run starts — rather than mid-run when env.budget_cap is later
+        # raised (e.g. benchmark/run_benchmark.py mutates it post-construction).
+        # Clamping to the nearest rung or extrapolating were both rejected: either
+        # would let two budgets silently share one target, corrupting the
+        # per-(defense x budget) result cells Phase 2/3 are keyed on.
+        missing = [b for b in range(1, self.budget_cap + 1) if b not in self.target_ladder]
+        if missing:
+            raise RuntimeError(
+                f"attack.target_ladder is missing rungs for budgets {missing} "
+                f"(covers {sorted(self.target_ladder)}, needs [1, {self.budget_cap}])")
+
+        if self.goal.get("type", "untargeted_degrade") != "untargeted_degrade":
+            logger.warning(
+                "Budget target ladder is inactive for goal type %r — the "
+                "configured attack.goal is used unchanged every round.",
+                self.goal.get("type"))
 
         self.test_loader = test_loader
         self.rng = rng
@@ -176,14 +214,22 @@ class FLArmsRaceEnv:
         return self.budget_cap
 
     def _round_goal(self) -> dict:
-        """This round's attack goal. When target sampling is on (untargeted_degrade),
-        draw ``target_accuracy_drop`` from ``target_choices`` so the policy becomes
-        TARGET-AWARE and generalizes across targets; otherwise the fixed config goal.
-        The returned dict is the CLEAN goal shown to the LLM and used by the reward."""
-        if self.sample_target and self.goal.get("type") == "untargeted_degrade":
-            return {"type": "untargeted_degrade",
-                    "target_accuracy_drop": self.rng.choice(self.target_choices)}
-        return self.goal
+        """This round's attack goal, budget-conditioned for ``untargeted_degrade``.
+
+        ``target_accuracy_drop`` is derived from this round's poison budget via
+        ``rl.rewards.target_for_budget(self.round_budget, self.target_ladder)`` —
+        the single source of truth also read by the attacker reward (via
+        ``goal_target``) and the schedule's relative win-gate
+        (``rl/switch.py::attacker_succeeded``), so all three agree on the round's
+        target. Goal types other than ``untargeted_degrade`` are returned
+        unchanged — the ladder does not apply to ``slow_degrade``'s
+        ``per_round_drop`` or ``targeted_label``'s label objective. The returned
+        dict is the CLEAN goal shown to the LLM and used by the reward."""
+        if self.goal.get("type", "untargeted_degrade") != "untargeted_degrade":
+            return self.goal
+        return {"type": "untargeted_degrade",
+                "target_accuracy_drop": target_for_budget(
+                    self.round_budget, self.target_ladder)}
 
     def _honest_update(self, cid: int) -> ModelUpdate:
         if self.benign_retrain and self._clients is not None:
