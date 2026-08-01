@@ -163,3 +163,14 @@ None - no external service configuration required. `data/mnist_raw/MNIST` was co
 ---
 *Phase: 01-budget-conditioned-target-ladder*
 *Completed: 2026-08-01 (Tasks 1-2; Task 3 checkpoint pending)*
+
+## Self-Check: PASSED
+
+- FOUND: benchmark/noise_probe.py
+- FOUND: tests/test_noise_probe.py
+- FOUND: .planning/phases/01-budget-conditioned-target-ladder/01-NOISE-BASELINE.md
+- FOUND: .planning/phases/01-budget-conditioned-target-ladder/01-03-SUMMARY.md
+- FOUND: c85b3bd (Task 1 commit)
+- FOUND: ebe96f8 (Rule 1 bug-fix commit)
+- FOUND: 41f8cea (Task 2 artifact commit)
+- FOUND: 31df76b (SUMMARY commit)
