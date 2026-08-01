@@ -302,7 +302,7 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
 
 - **`configs/base.yaml`** — FL hyperparameters (`n_clients: 20`,
   `n_compromisable: 5`, `poison_seed`, `benign_retrain_each_round`), the
-  `data.noniid_bias` (FLTrust `q`), the `attack` block (`goal`,
+  `data.noniid_bias` (FLTrust `q`), the `attack` block (`goal`, `target_ladder`,
   `max_poison_clients`, `sample_budget_in_training`, `eval_poison_clients`), and
   the `rl:` block — GRPO + LoRA + league + reward weights, including
   `reward.attacker.delta` (use-fewer-clients penalty) and `.zeta` (multi-client
@@ -317,19 +317,23 @@ Attack goals (configurable; `untargeted_degrade` is the first experiment):
 `untargeted_degrade` (target accuracy drop), `slow_degrade` (per-round drop),
 `targeted_label` (per-class — scaffolded).
 
-**Target generalization (untargeted_degrade).** Rather than overfitting a single
-target, training randomizes `target_accuracy_drop` each round from
-`attack.target_choices` (default `[0.05, 0.10, 0.20, 0.30]`) when
-`attack.sample_target_in_training: true` — the same domain-randomization idea as
-the per-round poison budget, so the policy becomes **target-aware** and generalizes
-to any requested drop. The sampled target is placed in the attacker's prompt AND
-used by its reward every round (sampled once per round, so all `G` GRPO rollouts in
-a group share it). The arms-race success gate is likewise **relative**: an attack
-"passes" when its committed drop reaches `rl.win_fraction` (default 0.6) of that
-round's target, so phase-switching tracks the sampled target instead of one absolute
-floor (`rl.attacker_min_drop` is only the fallback when no target is known). Set the
-flag to `false` to train against the single fixed `attack.goal.target_accuracy_drop`.
-Evaluation never samples: pick the target at the benchmark with `--goal` (see below).
+**Budget-conditioned target ladder (untargeted_degrade).** Rather than a single
+fixed target, each round's requested `target_accuracy_drop` is a deterministic
+function of that round's sampled poison budget, declared in `configs/base.yaml`
+under `attack.target_ladder` (1 → 0.02, 2 → 0.04, 3 → 0.06, 4 → 0.08, 5 → 0.12,
+the top rung deliberately super-linear because spending the whole pool demands
+more). The mapping is resolved by the single function
+`rl/rewards.py::target_for_budget`, which the attacker's prompt, its reward, and
+the arms-race win gate all read, so they cannot disagree about a round's target.
+The env refuses to start if `attack.target_ladder` does not cover every budget in
+`[1, attack.max_poison_clients]`. The reason the target scales with budget at all
+is that FedAvg dilutes one poisoned client's leverage by `1/n_clients`, so a
+target that ignores the round's budget is unreachable at budget 1 and trivial at
+budget 5. The arms-race success gate is likewise **relative**: an attack "passes"
+when its committed drop reaches `rl.win_fraction` (default 0.6) of that round's
+target, so phase-switching tracks the budget-conditioned target instead of one
+absolute floor (`rl.attacker_min_drop` is only the fallback when no target is
+known).
 
 Both the reward and this gate measure the committed drop against the round's
 **clean counterfactual** (the accuracy the aggregate reaches with no poison), not

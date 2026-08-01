@@ -192,9 +192,7 @@ def main():
     eval_budget = max(1, min(eval_budget, env.n_compromisable))
     env.sample_budget = False
     env.budget_cap = eval_budget
-    # Evaluation uses the FIXED attack goal above (no per-round target sampling), so the
-    # attacker is measured against one requested target for the whole run.
-    env.sample_target = False
+    # Evaluation fixes the poison budget, so the ladder resolves a single rung for the whole run.
     log.info(f"Eval poison budget = {eval_budget} of pool {env.n_compromisable} "
              f"(clients {list(range(env.n_compromisable))}); attacker selects which to poison")
 

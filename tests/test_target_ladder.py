@@ -11,6 +11,7 @@ import json
 import os
 import random
 import sys
+import yaml
 from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -230,6 +231,121 @@ def test_round_goal_never_returns_the_fixed_config_target():
         goal = env._round_goal()
         assert goal["target_accuracy_drop"] != 0.20
         assert goal["target_accuracy_drop"] == DEFAULT_TARGET_LADDER[budget]
+
+
+# ---------------------------------------------------------------------------
+# Config drives the ladder (GOAL-02): no code edit required to re-tune it
+# ---------------------------------------------------------------------------
+
+def test_config_ladder_overrides_the_default_with_no_code_edit():
+    """A config-supplied ``attack.target_ladder`` replaces
+    ``DEFAULT_TARGET_LADDER`` wholesale (D-04) with no code edit: budgets 1 and
+    2 resolve the config's non-default values (0.33/0.44, deliberately not on
+    the default ladder so a fallback would be visible), and rung 3 -- present
+    in ``DEFAULT_TARGET_LADDER`` but absent from this config -- raises rather
+    than silently falling back, proving the default did not survive as a
+    per-rung merge."""
+    cfg = _cfg(fl={"n_clients": 4, "n_compromisable": 2},
+               attack={"max_poison_clients": 2,
+                       "target_ladder": {1: 0.33, 2: 0.44}})
+    env = _make_env(cfg)
+
+    env.round_budget = 1
+    assert env._round_goal()["target_accuracy_drop"] == 0.33
+    env.round_budget = 2
+    assert env._round_goal()["target_accuracy_drop"] == 0.44
+
+    try:
+        target_for_budget(3, env.target_ladder)
+        assert False, "expected RuntimeError: rung 3 must not survive from DEFAULT_TARGET_LADDER"
+    except RuntimeError:
+        pass
+
+
+def test_quoted_string_ladder_keys_are_accepted():
+    """A hand-edited or quoted-YAML ladder (``{'1': 0.33, '2': 0.44}``) -- the
+    shape a quoted mapping key produces -- normalizes to integer keys and float
+    values identically to the int-keyed form (D-01). A quoted key that
+    silently missed would fall back to the default ladder and produce
+    plausible-looking targets nothing would flag."""
+    cfg = _cfg(fl={"n_clients": 4, "n_compromisable": 2},
+               attack={"max_poison_clients": 2,
+                       "target_ladder": {"1": 0.33, "2": 0.44}})
+    env = _make_env(cfg)
+
+    assert env.target_ladder == {1: 0.33, 2: 0.44}
+    env.round_budget = 1
+    assert env._round_goal()["target_accuracy_drop"] == 0.33
+    env.round_budget = 2
+    assert env._round_goal()["target_accuracy_drop"] == 0.44
+
+
+def test_shipped_config_declares_a_complete_ladder():
+    """The real ``configs/base.yaml`` -- not a test fixture -- declares a rung
+    for every budget in ``[1, attack.max_poison_clients]``, with strictly
+    increasing values. Deliberately does NOT assert the five literal numbers:
+    Plan 01's ``target_for_budget`` behavior check pins those exactly once,
+    and GOAL-06 may raise the bottom rung in Plan 03. Asserting the same five
+    numbers here too would turn a sanctioned rung raise into an unrelated
+    test edit in a second place."""
+    config_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "configs", "base.yaml")
+    attack = yaml.safe_load(open(config_path))["attack"]
+    ladder = {int(k): float(v) for k, v in attack["target_ladder"].items()}
+    cap = int(attack["max_poison_clients"])
+
+    assert set(ladder) >= set(range(1, cap + 1))
+    values_in_order = [ladder[b] for b in range(1, cap + 1)]
+    assert all(v > 0.0 for v in values_in_order)
+    assert all(b > a for a, b in zip(values_in_order, values_in_order[1:]))
+
+
+# ---------------------------------------------------------------------------
+# Retirement is self-enforcing (GOAL-04): a tree-wide scan, not a one-time grep
+# ---------------------------------------------------------------------------
+
+_RETIRED_TOKENS = ("target_choices", "sample_target_in_training")
+_SCAN_SKIP_DIRS = {".git", "__pycache__", ".planning", ".claude", "logs", "data",
+                   "checkpoints", "results", ".venv", "node_modules"}
+_SCAN_EXTENSIONS = {".py", ".md", ".yaml", ".yml", ".txt", ".json"}
+
+
+def test_retired_target_sampling_keys_have_no_reader_left():
+    """Automated form of ROADMAP Success Criterion 2's tree-wide search: after
+    this phase, neither retired token (``target_choices``,
+    ``sample_target_in_training``) may appear anywhere in tracked source,
+    config or documentation -- except inside this scanning test itself, which
+    necessarily contains both tokens in its own search strings.
+
+    ``.planning/`` is excluded because, per 01-PATTERNS.md's Deletion Sweep,
+    those files are requirement and discussion documents describing this very
+    retirement, not readers of the retired keys -- flagging them would fail
+    the suite on the phase's own planning artifacts forever.
+
+    The point of this test is that a reintroduced key fails the suite
+    permanently, not only on the day someone remembers to grep for it."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    this_file = os.path.abspath(__file__)
+
+    hits = []
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        dirnames[:] = [d for d in dirnames if d not in _SCAN_SKIP_DIRS]
+        for fname in filenames:
+            if os.path.splitext(fname)[1] not in _SCAN_EXTENSIONS:
+                continue
+            fpath = os.path.join(dirpath, fname)
+            if os.path.abspath(fpath) == this_file:
+                continue
+            try:
+                with open(fpath, encoding="utf-8", errors="ignore") as f:
+                    for lineno, line in enumerate(f, start=1):
+                        for token in _RETIRED_TOKENS:
+                            if token in line:
+                                hits.append(f"{fpath}:{lineno}: {token}")
+            except OSError:
+                continue
+
+    assert hits == [], "retired token(s) reintroduced:\n" + "\n".join(hits)
 
 
 def _run():
