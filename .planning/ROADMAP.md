@@ -35,12 +35,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. A recorded pre-flight measurement reports the standard deviation of `clean_reference_accuracy` across repeated clean rounds for each of the four defenses in `single` mode, and states per defense whether the 0.02 rung clears that noise by the agreed margin — if any defense fails, the bottom rung is raised in config before Phase 2 begins.
   4. The existing test suite passes, with the only edits being tests that asserted the retired `target_choices` sampling behavior.
 
-**Plans**: 3 plans
+**Plans**: 1/3 plans executed
 
 Plans:
 **Wave 1**
 
-- [ ] 01-01-PLAN.md — Tracer: budget → ladder target end to end through reward, win gate and prompt (GOAL-01, GOAL-03, GOAL-05)
+- [x] 01-01-PLAN.md — Tracer: budget → ladder target end to end through reward, win gate and prompt (GOAL-01, GOAL-03, GOAL-05)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -137,7 +137,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Budget-Conditioned Target Ladder | 0/3 | Planned | - |
+| 1. Budget-Conditioned Target Ladder | 1/3 | In Progress|  |
 | 2. Bounded Damage Normalization | 0/TBD | Not started | - |
 | 3. Graded Attack Success Rate | 0/TBD | Not started | - |
 | 4. Fair Cross-Defense Benchmark | 0/TBD | Not started | - |
