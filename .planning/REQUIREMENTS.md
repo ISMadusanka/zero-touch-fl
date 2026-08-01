@@ -99,47 +99,58 @@ Populated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| GOAL-01 | TBD | Pending |
-| GOAL-02 | TBD | Pending |
-| GOAL-03 | TBD | Pending |
-| GOAL-04 | TBD | Pending |
-| GOAL-05 | TBD | Pending |
-| GOAL-06 | TBD | Pending |
-| NORM-01 | TBD | Pending |
-| NORM-02 | TBD | Pending |
-| NORM-03 | TBD | Pending |
-| NORM-04 | TBD | Pending |
-| NORM-05 | TBD | Pending |
-| NORM-06 | TBD | Pending |
-| ASR-01 | TBD | Pending |
-| ASR-02 | TBD | Pending |
-| ASR-03 | TBD | Pending |
-| ASR-04 | TBD | Pending |
-| ASR-05 | TBD | Pending |
-| ASR-06 | TBD | Pending |
-| BENCH-01 | TBD | Pending |
-| BENCH-02 | TBD | Pending |
-| BENCH-03 | TBD | Pending |
-| BENCH-04 | TBD | Pending |
-| BENCH-05 | TBD | Pending |
-| BENCH-06 | TBD | Pending |
-| SCHED-01 | TBD | Pending |
-| SCHED-02 | TBD | Pending |
-| SCHED-03 | TBD | Pending |
-| SCHED-04 | TBD | Pending |
-| SCHED-05 | TBD | Pending |
-| SCHED-06 | TBD | Pending |
-| EVID-01 | TBD | Pending |
-| EVID-02 | TBD | Pending |
-| EVID-03 | TBD | Pending |
-| EVID-04 | TBD | Pending |
-| EVID-05 | TBD | Pending |
+| GOAL-01 | Phase 1 | Pending |
+| GOAL-02 | Phase 1 | Pending |
+| GOAL-03 | Phase 1 | Pending |
+| GOAL-04 | Phase 1 | Pending |
+| GOAL-05 | Phase 1 | Pending |
+| GOAL-06 | Phase 1 | Pending |
+| NORM-01 | Phase 2 | Pending |
+| NORM-02 | Phase 2 | Pending |
+| NORM-03 | Phase 2 | Pending |
+| NORM-04 | Phase 2 | Pending |
+| NORM-05 | Phase 2 | Pending |
+| NORM-06 | Phase 2 | Pending |
+| ASR-01 | Phase 3 | Pending |
+| ASR-02 | Phase 3 | Pending |
+| ASR-03 | Phase 3 | Pending |
+| ASR-04 | Phase 3 | Pending |
+| ASR-05 | Phase 3 | Pending |
+| ASR-06 | Phase 3 | Pending |
+| BENCH-01 | Phase 4 | Pending |
+| BENCH-02 | Phase 4 | Pending |
+| BENCH-03 | Phase 4 | Pending |
+| BENCH-04 | Phase 4 | Pending |
+| BENCH-05 | Phase 4 | Pending |
+| BENCH-06 | Phase 4 | Pending |
+| SCHED-01 | Phase 5 | Pending |
+| SCHED-02 | Phase 5 | Pending |
+| SCHED-03 | Phase 5 | Pending |
+| SCHED-04 | Phase 5 | Pending |
+| SCHED-05 | Phase 5 | Pending |
+| SCHED-06 | Phase 5 | Pending |
+| EVID-01 | Phase 6 | Pending |
+| EVID-02 | Phase 6 | Pending |
+| EVID-03 | Phase 6 | Pending |
+| EVID-04 | Phase 6 | Pending |
+| EVID-05 | Phase 6 | Pending |
 
 **Coverage:**
 - v1 requirements: 35 total
-- Mapped to phases: 0 ⚠️
-- Unmapped: 35 ⚠️
+- Mapped to phases: 35 ✓
+- Unmapped: 0 ✓
+
+**Per-phase distribution:**
+
+| Phase | Requirements | Count |
+|-------|--------------|-------|
+| Phase 1 — Budget-Conditioned Target Ladder | GOAL-01…GOAL-06 | 6 |
+| Phase 2 — Bounded Damage Normalization | NORM-01…NORM-06 | 6 |
+| Phase 3 — Graded Attack Success Rate | ASR-01…ASR-06 | 6 |
+| Phase 4 — Fair Cross-Defense Benchmark | BENCH-01…BENCH-06 | 6 |
+| Phase 5 — Adaptive Defense Scheduling | SCHED-01…SCHED-06 | 6 |
+| Phase 6 — Learning Evidence and Reproducible Results | EVID-01…EVID-05 | 5 |
 
 ---
 *Requirements defined: 2026-08-01*
-*Last updated: 2026-08-01 after initial definition*
+*Last updated: 2026-08-01 after roadmap creation (traceability populated)*
