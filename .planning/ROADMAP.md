@@ -31,7 +31,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. A test asserts the reward path, the win gate in `rl/switch.py`, and the attacker prompt all resolve the identical target for the same round; a tree-wide search finds no remaining reader of `attack.target_choices` or `attack.sample_target_in_training`.
   3. A recorded pre-flight measurement reports the standard deviation of `clean_reference_accuracy` across repeated clean rounds for each of the four defenses in `single` mode, and states per defense whether the 0.02 rung clears that noise by the agreed margin — if any defense fails, the bottom rung is raised in config before Phase 2 begins.
   4. The existing test suite passes, with the only edits being tests that asserted the retired `target_choices` sampling behavior.
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Tracer: budget → ladder target end to end through reward, win gate and prompt (GOAL-01, GOAL-03, GOAL-05)
+- [ ] 01-02-PLAN.md — Ladder declared in config; retired sampling keys deleted with a self-enforcing tree scan (GOAL-02, GOAL-04)
+- [ ] 01-03-PLAN.md — GOAL-06 gate: per-defense clean-counterfactual noise probe, recorded verdict, rung raise if needed (GOAL-06)
 
 ### Phase 2: Bounded Damage Normalization
 **Goal**: The attacker's damage term spans a usable range in every (defense × budget) cell so GRPO sees non-degenerate rewards, and the denominator cannot ratchet permanently on a single lucky round
@@ -105,7 +110,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Budget-Conditioned Target Ladder | 0/TBD | Not started | - |
+| 1. Budget-Conditioned Target Ladder | 0/3 | Planned | - |
 | 2. Bounded Damage Normalization | 0/TBD | Not started | - |
 | 3. Graded Attack Success Rate | 0/TBD | Not started | - |
 | 4. Fair Cross-Defense Benchmark | 0/TBD | Not started | - |
