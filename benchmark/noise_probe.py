@@ -246,6 +246,10 @@ def main():
     from rl.rewards import DEFAULT_TARGET_LADDER
 
     config = yaml.safe_load(open(args.config))
+    # configs/base.yaml defaults fl.device to "cuda" (RL training needs a GPU);
+    # --device is this probe's own override and must reach run_phase1 too, since
+    # it reads config["fl"]["device"] directly rather than taking a device arg.
+    config.setdefault("fl", {})["device"] = args.device
     fl = config["fl"]
     attack = config.get("attack", {})
     data_cfg = config.get("data", {})
