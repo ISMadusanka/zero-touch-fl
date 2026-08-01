@@ -165,3 +165,11 @@ None - no external service configuration required.
 ---
 *Phase: 01-budget-conditioned-target-ladder*
 *Completed: 2026-08-01*
+
+## Self-Check: PASSED
+
+- FOUND: tests/test_target_ladder.py
+- FOUND: .planning/phases/01-budget-conditioned-target-ladder/01-01-SUMMARY.md
+- FOUND: c7bfeab (Task 1 commit)
+- FOUND: c47341e (Task 2 commit)
+- FOUND: f43d020 (SUMMARY commit)
