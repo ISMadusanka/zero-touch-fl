@@ -221,9 +221,15 @@ def main():
         sys.exit(f"ERROR: no trained attacker adapter at {adapter_paths['attacker']}")
     policy.load_adapter("attacker", adapter_paths["attacker"])
     if "llm_defender" in names:
+        # Attacker-only training (--freeze defender) never writes a defender adapter.
+        # Drop the LLM defender from the panel and benchmark the algorithmic defenses
+        # instead of aborting the whole run.
         if not adapter_exists(adapter_paths["defender"]):
-            sys.exit(f"ERROR: llm_defender requested but no defender adapter at {adapter_paths['defender']}")
-        policy.load_adapter("defender", adapter_paths["defender"])
+            log.warning(f"No defender adapter at {adapter_paths['defender']} — dropping "
+                        f"'llm_defender' from the panel; running the remaining defenses.")
+            names = [n for n in names if n != "llm_defender"]
+        else:
+            policy.load_adapter("defender", adapter_paths["defender"])
 
     attacker_agent = AttackerAgent(attacker_cfg)
     defender_agent = DefenderAgent(defender_cfg)
