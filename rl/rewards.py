@@ -199,10 +199,29 @@ def perturbation_diversity(poisoned_by_client: dict, references: dict) -> float:
 
 
 def _soft_malicious_prob(v: DetectionVerdict) -> float:
-    """Map a verdict to a soft P(malicious) in [0, 1] using its confidence.
+    """Map a verdict to a soft P(malicious) in [0, 1].
 
-    Confident flag → ~1, confident pass → ~0, unsure → ~0.5.
+    Prefers the verdict's explicitly calibrated ``p_malicious`` when the producer
+    supplied one (every algorithmic defense does — see ``core.types``). Only when
+    it is absent do we reconstruct the probability from ``(is_suspicious,
+    confidence)``: confident flag → ~1, confident pass → ~0, unsure → ~0.5. That
+    reconstruction is correct for the LLM defender, which is asked for its
+    certainty in the label it just assigned.
+
+    It is NOT correct for a threshold filter, and relying on it was a bug: the
+    algorithmic defenses report a *suspicion score* whose decision boundary is not
+    at 0.5, so ``0.5 - 0.5 * c`` ran BACKWARDS over their un-flagged clients (a
+    barely-trusted survivor scored as "confidently benign", a well-trusted one as
+    "unsure"). Since the attacker's ``stealth`` term is ``1 - p`` averaged over
+    the clients it poisoned, that paid the attacker for creeping up to the
+    detection boundary rather than for looking honest — the exact opposite of the
+    intended gradient. Unbounded scores (Multi-Krum/DnC) additionally clipped to
+    1.0 and collapsed ``stealth`` to a binary, destroying the within-group spread
+    the continuous reward exists to provide.
     """
+    p = getattr(v, "p_malicious", None)
+    if p is not None:
+        return _clip(float(p), 0.0, 1.0)
     c = _clip(float(v.confidence), 0.0, 1.0)
     return 0.5 + 0.5 * c if v.is_suspicious else 0.5 - 0.5 * c
 
@@ -260,21 +279,60 @@ def defender_reward(
     return 2 * precision * recall / (precision + recall + eps)
 
 
-def group_advantages(rewards: list[float]) -> tuple[list[float], float]:
+# Default noise floor for a group's reward spread. The rewards are built from a
+# test-set accuracy measured on 10k MNIST examples, so accuracy is quantized to
+# 1e-4; divided by the smallest sampled ``target_accuracy_drop`` (0.05) that is
+# ~2e-3 of reward per SINGLE flipped test example. Anything below this floor is
+# measurement noise, not a difference between the plans. See group_advantages.
+DEFAULT_MIN_REWARD_SPREAD = 0.02
+# Floor on the z-score denominator, in reward units. Stops a barely-separated
+# group from being rescaled up to full-magnitude advantages. See group_advantages.
+DEFAULT_ADVANTAGE_STD_FLOOR = 0.05
+
+
+def group_advantages(
+    rewards: list[float],
+    *,
+    min_spread: float = DEFAULT_MIN_REWARD_SPREAD,
+    std_floor: float = DEFAULT_ADVANTAGE_STD_FLOOR,
+) -> tuple[list[float], float]:
     """Group-relative normalized advantages plus the zero-advantage fraction.
 
-    A_i = (r_i - mean) / (std + eps). When the group has (near-)zero spread the
-    advantages are ~0 → no learning signal; we report that fraction so the
-    schedule can surface a stalled-gradient warning.
+    ``A_i = (r_i - mean) / max(std, std_floor)``.
+
+    Two guards separate "the plans really differed" from "the measurement wobbled":
+
+    * ``min_spread`` — the group is declared DEGENERATE (advantages all 0,
+      zero-fraction 1.0, so ``grpo_step`` resamples or skips) unless
+      ``max(r) - min(r) >= min_spread``. The previous test was ``std < 1e-6``,
+      which is ~1000x smaller than the reward noise floor: two behaviourally
+      identical rollouts that happened to classify one test example differently
+      produced a 2e-3 reward gap, passed the gate, and were then z-scored up to
+      ``A = ±1.2`` and applied at full strength. GRPO was confidently reinforcing
+      coin flips. A meaningful difference clears this bar easily (a 1% accuracy
+      gap at the smallest target is 0.2 of reward).
+
+    * ``std_floor`` — floors the denominator instead of dividing by the raw std.
+      Plain z-scoring is scale-free: a group spread over 0.02 of reward and a group
+      spread over 1.0 both come out at ``A = ±1.2``, so the update size carries no
+      information about how much better the winning rollout actually was. With the
+      floor, advantages stay proportional to real reward differences until the
+      spread is genuinely large (std > std_floor), where this reduces to standard
+      GRPO z-scoring. The attacker reward spans about [-1.8, 2.2], so a healthy
+      group is unaffected.
+
+    Pass ``min_spread=0.0, std_floor=0.0`` for textbook GRPO behaviour.
     """
     n = len(rewards)
     if n == 0:
         return [], 1.0
+    eps = 1e-6
+    spread = max(rewards) - min(rewards)
+    if spread < max(float(min_spread), eps):
+        return [0.0] * n, 1.0
     mean = sum(rewards) / n
     var = sum((r - mean) ** 2 for r in rewards) / n
     std = var ** 0.5
-    eps = 1e-6
-    if std < eps:
-        return [0.0] * n, 1.0
-    adv = [(r - mean) / (std + eps) for r in rewards]
+    denom = max(std, float(std_floor), eps)
+    adv = [(r - mean) / denom for r in rewards]
     return adv, 0.0

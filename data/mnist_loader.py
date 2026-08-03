@@ -30,9 +30,13 @@ def build_root_loader(root_size: int = 100, batch_size: int = 64,
     train_dataset, _ = load_mnist(data_dir)
     g = torch.Generator().manual_seed(int(seed))
     idx = torch.randperm(len(train_dataset), generator=g)[:int(root_size)].tolist()
+    # The same seeded generator drives the shuffle, so FLTrust's root fine-tuning
+    # (and therefore its trusted reference direction g0) is reproducible across runs
+    # instead of drawing from the ambient global RNG. Within a round g0 is computed
+    # once and cached — see benchmark.defenses.fltrust.FLTrust._root_update.
     return DataLoader(Subset(train_dataset, idx),
                       batch_size=max(1, min(int(batch_size), int(root_size))),
-                      shuffle=True)
+                      shuffle=True, generator=g)
 
 
 def partition_iid(dataset, n_clients: int):

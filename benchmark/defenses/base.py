@@ -17,6 +17,44 @@ from dataclasses import dataclass, field
 from core.types import DetectionVerdict, ModelUpdate
 
 
+def rank_normalized_scores(scores: list) -> list:
+    """Turn per-client suspicion scores into calibrated P(malicious) in [0, 1].
+
+    Multi-Krum and DnC score clients on scales that are unbounded and
+    round-dependent (sums of squared distances, squared spectral projections),
+    with the convention "lower = more trusted". Those numbers cannot be used as a
+    probability: they routinely exceed 1, so clipping them collapses the signal to
+    a binary, and ``+inf`` (the sentinel both use for a non-finite client) is not
+    even serializable. See ``core.types.DetectionVerdict.p_malicious``.
+
+    We therefore report the client's normalized RANK: the fraction of OTHER
+    clients that scored strictly lower.
+
+        p_i = |{j : score_j < score_i}| / (n - 1)
+
+    This is bounded, scale-free, comparable across rounds and defenses, monotone
+    in the defense's own suspicion, ties-aware (equal scores get equal p), and it
+    agrees with the keep/drop decision by construction — both defenses keep the
+    lowest-scoring clients, so survivors land below the dropped ones. Crucially it
+    stays CONTINUOUS inside the surviving set, which is what gives the attacker's
+    stealth reward a usable gradient.
+
+    NaN is ordered as ``+inf`` (the worst score), matching ``keep_lowest`` /
+    ``select_lowest``, so an undefined-score client is never scored as trusted.
+    """
+    n = len(scores)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0.0]
+    inf = float("inf")
+    ordered = [inf if s != s else float(s) for s in scores]   # NaN -> +inf
+    return [
+        sum(1 for other in ordered if other < s) / (n - 1)
+        for s in ordered
+    ]
+
+
 @dataclass
 class StepResult:
     """What a defense produces for one round."""

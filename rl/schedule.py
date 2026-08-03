@@ -41,7 +41,10 @@ from core.types import RoundLog
 from core.debug import dbg
 from rl.grpo import grpo_step
 from rl.policy import PolicyGenerator
-from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
+from rl.rewards import (
+    DEFAULT_ADVANTAGE_STD_FLOOR, DEFAULT_MIN_REWARD_SPREAD,
+    attacker_reward, defender_reward, perturbation_diversity,
+)
 from rl.switch import PhaseController, SwitchConfig, committed_success
 from rl.turns import AttackerTurn, DefenderTurn
 
@@ -167,6 +170,8 @@ def train(
     skip_zero_adv = bool(rl.get("skip_zero_advantage", True))
     resample_zero_adv = bool(rl.get("resample_on_zero_advantage", True))
     resample_temp = float(rl.get("resample_temperature", 1.3))
+    min_reward_spread = float(rl.get("min_reward_spread", DEFAULT_MIN_REWARD_SPREAD))
+    advantage_std_floor = float(rl.get("advantage_std_floor", DEFAULT_ADVANTAGE_STD_FLOOR))
     switch_mode = str(rl.get("switch_mode", "best_response"))
     first_learner = str(rl.get("first_learner", "attacker"))
     curriculum_on_cap = bool(rl.get("curriculum_on_cap", True))
@@ -219,6 +224,7 @@ def train(
         grad_clip=grad_clip, opp_temp=opp_temp, scoring_opp_temp=scoring_opp_temp,
         skip_zero_adv=skip_zero_adv, resample_zero_adv=resample_zero_adv,
         resample_temp=resample_temp, reward_att=reward_att, reward_def=reward_def,
+        min_reward_spread=min_reward_spread, advantage_std_floor=advantage_std_floor,
     )
 
     state = dict(
@@ -299,6 +305,8 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
         skip_zero_advantage=k["skip_zero_adv"],
         resample_on_zero_advantage=k["resample_zero_adv"],
         resample_temperature=k["resample_temp"],
+        min_reward_spread=k["min_reward_spread"],
+        advantage_std_floor=k["advantage_std_floor"],
     )
 
     # Advance the env by committing the best-scoring candidate action.
@@ -626,6 +634,9 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                 "loss": stats["loss"],
                 "mean_reward": stats["mean_reward"],
                 "max_reward": stats["max_reward"],
+                # Raw within-group reward span: the quantity the degeneracy gate
+                # tests, so a run of skipped steps is diagnosable from the logs.
+                "reward_spread": stats.get("reward_spread"),
                 "zero_advantage_fraction": stats["zero_advantage_fraction"],
                 "stepped": stats.get("stepped", True),
                 "resampled": stats.get("resampled", False),

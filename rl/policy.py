@@ -123,6 +123,12 @@ class LLMPolicy:
         # Per-rollout "did this finish on its own (EOS) rather than hit the token
         # cap?", set by every generate() call. See generate().
         self.last_generation_completed: list[bool] = []
+        # The EXACT completion token ids sampled by the last generate() call, one
+        # 1-D tensor per returned text (EOS included when the rollout ended on it,
+        # trailing padding stripped). GRPO feeds these straight back into the
+        # log-prob pass so it differentiates the sequence that was actually
+        # sampled — see generate() and _completion_token_logprobs.
+        self.last_generation_ids: list = []
         self.set_adapter(self.adapters[0])
         logger.info(f"LLMPolicy ready — adapters={self.adapters}, device={self.device}")
 
@@ -274,12 +280,89 @@ class LLMPolicy:
             pass
         return ids
 
+    def _split_generated(self, gen):
+        """Turn a batch of generated spans into per-row ``(ids, completed)``.
+
+        ``gen`` is the ``(rows, max_new_tokens)`` slice AFTER the prompt. Each row is
+        cut at (and including) its FIRST end-of-sequence token; a row with no EOS ran
+        into the token cap and is kept whole with ``completed=False``.
+
+        Cutting at the first EOS — rather than stripping "trailing pad" — is what
+        makes the ids usable as the exact sampled sequence. Qwen2.5's pad token
+        (``<|endoftext|>``) is itself one of the model's EOS ids, so the two are
+        indistinguishable by value: the previous "does the span contain an EOS?" test
+        was satisfied by HF's own padding of already-finished rows, and any
+        pad-stripping heuristic would have been unable to tell a genuine
+        ``<|endoftext|>`` stop from filler.
+        """
+        torch = self.torch
+        eos_ids = self._eos_ids()
+        eos_t = torch.tensor(sorted(eos_ids), device=gen.device) if eos_ids else None
+        ids, completed = [], []
+        for i in range(gen.shape[0]):
+            row = gen[i]
+            cut = None
+            if eos_t is not None:
+                hit = torch.nonzero(torch.isin(row, eos_t), as_tuple=False)
+                if hit.numel():
+                    cut = int(hit[0].item()) + 1      # keep the stop token itself
+            ids.append((row if cut is None else row[:cut]).detach().clone())
+            completed.append(cut is not None)
+        return ids, completed
+
+    def _sampling_config(self, n, do_sample, temperature, max_new_tokens):
+        """A FRESH ``GenerationConfig`` for one generate call.
+
+        Built from scratch — never merged with ``model.generation_config`` — because
+        Qwen2.5-Instruct ships chat-tuned defaults (``top_k: 20``, ``top_p: 0.8``,
+        ``temperature: 0.7``, ``repetition_penalty: 1.05``) and HF applies every one
+        of them that the caller does not override. Passing only ``temperature`` and
+        ``top_p`` therefore left ``top_k=20`` and a repetition penalty silently
+        active, so rollouts were drawn from a truncated, history-dependent
+        distribution while GRPO differentiated the untruncated softmax. The policy
+        gradient's ``ratio == 1`` assumption (see rl/grpo.py) requires the sampler
+        and the log-prob pass to be the SAME distribution, and a repetition penalty
+        is especially damaging here because the attacker's output is repetitive JSON
+        (``op``/``target``/``id`` once per client).
+
+        So: every logits warper is explicitly neutralized and temperature is the only
+        shaping left — matched by ``_completion_token_logprobs(temperature=...)``.
+        """
+        from transformers import GenerationConfig
+        eos = sorted(self._eos_ids())
+        kw = dict(
+            max_new_tokens=int(max_new_tokens),
+            do_sample=bool(do_sample),
+            use_cache=True,
+            num_return_sequences=int(n),
+            pad_token_id=self._tok.pad_token_id,
+            eos_token_id=(eos if eos else None),
+        )
+        if do_sample:
+            # UNTRUNCATED sampling: the behaviour policy must equal the policy whose
+            # log-probs enter the loss, so temperature is the only shaping applied.
+            # 0 / 1.0 disable each warper in HF. (Set only under do_sample; greedy
+            # ignores warpers and HF warns about non-default values there.)
+            kw.update(
+                temperature=float(temperature),
+                top_k=0, top_p=1.0, typical_p=1.0, min_p=None,
+                repetition_penalty=1.0, no_repeat_ngram_size=0,
+            )
+        return GenerationConfig(**kw)
+
     def generate(self, adapter, system, user, n=1, temperature=0.0, max_new_tokens=2048) -> list[str]:
-        """Sample ``n`` completions. Also sets ``self.last_generation_completed``:
-        one bool per returned text saying whether that rollout emitted EOS on its
-        own (vs being cut off at ``max_new_tokens``). GRPO reads it immediately
-        after the call to decide whether it may train on the stop token — it is
-        overwritten by the next ``generate``, including the opponent's."""
+        """Sample ``n`` completions.
+
+        Also sets, for the rollouts just produced:
+
+        * ``self.last_generation_ids`` — the exact completion token ids, which GRPO
+          feeds back into the log-prob pass instead of re-tokenizing the decoded
+          text (a BPE round-trip is not guaranteed to reproduce them).
+        * ``self.last_generation_completed`` — one bool per rollout: did it emit EOS
+          on its own, or hit ``max_new_tokens``?
+
+        Both are overwritten by the next ``generate`` call, including the opponent's
+        during reward scoring, so a caller must read them immediately."""
         self.set_adapter(adapter)
         prompt_ids = self._prompt_ids(system, user)
         plen = prompt_ids.shape[1]
@@ -319,38 +402,30 @@ class LLMPolicy:
         is deterministic — the n rollouts would be identical — so we generate one
         and replicate (this also sidesteps HF's "num_return_sequences>1 requires
         sampling" error for the n>1 greedy case).
+
+        Sampling shape comes from ``_sampling_config`` — a FRESH GenerationConfig, so
+        the model's chat-tuned generation defaults cannot leak into the behaviour
+        policy.
         """
         torch = self.torch
         was_training = self.model.training
         try:
             self.model.eval()
-            gen_kwargs = dict(
-                max_new_tokens=max_new_tokens, do_sample=do_sample, use_cache=True,
-                pad_token_id=self._tok.pad_token_id,
-                num_return_sequences=(n if do_sample else 1),
-            )
-            if do_sample:
-                gen_kwargs.update(temperature=float(temperature), top_p=0.95)
+            gen_cfg = self._sampling_config(
+                n if do_sample else 1, do_sample, temperature, max_new_tokens)
             with torch.no_grad():
-                out = self.model.generate(prompt_ids, **gen_kwargs)
-            texts = [
-                self._tok.decode(out[i, plen:], skip_special_tokens=True)
-                for i in range(out.shape[0])
-            ]
-            # A rollout finished on its own iff its generated span contains EOS.
-            eos_ids = self._eos_ids()
-            if eos_ids:
-                eos_t = torch.tensor(sorted(eos_ids), device=out.device)
-                completed = [bool(torch.isin(out[i, plen:], eos_t).any())
-                             for i in range(out.shape[0])]
-            else:
-                completed = [False] * out.shape[0]
+                out = self.model.generate(prompt_ids, generation_config=gen_cfg)
+            # Exact sampled ids per row, cut at the first EOS; texts are decoded FROM
+            # those ids so text and ids always describe the same sequence.
+            ids, completed = self._split_generated(out[:, plen:])
+            texts = [self._tok.decode(row, skip_special_tokens=True) for row in ids]
             if not do_sample:
-                texts = texts * n   # deterministic greedy → replicate the single completion
-                completed = completed * n
+                # deterministic greedy -> replicate the single completion
+                texts, ids, completed = texts * n, ids * n, completed * n
+            self.last_generation_ids = ids
             self.last_generation_completed = completed
             del out
-            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()   # release the KV cache before the GRPO backward
             return texts
         finally:
             if was_training:
@@ -384,11 +459,13 @@ class LLMPolicy:
             with torch.no_grad():
                 logits = self._last_logits(ids)                    # (n_gen, vocab)
             if do_sample:
-                logits = logits / max(float(temperature), 1e-6)
-                k = min(50, logits.shape[-1])
-                top = torch.topk(logits, k, dim=-1)
-                probs = torch.softmax(top.values, dim=-1)
-                nxt = top.indices.gather(-1, torch.multinomial(probs, 1))  # (n_gen, 1)
+                # UNTRUNCATED sampling from the tempered softmax. The old top-k=50
+                # truncation made this path sample from a different distribution than
+                # both _fast_generate and the log-prob pass, so which sampler ran (a
+                # silent runtime fallback) changed the gradient. Now every path is the
+                # plain tempered softmax that _completion_token_logprobs scores.
+                probs = torch.softmax(logits / max(float(temperature), 1e-6), dim=-1)
+                nxt = torch.multinomial(probs, 1)                   # (n_gen, 1)
             else:
                 nxt = logits.argmax(dim=-1, keepdim=True)           # (n_gen, 1)
             if eos_tensor is not None:
@@ -399,77 +476,116 @@ class LLMPolicy:
                 finished = finished | torch.isin(nxt.squeeze(1), eos_tensor)
                 if bool(finished.all()):
                     break
-        texts = [
-            self._tok.decode(ids[i, plen:], skip_special_tokens=True)
-            for i in range(n_gen)
-        ]
-        completed = [bool(x) for x in finished.tolist()]   # per-row: hit EOS
+        # Exact sampled ids per row, cut at the first EOS (which also drops the pad
+        # filler this loop emits after a row finishes); texts decode FROM those ids.
+        gen_ids, completed = self._split_generated(ids[:, plen:])
+        texts = [self._tok.decode(row, skip_special_tokens=True) for row in gen_ids]
         if not do_sample:
-            texts = texts * n   # deterministic greedy → replicate the single completion
-            completed = completed * n
+            # deterministic greedy -> replicate the single completion
+            texts, gen_ids, completed = texts * n, gen_ids * n, completed * n
+        self.last_generation_ids = gen_ids
         self.last_generation_completed = completed
         del ids
         torch.cuda.empty_cache()
         return texts
 
+    def _completion_ids(self, completion, completion_ids, append_eos):
+        """The completion's token ids as a ``(1, L)`` tensor.
+
+        ``completion_ids`` — the ids ``generate`` actually sampled — is the CORRECT
+        input and is what GRPO passes. Re-tokenizing the decoded text (the fallback,
+        for generators that cannot supply ids, e.g. the frozen inference backends)
+        is only approximately inverse: BPE round-tripping is not guaranteed to
+        reproduce the sampled ids, and these completions are JSON full of digits,
+        decimals and whitespace runs — exactly where re-merge differs. When it does
+        differ, GRPO computes log-probs for a sequence the policy never generated,
+        which silently voids the ``ratio == 1`` identity the loss is built on.
+
+        ``append_eos`` applies to the TEXT path only: decoding strips special tokens,
+        so the stop token has to be re-attached or the policy gets no gradient on the
+        decision to stop (and drifts toward rambling past ``max_new_tokens``). Callers
+        pass it only for rollouts that terminated on their own. The ids path needs
+        none of this — ``_split_generated`` keeps the real stop token in place.
+        """
+        torch = self.torch
+        if completion_ids is not None:
+            return completion_ids.reshape(1, -1).to(self.device)
+        comp_ids = self._tok(
+            completion, add_special_tokens=False, return_tensors="pt",
+        ).input_ids.to(self.device)
+        if append_eos and self._tok.eos_token_id is not None:
+            eos = torch.tensor([[int(self._tok.eos_token_id)]], device=self.device)
+            comp_ids = torch.cat([comp_ids, eos], dim=1)
+        return comp_ids
+
     def _completion_token_logprobs(self, system, user, completion, with_grad,
-                                   append_eos=False):
-        """Per-token log-probs of ``completion`` given the prompt.
+                                   append_eos=False, completion_ids=None,
+                                   temperature=1.0):
+        """Per-token log-probs of a completion given the prompt.
 
         Returns a 1-D tensor (one entry per completion token). Differentiable
         when ``with_grad`` and an adapter is active; used both for the policy
         term (grad) and, under ``disable_adapter`` + no_grad, the KL reference.
 
-        ``append_eos`` re-attaches the end-of-turn token that ``generate`` strips
-        when decoding with ``skip_special_tokens=True``. Without it the policy
-        gets no gradient on the decision to STOP, so nothing holds it back from
-        drifting toward rambling past ``max_new_tokens`` (which also truncates the
-        JSON the agents have to parse). Callers pass it only for rollouts that
-        actually terminated on their own — appending EOS to a truncated rollout
-        would train the model to stop mid-output.
+        ``temperature`` MUST be the temperature the rollout was sampled at. The
+        policy GRPO optimizes is ``softmax(logits / T)`` — the distribution the
+        sampler drew from — so scoring at a fixed T=1 while sampling at any other
+        temperature makes the gradient an estimate of the wrong objective. This
+        happened to be harmless while ``rl.temperature`` was exactly 1.0, but the
+        zero-advantage resample path re-draws at ``resample_temperature`` (1.3), and
+        lowering ``rl.temperature`` would have quietly biased every update with no
+        error anywhere. Applied to the reference pass too, so the KL compares two
+        distributions at the same temperature.
         """
         torch = self.torch
         prompt_ids = self._prompt_ids(system, user)
-        comp_ids = self._tok(
-            completion, add_special_tokens=False, return_tensors="pt",
-        ).input_ids.to(self.device)
-
-        if append_eos and self._tok.eos_token_id is not None:
-            eos = torch.tensor([[int(self._tok.eos_token_id)]], device=self.device)
-            comp_ids = torch.cat([comp_ids, eos], dim=1)
+        comp_ids = self._completion_ids(completion, completion_ids, append_eos)
 
         if comp_ids.shape[1] == 0:
-            # Empty completion → zero-length logprob vector.
+            # Empty completion -> zero-length logprob vector.
             return torch.zeros(0, device=self.device)
 
         full = torch.cat([prompt_ids, comp_ids], dim=1)
         # Guard against exceeding context.
         if full.shape[1] > self.max_seq_len:
             full = full[:, -self.max_seq_len:]
+        n_pred = min(comp_ids.shape[1], full.shape[1] - 1)
         ctx = torch.enable_grad() if with_grad else torch.no_grad()
         with ctx:
-            logits = self.model(full).logits[:, :-1, :]
+            logits = self.model(full).logits
+            # Only the positions that PREDICT the completion matter. Slicing before
+            # the softmax (instead of taking log_softmax over the whole sequence and
+            # discarding the prompt part) keeps the fp32 vocab-sized tensors at
+            # completion length rather than prompt+completion length.
+            logits = logits[:, -(n_pred + 1):-1, :]
+            if float(temperature) != 1.0:
+                logits = logits / max(float(temperature), 1e-6)
             logp = torch.log_softmax(logits.float(), dim=-1)
-            targets = full[:, 1:]
+            targets = full[:, -n_pred:]
             tok_logp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)[0]
-        comp_len = comp_ids.shape[1]
-        return tok_logp[-comp_len:]
+        return tok_logp
 
-    def policy_token_logprobs(self, adapter, system, user, completion, append_eos=False):
+    def policy_token_logprobs(self, adapter, system, user, completion,
+                              append_eos=False, completion_ids=None,
+                              temperature=1.0):
         """Differentiable per-token log-probs under ``adapter``."""
         self.set_adapter(adapter)
         return self._completion_token_logprobs(
-            system, user, completion, with_grad=True, append_eos=append_eos)
+            system, user, completion, with_grad=True, append_eos=append_eos,
+            completion_ids=completion_ids, temperature=temperature)
 
-    def reference_token_logprobs(self, system, user, completion, append_eos=False):
+    def reference_token_logprobs(self, system, user, completion, append_eos=False,
+                                 completion_ids=None, temperature=1.0):
         """No-grad per-token log-probs under the BASE model (KL reference).
 
-        ``append_eos`` must match the policy pass so the two sequences line up
-        token-for-token and the KL is computed over the same positions.
+        ``append_eos`` / ``completion_ids`` / ``temperature`` must match the policy
+        pass so the two sequences line up token-for-token and the KL is computed over
+        the same positions of the same distribution family.
         """
         with self.model.disable_adapter():
             return self._completion_token_logprobs(
-                system, user, completion, with_grad=False, append_eos=append_eos).detach()
+                system, user, completion, with_grad=False, append_eos=append_eos,
+                completion_ids=completion_ids, temperature=temperature).detach()
 
 
 class PolicyGenerator:

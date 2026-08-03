@@ -297,14 +297,21 @@ class DeFL(Defense):
                 p = 0.0
             coeffs.append(p * data_w[i])
 
-        verdicts = [
-            DetectionVerdict(
+        # ``votes/L`` (the fraction of layer groups whose MOUD z-test called this
+        # client an outlier) is already a bounded, monotone P(malicious), and
+        # ``moud_vote`` flags a top slice of it — so it belongs in ``p_malicious``.
+        # ``confidence`` is certainty in the verdict (see core.types); it used to
+        # hold the suspicion score, which inverted the attacker's stealth reward for
+        # every un-flagged client (see ``rl.rewards._soft_malicious_prob``).
+        verdicts = []
+        for i, u in enumerate(updates):
+            p_mal = float(votes[i] / L) if L else 0.0
+            verdicts.append(DetectionVerdict(
                 u.client_id, bool(flagged[i]),
-                float(votes[i] / L) if L else 0.0,
+                abs(2.0 * p_mal - 1.0),
                 f"votes={votes[i]}/{L} clp={int(in_clp)}",
-            )
-            for i, u in enumerate(updates)
-        ]
+                p_malicious=p_mal,
+            ))
 
         # 5) Trust+data-weighted average of ABSOLUTE weights (renormalised).
         wsum = sum(coeffs)

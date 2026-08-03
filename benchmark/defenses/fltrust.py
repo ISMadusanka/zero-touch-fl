@@ -100,30 +100,81 @@ class FLTrust(Defense):
         self.server = FedServer(device=device)
         self.root_client = BenignClient(client_id=-1, data_loader=root_loader,
                                         lr=lr, local_epochs=local_epochs, device=device)
+        self._g0_cache: tuple[bytes, "torch.Tensor"] | None = None
 
     def reset(self, init_global):
         super().reset(init_global)               # clones into self._global
         self.server.set_global_weights(self._global)
+        self._g0_cache = None
+
+    def _root_update(self, gw: dict, gw_flat: "torch.Tensor", keys: list) -> "torch.Tensor":
+        """The trusted reference direction ``g0 = w_root - w_global``, computed ONCE
+        per distinct global model and cached.
+
+        The caching is a correctness requirement, not an optimization. ``g0`` comes
+        from SGD over a shuffled root loader, so it is a random variable: re-running
+        it per call gave every scored rollout in a GRPO group a DIFFERENT reference
+        direction. Since trust is ``ReLU(cos(delta_i, g0))`` and Eq. 3 rescales every
+        accepted delta to ``||g0||``, both the verdicts and the post-aggregation
+        accuracy then moved between rollouts for reasons that had nothing to do with
+        the attacker's action — and GRPO's advantage is exactly the within-group
+        reward spread, so it was fitting root-training noise. It also broke the
+        contract ``AlgorithmicDefender.run(commit=False)`` advertises ("repeated
+        scoring calls within a round are independent and identically defended") and
+        meant the COMMITTED round was graded by a different defense than the reward
+        the policy trained on.
+
+        Keying on the global's contents (rather than a round counter) needs no new
+        interface: within a round every ``step`` sees the byte-identical global that
+        ``sync_global`` installed, so all G rollouts, the clean counterfactual and
+        the commit share one ``g0``; the next round's global differs, so the cache
+        misses and the reference is legitimately redrawn.
+        """
+        import hashlib
+        digest = hashlib.blake2b(
+            gw_flat.detach().to("cpu").contiguous().numpy().tobytes(),
+            digest_size=16,
+        )
+        digest.update("\0".join(keys).encode())   # guard against a key-order change
+        key = digest.digest()
+        if self._g0_cache is not None and self._g0_cache[0] == key:
+            return self._g0_cache[1]
+
+        self.server.set_global_weights(gw)
+        root_update = self.root_client.train(self.server.model)   # absolute weights
+        g0 = _flatten(root_update.weights, keys) - gw_flat
+        self._g0_cache = (key, g0)
+        return g0
 
     def step(self, updates, poisoned_ids) -> StepResult:
         gw = self._global
         keys = list(gw.keys())
         gw_flat = _flatten(gw, keys)
 
-        # Server reference update g0: one local epoch on the clean root set,
-        # starting from the CURRENT global model.
-        self.server.set_global_weights(gw)
-        root_update = self.root_client.train(self.server.model)   # absolute weights
-        g0 = _flatten(root_update.weights, keys) - gw_flat
+        # Server reference update g0: root_epochs local epochs on the clean root
+        # set, starting from the CURRENT global model. Cached per global — see
+        # _root_update for why that is required, not just faster.
+        g0 = self._root_update(gw, gw_flat, keys)
 
         deltas = [_flatten(u.weights, keys) - gw_flat for u in updates]
         agg, trust = fltrust_combine(deltas, g0)
 
-        verdicts = [
-            DetectionVerdict(u.client_id, ts <= self.trust_flag_threshold,
-                             float(max(0.0, 1.0 - ts)), f"trust={ts:.3f}")
-            for u, ts in zip(updates, trust)
-        ]
+        # Trust is ReLU(cos) in [0, 1], so `1 - ts` is already a calibrated
+        # P(malicious): 1.0 for a client pointing away from the trusted direction
+        # (which is also exactly the drop condition), falling continuously to 0 for
+        # a client perfectly aligned with it. It goes in ``p_malicious``; the
+        # ``confidence`` slot means certainty in the VERDICT (see core.types), which
+        # for a threshold at trust<=0 is |2p - 1|. Putting the suspicion score in
+        # ``confidence`` inverted the attacker's stealth reward — see
+        # ``rl.rewards._soft_malicious_prob``.
+        verdicts = []
+        for u, ts in zip(updates, trust):
+            p_mal = max(0.0, min(1.0, 1.0 - ts))
+            verdicts.append(DetectionVerdict(
+                u.client_id, ts <= self.trust_flag_threshold,
+                abs(2.0 * p_mal - 1.0), f"trust={ts:.3f}",
+                p_malicious=p_mal,
+            ))
 
         if agg is not None:
             new_flat = gw_flat + self.eta * agg              # w <- w + eta*g (Eq. 4/5)

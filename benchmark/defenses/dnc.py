@@ -48,7 +48,7 @@ import random
 
 from core.types import DetectionVerdict
 
-from benchmark.defenses.base import Defense, StepResult
+from benchmark.defenses.base import Defense, StepResult, rank_normalized_scores
 
 
 def num_to_remove(c: float, m: int, n: int) -> int:
@@ -162,7 +162,9 @@ class DnC(Defense):
 
         if keep_count >= n or n <= 1:
             # Nothing to remove (m=0 or a single client) -> plain FedAvg over all.
-            verdicts = [DetectionVerdict(u.client_id, False, 0.0, "dnc keep-all")
+            # No client is under suspicion, so p_malicious is 0 for everyone.
+            verdicts = [DetectionVerdict(u.client_id, False, 0.0, "dnc keep-all",
+                                        p_malicious=0.0)
                         for u in updates]
             kept = set(range(n))
             mean_scores = [0.0] * n
@@ -180,11 +182,19 @@ class DnC(Defense):
             mean_scores = [sum(it[i] for it in score_iters) / len(score_iters)
                            for i in range(n)]
             kept = finalize_keep(kept_sets, mean_scores, keep_count)
+            # The raw spectral score is unbounded (a squared projection) and can be
+            # +inf for a non-finite client, so it is NOT a probability — reporting it
+            # as one saturated the attacker's stealth reward into a binary and ran
+            # backwards over the kept clients. Rank-normalize it instead; the flag is
+            # a bottom-`keep_count` slice of the same ordering, so hard and soft
+            # read-outs agree. See base.rank_normalized_scores.
+            p_mal = rank_normalized_scores(mean_scores)
             verdicts = [
                 DetectionVerdict(
                     u.client_id, i not in kept,
-                    float(mean_scores[i]),
+                    abs(2.0 * p_mal[i] - 1.0),
                     f"dnc {'removed' if i not in kept else 'kept'} score={mean_scores[i]:.3g}",
+                    p_malicious=p_mal[i],
                 )
                 for i, u in enumerate(updates)
             ]

@@ -39,7 +39,7 @@ path is tested in tests/test_multikrum.py.
 """
 from core.types import DetectionVerdict
 
-from benchmark.defenses.base import Defense, StepResult
+from benchmark.defenses.base import Defense, StepResult, rank_normalized_scores
 
 
 def k_closest_count(n: int, f: int) -> int:
@@ -114,8 +114,10 @@ class MultiKrum(Defense):
         k = k_closest_count(n, f)
 
         if m >= n or n <= 1:
-            # Select everyone -> plain FedAvg (nothing to drop).
-            verdicts = [DetectionVerdict(u.client_id, False, 0.0, "multikrum select-all")
+            # Select everyone -> plain FedAvg (nothing to drop). Nobody is under
+            # suspicion, so p_malicious is 0 for everyone.
+            verdicts = [DetectionVerdict(u.client_id, False, 0.0, "multikrum select-all",
+                                        p_malicious=0.0)
                         for u in updates]
             selected = set(range(n))
         else:
@@ -128,10 +130,18 @@ class MultiKrum(Defense):
                 scores = [float("inf") if not finite_row[i] else scores[i]
                           for i in range(n)]
             selected = select_lowest(scores, m)
+            # The Krum score is an unbounded sum of squared distances (and +inf for a
+            # non-finite client), so it is not a probability: reporting it as one both
+            # saturated the attacker's stealth reward and ran BACKWARDS over the
+            # selected clients, and `inf` is not valid JSON in the round logs.
+            # Rank-normalize it; `select_lowest` slices the same ordering, so the hard
+            # flag and the soft score agree. See base.rank_normalized_scores.
+            p_mal = rank_normalized_scores(scores)
             verdicts = [
                 DetectionVerdict(
-                    u.client_id, i not in selected, float(scores[i]),
+                    u.client_id, i not in selected, abs(2.0 * p_mal[i] - 1.0),
                     f"multikrum {'selected' if i in selected else 'dropped'} score={scores[i]:.3g}",
+                    p_malicious=p_mal[i],
                 )
                 for i, u in enumerate(updates)
             ]

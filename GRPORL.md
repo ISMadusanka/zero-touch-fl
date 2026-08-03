@@ -113,15 +113,31 @@ rewards = [reward(c) for c in completions]      # e.g. [0.0, 0.5, 0.1, 1.0]
 ```
 
 ### Step 3 — Turn rewards into *advantages* (the group-relative part)
-`group_advantages` ([rl/rewards.py:119](rl/rewards.py)) z-scores the rewards:
+`group_advantages` ([rl/rewards.py](rl/rewards.py)) z-scores the rewards:
 
 ```
+spread = max(rewards) − min(rewards)
 mean   = average(rewards)
 std    = population standard deviation(rewards)
-Aᵢ     = (rᵢ − mean) / (std + 1e-6)
+Aᵢ     = (rᵢ − mean) / max(std, advantage_std_floor)
 ```
-If `std < 1e-6` (all rewards equal), it returns **all-zero advantages** and flags
-`zero_advantage_fraction = 1.0` (a dead, no-gradient round — see §5/§10).
+Two guards separate "the plans really differed" from "the measurement wobbled":
+
+* If `spread < min_reward_spread` (default **0.02**) the group is **degenerate**:
+  all-zero advantages and `zero_advantage_fraction = 1.0` (a dead, no-gradient
+  round — see §5/§10). The bar is a noise floor, not exact equality: accuracy is
+  measured on 10k test examples, so it is quantized to 1e-4, which at the smallest
+  sampled `target_accuracy_drop` (0.05) is ~2e-3 of reward per *single flipped test
+  example*. The old test was `std < 1e-6` — a thousand times below that noise — so
+  two behaviourally identical rollouts were routinely z-scored up to `A = ±1.2` and
+  trained on at full strength. A real 1% accuracy gap scores 0.2 at that target, so
+  genuine differences clear the bar easily.
+* `advantage_std_floor` (default **0.05**) floors the denominator. Plain z-scoring
+  is scale-free — a group spread over 0.02 and one spread over 1.0 both come out at
+  `A = ±1.2` — so the update size carried no information about *how much* better the
+  winning rollout was. Above this std it reduces to standard GRPO z-scoring.
+
+Set both to `0` in `configs/base.yaml` for textbook GRPO.
 
 **Worked example** with `rewards = [0.0, 0.5, 0.1, 1.0]`:
 
@@ -254,25 +270,56 @@ Sample `n` answers (no gradient). Two paths:
   Transformers generation **with a KV cache** (fast). It flips the model to
   `eval()` during generation (so gradient-checkpointing doesn't disable the cache)
   then back to `train()` for the backward pass.
-- `_manual_generate` ([policy.py:273](rl/policy.py)) — a fallback no-cache
+- `_manual_generate` ([policy.py](rl/policy.py)) — a fallback no-cache
   decoder (slower, O(L²)) used automatically if the fast path errors on this
   Unsloth/Transformers combo. In both paths `temperature=0` → greedy (argmax);
-  `>0` → sampling (the fast path uses top-p 0.95; the manual path uses top-k 50).
+  `>0` → **untruncated** sampling from the tempered softmax.
 
-**(c) `policy_token_logprobs(adapter, system, user, completion)`** — [policy.py:331](rl/policy.py)
+> **Both paths must sample the exact distribution the loss differentiates.**
+> Sampling shape comes from `_sampling_config`, a *fresh* `GenerationConfig` — never
+> merged with `model.generation_config`, because Qwen2.5-Instruct ships chat-tuned
+> defaults (`top_k: 20`, `top_p: 0.8`, `repetition_penalty: 1.05`) that HF applies to
+> anything the caller does not override. Rollouts used to be drawn from a truncated,
+> history-dependent distribution while the loss scored the untruncated softmax; a
+> repetition penalty is especially wrong here because the attacker's output is
+> repetitive JSON. Every warper is now explicitly disabled, so **temperature is the
+> only shaping** — and the log-prob passes below are told what it was.
+
+Each `generate` also records, for the rollouts it just produced:
+`last_generation_ids` (the exact sampled completion tokens, cut at the first EOS)
+and `last_generation_completed`. Both are overwritten by the next `generate` —
+including the frozen opponent's during reward scoring — so `grpo_step` captures
+them *before* calling `turn.reward()`.
+
+**(c) `policy_token_logprobs(adapter, system, user, completion, completion_ids=, temperature=)`**
 Re-run the chosen adapter over `prompt + completion` **with gradients** and return
 the log-probability of each completion token. This is the differentiable `lp` in
 the GRPO loss — the term we actually backprop through.
 
-**(d) `reference_token_logprobs(system, user, completion)`** — [policy.py:336](rl/policy.py)
+**(d) `reference_token_logprobs(system, user, completion, completion_ids=, temperature=)`**
 Same thing but under `disable_adapter()` (the base model) and **no gradient** —
-this is the `ref` used by the KL penalty.
+this is the `ref` used by the KL penalty. Same ids and temperature as (c), so the
+KL compares the two distributions token-for-token.
 
 > Why recompute log-probs separately from generation? Because generation is done
 > with `no_grad` for speed; to get a gradient we must re-run a forward pass over
-> the produced text **with** grad enabled. Since the answer was just sampled from
+> the produced tokens **with** grad enabled. Since the answer was just sampled from
 > this same policy, the importance ratio is 1 — which is why GRPO here needs **no
-> PPO-style clipping** (see §10).
+> PPO-style clipping** (see §10). That identity is only true if we score *what was
+> actually sampled*, hence two requirements:
+>
+> * **`completion_ids`, not the decoded text.** GRPO passes the sampled token ids
+>   straight back in. Re-tokenizing the decoded string is only approximately
+>   inverse — BPE round-tripping is not guaranteed to reproduce the ids, and these
+>   completions are JSON full of digits, decimals and whitespace runs, exactly where
+>   re-merge differs. Any mismatch means differentiating a sequence the policy never
+>   produced. (Text re-tokenization survives as a fallback for the frozen inference
+>   backends, which cannot hand back ids.)
+> * **`temperature` = the sampling temperature.** The policy being optimized is
+>   `softmax(logits / T)`. Scoring at a fixed `T = 1` was harmless only while
+>   `rl.temperature` was exactly 1.0 — but the zero-advantage re-roll draws at
+>   `resample_temperature` (1.3), and lowering `rl.temperature` would have silently
+>   biased every update with no error anywhere.
 
 ### Supporting helpers
 - `adapter_parameters(name)` ([policy.py:124](rl/policy.py)) — the trainable LoRA
@@ -305,12 +352,29 @@ signal: the mean over poisoned clients of `1 − P(malicious)`, where `P(malicio
 is derived from the defender's **confidence** (`_soft_malicious_prob`). Continuous
 (not 0/1) on purpose — it gives GRPO a usable spread even when the hard flags tie.
 
-**`defender_reward`** ([rl/rewards.py:82](rl/rewards.py), default `soft_f1`):
+**`defender_reward`** ([rl/rewards.py](rl/rewards.py), default `soft_f1`):
 a confidence-weighted F1 of "flagged the poisoned clients, spared the honest ones."
 Range [0, 1].
 
-**`group_advantages`** ([rl/rewards.py:119](rl/rewards.py)): the z-scoring from §4,
-plus the `zero_advantage_fraction` signal.
+**`_soft_malicious_prob`** ([rl/rewards.py](rl/rewards.py)) is what makes both of
+those continuous. It prefers a verdict's explicitly calibrated
+`p_malicious` and only falls back to reconstructing the probability from
+`(is_suspicious, confidence)` when none was supplied. The distinction matters:
+`confidence` means *certainty in the verdict just given* (the LLM defender's
+contract), whereas every algorithmic defense naturally produces a *suspicion
+score* whose decision boundary is not at 0.5 — FLTrust drops at `trust <= 0`,
+Multi-Krum/DnC drop a fixed count per round. Feeding such a score through the
+reconstruction ran it **backwards** over every un-flagged client, so a poisoned
+client the defense had *nearly dropped* scored as maximally stealthy: the attacker
+was being trained to sit on the detection boundary. Multi-Krum/DnC scores are
+additionally unbounded (and `+inf` for a non-finite client), so clipping them
+collapsed `stealth` to a binary and destroyed the group spread the continuous
+reward exists to create. Each defense now reports a calibrated `p_malicious`
+(FLTrust `1 − trust`; DeFL `votes/L`; Multi-Krum/DnC the normalized rank from
+`benchmark.defenses.base.rank_normalized_scores`).
+
+**`group_advantages`** ([rl/rewards.py](rl/rewards.py)): the z-scoring from §4,
+plus the degeneracy gate and the `zero_advantage_fraction` signal.
 
 ---
 
