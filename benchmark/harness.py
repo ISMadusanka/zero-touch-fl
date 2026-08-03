@@ -22,6 +22,44 @@ from benchmark.metrics import DefenseMetrics
 logger = logging.getLogger("benchmark")
 
 
+def _check_prompt_fits(policy, system, user, max_new_tokens, pool_size):
+    """Log the attacker prompt's real token cost once, and warn if it crowds the context.
+
+    The prompt carries ``delta_details`` for EVERY client in the controllable pool, so
+    its size scales with the pool — and the benchmark can now widen that pool up to
+    ``fl.n_clients`` via ``--max-poison-clients``. At the top of that range the prompt
+    plus ``max_new_tokens`` can approach ``rl.max_seq_len``, at which point generations
+    get truncated and the JSON the attacker emits stops parsing (which would show up as
+    a mysteriously ineffective attack rather than as a context error). Measure it rather
+    than let the user guess.
+    """
+    try:
+        ids = policy._prompt_ids(system, user)
+        n_prompt = int(ids.shape[1])
+        limit = int(getattr(policy, "max_seq_len", 0)) or None
+    except Exception:                       # a stub/inference generator: nothing to check
+        return
+    budget_msg = (f"attacker prompt = {n_prompt} tokens for a pool of {pool_size} "
+                  f"client(s), + up to {max_new_tokens} generated")
+    if limit is None:
+        logger.info(budget_msg)
+        return
+    needed = n_prompt + int(max_new_tokens)
+    logger.info(f"{budget_msg} = {needed}/{limit} of rl.max_seq_len")
+    if needed > limit:
+        logger.warning(
+            f"Attacker prompt + max_new_tokens ({needed}) EXCEEDS rl.max_seq_len "
+            f"({limit}). Generations will be cut short and the attack JSON will fail to "
+            f"parse. Raise rl.max_seq_len, lower rl.max_new_tokens, or reduce "
+            f"--max-poison-clients (the pool of {pool_size} is what makes the prompt big)."
+        )
+    elif needed > 0.9 * limit:
+        logger.warning(
+            f"Attacker prompt + max_new_tokens ({needed}) is within 10% of "
+            f"rl.max_seq_len ({limit}) — a longer plan may get truncated."
+        )
+
+
 def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
                   init_global, baseline_accuracy, n_rounds, *,
                   attack_temperature: float = 0.7, max_new_tokens: int = 512,
@@ -51,6 +89,8 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
         system = attacker_agent.system_prompt()
         user = attacker_agent.build_user_prompt(ctx.round_num, reference_acc,
                                                 ctx.pool_benign, env.global_weights, ctx.budget)
+        if r == 1:
+            _check_prompt_fits(policy, system, user, max_new_tokens, len(ctx.pool_benign))
         text = policy.generate(attacker_adapter, system, user, n=1,
                                temperature=attack_temperature, max_new_tokens=max_new_tokens)[0]
         poisoned, chosen_ids, _n_malformed = attacker_agent.select_and_apply(

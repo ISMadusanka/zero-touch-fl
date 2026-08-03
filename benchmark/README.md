@@ -36,7 +36,38 @@ python -m benchmark.run_benchmark --rounds 200 \
     --attack-temperature 0.7 --root-size 100 --eta 1.0 \
     --defl-delta 0.05 --defl-tau 2.5 --dnc-c 1.0 --dnc-sub-dim 10000 \
     --multikrum-m 4 --out logs/benchmark
+
+# sweep the adversary's size: 1 .. fl.n_clients (20) poisoners per round.
+# Evaluation is NOT limited to fl.n_compromisable (5) the way training is — the
+# controllable pool is widened to match the budget, so `10` really does give the
+# attacker 10 clients to work with (clients 0..9).
+for k in 1 3 5 10 15 20; do
+  python -m benchmark.run_benchmark --rounds 50 --max-poison-clients $k \
+      --out logs/benchmark/poisoners_$k
+done
 ```
+
+### `--max-poison-clients` (the eval poison budget)
+
+Valid range is **1 .. `fl.n_clients`** (20 by default). Two things to keep in mind:
+
+- It is a **ceiling, not a quota.** How many of its pool the attacker actually
+  recruits is part of its action, and it trained with `rl.reward.attacker.delta`
+  charging it for every extra client — so it may well use fewer. The report header
+  prints the realised count next to the budget (`Num of poisoners=10 budget, 3.0
+  used/round`), and each summary carries `mean_poisoned`.
+- **Past ~50% the defenses have no guarantee left.** Multi-Krum (needs `n ≥ 2f+3`),
+  DnC and DeFL all assume the adversary is a minority; at or above half the
+  federation, weak detection is the expected result rather than a defect. FLTrust is
+  the exception — its trust comes from the server's clean root set, not from the
+  client population. At `--max-poison-clients 20` there are no honest updates at all,
+  so FPR/precision are degenerate and only the accuracy columns mean anything. The
+  run warns about each of these thresholds as it starts.
+
+Going above `fl.n_compromisable` also means the policy is being evaluated outside the
+threat model it was fitted to (it trained against a 5-client foothold). That is a
+legitimate generalization test, and the run says so — raise `fl.n_compromisable` and
+retrain if you want it in-distribution.
 
 Output: a console table + `logs/benchmark/benchmark.{json,csv}` + per-round
 `history.json` + a 4-panel graph `benchmark.png` (accuracy per round, rolling

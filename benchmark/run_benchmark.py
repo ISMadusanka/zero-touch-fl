@@ -42,9 +42,12 @@ def _parse_args():
                     help="attacker sampling temperature (0 = greedy/deterministic)")
     ap.add_argument("--defender-temperature", type=float, default=0.0,
                     help="LLM-defender sampling temperature")
-    ap.add_argument("--max-poison-clients", type=int, default=None,
+    ap.add_argument("--max-poison-clients", type=int, default=None, metavar="N",
                     help="eval poison budget: max clients the attacker may poison per round "
-                         "(the attacker chooses WHICH of its pool). Default: attack.eval_poison_clients (=1)")
+                         "(the attacker chooses WHICH of its pool). Anything from 1 up to "
+                         "fl.n_clients (20) is allowed here — the controllable pool is widened "
+                         "to match, so this is NOT limited to fl.n_compromisable the way "
+                         "training is. Default: attack.eval_poison_clients (=1)")
     ap.add_argument("--root-size", type=int, default=100, help="FLTrust clean root-set size")
     ap.add_argument("--root-epochs", type=int, default=None,
                     help="FLTrust server local epochs R_l (default: defense.fltrust.root_epochs, "
@@ -100,6 +103,102 @@ def _build_root_loader(data_cfg, root_size, batch_size, seed):
     return build_root_loader(root_size=root_size, batch_size=batch_size,
                              data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
                              seed=seed)
+
+
+def _resolve_eval_budget(env, requested, log=None):
+    """Pin ``env`` to a fixed evaluation poison budget and return it.
+
+    The benchmark's ceiling is ``fl.n_clients``, **not** ``fl.n_compromisable``.
+    Training pins the attacker to a fixed insider pool (5 of 20 by default) because
+    that is the threat model it learns under. Evaluation is where you ask "how do these
+    defenses hold up as the adversary controls more of the federation?", which has to
+    go past that pool and up to every client. Clamping the eval budget to
+    ``n_compromisable`` made ``--max-poison-clients 10`` silently behave exactly like 5.
+
+    Raising the cap alone is not enough. The attacker may only pick from
+    ``env.pool_ids == range(n_compromisable)``, and ``AttackerAgent.select_and_apply``
+    clamps the budget to the pool size — so the pool is widened to match. That widening
+    mutates only THIS env instance, after ``reset()``: training reads
+    ``fl.n_compromisable`` from the config and is untouched.
+
+    Also switches off the per-round budget/target randomisation that training uses, so
+    every evaluated round faces the same requested budget and the same goal.
+
+    Note this sets the budget (the max the attacker MAY poison), not a quota: choosing
+    how many of its pool to actually recruit is part of the policy's action, and the
+    reward it trained under charged ``rl.reward.attacker.delta`` for each extra client.
+    The realised count per round is logged and reported as ``mean_poisoned``.
+    """
+    log = log or logging.getLogger("benchmark")
+    n_all = int(env.n_clients)
+    budget = max(1, min(int(requested), n_all))
+    if budget != int(requested):
+        log.warning(f"--max-poison-clients {requested} clamped to {budget} "
+                    f"(1..fl.n_clients={n_all} is the valid range)")
+
+    trained_pool = int(env.n_compromisable)
+    if budget > trained_pool:
+        env.n_compromisable = budget
+        log.warning(
+            f"Widening the attacker's controllable pool from {trained_pool} to {budget} "
+            f"client(s) for this evaluation (clients 0..{budget - 1}). The policy was "
+            f"TRAINED against a pool of {trained_pool}, so this measures "
+            f"out-of-distribution generalization to a larger insider foothold — "
+            f"informative, but not the setting it was fitted to. Raise "
+            f"fl.n_compromisable and retrain to make it in-distribution."
+        )
+
+    env.sample_budget = False       # eval never randomises the budget
+    env.budget_cap = budget
+    env.sample_target = False       # ...nor the goal
+    log.info(f"Eval poison budget = {budget} of pool {env.n_compromisable} "
+             f"(clients {list(range(env.n_compromisable))}); "
+             f"attacker selects which to poison")
+    _warn_about_adversary_share(budget, n_all, log)
+    return budget
+
+
+def _warn_about_adversary_share(budget, n_clients, log):
+    """Flag the thresholds where the benchmark's numbers change meaning.
+
+    Every robust aggregator in the panel assumes the adversary is a MINORITY:
+    Multi-Krum needs n >= 2f+3 for its resilience bound, DnC filters c*m spectral
+    outliers around an honest bulk, and DeFL's MOUD-Vote calls outliers relative to
+    the population. Once the poisoners are half or more of the federation, "the
+    honest majority" no longer exists and those algorithms have no guarantee left —
+    a low detection rate there is the expected result, not a defense bug. FLTrust is
+    the exception by design: its trust comes from a server-held clean root set rather
+    than from the client population, so it degrades gracefully instead of inverting.
+
+    Raising the budget that far is a legitimate experiment (it is the standard
+    "attack success vs fraction malicious" sweep) — it just has to be read with this
+    caveat, so we say it plainly rather than letting the table look like a defense
+    collapse at ordinary settings.
+    """
+    if n_clients <= 0:
+        return
+    share = budget / n_clients
+    if budget >= n_clients:
+        log.warning(
+            f"EVERY client is a poisoner ({budget}/{n_clients}). There are no honest "
+            f"updates and no true negatives, so FPR/precision are degenerate and "
+            f"detection numbers are not interpretable. Accuracy drop is the only "
+            f"meaningful column in this configuration."
+        )
+    elif share >= 0.5:
+        log.warning(
+            f"Poisoners are {budget}/{n_clients} ({share:.0%}) — NO honest majority. "
+            f"Multi-Krum/DnC/DeFL assume the adversary is a minority (Multi-Krum's "
+            f"bound needs n >= 2f+3), so their guarantees do not hold here and weak "
+            f"detection is the expected outcome rather than a defect. FLTrust is the "
+            f"exception: its trust is bootstrapped from the server's clean root set."
+        )
+    elif share > 1.0 / 3.0:
+        log.info(
+            f"Poisoners are {budget}/{n_clients} ({share:.0%}) — past the ~1/3 point "
+            f"where Byzantine-robust aggregators typically start to degrade. Expected, "
+            f"but worth noting when reading the table."
+        )
 
 
 def _resolve_llm_defender(names, adapter_paths, base_cfg, exists=None):
@@ -237,19 +336,9 @@ def main():
     env = FLArmsRaceEnv(base_cfg, client_loaders, test_loader, rng)
     env.reset(copy.deepcopy(global_weights), client_weights, baseline_accuracy)
 
-    # Evaluation uses a FIXED poison budget: the attacker chooses which <= budget of
-    # its controllable pool to poison each round. Default from config (=1); override
-    # with --max-poison-clients.
-    eval_budget = (args.max_poison_clients if args.max_poison_clients is not None
-                   else int(base_cfg.get("attack", {}).get("eval_poison_clients", 1)))
-    eval_budget = max(1, min(eval_budget, env.n_compromisable))
-    env.sample_budget = False
-    env.budget_cap = eval_budget
-    # Evaluation uses the FIXED attack goal above (no per-round target sampling), so the
-    # attacker is measured against one requested target for the whole run.
-    env.sample_target = False
-    log.info(f"Eval poison budget = {eval_budget} of pool {env.n_compromisable} "
-             f"(clients {list(range(env.n_compromisable))}); attacker selects which to poison")
+    requested_budget = (args.max_poison_clients if args.max_poison_clients is not None
+                        else int(base_cfg.get("attack", {}).get("eval_poison_clients", 1)))
+    eval_budget = _resolve_eval_budget(env, requested_budget)
 
     # Load the trained policy: the attacker adapter is always needed; the defender
     # adapter only if the LLM defender is in the panel.
@@ -323,8 +412,22 @@ def main():
     # DnC / Multi-Krum assume a known upper bound on #malicious; default it to the
     # eval poison budget (the max clients the attacker may actually poison), clamped
     # to a benign majority. This is an assumed adversary budget, NOT per-round truth.
+    #
+    # The clamp stays even when --max-poison-clients exceeds it: both algorithms are
+    # only defined for a minority adversary (Multi-Krum keeps m = n - f updates, so
+    # f >= n/2 would leave it averaging half the federation or fewer), so feeding them
+    # f = 12 of 20 does not make them stronger, it makes them ill-posed. They are
+    # deliberately given the strongest well-formed assumption instead, and the
+    # honest-majority warning above explains why detection falls off past that point.
     n_cl = int(fl["n_clients"])
     assumed_byz = max(1, min(eval_budget, (n_cl - 1) // 2))
+    if eval_budget > assumed_byz:
+        log.info(
+            f"DnC/Multi-Krum assumed_byzantine capped at {assumed_byz} (of {n_cl}) while "
+            f"{eval_budget} clients are actually poisoned — those algorithms are only "
+            f"defined for a minority adversary. Override with --dnc-num-byzantine / "
+            f"--multikrum-f."
+        )
     dnc_m = args.dnc_num_byzantine if args.dnc_num_byzantine is not None else assumed_byz
     mk_f = args.multikrum_f if args.multikrum_f is not None else assumed_byz
 

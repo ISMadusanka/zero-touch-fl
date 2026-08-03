@@ -52,12 +52,24 @@ def render(summaries: list[dict], n_rounds: int, baseline_accuracy: float,
            out_dir: str | None = None, goal: dict | None = None,
            n_poisoners: int | None = None) -> str:
     goal_s = _goal_str(goal)
-    # ``n_poisoners`` = the per-round poison budget (max clients the attacker may
-    # poison each round; it chooses which/how many up to this). Shown in the header.
+    # ``n_poisoners`` = the per-round poison BUDGET (max clients the attacker may poison
+    # each round; it chooses which/how many up to this). The realised count is shown
+    # next to it — identical across defenses, since one attack is fed to all of them —
+    # so a budget of 10 is never read as "10 clients were poisoned" when the attacker
+    # chose fewer.
+    used = None
+    if summaries:
+        used = summaries[0].get("mean_poisoned")
+    poisoner_s = ""
+    if n_poisoners is not None:
+        poisoner_s = f", Num of poisoners={n_poisoners}"
+        if used is not None:
+            poisoner_s += (" (all used)" if abs(used - n_poisoners) < 0.05
+                           else f" budget, {used:.1f} used/round")
     title = (f"DEFENSE BENCHMARK — {n_rounds} attack rounds  "
              f"(clean baseline acc = {baseline_accuracy:.3f}"
              f"{f'; goal = {goal_s}' if goal_s else ''})"
-             f"{f', Num of poisoners={n_poisoners}' if n_poisoners is not None else ''}")
+             f"{poisoner_s}")
     bar = "=" * len(title)
     text = f"{bar}\n{title}\n{bar}\n{format_table(summaries)}\n"
     # Threshold acc at/below which the attack's degradation goal counts as met.

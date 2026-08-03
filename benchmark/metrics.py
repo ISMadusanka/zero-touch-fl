@@ -78,6 +78,12 @@ class DefenseMetrics:
             "defense": self.name,
             "rounds": self.rounds,
             "malicious_total": self.tp + self.fn,     # poisoned-client instances seen
+            # Mean clients actually poisoned per round. The eval budget
+            # (--max-poison-clients) is a CEILING, not a quota: how many of its pool the
+            # attacker recruits is part of its action, and it was trained with
+            # rl.reward.attacker.delta charging it for each extra client. Report the
+            # realised count so "budget 10" is never mistaken for "10 were poisoned".
+            "mean_poisoned": _safe_div(self.tp + self.fn, self.rounds),
             "detected": self.tp,                      # of those, how many were caught
             "detection_rate": tpr,                    # = recall = "how much of the attack detected"
             "tpr": tpr,

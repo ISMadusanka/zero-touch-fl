@@ -10,7 +10,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.types import DetectionVerdict          # noqa: E402
 from benchmark.metrics import DefenseMetrics      # noqa: E402
 from benchmark import report                      # noqa: E402
-from benchmark.run_benchmark import _resolve_llm_defender   # noqa: E402
+from benchmark.run_benchmark import (                       # noqa: E402
+    _resolve_eval_budget, _resolve_llm_defender,
+)
 
 
 def _verdicts(flagged_ids, all_ids):
@@ -201,6 +203,128 @@ def test_missing_defense_config_defaults_to_algorithmic():
     """An older config with no `defense:` block must still resolve, not KeyError."""
     names, skipped = _resolve_llm_defender(_FULL_PANEL, _PATHS, {}, exists=lambda p: False)
     assert skipped is True and "llm_defender" not in names
+
+
+# --- eval poison budget: settable up to n_clients, pool widened to match -----
+
+class _FakeEnv:
+    """Just the attributes the benchmark's budget/pool resolution touches."""
+
+    def __init__(self, n_clients=20, n_compromisable=5):
+        self.n_clients = n_clients
+        self.n_compromisable = n_compromisable
+        self.budget_cap = 1
+        self.sample_budget = True
+        self.sample_target = True
+
+    def pool_ids(self):
+        return list(range(self.n_compromisable))
+
+
+# The real resolution used by the benchmark — not a re-implementation, so these
+# tests cannot drift away from what actually runs.
+_resolve_budget = _resolve_eval_budget
+
+
+def test_eval_budget_can_exceed_the_trained_pool_up_to_n_clients():
+    """The reported bug: --max-poison-clients was clamped to fl.n_compromisable (5),
+    so asking for 10 silently behaved exactly like 5."""
+    env = _FakeEnv(n_clients=20, n_compromisable=5)
+    assert _resolve_budget(env, 10) == 10
+    assert env.budget_cap == 10
+    # Raising the cap is useless unless the POOL grows too: the attacker may only
+    # choose from range(n_compromisable), and select_and_apply clamps to the pool size.
+    assert env.n_compromisable == 10
+    assert env.pool_ids() == list(range(10))
+    assert env.sample_budget is False       # eval never randomises the budget
+
+
+def test_eval_budget_reaches_every_client():
+    env = _FakeEnv(n_clients=20, n_compromisable=5)
+    assert _resolve_budget(env, 20) == 20
+    assert env.n_compromisable == 20 and env.pool_ids() == list(range(20))
+
+
+def test_eval_budget_is_capped_at_n_clients():
+    env = _FakeEnv(n_clients=20, n_compromisable=5)
+    assert _resolve_budget(env, 999) == 20     # cannot poison more clients than exist
+    assert _resolve_budget(_FakeEnv(), 0) == 1  # ...and at least one
+    assert _resolve_budget(_FakeEnv(), -5) == 1
+
+
+def test_small_eval_budget_leaves_the_pool_alone():
+    """Asking for fewer than the trained pool must NOT shrink it — the attacker still
+    chooses which of its 5 insiders to use."""
+    env = _FakeEnv(n_clients=20, n_compromisable=5)
+    assert _resolve_budget(env, 2) == 2
+    assert env.n_compromisable == 5 and env.budget_cap == 2
+
+
+def test_attacker_can_actually_select_ten_of_twenty():
+    """End-to-end on the parsing path: with a widened pool the agent really does return
+    10 poisoned clients, rather than being truncated to the old pool of 5."""
+    import torch
+    from agents.attacker_agent import AttackerAgent
+
+    env = _FakeEnv(n_clients=20, n_compromisable=5)
+    budget = _resolve_budget(env, 10)
+    pool = {cid: {"w": torch.ones(4)} for cid in env.pool_ids()}
+    assert len(pool) == 10
+
+    plan = {"clients": [{"id": cid, "operations": [{"op": "scale", "target": "all",
+                                                    "factor": 1.5 + 0.1 * cid}]}
+                        for cid in range(10)]}
+    poisoned, chosen, n_malformed = AttackerAgent().select_and_apply(
+        __import__("json").dumps(plan), pool, budget)
+    assert chosen == list(range(10)), chosen
+    assert len(poisoned) == 10 and n_malformed == 0
+    # Every chosen client's weights really changed (not silently a no-op).
+    assert all(not torch.equal(poisoned[c]["w"], pool[c]["w"]) for c in chosen)
+
+
+def test_selection_is_still_truncated_to_the_budget():
+    """Widening the pool must not let the attacker exceed the budget it was given."""
+    import json
+
+    import torch
+    from agents.attacker_agent import AttackerAgent
+
+    env = _FakeEnv(n_clients=20, n_compromisable=5)
+    budget = _resolve_budget(env, 10)
+    pool = {cid: {"w": torch.ones(3)} for cid in env.pool_ids()}
+    plan = {"clients": [{"id": cid, "operations": [{"op": "scale", "target": "all",
+                                                    "factor": 2.0}]}
+                        for cid in range(10)]}
+    plan["clients"] += [{"id": 0, "operations": [{"op": "scale", "target": "all",
+                                                  "factor": 3.0}]}]      # duplicate
+    _p, chosen, _m = AttackerAgent().select_and_apply(json.dumps(plan), pool, budget)
+    assert len(chosen) == budget == 10
+    assert len(set(chosen)) == len(chosen)          # deduped
+
+
+def test_honest_majority_warnings_fire_at_the_right_thresholds():
+    import io
+    import logging
+
+    from benchmark.run_benchmark import _warn_about_adversary_share
+
+    def _capture(budget, n):
+        buf = io.StringIO()
+        h = logging.StreamHandler(buf)
+        log = logging.getLogger("bench-share-test")
+        log.setLevel(logging.INFO)
+        log.addHandler(h)
+        try:
+            _warn_about_adversary_share(budget, n, log)
+            return buf.getvalue()
+        finally:
+            log.removeHandler(h)
+
+    assert _capture(5, 20) == ""                          # 25%: nothing to say
+    assert "1/3 point" in _capture(8, 20)                 # 40%: informational
+    assert "NO honest majority" in _capture(10, 20)       # 50%: guarantees void
+    assert "EVERY client is a poisoner" in _capture(20, 20)
+    assert _capture(1, 0) == ""                           # degenerate, no crash
 
 
 def _run():
