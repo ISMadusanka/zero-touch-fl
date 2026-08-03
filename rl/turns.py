@@ -14,6 +14,14 @@ Generators are duck-typed: any object with
 ``generate(system, user, n, temperature) -> list[str]`` works — a
 ``PolicyGenerator`` (trainable LoRA adapter) during RL, or an
 ``InferenceGenerator`` (frozen Ollama/OpenAI) during --dry-run.
+
+The attacker's opponent is whatever defends the round. With the defender LLM
+disabled (``defense.mode: algorithmic``) that is ``env.defense`` — one published
+algorithm per round — and ``DefenderTurn`` is never constructed because there is
+no defender policy left to train. ``AttackerTurn`` handles both cases: the
+algorithmic defense also produces the round's aggregate, so its post-round
+accuracy comes from ``env.evaluate_state`` / ``env.commit_state`` rather than
+from FedAvg over the un-flagged clients.
 """
 
 import logging
@@ -25,9 +33,16 @@ logger = logging.getLogger(__name__)
 
 
 class AttackerTurn:
-    """Learning agent = attacker. Opponent = frozen defender (greedy)."""
+    """Learning agent = attacker. Opponent = the server-side defense.
 
-    def __init__(self, env, attacker_agent, defender_agent, defender_gen,
+    The defense is either the frozen defender LLM (``defender_gen``) or, when the
+    defender LLM is disabled, ``env.defense`` — the round's algorithm. The two
+    opponent-temperature knobs apply only to the LLM path; an algorithm is
+    deterministic given the updates, so scoring and committing see the same
+    defense either way.
+    """
+
+    def __init__(self, env, attacker_agent, defender_agent, defender_gen=None,
                  reward_cfg: dict | None = None, opponent_temperature: float = 0.0,
                  scoring_opponent_temperature: float | None = None):
         self.env = env
@@ -36,6 +51,13 @@ class AttackerTurn:
         self.defender_gen = defender_gen
         self.reward_cfg = reward_cfg or {}
         self.opp_temp = opponent_temperature
+        # Who defends: the round's algorithm, or the frozen defender LLM.
+        self.algorithmic = getattr(env, "defense", None) is not None
+        if not self.algorithmic and defender_gen is None:
+            raise ValueError(
+                "AttackerTurn needs a defender generator when the defender LLM "
+                "defends (defense.mode: llm) — none was supplied"
+            )
         # When SCORING the G candidate plans we sample the frozen defender at a
         # (usually nonzero) temperature so different plans see different verdicts
         # — this restores within-group reward spread and is the key fix for the
@@ -82,19 +104,30 @@ class AttackerTurn:
                         temperature=temperature)
         return verdicts
 
-    def _apply(self, attacker_text, temperature):
+    def _defend(self, updates, temperature, commit):
+        """Run the round's defense. Returns ``(verdicts, state)`` where ``state``
+        is the defense's own aggregate (algorithmic path) or ``None`` — meaning
+        "aggregate with FedAvg over the un-flagged clients" (LLM path)."""
+        if self.algorithmic:
+            verdicts, state = self.env.defend(updates, commit=commit)
+            dbg.algo_defense(self.env.round_defense, verdicts, commit=commit)
+            return verdicts, state
+        return self._defender_verdicts(updates, temperature), None
+
+    def _apply(self, attacker_text, temperature, commit=False):
         poisoned, chosen_ids, n_malformed = self.attacker_agent.select_and_apply(
             attacker_text, self.pool_references, self.budget
         )
         updates = self.env.build_updates(poisoned)
-        verdicts = self._defender_verdicts(updates, temperature)
-        return updates, verdicts, n_malformed, chosen_ids, poisoned
+        verdicts, state = self._defend(updates, temperature, commit)
+        return updates, verdicts, state, n_malformed, chosen_ids, poisoned
 
     def reward(self, attacker_text) -> float:
         dbg.scoring_rollout(attacker_text)
-        updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
-            attacker_text, self.scoring_opp_temp)
-        post_acc = self.env.evaluate_updates(updates, verdicts)
+        updates, verdicts, state, n_malformed, chosen_ids, poisoned = self._apply(
+            attacker_text, self.scoring_opp_temp, commit=False)
+        post_acc = (self.env.evaluate_state(state) if self.algorithmic
+                    else self.env.evaluate_updates(updates, verdicts))
         diversity = perturbation_diversity(
             poisoned, {cid: self.pool_references[cid] for cid in chosen_ids})
         r = attacker_reward(
@@ -114,10 +147,11 @@ class AttackerTurn:
 
     def commit(self, attacker_text) -> dict:
         dbg.committing()
-        updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
-            attacker_text, self.opp_temp)
+        updates, verdicts, state, n_malformed, chosen_ids, poisoned = self._apply(
+            attacker_text, self.opp_temp, commit=True)
         self.env.set_committed_poison(chosen_ids)
-        new_acc = self.env.commit(updates, verdicts)
+        new_acc = (self.env.commit_state(state) if self.algorithmic
+                   else self.env.commit(updates, verdicts))
         return {
             "updates": updates,
             "verdicts": verdicts,
@@ -125,6 +159,7 @@ class AttackerTurn:
             "post_accuracy": new_acc,
             "poisoned_ids": chosen_ids,
             "poisoned_by_client": poisoned,
+            "defense_algorithm": self.env.round_defense,
         }
 
 
@@ -137,6 +172,12 @@ class DefenderTurn:
 
     def __init__(self, env, attacker_agent, defender_agent, attacker_gen,
                  reward_cfg: dict | None = None, opponent_temperature: float = 0.0):
+        if getattr(env, "defense", None) is not None:
+            raise RuntimeError(
+                "DefenderTurn requires the defender LLM, but this run defends with "
+                "algorithms (defense.mode: algorithmic) — there is no defender "
+                "policy to train. Set defense.mode: llm to re-enable it."
+            )
         self.env = env
         self.attacker_agent = attacker_agent
         self.defender_agent = defender_agent

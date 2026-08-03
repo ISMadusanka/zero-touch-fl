@@ -5,6 +5,10 @@
 ``run_inference`` runs the full round loop end-to-end without any weight
 updates — the cheapest way to validate the plumbing (prompt building, attack-plan
 parse + apply, feature extraction, FedAvg, reward computation) on a CPU box.
+
+When the defender LLM is disabled (``defense.mode: algorithmic``) the defense
+side is ``env.defense`` — one published algorithm per round — so only the
+attacker calls the LLM here.
 """
 
 import logging
@@ -56,16 +60,21 @@ def run_inference(
         env.set_committed_poison(chosen_ids)
         updates = env.build_updates(poisoned)
 
-        # Defender classifies every client from the feature vectors.
-        feats = env.features(updates)
-        client_ids = [u.client_id for u in updates]
-        d_sys = defender_agent.system_prompt()
-        d_user = defender_agent.build_user_prompt(feats)
-        d_text = generator.generate(d_sys, d_user, n=1, temperature=temperature)[0]
-        verdicts = defender_agent.parse(d_text, client_ids)
-
+        # Defense: either this round's algorithm (defender LLM disabled — it also
+        # produces the aggregate) or the defender LLM classifying every client
+        # from the feature vectors, with FedAvg over the un-flagged.
         prev_acc = ctx.global_accuracy
-        new_acc = env.commit(updates, verdicts)
+        if env.defense is not None:
+            verdicts, state = env.defend(updates, commit=True)
+            new_acc = env.commit_state(state)
+        else:
+            feats = env.features(updates)
+            client_ids = [u.client_id for u in updates]
+            d_sys = defender_agent.system_prompt()
+            d_user = defender_agent.build_user_prompt(feats)
+            d_text = generator.generate(d_sys, d_user, n=1, temperature=temperature)[0]
+            verdicts = defender_agent.parse(d_text, client_ids)
+            new_acc = env.commit(updates, verdicts)
 
         diversity = perturbation_diversity(
             poisoned, {cid: ctx.pool_benign[cid] for cid in chosen_ids})
@@ -93,11 +102,13 @@ def run_inference(
             learning_agent="none",
             attack_metadata={"n_malformed": n_malformed, "budget": ctx.budget,
                              "n_used": len(chosen_ids),
+                             "defense": env.round_defense or "llm",
                              "clean_accuracy": round(float(ctx.clean_accuracy), 6),
                              "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6)},
         ))
         logger.info(
             f"[dry-run] round {ctx.round_num}: poisoned={chosen_ids} budget={ctx.budget} "
+            f"def={env.round_defense or 'llm'} "
             f"acc {prev_acc:.4f}->{new_acc:.4f} "
             f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - new_acc:+.4f}) "
             f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} malformed={n_malformed}"

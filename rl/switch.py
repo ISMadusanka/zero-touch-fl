@@ -23,9 +23,12 @@ without a GPU. It consumes only plain numbers and ``DetectionVerdict``-like
 objects (anything exposing ``.client_id`` and ``.is_suspicious``).
 """
 
+import logging
 from dataclasses import dataclass
 
 from rl.rewards import goal_target
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -125,11 +128,25 @@ class PhaseController:
     Call :meth:`record` once per *committed* round with whether the learner won.
     It returns ``(switch, reason)``: when ``switch`` is True the driver should
     snapshot+freeze the current learner, then call :meth:`next_phase(reason)`.
+
+    ``learners`` is the rotation of TRAINABLE agents. It is both roles by default;
+    when the defender LLM is disabled (the defense is algorithmic, so there is no
+    defender policy) the driver passes ``("attacker",)`` and every phase is an
+    attacker phase — the phase boundary still fires on a sustained win or the cap,
+    which is what triggers the between-phase honest FL interlude.
     """
 
-    def __init__(self, cfg: SwitchConfig, first_learner: str = "attacker"):
-        if first_learner not in ("attacker", "defender"):
-            raise ValueError(f"first_learner must be attacker|defender, got {first_learner!r}")
+    def __init__(self, cfg: SwitchConfig, first_learner: str = "attacker",
+                 learners: tuple = ("attacker", "defender")):
+        self.learners = tuple(learners)
+        if not self.learners:
+            raise ValueError("learners must contain at least one agent")
+        bad = [n for n in self.learners if n not in ("attacker", "defender")]
+        if bad:
+            raise ValueError(f"learners must be attacker|defender, got {bad}")
+        if first_learner not in self.learners:
+            raise ValueError(f"first_learner must be one of {self.learners}, "
+                             f"got {first_learner!r}")
         self.cfg = cfg
         self.learner = first_learner
         self.phase_index = 0
@@ -152,6 +169,15 @@ class PhaseController:
         learner = state.get("learner", self.learner)
         if learner not in ("attacker", "defender"):
             raise ValueError(f"controller learner must be attacker|defender, got {learner!r}")
+        if learner not in self.learners:
+            # Resuming a checkpoint written when the other side was still trainable
+            # (e.g. the defender LLM has since been disabled). Fall back to this
+            # run's rotation instead of resuming into a phase that cannot run.
+            logger.warning(
+                f"Resumed controller says learner={learner!r}, but only {self.learners} "
+                f"is trainable in this run — continuing as {self.learners[0]!r}."
+            )
+            learner = self.learners[0]
         self.learner = learner
         self.phase_index = int(state.get("phase_index", self.phase_index))
         self.phase_round = int(state.get("phase_round", self.phase_round))
@@ -160,6 +186,9 @@ class PhaseController:
 
     @property
     def opponent(self) -> str:
+        """The frozen side of this phase. With a single trainable learner the
+        opponent is not an agent at all (it is the fixed algorithmic defense) —
+        the name is then only a label for logs."""
         return "defender" if self.learner == "attacker" else "attacker"
 
     def record(self, success: bool) -> tuple[bool, str | None]:
@@ -173,11 +202,14 @@ class PhaseController:
         return False, None
 
     def next_phase(self, reason: str) -> None:
-        """Advance to the opponent's phase. ``reason`` is the switch reason of the
-        phase just completed; ``capped`` flags that the NEXT phase may want to
-        face an earlier opponent snapshot (curriculum) because this one stalled."""
+        """Advance to the next learner in the rotation. ``reason`` is the switch
+        reason of the phase just completed; ``capped`` flags that the NEXT phase
+        may want to face an earlier opponent snapshot (curriculum) because this
+        one stalled. With a single trainable learner the rotation is a no-op and
+        the same agent simply starts a fresh phase."""
         self.capped = (reason == "cap")
-        self.learner = self.opponent
+        i = self.learners.index(self.learner)
+        self.learner = self.learners[(i + 1) % len(self.learners)]
         self.phase_index += 1
         self.phase_round = 0
         self.streak = 0

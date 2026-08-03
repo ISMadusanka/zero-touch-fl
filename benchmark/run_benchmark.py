@@ -94,13 +94,10 @@ def _parse_goal(spec: str) -> dict:
 
 
 def _build_root_loader(data_cfg, root_size, batch_size, seed):
-    import torch
-    from torch.utils.data import DataLoader, Subset
-    from data.mnist_loader import load_mnist
-    train_ds, _ = load_mnist(data_cfg.get("data_dir", "./data/mnist_raw"))
-    g = torch.Generator().manual_seed(seed)
-    idx = torch.randperm(len(train_ds), generator=g)[:root_size].tolist()
-    return DataLoader(Subset(train_ds, idx), batch_size=min(batch_size, root_size), shuffle=True)
+    from data.mnist_loader import build_root_loader
+    return build_root_loader(root_size=root_size, batch_size=batch_size,
+                             data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
+                             seed=seed)
 
 
 def main():

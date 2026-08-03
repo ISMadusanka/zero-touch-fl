@@ -14,7 +14,8 @@ checkpoint layout. It supersedes the old feedback/episodic-memory design.
 | Server | `server/fed_server.py`, `server/aggregation.py` | Global model + eval; FedAvg over non-flagged clients. |
 | Features | `detector/features.py` | Per-client, per-layer statistical feature vectors (no decisions). |
 | Attacker | `agents/attacker_agent.py` + `agents/attack_ops.py` | Prompt (layer stats) + parse/apply of an attack plan (operator DSL). |
-| Defender | `agents/defender_agent.py` | Prompt + parse of per-client benign/malicious labels. |
+| Defender (default) | `server/algo_defender.py` | **Active defense.** Rotating pool of published algorithms (FLTrust / DeFL / DnC / Multi-Krum from `benchmark/defenses/`); one drawn per round, producing both the verdicts and the aggregate. |
+| Defender (LLM) | `agents/defender_agent.py` | Prompt + parse of per-client benign/malicious labels. **Disabled** unless `defense.mode: llm`. |
 | RL | `rl/*` | Environment, rewards, turns, GRPO, schedule, policy, baseline, inference. |
 | Metrics | `metrics/*` | Ground-truth confusion/TPR/FPR/ASR/APR (research + reward source). |
 
@@ -26,19 +27,24 @@ the realized updates.
 ```
 reset env from Phase-1 checkpoint (per-client benign weights, global, baseline acc)
 for each round:
-  1. honest updates for all N clients             # retrain from global, or replay Phase-1 weights
+  0. DRAW this round's defense algorithm            # algorithmic mode; fixed for the whole round
+  1. honest updates for all N clients               # retrain from global, or replay Phase-1 weights
   2. expose the attacker's controllable pool [0..n_compromisable) + a poison budget b
      (b = randint(1, max_poison_clients) in training; fixed = eval budget at eval time)
   3. ATTACKER LLM → SELECT <= b clients from the pool + a per-client attack plan
      (input: round, controllable_client_ids, max_poison_clients, per-client LAYER STATS, acc, goal)
      → apply_plan(benign_i, plan_i) → poisoned weights for the CHOSEN clients
   4. build full update list (poisoned ∪ honest)
-  5. detector/features → per-client per-layer stat vectors
-  6. DEFENDER LLM → benign/malicious label + confidence per client   (input: features ONLY)
-  7. FedAvg over clients labelled benign → new global (None if all flagged → keep prev)
-  8. evaluate global accuracy
-  9. attacker_reward + defender_reward (ground truth = the CHOSEN poisoned set)  ← train-time only
- 10. GRPO update for the learning agent; write round log + metrics
+  5. DEFEND:
+     algorithmic (default) — env.defend(): the round's algorithm emits per-client
+       verdicts AND its own aggregate (FLTrust trust-weighting, DeFL Beta+CLP,
+       DnC/Multi-Krum filtered mean) → new global (None → keep prev)
+     llm — detector/features → per-client stat vectors → DEFENDER LLM emits a
+       benign/malicious label + confidence per client (input: features ONLY),
+       then FedAvg over the clients labelled benign
+  6. evaluate global accuracy
+  7. attacker_reward + defender_reward (ground truth = the CHOSEN poisoned set)  ← train-time only
+  8. GRPO update for the learning agent; write round log + metrics
 ```
 
 The attacker may poison at most `min(max_poison_clients, n_compromisable)` of its
@@ -54,6 +60,37 @@ for all clients, no attacker/detector — the refreshed client weights + global 
 kept), and the defender trains (attacker frozen) until it wins 3 in a row, then
 another benign FL round runs, and so on. Every GRPO phase after the first starts
 from a freshly advanced client state (see "Between-phase benign FL round" below).
+With the defender LLM disabled there is no defender phase: every phase is an
+attacker phase, still bounded by the same win-streak / cap gate, so the benign FL
+interlude keeps firing between them.
+
+## Defense (`defense.mode`, `server/algo_defender.py`)
+
+The shipped config is **`defense.mode: algorithmic`** — the defender LLM is off.
+`AlgorithmicDefender` holds the pool named by `defense.algorithms` (default
+`fltrust, defl, dnc, multikrum`, the same classes the benchmark panel uses) and
+`choose()`s one per round from a dedicated RNG, so the draw never shifts the
+env's poison / budget / target sampling.
+
+- **Fixed for the round.** Drawn in `env.begin_round()`, so the clean
+  counterfactual, all `G` scored rollouts and the commit face the same defense —
+  GRPO advantages stay meaningful.
+- **Verdicts + aggregate together.** `env.defend(updates, commit=)` returns both;
+  `env.evaluate_state` / `env.commit_state` consume the state. The verdicts are
+  what `defender_reward`, the metrics tracker and the attacker's evasion term see.
+  For the derived-flag defenses (FLTrust trust ≤ 0, DnC/Multi-Krum "dropped",
+  DeFL MOUD-Vote) read `induced_drop` as the primary signal and TPR/FPR loosely —
+  same caveat as `benchmark/README.md`.
+- **Scoring is side-effect free.** `commit=False` snapshots and restores the
+  algorithm's cross-round state (`Defense.state_snapshot` / `state_restore`:
+  DeFL's Beta counts + `S(t-1)`, DnC's subsampling RNG).
+- **Attacker-only training.** `rl/schedule.py` builds one optimizer, keeps the
+  `PhaseController` on `learners=("attacker",)`, skips league/curriculum opponent
+  swaps, and never writes `checkpoints/defender_adapter/`. `main.py` doesn't even
+  create the defender LoRA adapter. Set `defense.mode: llm` to restore the
+  two-sided race — the defender adapter resumes untouched.
+- Each round log carries `attack_metadata.defense` (the algorithm name, or
+  `"llm"`); rounds are only comparable within one defense.
 
 ## Attacker contract (client selection + attack-plan DSL)
 
@@ -96,7 +133,7 @@ from a freshly advanced client state (see "Between-phase benign FL round" below)
   poisoned made the ASR metric report 100% success for an attack that did nothing
   and trained the defender to flag undetectable clients.
 
-## Defender contract (classification)
+## Defender-LLM contract (classification) — only under `defense.mode: llm`
 
 - **Input** (`agents/defender_agent.build_user_prompt`): per-client features
   from `detector/features.compute_client_features` — **only** features, never the
@@ -171,7 +208,10 @@ Both continuous, so GRPO group advantages don't collapse.
   `disable_adapter` exposes the base as the KL reference.
 - **`rl/schedule.py`**: freeze-and-alternate — train attacker `K_a` rounds
   (defender frozen, greedy), then defender `K_d` rounds (attacker frozen,
-  greedy), repeat. The best-scoring sampled action is committed to advance the
+  greedy), repeat. **With the algorithmic defense the rotation is attacker-only**
+  (`learners=("attacker",)`): one optimizer, no opponent generator, no league
+  swaps, and the defender adapter is neither loaded nor saved.
+  The best-scoring sampled action is committed to advance the
   env. An **opponent league** snapshots adapters periodically and, with
   probability `league_prob`, makes a phase face a random past snapshot. The league
   is a **bounded ring buffer** (`league_max_snapshots`, default 10, oldest
@@ -202,6 +242,12 @@ Both continuous, so GRPO group advantages don't collapse.
 | Train | *(default)* | `rl/policy.py` + `rl/schedule.py` (GRPO) | yes |
 | Dry-run | `--dry-run` | `rl/inference.py` (frozen Ollama/OpenAI), full loop, no updates | no |
 | Baseline | `--baseline` | `rl/baseline.py` best-of-N fixed actions, no LLM | no |
+
+All three run against whichever defense `defense.mode` selects. Under
+`algorithmic` the defender LLM is never called, so `--dry-run` makes one LLM call
+per round (the attacker) instead of two, and `--baseline` scores its fixed
+actions against the round's real algorithm rather than the built-in norm
+heuristic (which is only used under `defense.mode: llm`).
 
 All three honour `--rounds N` (an absolute budget overriding `fl.simulation_rounds`)
 and `--config <path>`. `--debug` without `--rounds` caps how many rounds **this
@@ -242,8 +288,9 @@ legacy `round_NNN.json` files, so logs from older runs still load.
   `poisoned_client_ids`, `predicted_labels`, accuracies, `attacker_reward`,
   `defender_reward`, `learning_agent`, and an `attack_metadata` block with
   `clean_accuracy` / `induced_drop` (the counterfactual and the damage the reward
-  actually uses), `n_malformed`, `budget`, `n_used`, plus a `train` sub-block
-  (loss, mean reward, zero-advantage fraction).
+  actually uses), `n_malformed`, `budget`, `n_used`, `defense` (which algorithm
+  faced the round, or `"llm"` — rounds are only comparable within one defense),
+  plus a `train` sub-block (loss, mean reward, zero-advantage fraction).
 - `logs/metrics/rounds.jsonl` + `summary.json` — ground-truth confusion / TPR /
   FPR / ASR / APR. `summary.json`'s `aggregate` covers every round; its
   `per_round` block is the retained tail (`MetricsTracker.keep_rounds`, default

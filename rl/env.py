@@ -55,7 +55,18 @@ class RoundContext:
 
 
 class FLArmsRaceEnv:
-    def __init__(self, config: dict, client_loaders, test_loader, rng):
+    def __init__(self, config: dict, client_loaders, test_loader, rng, defense=None):
+        """``defense`` is an optional :class:`server.algo_defender.AlgorithmicDefender`.
+
+        When present the defender LLM is disabled and the server side of every
+        round is run by one published defense algorithm, drawn per round in
+        :meth:`begin_round` and used for the clean counterfactual, every scored
+        rollout and the commit. That algorithm also produces the round's
+        AGGREGATE (FLTrust re-weights and rescales, DeFL Beta-weights, ...), so
+        callers use :meth:`defend` + :meth:`evaluate_state` / :meth:`commit_state`
+        instead of the verdict-driven :meth:`evaluate_updates` / :meth:`commit`.
+        ``defense=None`` keeps the original FedAvg-over-unflagged path.
+        """
         fl = config["fl"]
         attack = config.get("attack", {})
         self.n_clients = int(fl["n_clients"])
@@ -86,6 +97,8 @@ class FLArmsRaceEnv:
         self.rng = rng
         self.aggregator = FedAvgAggregator()
         self.server = FedServer(device=self.device)
+        # Algorithmic (non-LLM) defense, or None when the defender LLM defends.
+        self.defense = defense
 
         # Benign clients (used only when benign_retrain is True).
         self._clients = [
@@ -113,6 +126,7 @@ class FLArmsRaceEnv:
         self.round_goal: dict = dict(self.goal)           # this round's (maybe sampled) goal
         self.poisoned_ids: list[int] = []                 # attacker's committed choice
         self._clean_ref_acc: float | None = None          # cached per-round clean counterfactual
+        self.round_defense: str | None = None             # this round's defense algorithm (if any)
 
     # ------------------------------------------------------------------
     def reset(self, global_weights, client_weights, baseline_accuracy):
@@ -198,11 +212,16 @@ class FLArmsRaceEnv:
         self.round_goal = self._round_goal()
         self.poisoned_ids = []                            # attacker decides at commit
         self._clean_ref_acc = None                        # recomputed lazily for this round
+        # Draw this round's defense BEFORE anything is scored (the clean
+        # counterfactual below already goes through it), so the counterfactual,
+        # every rollout and the commit all face the SAME algorithm.
+        self.round_defense = self.defense.choose() if self.defense is not None else None
 
         clean_acc = self.clean_reference_accuracy()
         logger.info(
             f"Round {round_num}: controllable_pool={self.pool_ids} "
             f"budget={self.round_budget} goal={self.round_goal} "
+            f"defense={self.round_defense or 'llm'} "
             f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_acc:.4f})"
         )
         return RoundContext(
@@ -236,11 +255,21 @@ class FLArmsRaceEnv:
 
         Computed lazily and cached for the round (one extra test-set evaluation
         per round, against the G+1 the attacker's rollouts already cost).
+
+        With an algorithmic defense the unpoisoned updates are run through THIS
+        round's algorithm too (without committing its state), so the reference is
+        "what the defended aggregate scores with no poison" — the drop then
+        isolates the attack rather than the defense's own cost in honest rounds.
         """
         if self._clean_ref_acc is None:
             updates = self.build_updates({})
-            clean = [DetectionVerdict(u.client_id, False, 0.0, "clean_ref") for u in updates]
-            self._clean_ref_acc = self._eval_state(self.aggregator.aggregate(updates, clean))
+            if self.defense is not None:
+                _verdicts, state = self.defend(updates, commit=False)
+            else:
+                clean = [DetectionVerdict(u.client_id, False, 0.0, "clean_ref")
+                         for u in updates]
+                state = self.aggregator.aggregate(updates, clean)
+            self._clean_ref_acc = self._eval_state(state)
         return self._clean_ref_acc
 
     def set_committed_poison(self, chosen_ids) -> None:
@@ -285,12 +314,47 @@ class FLArmsRaceEnv:
 
     def commit(self, updates, verdicts) -> float:
         """Aggregate, update the global model, and advance the round."""
-        candidate = self.aggregator.aggregate(updates, verdicts)
-        if candidate is not None:
-            self.server.set_global_weights(candidate)
+        return self.commit_state(self.aggregator.aggregate(updates, verdicts))
+
+    # ------------------------------------------------------------------
+    # Algorithmic-defense path (defender LLM disabled)
+    # ------------------------------------------------------------------
+    def defend(self, updates, *, commit: bool = False):
+        """Run THIS round's defense algorithm over ``updates``.
+
+        Returns ``(verdicts, aggregated_state)``. Unlike the FedAvg path the
+        algorithm emits BOTH — its verdicts and its own aggregate — so the two
+        must come from the same call; the caller passes the state to
+        :meth:`evaluate_state` (scoring) or :meth:`commit_state` (committing).
+        ``aggregated_state`` is ``None`` when the defense declined to update the
+        global (e.g. every client removed).
+
+        ``commit=False`` rolls back the algorithm's cross-round memory afterwards,
+        so all G rollouts in a group are graded against an identical defense.
+        """
+        if self.defense is None:
+            raise RuntimeError(
+                "env.defend() requires an algorithmic defense; this env is running "
+                "the defender-LLM path (defense.mode: llm)"
+            )
+        outcome = self.defense.run(
+            updates, self.server.get_global_weights(),
+            commit=commit, algorithm=self.round_defense,
+        )
+        return outcome.verdicts, outcome.new_global
+
+    def evaluate_state(self, state: dict | None) -> float:
+        """Accuracy of an already-aggregated state, without committing it.
+        ``None`` (defense skipped the round) scores the unchanged global."""
+        return self._eval_state(state)
+
+    def commit_state(self, state: dict | None) -> float:
+        """Install an already-aggregated state as the new global and re-evaluate."""
+        if state is not None:
+            self.server.set_global_weights(state)
             self.current_accuracy = self.server.evaluate(self.test_loader)
         else:
-            logger.warning("Round commit: all clients flagged — global model unchanged")
+            logger.warning("Round commit: no aggregate produced — global model unchanged")
         return self.current_accuracy
 
     # ------------------------------------------------------------------

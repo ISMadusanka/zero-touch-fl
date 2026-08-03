@@ -18,6 +18,23 @@ def load_mnist(data_dir: str = "./data/mnist_raw"):
     return train_dataset, test_dataset
 
 
+def build_root_loader(root_size: int = 100, batch_size: int = 64,
+                      data_dir: str = "./data/mnist_raw", seed: int = 0):
+    """A small CLEAN root dataset held by the server, for FLTrust.
+
+    FLTrust (Cao et al., NDSS 2021) bootstraps trust from a handful of clean
+    examples the server collects itself; we sample ``root_size`` of them from the
+    MNIST training set with a fixed seed so runs are reproducible. Used by both
+    the benchmark panel and the arms race's algorithmic defender.
+    """
+    train_dataset, _ = load_mnist(data_dir)
+    g = torch.Generator().manual_seed(int(seed))
+    idx = torch.randperm(len(train_dataset), generator=g)[:int(root_size)].tolist()
+    return DataLoader(Subset(train_dataset, idx),
+                      batch_size=max(1, min(int(batch_size), int(root_size))),
+                      shuffle=True)
+
+
 def partition_iid(dataset, n_clients: int):
     """Split dataset into n_clients equal IID shards."""
     indices = torch.randperm(len(dataset)).tolist()

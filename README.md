@@ -25,11 +25,16 @@ Two phases:
      scale_neurons, blend_random, quantize). A deterministic interpreter applies
      each plan to that client's benign weights to produce the poisoned weights
      sent to the server.
-   - **Defender LLM** — input: per-client, per-layer statistical feature vectors.
-     Output: a direct **benign/malicious classification** per client.
-   - The server FedAvg-aggregates the clients the defender did not flag.
-   - Because we know the ground-truth poisoned set, both agents get an exact
-     **verifiable reward**, and both are trained online with **GRPO**.
+   - **Defense** — see [Defense: the defender LLM is currently
+     disabled](#defense-the-defender-llm-is-currently-disabled). By default the
+     server defends with a published **algorithm** drawn at random each round
+     (FLTrust / DeFL / DnC / Multi-Krum), and only the attacker trains. The
+     alternative (`defense.mode: llm`) is the **defender LLM** — input:
+     per-client, per-layer statistical feature vectors; output: a direct
+     **benign/malicious classification** per client, after which the server
+     FedAvg-aggregates the clients it did not flag.
+   - Because we know the ground-truth poisoned set, the agents get an exact
+     **verifiable reward** and are trained online with **GRPO**.
    - A selected client counts as poisoned only if its plan **actually changed its
      weights**; no-ops (unparseable output, empty plans, ops all skipped as
      invalid, `scale factor=1.0`) send honest weights, so they are charged as
@@ -38,8 +43,51 @@ Two phases:
      aggregate reaches with no poison at all — so hitting the goal scores the same
      every round it is hit.
 
-There are no hardcoded attack plugins, no hardcoded detector rules, and no
-episodic-memory feedback loop — the LLMs learn everything via RL.
+There are no hardcoded attack plugins and no episodic-memory feedback loop — the
+attacker learns everything via RL.
+
+## Defense: the defender LLM is currently disabled
+
+`configs/base.yaml` ships with **`defense.mode: algorithmic`**. The defender LLM
+is switched off and the server defends with the published algorithms already
+implemented for the benchmark, **one drawn at random per round**:
+
+| Algorithm | What it does |
+|---|---|
+| `fltrust` | Cosine trust vs a clean root update, norm-rescaled, trust-weighted (NDSS'21) |
+| `defl` | Per-layer FGNV + MOUD-Vote + CLP gating with Beta trust (AAAI-23) |
+| `dnc` | Spectral (top-singular-direction) outlier filter (NDSS'21) |
+| `multikrum` | Distance-based selection of the `n - f` most central updates (NeurIPS'17) |
+
+Details that matter:
+
+- **One algorithm defends the whole round.** It is drawn in `env.begin_round()`
+  and used for the round's clean counterfactual, every one of the `G` scored
+  GRPO rollouts, and the commit — so the group's rewards stay comparable and the
+  advantage is "which plan beat *this* defense", not "which plan got the softer
+  defense".
+- **The algorithm also produces the aggregate.** FLTrust re-weights and rescales,
+  DeFL Beta-weights and CLP-gates; reducing them to a drop-list for FedAvg would
+  throw the defense away. So `env.defend()` returns the verdicts *and* the new
+  global, and the env commits that state (`env.commit_state`).
+- **Scoring never advances the defense's memory.** DeFL's Beta counts and
+  `S(t-1)` (and DnC's subsampling RNG) are snapshotted and rolled back for every
+  uncommitted call, so all `G` rollouts face an identical defense.
+- **Only the attacker trains.** There is no defender policy, so `rl/schedule.py`
+  runs attacker-only phases: no defender optimizer, no defender adapter in VRAM,
+  no league snapshots or curriculum for it, and **the defender checkpoint on disk
+  is never overwritten**. A phase still ends on a sustained win or the cap, which
+  is what schedules the honest FL interlude between phases.
+- **Rotation is stateful per algorithm.** A rotating algorithm's memory (DeFL)
+  only advances on the rounds it is actually selected. Use
+  `defense.selection: round_robin` for even coverage, or list a single algorithm
+  to pin one for a controlled run.
+- Every round log records which defense faced it
+  (`attack_metadata.defense` in `logs/round_data/rounds.jsonl`). Compare rounds
+  **within** a defense — accuracy drops are not comparable across them.
+
+To restore the original two-sided LLM arms race, set `defense.mode: llm`. Nothing
+else changes; the defender adapter resumes from where it left off.
 
 ## Why GRPO (not PPO / DPO)
 
@@ -205,7 +253,13 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
   unbounded OOMs a long run).
 - **`configs/attacker_agent.yaml`** — attacker goal fallback, layer-detail
   precision, poisoned-weight clamp, attacker adapter path.
-- **`configs/defender_agent.yaml`** — defender defaults, defender adapter path.
+- **`configs/base.yaml` → `defense:`** — who defends. `mode` (`algorithmic`, the
+  shipped default, vs `llm`), the `algorithms` rotation pool, `selection`
+  (`random` / `round_robin`), the algorithm-draw `seed`, `assumed_byzantine`
+  (DnC / Multi-Krum's assumed adversary budget), and each algorithm's own knobs.
+  See [Defense](#defense-the-defender-llm-is-currently-disabled).
+- **`configs/defender_agent.yaml`** — defender-LLM defaults + adapter path. Only
+  read when `defense.mode: llm`.
 
 Attack goals (configurable; `untargeted_degrade` is the first experiment):
 `untargeted_degrade` (target accuracy drop), `slow_degrade` (per-round drop),
@@ -250,7 +304,8 @@ core/         Shared types (ModelUpdate, DetectionVerdict, RoundLog) + aggregato
 model/        Tiny MLP (~970 params) — the schema both LLMs operate over
 data/         MNIST loading & partitioning
 clients/      Honest client local training
-server/       Central server + FedAvg aggregation
+server/       Central server + FedAvg aggregation + algo_defender.py (the round-rotating
+              algorithmic defense that currently replaces the defender LLM)
 detector/     features.py — per-client per-layer statistical feature extractor
 agents/       attacker_agent.py / defender_agent.py (pure prompt+parse), attack_ops.py (operator DSL), llm_client.py
 rl/           env, rewards, turns, inference (dry-run), policy (Unsloth+LoRA), grpo, schedule, baseline

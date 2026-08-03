@@ -255,6 +255,18 @@ class DeFL(Defense):
         self._prev_total_fgnv = None
         self._layer_groups = group_layers(list(init_global.keys()))
 
+    # DeFL is the only stateful defense: ``step`` bumps every client's Beta counts
+    # and advances S(t-1). Snapshot/restore keeps a *scored* (uncommitted) round
+    # from polluting that memory — see ``benchmark.defenses.base.Defense``.
+    def state_snapshot(self) -> dict:
+        return {"alpha": dict(self._beta.alpha), "beta": dict(self._beta.beta),
+                "prev_total_fgnv": self._prev_total_fgnv}
+
+    def state_restore(self, snapshot: dict) -> None:
+        self._beta.alpha = dict(snapshot.get("alpha", {}))
+        self._beta.beta = dict(snapshot.get("beta", {}))
+        self._prev_total_fgnv = snapshot.get("prev_total_fgnv")
+
     def step(self, updates, poisoned_ids) -> StepResult:
         import torch
         gw = self._global

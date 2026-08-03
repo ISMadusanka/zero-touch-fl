@@ -43,6 +43,36 @@ class Defense(ABC):
     def global_weights(self) -> dict | None:
         return self._global
 
+    # ------------------------------------------------------------------
+    # Hooks for running a defense against an EXTERNALLY owned global model
+    # (the Phase-2 arms race — see ``server.algo_defender``). The benchmark
+    # itself never needs them: there each defense owns its own world.
+    # ------------------------------------------------------------------
+    def sync_global(self, weights: dict) -> None:
+        """Re-base this defense on an externally owned global model.
+
+        Unlike :meth:`reset` this KEEPS whatever cross-round memory the defense
+        has accumulated (DeFL's Beta counts, for example) and only changes the
+        model the next :meth:`step` measures its deltas against. The reference is
+        adopted as-is (no clone): the caller owns it, and ``step`` replaces
+        ``self._global`` with its own aggregate anyway.
+        """
+        self._global = weights
+
+    def state_snapshot(self) -> dict:
+        """Copy of the cross-round state :meth:`step` mutates.
+
+        Empty for the stateless aggregators (Multi-Krum, FLTrust, FedAvg,
+        Oracle). Paired with :meth:`state_restore` it lets a caller SCORE a
+        candidate round without the defense's memory absorbing it — needed when
+        several candidate attacks are graded against one identical defense.
+        """
+        return {}
+
+    def state_restore(self, snapshot: dict) -> None:
+        """Undo every mutation made since :meth:`state_snapshot`. No-op by default."""
+        return None
+
     @abstractmethod
     def step(self, updates: list[ModelUpdate], poisoned_ids: set[int]) -> StepResult:
         """Process one round of client updates against this defense's current

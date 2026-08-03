@@ -182,6 +182,9 @@ def test_borrowed_opponent_saves_live_weights():
         league.snapshots["defender"] = [{"w": torch.tensor([99.0])}]   # an OLD snapshot
         state = {"policy": policy, "league": league, "max_new_tokens": 8,
                  "borrowed_opponent": None,
+                 # Both sides trainable: this is the defender-LLM path, the only
+                 # one where an opponent adapter can be borrowed at all.
+                 "trainable": ("attacker", "defender"), "algorithmic_defense": False,
                  "adapter_paths": {"attacker": os.path.join(td, "att"),
                                    "defender": os.path.join(td, "def")}}
         _opp_gen, restore = sched._opponent_generator(state, "defender", face_snapshot=True)

@@ -5,11 +5,17 @@ Two phases:
   Phase 2 (simulation_rounds): LLM-direct adversarial arms race with RL.
 
 In Phase 2 a random subset of clients is poisoned each round. An attacker LLM
-emits an attack plan (primitive weight operators) applied to the benign weights;
-a defender LLM classifies each client benign/
-malicious from per-client per-layer statistics. Both get a verifiable per-round
-reward and are trained with GRPO (separate LoRA adapters over one frozen
-Qwen2.5-3B-Instruct base).
+emits an attack plan (primitive weight operators) applied to the benign weights,
+and the server defends.
+
+The DEFENDER LLM IS CURRENTLY DISABLED (``defense.mode: algorithmic`` in
+configs/base.yaml). The server instead defends with the published algorithms —
+FLTrust, DeFL, DnC and Multi-Krum — using ONE of them, drawn at random, per
+round (see ``server/algo_defender.py``). Only the attacker is trained with GRPO.
+Setting ``defense.mode: llm`` restores the original two-sided arms race, where a
+defender LLM classifies each client benign/malicious from per-client per-layer
+statistics and both sides get a verifiable per-round reward and train with GRPO
+(separate LoRA adapters over one frozen Qwen2.5-3B-Instruct base).
 
 Modes:
   python main.py --env linux                 # full GRPO training (needs a GPU)
@@ -32,10 +38,11 @@ from dataclasses import asdict
 
 import yaml
 
-from data.mnist_loader import get_data_loaders
+from data.mnist_loader import get_data_loaders, build_root_loader
 from clients.benign_client import BenignClient
 from server.fed_server import FedServer
 from server.aggregation import FedAvgAggregator
+from server.algo_defender import build_algorithmic_defender
 from agents.attacker_agent import AttackerAgent
 from agents.defender_agent import DefenderAgent
 from agents.llm_client import create_llm_client
@@ -188,8 +195,23 @@ def run_phase2(
     logger.info(f"  baseline_accuracy={baseline_accuracy:.4f}")
     logger.info("=" * 60)
 
-    rng = random.Random(int(fl.get("poison_seed", 0)))
-    env = FLArmsRaceEnv(config, client_loaders, test_loader, rng)
+    seed = int(fl.get("poison_seed", 0))
+    rng = random.Random(seed)
+    # Server-side defense. With ``defense.mode: algorithmic`` (the default) the
+    # defender LLM is disabled and one published algorithm — FLTrust / DeFL / DnC /
+    # Multi-Krum — defends each round, drawn at random; only the attacker trains.
+    # ``defense.mode: llm`` restores the trainable defender LLM.
+    defense = build_algorithmic_defender(
+        config, seed=seed,
+        root_loader_factory=lambda: build_root_loader(
+            root_size=int(((config.get("defense") or {}).get("fltrust") or {})
+                          .get("root_size", 100)),
+            batch_size=int(fl["batch_size"]),
+            data_dir=config.get("data", {}).get("data_dir", "./data/mnist_raw"),
+            seed=seed,
+        ),
+    )
+    env = FLArmsRaceEnv(config, client_loaders, test_loader, rng, defense=defense)
     env.reset(global_weights, client_weights, baseline_accuracy)
 
     metrics_tracker = MetricsTracker(baseline_accuracy=baseline_accuracy, output_dir="logs/metrics")
@@ -222,6 +244,11 @@ def run_phase2(
             "attacker": "checkpoints/attacker_adapter",
             "defender": "checkpoints/defender_adapter",
         })
+        # With the defender LLM disabled there is no defender policy to train, so
+        # we don't even materialise its LoRA adapter (one fewer ~115 MB copy of
+        # LoRA tensors on the GPU). Its checkpoint on disk is left untouched, so
+        # flipping ``defense.mode`` back to ``llm`` resumes it unchanged.
+        adapter_names = ("attacker",) if defense is not None else ("attacker", "defender")
         policy = LLMPolicy(
             base_model=rl_cfg.get("model", "unsloth/Qwen2.5-3B-Instruct"),
             max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
@@ -229,12 +256,13 @@ def run_phase2(
             lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
             load_in_4bit=bool(rl_cfg.get("load_in_4bit", True)),
             seed=int(fl.get("poison_seed", 0)),
+            adapters=adapter_names,
             attn_implementation=rl_cfg.get("attn_implementation", "eager"),
             use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
         )
         # Resume adapters if present.
         for name, path in adapter_paths.items():
-            if adapter_exists(path):
+            if name in adapter_names and adapter_exists(path):
                 policy.load_adapter(name, path)
         progress = load_progress()
         start_round = progress["rounds_done"]
@@ -370,6 +398,9 @@ def main():
             output_dir="logs", filename="debug.json", mode=mode,
             config_summary={
                 "model": base_config.get("rl", {}).get("model"),
+                "defense_mode": (base_config.get("defense", {}) or {}).get("mode", "algorithmic"),
+                "defense_algorithms": (base_config.get("defense", {}) or {}).get("algorithms"),
+                "defense_selection": (base_config.get("defense", {}) or {}).get("selection", "random"),
                 "n_clients": fl.get("n_clients"),
                 "n_compromisable": fl.get("n_compromisable"),
                 "max_poison_clients": base_config.get("attack", {}).get("max_poison_clients"),

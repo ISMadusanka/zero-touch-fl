@@ -3,10 +3,14 @@
 Before trusting GRPO it's worth proving the *reward harness itself* is sane:
 rewards should move in the expected direction — a bigger perturbation degrades
 accuracy more (higher drop term) but is easier to flag (lower evasion). This
-baseline enumerates a fixed set of deterministic attacker actions against a
-fixed norm-based defender heuristic and logs each action's reward, then commits
-the best. It exercises env + features + rewards end-to-end with zero LLM calls
-and zero GPU.
+baseline enumerates a fixed set of deterministic attacker actions, logs each
+action's reward, then commits the best. It exercises env + features + rewards
+end-to-end with zero LLM calls and zero GPU.
+
+The defense is whatever the run is configured with: the round's algorithm when
+the defender LLM is disabled (``defense.mode: algorithmic``), otherwise the
+fixed norm-based heuristic below — which stands in for the defender LLM so the
+harness needs no model.
 """
 
 import copy
@@ -88,14 +92,21 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
                          if not _same_weights(poisoned[cid], selected_benign[cid])]
             n_malformed = len(selected_ids) - len(effective)
             updates = env.build_updates({cid: poisoned[cid] for cid in effective})
-            verdicts = fixed_defender(env.features(updates))
-            post_acc = env.evaluate_updates(updates, verdicts)
+            if env.defense is not None:
+                # The algorithm produces the verdicts AND the aggregate; scoring
+                # must not advance its cross-round state (commit=False).
+                verdicts, state = env.defend(updates, commit=False)
+                post_acc = env.evaluate_state(state)
+            else:
+                verdicts = fixed_defender(env.features(updates))
+                post_acc = env.evaluate_updates(updates, verdicts)
             # Same reference as training: this round's clean (unpoisoned) aggregate.
             reward = attacker_reward(ctx.clean_accuracy, post_acc, ctx.goal,
                                      effective, verdicts, n_malformed)
             scored.append((label, effective, n_malformed, updates, verdicts, post_acc, reward))
             logger.info(
                 f"[baseline] round {ctx.round_num} action={label:9s} "
+                f"def={env.round_defense or 'fixed_heuristic'} "
                 f"acc->{post_acc:.4f} att_reward={reward:.3f} poisoned={effective} "
                 f"flagged={[v.client_id for v in verdicts if v.is_suspicious]}"
             )
@@ -104,7 +115,13 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
         label, chosen_ids, n_malformed, updates, verdicts, _, _ = max(
             scored, key=lambda s: s[6])
         env.set_committed_poison(chosen_ids)
-        new_acc = env.commit(updates, verdicts)
+        if env.defense is not None:
+            # Re-run the winning action through the defense, this time letting its
+            # cross-round state advance exactly once.
+            verdicts, state = env.defend(updates, commit=True)
+            new_acc = env.commit_state(state)
+        else:
+            new_acc = env.commit(updates, verdicts)
         a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal,
                                 chosen_ids, verdicts, n_malformed)
         d_rew = defender_reward(verdicts, chosen_ids)
@@ -126,11 +143,13 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             learning_agent="none",
             attack_metadata={"baseline_action": label, "budget": ctx.budget,
                              "n_used": len(chosen_ids), "n_malformed": n_malformed,
+                             "defense": env.round_defense or "fixed_heuristic",
                              "clean_accuracy": round(float(ctx.clean_accuracy), 6),
                              "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6)},
         ))
         logger.info(
             f"[baseline] round {ctx.round_num}: committed '{label}' "
+            f"def={env.round_defense or 'fixed_heuristic'} "
             f"acc {ctx.global_accuracy:.4f}->{new_acc:.4f} "
             f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - new_acc:+.4f}) "
             f"def_reward={d_rew:.3f}"

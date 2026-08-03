@@ -409,6 +409,29 @@ class DebugLogger:
         })
 
     @_guard
+    def algo_defense(self, algorithm, verdicts, commit=False, poisoned_ids=None,
+                     info=None):
+        """The algorithmic defender's decision (defender LLM disabled).
+
+        Replaces :meth:`defender_io` on that path: there is no prompt and no raw
+        completion, just the algorithm that defended this round and the verdicts
+        it derived. ``commit=False`` marks a rollout being SCORED (the defense's
+        cross-round state is rolled back afterwards)."""
+        stage = "commit" if commit else "scoring"
+        self._line()
+        self._line(f"[DEFENSE] algorithm={algorithm} ({stage})"
+                   + (f"  {json.dumps(info, default=str)}" if info else ""))
+        self._line("[VERDICTS] derived:")
+        for ln in self._verdict_lines(verdicts, poisoned_ids):
+            self._line(ln)
+        self._record("defense", f"algo_defense_{algorithm}", {
+            "algorithm": algorithm, "committed": bool(commit), "info": info,
+            "verdicts": [{"client_id": v.client_id, "is_suspicious": v.is_suspicious,
+                          "confidence": _short(v.confidence), "reason": v.reason}
+                         for v in verdicts],
+        })
+
+    @_guard
     def opponent_move(self, temperature):
         self._stage = "opponent-move"
         self._line()

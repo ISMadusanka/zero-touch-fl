@@ -25,6 +25,14 @@ When SCORING the G candidate rollouts the frozen opponent is sampled at
 opponent responses — this restores the within-group reward spread GRPO needs.
 The COMMITTED round uses the greedy ``opponent_temperature`` so each win/loss is
 measured against the real, deterministic opponent.
+
+**Defender LLM disabled.** When ``env.defense`` is set (``defense.mode:
+algorithmic``), the defender is a published algorithm drawn per round rather than
+a policy, so there is nothing on that side to train: the rotation collapses to
+attacker-only phases, no opponent adapter is loaded/borrowed/snapshotted, and the
+defender checkpoint on disk is left untouched. The phase machinery still runs —
+a phase ends on a sustained win or the cap, which is what schedules the honest FL
+interlude between phases and keeps the attacker ratcheting.
 """
 
 import logging
@@ -182,10 +190,26 @@ def train(
     else:
         logger.info(f"Training budget: rounds {start_round} -> {total_rounds}")
 
+    # With an algorithmic defense there is no defender POLICY: only the attacker
+    # trains, and the defender adapter (on disk and in the league) is left alone.
+    algorithmic_defense = getattr(env, "defense", None) is not None
+    trainable = ("attacker",) if algorithmic_defense else ("attacker", "defender")
+    if algorithmic_defense:
+        if first_learner != "attacker":
+            logger.warning(
+                f"rl.first_learner={first_learner!r} ignored — the defender LLM is "
+                f"disabled (algorithmic defense), so only the attacker trains."
+            )
+            first_learner = "attacker"
+        logger.info(
+            f"Defender LLM disabled: attacker-only training against "
+            f"{env.defense.describe()}"
+        )
+
     import torch
     optimizers = {
-        "attacker": torch.optim.AdamW(policy.adapter_parameters("attacker"), lr=lr),
-        "defender": torch.optim.AdamW(policy.adapter_parameters("defender"), lr=lr),
+        name: torch.optim.AdamW(policy.adapter_parameters(name), lr=lr)
+        for name in trainable
     }
     league = League(rng, max_snapshots=league_max)
 
@@ -206,6 +230,7 @@ def train(
         max_new_tokens=max_new_tokens, rng=rng, curriculum_on_cap=curriculum_on_cap,
         fl_interlude=fl_interlude, controller=None,
         fl_state_cb=fl_state_cb, borrowed_opponent=None,
+        trainable=trainable, algorithmic_defense=algorithmic_defense,
     )
 
     # Resume the FL round-number counter so round labels + logs/round_data advance
@@ -242,7 +267,10 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     k = state["knobs"]
     ctx = env.begin_round()
 
-    dbg.round_header(ctx.round_num, learner, opp, phase_index, phase_round,
+    # With an algorithmic defense the "opponent" is this round's drawn algorithm,
+    # not a frozen adapter — label it as such in the debug view.
+    opp_label = (f"algo:{env.round_defense}" if state.get("algorithmic_defense") else opp)
+    dbg.round_header(ctx.round_num, learner, opp_label, phase_index, phase_round,
                      ctx.pool_ids, ctx.budget, ctx.global_accuracy, k["G"],
                      k["scoring_opp_temp"], k["opp_temp"])
     # The poison SET is chosen per-rollout by the attacker, so it is unknown at
@@ -288,7 +316,8 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     _log_round(env, ctx, info, learner, stats, state["metrics_tracker"],
                state["save_round_log"], reward_att=k["reward_att"], reward_def=k["reward_def"],
                phase_index=phase_index, phase_round=phase_round, success=success,
-               best_index=best, poisoned_ids=poisoned_ids)
+               best_index=best, poisoned_ids=poisoned_ids,
+               defense_algorithm=env.round_defense)
     return stats, drop, success
 
 
@@ -297,7 +326,9 @@ def _post_round_bookkeeping(state, done):
     if state["snap_every"] and done % state["snap_every"] == 0:
         borrowed = state.get("borrowed_opponent")
         overrides = {borrowed[0]: borrowed[1]} if borrowed else None
-        state["league"].snapshot(state["policy"], state["policy"].adapters, states=overrides)
+        # Only trainable adapters are snapshotted: with the defender LLM disabled
+        # its adapter never changes, so pooling it would just burn host RAM.
+        state["league"].snapshot(state["policy"], state["trainable"], states=overrides)
     # Checkpoint adapters + progress TOGETHER so a resume is always consistent
     # (the saved round count never points past the saved adapter weights).
     if state["save_every"] and done % state["save_every"] == 0:
@@ -313,7 +344,12 @@ def _opponent_generator(state, opp, face_snapshot):
     mid-phase checkpoint / league snapshot persists the opponent's LIVE weights,
     not the borrowed snapshot — otherwise the real opponent adapter would be
     clobbered on disk and silently regress on resume. ``restore`` puts the live
-    weights back and clears the marker."""
+    weights back and clears the marker.
+
+    With an algorithmic defense there is no opponent adapter at all, so this is a
+    no-op returning ``None`` as the generator — ``AttackerTurn`` does not use one."""
+    if state.get("algorithmic_defense"):
+        return None, (lambda: None)
     policy = state["policy"]
     live_opp = policy.get_adapter_state(opp)
     used = False
@@ -389,7 +425,8 @@ def _run_fl_interlude(state, next_learner, phase_index):
 
 def _train_best_response(state, first_learner, start_round, resume=None):
     """Success-gated iterated best response. Returns the final round count."""
-    ctrl = PhaseController(state["switch_cfg"], first_learner=first_learner)
+    ctrl = PhaseController(state["switch_cfg"], first_learner=first_learner,
+                           learners=state["trainable"])
     if resume and resume.get("controller"):
         ctrl.load_state_dict(resume["controller"])
         logger.info(
@@ -415,13 +452,15 @@ def _train_best_response(state, first_learner, start_round, resume=None):
         # Curriculum: a phase that capped without a win means the opponent is too
         # strong — let this learner face an earlier snapshot of it. Otherwise mix
         # in a league snapshot with probability league_prob (anti-overfit).
-        face_snapshot = (
+        # Neither applies to an algorithmic defense (no opponent adapter exists).
+        face_snapshot = (not state["algorithmic_defense"]) and (
             (state["curriculum_on_cap"] and ctrl.capped)
             or (state["league_prob"] > 0 and rng.random() < state["league_prob"])
         )
         opp_gen, restore = _opponent_generator(state, opp, face_snapshot)
         dbg.phase_event("PHASE START", phase=ctrl.phase_index, learner=learner,
-                        opponent=opp, facing_snapshot=face_snapshot)
+                        opponent=("algorithms" if state["algorithmic_defense"] else opp),
+                        facing_snapshot=face_snapshot)
 
         reason = None
         while done < state["total_rounds"]:
@@ -464,13 +503,16 @@ def _train_fixed(state, K_a, K_d, start_round):
     """Legacy fixed-clock alternation. Returns the final round count."""
     rng = state["rng"]
     done = start_round
-    schedule = [("attacker", K_a), ("defender", K_d)]
+    schedule = [(name, K_a if name == "attacker" else K_d)
+                for name in state["trainable"]]
     si = 0
     while done < state["total_rounds"]:
         learner, K = schedule[si % len(schedule)]
         si += 1
         opp = "defender" if learner == "attacker" else "attacker"
-        face_snapshot = state["league_prob"] > 0 and rng.random() < state["league_prob"]
+        face_snapshot = (not state["algorithmic_defense"]
+                         and state["league_prob"] > 0
+                         and rng.random() < state["league_prob"])
         opp_gen, restore = _opponent_generator(state, opp, face_snapshot)
 
         for _ in range(K):
@@ -503,10 +545,14 @@ def _save_adapters(state):
     live weights temporarily swapped for an older league snapshot during a
     curriculum/league phase), write its LIVE weights instead of the borrowed
     snapshot, so a mid-phase checkpoint can't overwrite the real opponent adapter
-    on disk (which would silently regress the frozen opponent on resume)."""
+    on disk (which would silently regress the frozen opponent on resume).
+
+    Only TRAINABLE adapters are written: with the defender LLM disabled its
+    checkpoint must survive untouched so the run can be switched back later."""
     policy = state["policy"]
     borrowed = state.get("borrowed_opponent")
-    for name, path in state["adapter_paths"].items():
+    for name in state["trainable"]:
+        path = state["adapter_paths"][name]
         if borrowed and borrowed[0] == name:
             policy.save_adapter_state_dict(name, borrowed[1], path)
         else:
@@ -515,7 +561,8 @@ def _save_adapters(state):
 
 def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                reward_att=None, reward_def=None, phase_index=0, phase_round=0,
-               success=False, best_index=0, poisoned_ids=None):
+               success=False, best_index=0, poisoned_ids=None,
+               defense_algorithm=None):
     verdicts = info["verdicts"]
     post_acc = info["post_accuracy"]
     n_malformed = info["n_malformed"]
@@ -563,6 +610,9 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             "budget": ctx.budget,
             "n_used": len(poisoned_ids),
             "controllable_pool": ctx.pool_ids,
+            # Which defense faced this round: an algorithm name, or "llm" when the
+            # defender LLM is in charge. Rounds are only comparable within a defense.
+            "defense": defense_algorithm or "llm",
             "attack_diversity": round(float(diversity), 4),
             # The clean counterfactual and the damage measured against it — the
             # quantities the reward and the win-gate actually use, so monitor.py
@@ -590,6 +640,7 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     dbg.flush()
     logger.info(
         f"Round {ctx.round_num} [learn={learner} ph={phase_index}.{phase_round} "
+        f"def={defense_algorithm or 'llm'} "
         f"{'WIN' if success else '...'}]: acc {ctx.global_accuracy:.4f}->{post_acc:.4f} "
         f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - post_acc:+.4f}) "
         f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} "

@@ -130,6 +130,16 @@ class DnC(Defense):
         from server.aggregation import FedAvgAggregator
         self._agg = FedAvgAggregator()
 
+    # The coordinate subsampler is the only thing ``step`` carries across rounds
+    # (and only when d > sub_dim). Snapshot/restore keeps a *scored* (uncommitted)
+    # round from advancing the stream — see ``benchmark.defenses.base.Defense``.
+    def state_snapshot(self) -> dict:
+        return {"rng": self._rng.getstate()}
+
+    def state_restore(self, snapshot: dict) -> None:
+        if "rng" in snapshot:
+            self._rng.setstate(snapshot["rng"])
+
     def step(self, updates, poisoned_ids) -> StepResult:
         import torch
         gw = self._global

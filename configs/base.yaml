@@ -44,6 +44,50 @@ attack:
                                   # the policy is BUDGET-AWARE (generalizes to any eval budget).
   eval_poison_clients: 1          # EVALUATION default budget (benchmark --max-poison-clients override)
 
+# Server-side defense — what the attacker actually faces every Phase-2 round.
+defense:
+  mode: "algorithmic"             # algorithmic | llm
+                                  # algorithmic = the DEFENDER LLM IS DISABLED. The server
+                                  #   defends with the published algorithms below instead;
+                                  #   only the attacker trains (rl/schedule.py runs
+                                  #   attacker-only phases and never touches the defender
+                                  #   adapter on disk, so `llm` can be restored later).
+                                  # llm = the original two-sided arms race (trainable
+                                  #   defender LLM + FedAvg over the un-flagged clients).
+  algorithms: ["fltrust", "defl", "dnc", "multikrum"]
+                                  # the rotation pool. ONE is used per round and defends
+                                  # the whole round (clean counterfactual, all G scored
+                                  # rollouts, and the commit), so the group's rewards stay
+                                  # comparable. Each algorithm also produces the round's
+                                  # AGGREGATE — FLTrust's trust-weighted rescaling, DeFL's
+                                  # Beta weighting, DnC/Multi-Krum's filtered mean — rather
+                                  # than only a drop-list. 'oracle' (reads ground truth) and
+                                  # 'llm_defender' are not selectable here.
+  selection: "random"             # random = draw one algorithm per round (uniform).
+                                  # round_robin = cycle them in listed order (controlled
+                                  # comparisons / even coverage).
+  seed: null                      # RNG seed for the algorithm draw; null = fl.poison_seed.
+                                  # A dedicated stream, so it never shifts the env's
+                                  # poison/budget/target sampling.
+  assumed_byzantine: null         # DnC / Multi-Krum assumed #malicious (a hyperparameter,
+                                  # never per-round truth). null = attack.max_poison_clients
+                                  # clamped to keep an honest majority.
+  fltrust:
+    root_size: 100                # clean server-side root examples (FLTrust bootstrap)
+    root_epochs: 1                # server local epochs R_l on the root set
+    root_lr: null                 # null = fl.lr
+    eta: 1.0                      # FLTrust global learning rate
+  defl:
+    delta: 0.05                   # CLP relative-rise threshold (paper Eq. 4)
+    tau: 2.5                      # MOUD per-layer outlier z-threshold
+  dnc:
+    c: 1.0                        # filtering fraction
+    niters: 1                     # subsampling iterations
+    sub_dim: 10000                # subsample dim b (clamped to the model's 970 dims)
+    seed: null                    # null = defense.seed / fl.poison_seed
+  multikrum:
+    m: null                       # #selected/averaged; null = n - assumed_byzantine
+
 # Inference-only LLM defaults (used by --dry-run and the OpenAI path).
 llm:
   ollama_base_url: "http://localhost:11434"
@@ -66,6 +110,12 @@ rl:
   scoring_opponent_temperature: 0.7 # frozen opponent temp while SCORING the G rollouts;
                                   # >0 so candidates see varied opponent verdicts -> restores
                                   # within-group reward spread (fixes attacker zero-advantage)
+                                  # NOTE: both opponent temperatures apply only to the defender
+                                  # LLM (defense.mode: llm). An algorithm is deterministic given
+                                  # the updates, so under defense.mode: algorithmic the
+                                  # within-group spread comes from the attack plans themselves.
+  # first_learner / K_a / K_d below are attacker-only under defense.mode: algorithmic
+  # (there is no defender policy to train — see the `defense:` block).
   max_new_tokens: 1024            # headroom for the defender's 20-client verdict list and the
                                   # attacker's per-client plans (raise if outputs get truncated)
   grad_clip: 1.0
