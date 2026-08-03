@@ -1,4 +1,4 @@
-"""Torch-free tests for the benchmark metrics + report.
+"""Torch-free tests for the benchmark metrics + report + panel resolution.
 
 Runs anywhere:  python tests/test_benchmark.py
 """
@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.types import DetectionVerdict          # noqa: E402
 from benchmark.metrics import DefenseMetrics      # noqa: E402
 from benchmark import report                      # noqa: E402
+from benchmark.run_benchmark import _resolve_llm_defender   # noqa: E402
 
 
 def _verdicts(flagged_ids, all_ids):
@@ -119,6 +120,87 @@ def test_plot_skips_gracefully_without_matplotlib():
         return  # matplotlib present here -> nothing to assert about the skip path
     except Exception:
         assert plot_history(hist, 0.8, "logs/benchmark/benchmark.png") is None
+
+
+# --- panel resolution: a missing defender adapter must not kill the run ------
+
+_PATHS = {"attacker": "checkpoints/attacker_adapter",
+          "defender": "checkpoints/defender_adapter"}
+_ALGORITHMIC = {"defense": {"mode": "algorithmic"}}
+_FULL_PANEL = ["fedavg", "oracle", "llm_defender", "fltrust", "defl", "dnc", "multikrum"]
+
+
+def test_missing_defender_adapter_skips_only_that_column():
+    """The reported bug. `llm_defender` is in the DEFAULT --defenses list, and with
+    `defense.mode: algorithmic` (the shipped config) the defender adapter is never
+    trained — so a plain `run_benchmark` used to sys.exit before measuring anything,
+    discarding all six other defenses because one optional column was unavailable."""
+    names, skipped = _resolve_llm_defender(
+        _FULL_PANEL, _PATHS, _ALGORITHMIC, exists=lambda p: False)
+    assert skipped is True
+    assert names == ["fedavg", "oracle", "fltrust", "defl", "dnc", "multikrum"]
+    assert "llm_defender" not in names
+    # Order of the surviving columns is preserved (the report renders in panel order).
+    assert names == [n for n in _FULL_PANEL if n != "llm_defender"]
+
+
+def test_present_defender_adapter_keeps_the_column():
+    names, skipped = _resolve_llm_defender(
+        _FULL_PANEL, _PATHS, _ALGORITHMIC, exists=lambda p: True)
+    assert skipped is False and names == _FULL_PANEL
+
+
+def test_panel_without_llm_defender_is_untouched():
+    """No adapter lookup should even happen when the column was not requested."""
+    panel = ["fedavg", "fltrust", "dnc"]
+
+    def _boom(path):
+        raise AssertionError("should not probe the defender adapter")
+
+    names, skipped = _resolve_llm_defender(panel, _PATHS, _ALGORITHMIC, exists=_boom)
+    assert names == panel and skipped is False
+
+
+def test_llm_defender_alone_is_a_clear_error_not_a_silent_fedavg_run():
+    """If it was the ONLY defense asked for there is nothing to compare against, so
+    failing is right — but the message must name the flag that fixes it. `fedavg` is
+    force-added as the no-defense reference and does not count as a comparison."""
+    try:
+        _resolve_llm_defender(["fedavg", "llm_defender"], _PATHS, _ALGORITHMIC,
+                             exists=lambda p: False)
+    except SystemExit as e:
+        msg = str(e)
+        assert "--defenses" in msg and "--defender-adapter" in msg
+        assert "defense.mode: algorithmic" in msg
+    else:
+        raise AssertionError("expected SystemExit when no comparable defense remains")
+
+
+def test_skip_reason_distinguishes_disabled_from_untrained():
+    """`defense.mode: llm` means a defender WAS supposed to be trained, so the message
+    should not blame the config."""
+    import io
+    import logging
+
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    logger = logging.getLogger("benchmark")
+    logger.addHandler(handler)
+    try:
+        _resolve_llm_defender(_FULL_PANEL, _PATHS, {"defense": {"mode": "llm"}},
+                             exists=lambda p: False)
+        assert "no defender adapter has been trained yet" in buf.getvalue()
+        buf.truncate(0), buf.seek(0)
+        _resolve_llm_defender(_FULL_PANEL, _PATHS, _ALGORITHMIC, exists=lambda p: False)
+        assert "defender LLM is disabled" in buf.getvalue()
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_missing_defense_config_defaults_to_algorithmic():
+    """An older config with no `defense:` block must still resolve, not KeyError."""
+    names, skipped = _resolve_llm_defender(_FULL_PANEL, _PATHS, {}, exists=lambda p: False)
+    assert skipped is True and "llm_defender" not in names
 
 
 def _run():

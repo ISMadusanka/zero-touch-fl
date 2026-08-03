@@ -74,7 +74,22 @@ defense:
                                   # clamped to keep an honest majority.
   fltrust:
     root_size: 100                # clean server-side root examples (FLTrust bootstrap)
-    root_epochs: 1                # server local epochs R_l on the root set
+    root_epochs: null             # server local epochs R_l on the root set.
+                                  # null = size it so the root update takes the SAME
+                                  # number of SGD ITERATIONS as an honest client
+                                  # (fl.local_epochs x batches_per_client). This is
+                                  # load-bearing: FLTrust rescales EVERY accepted delta
+                                  # to ||g0|| (Eq. 3), so the SERVER's reference update
+                                  # sets how far the global can move each round. The
+                                  # old root_epochs: 1 gave ~2 iterations (100 examples
+                                  # / batch 64) against a client's ~120, i.e. ||g0||
+                                  # ~60x too small — the global froze, so the clean
+                                  # counterfactual and every poisoned rollout scored
+                                  # the same accuracy, the damage term was ~0 for all G
+                                  # candidates, and ~1/4 of all rounds (FLTrust's share
+                                  # of the rotation) produced no gradient at all. The
+                                  # configured target drops were unreachable in
+                                  # principle. Set an integer to pin R_l explicitly.
     root_lr: null                 # null = fl.lr
     eta: 1.0                      # FLTrust global learning rate
   defl:
@@ -140,6 +155,16 @@ rl:
                                   # that differed by measurement noise were z-scored up to
                                   # A = +-1.2 and trained on. A real 1% accuracy gap scores 0.2
                                   # at that target, so this bar is easy for genuine differences.
+  commit_selection: "sample"      # which of the G scored rollouts ADVANCES the environment.
+                                  # sample = a uniform draw from the group (on-policy).
+                                  # argmax = the best-scoring one (legacy). argmax made the
+                                  # committed round a best-of-G result, so every logged
+                                  # `learner_success` and every phase switch measured
+                                  # max-of-G rather than the policy — numbers that do not
+                                  # reproduce at eval, where the benchmark samples once. It
+                                  # also fed the learner an optimistic state trajectory it
+                                  # never has to survive. The argmax is still logged as
+                                  # `best_index` next to `committed_index`.
   advantage_std_floor: 0.05       # floor on the z-score denominator, in reward units. Plain
                                   # z-scoring is scale-free (spread 0.02 and spread 1.0 both give
                                   # A = +-1.2), so the update size carried no information about how

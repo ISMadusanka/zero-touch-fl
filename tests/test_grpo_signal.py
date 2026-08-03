@@ -175,12 +175,19 @@ def test_a_genuinely_separated_group_still_learns():
 # --- 4 + 5. the loss differentiates what was actually sampled ---------------
 
 class _StubPolicy:
-    """Minimal LLMPolicy surface, recording what grpo_step asks it to score."""
+    """Minimal LLMPolicy surface, recording what grpo_step asks it to score.
+
+    Each rollout's log-probs are ``params[i] * ones(len(ids_i))``, so ``params[i].grad``
+    isolates that rollout's contribution to the update and the token-count weighting
+    is directly observable."""
 
     def __init__(self, ids_per_rollout, rewards):
         self._ids = ids_per_rollout
         self._rewards = rewards
         self.param = torch.zeros(3, requires_grad=True)
+        self.params = [torch.zeros(1, requires_grad=True) for _ in ids_per_rollout]
+        self.per_rollout_lengths = None    # set to a list to use the params above
+        self._call_i = 0
         self.last_generation_ids = []
         self.last_generation_completed = []
         self.calls = []          # (kind, completion_ids, temperature)
@@ -196,7 +203,12 @@ class _StubPolicy:
 
     def _logprobs(self, kind, completion_ids, temperature):
         self.calls.append((kind, completion_ids, temperature))
-        return self.param * 1.0
+        if self.per_rollout_lengths is None:
+            return self.param * 1.0
+        i = self._call_i
+        if kind == "ref":                     # policy then ref for each rollout
+            self._call_i += 1
+        return self.params[i] * torch.ones(self.per_rollout_lengths[i])
 
     def policy_token_logprobs(self, adapter, system, user, completion,
                               append_eos=False, completion_ids=None, temperature=1.0):
@@ -207,7 +219,7 @@ class _StubPolicy:
         return self._logprobs("ref", completion_ids, temperature).detach()
 
     def adapter_parameters(self, name):
-        return [self.param]
+        return [self.param] if self.per_rollout_lengths is None else list(self.params)
 
 
 class _StubTurn:
@@ -297,6 +309,49 @@ def test_degenerate_group_applies_no_gradient():
     assert stats["reward_spread"] == 0.0
 
 
+def _length_weighted_grads(lengths, rewards):
+    """Run one step where rollout i's log-probs are ``w_i * ones(L_i)``, and return
+    ``(per-rollout grad, advantages, total_tokens)``. With ``grad_clip`` disabled so
+    the raw normalization is observable."""
+    ids = [torch.arange(L) for L in lengths]
+    policy = _StubPolicy(ids, rewards)
+    policy.per_rollout_lengths = list(lengths)
+    stats = grpo_step(policy, "attacker", _StubOptimizer(), _StubTurn(rewards),
+                      G=len(rewards), max_new_tokens=64, kl_beta=0.0,
+                      grad_clip=1e9)
+    return [float(p.grad) for p in policy.params], stats["advantages"], stats
+
+
+def test_gradient_weights_every_token_equally_not_every_rollout():
+    """THE length-bias fix. Rollout 1 sampled 4x as many tokens as rollout 0, so it
+    must carry 4x the gradient at equal |advantage|. The old sequence-mean form
+    divided each rollout by its OWN length, giving both the same weight — i.e. the
+    short rollout's tokens counted 4x each. Output length here is tied to the action
+    (a 5-client plan is much longer than a 1-client plan), so that bias pushed on
+    client-count selection independently of the reward."""
+    grads, adv, stats = _length_weighted_grads([2, 8], [0.0, 1.0])
+    assert adv == [-1.0, 1.0], adv
+    assert stats["total_tokens"] == 10 and stats["completion_tokens"] == [2, 8]
+
+    # d/dw_i of (1/ΣL) * Σ_i (-A_i * w_i * L_i)  =  -A_i * L_i / ΣL
+    assert abs(grads[0] - (-adv[0] * 2 / 10)) < 1e-6, grads
+    assert abs(grads[1] - (-adv[1] * 8 / 10)) < 1e-6, grads
+    assert abs(abs(grads[1] / grads[0]) - 4.0) < 1e-6, "gradient is not length-weighted"
+
+    # The old form would have given both the same magnitude (-A_i / G).
+    assert abs(abs(grads[0]) - abs(adv[0]) / 2) > 1e-3
+
+
+def test_equal_length_rollouts_reproduce_the_sequence_mean_update():
+    """Token-level normalization must not silently rescale the effective learning
+    rate: when all rollouts are the same length the two forms coincide exactly."""
+    for L in (1, 3, 17):
+        grads, adv, stats = _length_weighted_grads([L] * 4, [0.0, 0.4, 0.8, 1.2])
+        assert stats["total_tokens"] == 4 * L
+        for g, a in zip(grads, adv):
+            assert abs(g - (-a / 4)) < 1e-6, (L, g, a)   # == old (pg = -A*mean_t lp)/G
+
+
 def test_stub_generators_without_ids_fall_back_to_the_text_path():
     """rl/inference.py's frozen backends cannot return token ids; grpo_step must
     degrade to re-tokenizing rather than crash."""
@@ -312,6 +367,99 @@ def test_stub_generators_without_ids_fall_back_to_the_text_path():
     assert stats["temperature"] == 1.0
     assert stats["stepped"]
     assert all(c[1] is None for c in policy.calls)
+
+
+# --- 6. the defense is strong enough to produce a measurable outcome ---------
+
+def test_root_epochs_match_the_clients_iteration_count():
+    """FLTrust rescales EVERY accepted delta to ||g0|| and applies w <- w + eta*g, so
+    the SERVER's reference update sets how far the global can move per round. At
+    root_epochs=1 the root took ~2 SGD steps (100 examples / batch 64) against a
+    client's ~144: ||g0|| was ~60x too small, the global froze, and the damage term
+    was ~0 for every candidate in the group — no gradient on FLTrust's ~1/4 of rounds,
+    and the configured target drops were unreachable in principle."""
+    from server.algo_defender import resolve_root_epochs
+
+    # null -> match the honest client's ITERATION count (not its epoch count).
+    assert resolve_root_epochs(None, root_batches=2, client_iterations=144) == 72
+    assert resolve_root_epochs(None, root_batches=48, client_iterations=144) == 3
+    # An explicit value is always honoured, and is never allowed below 1.
+    assert resolve_root_epochs(5, root_batches=2, client_iterations=144) == 5
+    assert resolve_root_epochs(0, root_batches=2, client_iterations=144) == 1
+    # Unknown client cost (no loaders, e.g. a unit test) degrades to the old default.
+    assert resolve_root_epochs(None, root_batches=2, client_iterations=None) == 1
+    assert resolve_root_epochs(None, root_batches=0, client_iterations=144) == 1
+
+
+def test_matching_iterations_makes_the_global_actually_move():
+    """The measurable consequence: ||g0|| goes from a rounding error to a real step."""
+    import torch as _torch
+    from benchmark.defenses.fltrust import FLTrust, _flatten
+    from clients.benign_client import BenignClient
+    from core.types import ModelUpdate
+    from model.mnist_net import MnistNet
+    from server.fed_server import FedServer
+    from torch.utils.data import DataLoader, TensorDataset
+
+    _torch.manual_seed(0)
+    srv = FedServer(device="cpu")
+    gw = srv.get_global_weights()
+    keys = list(gw.keys())
+
+    def loader(n, batch):
+        return DataLoader(TensorDataset(_torch.randn(n, 1, 28, 28),
+                                        _torch.randint(0, 10, (n,))),
+                          batch_size=batch, shuffle=False)
+
+    client_loader = loader(3072, 64)                       # 48 batches
+    client = BenignClient(0, client_loader, lr=0.002, local_epochs=3, device="cpu")
+    client_delta = (_flatten(client.train(srv.model).weights, keys)
+                    - _flatten(gw, keys)).norm()
+    ups = [ModelUpdate(client_id=i, weights=client.train(srv.model).weights,
+                       metadata={"train_samples": 100}) for i in range(4)]
+
+    norms = {}
+    for label, epochs in (("old", 1), ("matched", 72)):    # 2 batches x 72 = 144 iters
+        ft = FLTrust(loader(100, 64), lr=0.002, local_epochs=epochs, device="cpu")
+        ft.reset(gw)
+        norms[label] = ft.step(ups, set()).info["g0_norm"]
+
+    old_frac = norms["old"] / float(client_delta)
+    new_frac = norms["matched"] / float(client_delta)
+    assert old_frac < 0.05, old_frac              # was a rounding error
+    assert new_frac > 10 * old_frac, (old_frac, new_frac)
+
+
+# --- 7. the environment advances on-policy, not on best-of-G -----------------
+
+def test_committed_rollout_is_an_on_policy_draw_not_the_argmax():
+    """Committing the argmax made the committed round — and therefore every logged
+    `learner_success` and every phase switch — a best-of-G result that does not
+    reproduce at eval, where the benchmark samples once."""
+    import random
+
+    from rl.schedule import _committed_index
+
+    rewards = [0.1, 0.9, 0.2, 0.3]        # index 1 is the best
+    assert _committed_index(rewards, "argmax", random.Random(0)) == 1
+
+    picks = {_committed_index(rewards, "sample", random.Random(s)) for s in range(50)}
+    assert picks == {0, 1, 2, 3}, picks              # every rollout is reachable
+    # Uniform, so the best is chosen ~1/G of the time rather than always.
+    rng = random.Random(0)
+    chose_best = sum(_committed_index(rewards, "sample", rng) == 1 for _ in range(2000))
+    assert 300 < chose_best < 700, chose_best
+    assert _committed_index([], "sample", random.Random(0)) == 0
+
+
+def test_commit_selection_is_validated():
+    """A typo must fail loudly rather than silently falling back to sampling."""
+    import pathlib
+    import re
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "rl" / "schedule.py"
+    text = src.read_text(encoding="utf-8")
+    assert re.search(r"commit_selection must be sample\|argmax", text)
 
 
 if __name__ == "__main__":

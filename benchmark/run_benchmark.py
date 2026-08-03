@@ -46,7 +46,9 @@ def _parse_args():
                     help="eval poison budget: max clients the attacker may poison per round "
                          "(the attacker chooses WHICH of its pool). Default: attack.eval_poison_clients (=1)")
     ap.add_argument("--root-size", type=int, default=100, help="FLTrust clean root-set size")
-    ap.add_argument("--root-epochs", type=int, default=1, help="FLTrust server local epochs (R_l)")
+    ap.add_argument("--root-epochs", type=int, default=None,
+                    help="FLTrust server local epochs R_l (default: defense.fltrust.root_epochs, "
+                         "or sized to match an honest client's SGD iteration count)")
     ap.add_argument("--root-lr", type=float, default=None, help="FLTrust server lr (default: fl.lr)")
     ap.add_argument("--eta", type=float, default=1.0, help="FLTrust global learning rate")
     ap.add_argument("--defl-delta", type=float, default=0.05,
@@ -98,6 +100,58 @@ def _build_root_loader(data_cfg, root_size, batch_size, seed):
     return build_root_loader(root_size=root_size, batch_size=batch_size,
                              data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
                              seed=seed)
+
+
+def _resolve_llm_defender(names, adapter_paths, base_cfg, exists=None):
+    """Drop ``llm_defender`` from the panel when its adapter is not on disk.
+
+    Returns ``(names, skipped)``.
+
+    ``llm_defender`` is the only column that needs a trained DEFENDER adapter, and
+    with ``defense.mode: algorithmic`` — the shipped default — that adapter is never
+    written: the defender LLM is disabled and ``rl/schedule.py`` trains the attacker
+    only, deliberately leaving the defender checkpoint untouched. Since
+    ``llm_defender`` is also in the default ``--defenses`` list, the old hard
+    ``sys.exit`` meant a plain ``run_benchmark`` on a normally-trained run aborted
+    before measuring ANY defense — throwing away FLTrust, DeFL, DnC, Multi-Krum,
+    Oracle and FedAvg because one optional column was unavailable.
+
+    A missing defender adapter is therefore expected, not exceptional: warn, drop the
+    column, keep going. Only a panel with nothing comparable left is fatal — and that
+    is reported with the flag needed to fix it rather than as a stack trace.
+
+    ``exists`` is injectable so this is testable without ``storage.checkpoint``.
+    """
+    if "llm_defender" not in names:
+        return list(names), False
+    if exists is None:
+        from storage.checkpoint import adapter_exists as exists
+    path = adapter_paths["defender"]
+    if exists(path):
+        return list(names), False
+
+    remaining = [n for n in names if n != "llm_defender"]
+    mode = str(((base_cfg.get("defense") or {}).get("mode") or "algorithmic")).lower()
+    why = ("the defender LLM is disabled in this config (defense.mode: algorithmic), "
+           "so no defender adapter is ever trained"
+           if mode == "algorithmic" else "no defender adapter has been trained yet")
+    log = logging.getLogger("benchmark")
+    # `fedavg` is force-added as the no-defense reference, so it does not count as a
+    # defense the user asked to compare against.
+    if not [n for n in remaining if n != "fedavg"]:
+        raise SystemExit(
+            f"ERROR: nothing left to benchmark — 'llm_defender' was the only requested "
+            f"defense and {why} (looked in {path}).\n"
+            f"       Request algorithmic defenses instead, e.g.\n"
+            f"       --defenses fltrust,defl,dnc,multikrum\n"
+            f"       or pass --defender-adapter <dir> to point at a checkpoint."
+        )
+    log.warning(
+        f"Skipping the 'llm_defender' column: {why} (looked in {path}). "
+        f"Continuing with {remaining}. To include it, pass --defender-adapter <dir>, "
+        f"or set defense.mode: llm and train a defender."
+    )
+    return remaining, True
 
 
 def main():
@@ -208,6 +262,22 @@ def main():
     if args.defender_adapter:
         adapter_paths["defender"] = args.defender_adapter
 
+    # The ATTACKER adapter is what is under evaluation — without it there is nothing
+    # to benchmark, so this one really is fatal.
+    if not adapter_exists(adapter_paths["attacker"]):
+        sys.exit(f"ERROR: no trained attacker adapter at {adapter_paths['attacker']}")
+
+    # The DEFENDER adapter is needed ONLY by the `llm_defender` column, and a missing
+    # one is the NORMAL case rather than an error: with `defense.mode: algorithmic`
+    # (the shipped default) the defender LLM is disabled and rl/schedule.py
+    # deliberately never writes that checkpoint. Aborting the run therefore threw away
+    # every algorithmic-defense result the benchmark exists to produce. Drop the column
+    # and carry on. Resolved BEFORE the model is built so a skipped column does not
+    # also materialise an unused defender LoRA (~115 MB of VRAM at lora_r=16).
+    names, skipped_llm_defender = _resolve_llm_defender(names, adapter_paths, base_cfg)
+
+    adapter_names = (("attacker", "defender") if "llm_defender" in names
+                     else ("attacker",))
     policy = LLMPolicy(
         base_model=rl_cfg.get("model", "unsloth/Qwen2.5-3B-Instruct"),
         max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
@@ -215,23 +285,40 @@ def main():
         lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
         load_in_4bit=bool(rl_cfg.get("load_in_4bit", True)),
         seed=seed,
+        adapters=adapter_names,
         attn_implementation=rl_cfg.get("attn_implementation", "eager"),
         use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
     )
-    if not adapter_exists(adapter_paths["attacker"]):
-        sys.exit(f"ERROR: no trained attacker adapter at {adapter_paths['attacker']}")
     policy.load_adapter("attacker", adapter_paths["attacker"])
     if "llm_defender" in names:
-        if not adapter_exists(adapter_paths["defender"]):
-            sys.exit(f"ERROR: llm_defender requested but no defender adapter at {adapter_paths['defender']}")
         policy.load_adapter("defender", adapter_paths["defender"])
 
     attacker_agent = AttackerAgent(attacker_cfg)
+    # Only meaningful for the llm_defender column; harmless to build either way.
     defender_agent = DefenderAgent(defender_cfg)
 
     root_loader = None
+    root_epochs = 1
     if "fltrust" in names:
         root_loader = _build_root_loader(data_cfg, args.root_size, fl["batch_size"], seed)
+        # R_l must match what the attacker TRAINED against, or the FLTrust column
+        # measures a different defense than the one the policy learned to beat.
+        # --root-epochs wins; otherwise fall back to the config, whose default (null)
+        # sizes the root update to an honest client's iteration count. FLTrust rescales
+        # every accepted delta to ||g0||, so R_l alone decides how far the global can
+        # move per round — see server.algo_defender.resolve_root_epochs.
+        from server.algo_defender import resolve_root_epochs
+        configured = args.root_epochs
+        if configured is None:
+            configured = ((base_cfg.get("defense") or {}).get("fltrust") or {}).get("root_epochs")
+        root_epochs = resolve_root_epochs(
+            configured, root_batches=len(root_loader),
+            client_iterations=int(fl["local_epochs"]) * len(client_loaders[0]),
+        )
+        log.info(f"FLTrust root fine-tuning: root_epochs={root_epochs} over "
+                 f"{len(root_loader)} batch(es) = ~{root_epochs * len(root_loader)} SGD "
+                 f"iterations (honest client: "
+                 f"~{int(fl['local_epochs']) * len(client_loaders[0])})")
 
     # DnC / Multi-Krum assume a known upper bound on #malicious; default it to the
     # eval poison budget (the max clients the attacker may actually poison), clamped
@@ -244,7 +331,7 @@ def main():
     defenses = build_defenses(
         names, device=device, policy=policy, defender_agent=defender_agent,
         root_loader=root_loader, root_lr=args.root_lr or float(fl["lr"]),
-        root_epochs=args.root_epochs, eta=args.eta,
+        root_epochs=root_epochs, eta=args.eta,
         defender_temperature=args.defender_temperature,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)),
         defl_delta=args.defl_delta, defl_tau=args.defl_tau,
@@ -254,7 +341,9 @@ def main():
     )
 
     log.info(f"Benchmark: {args.rounds} rounds | defenses={list(defenses)} | "
-             f"baseline_acc={baseline_accuracy:.4f} | attack_temp={args.attack_temperature}")
+             f"baseline_acc={baseline_accuracy:.4f} | attack_temp={args.attack_temperature}"
+             + (" | llm_defender SKIPPED (no defender adapter)"
+                if skipped_llm_defender else ""))
     summaries, _metrics = run_benchmark(
         env, policy, attacker_agent, defenses, test_loader,
         init_global=copy.deepcopy(global_weights), baseline_accuracy=baseline_accuracy,
@@ -273,7 +362,12 @@ def main():
         import json as _json
         history = {name: m.history for name, m in _metrics.items()}
         with open(os.path.join(out_dir, "history.json"), "w") as f:
-            _json.dump({"baseline_accuracy": baseline_accuracy, "history": history}, f, indent=2)
+            _json.dump({"baseline_accuracy": baseline_accuracy,
+                        "defenses": list(defenses),
+                        # Recorded so a saved result is self-describing: a missing
+                        # llm_defender column is a deliberate skip, not a lost run.
+                        "llm_defender_skipped": skipped_llm_defender,
+                        "history": history}, f, indent=2)
         log.info(f"[saved] {os.path.join(out_dir, 'history.json')}")
         if not args.no_plot:
             from benchmark.plot import plot_history

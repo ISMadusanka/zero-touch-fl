@@ -181,14 +181,52 @@ def defense_mode(cfg: dict) -> str:
     return mode
 
 
+def resolve_root_epochs(configured, root_batches: int, client_iterations: int | None) -> int:
+    """FLTrust's server-side local epochs R_l over the root set.
+
+    ``configured is None`` means "match an honest client's local training", which is
+    what the paper assumes and what this codebase got wrong. FLTrust rescales EVERY
+    accepted client delta to ``||g0||`` (Eq. 3) and applies ``w <- w + eta*g``, so the
+    global model moves by about ``||g0||`` per round: the server's reference update
+    sets the whole system's learning rate. The paper specifies R_l in *iterations*,
+    but this config expresses local training in *epochs*, and the root set is far
+    smaller than a client shard — 100 examples at batch 64 is 2 iterations/epoch
+    against a client's ~40. At ``root_epochs: 1`` the root update therefore took ~2
+    SGD steps against a client's ~120, making ``||g0||`` roughly 60x too small.
+
+    The consequence was not a slightly slow defense but a broken training signal:
+    with the aggregate pinned to a near-zero magnitude, the clean counterfactual and
+    every poisoned rollout landed at essentially the same accuracy, so the damage
+    term was ~0 for all G candidates and the whole group was degenerate. Roughly a
+    quarter of all rounds (FLTrust's share of the rotation) produced no gradient, and
+    the configured ``target_accuracy_drop`` of 0.05-0.30 was not reachable in
+    principle.
+
+    Matching ITERATIONS instead of epochs fixes the scale while leaving the algorithm
+    and the "server holds only a few clean examples" premise untouched. Pass an
+    explicit integer to override.
+    """
+    if configured is not None:
+        return max(1, int(configured))
+    if not client_iterations or root_batches <= 0:
+        return 1
+    return max(1, round(int(client_iterations) / int(root_batches)))
+
+
 def build_algorithmic_defender(cfg: dict, *, root_loader=None,
                                root_loader_factory=None,
-                               seed: int | None = None) -> AlgorithmicDefender | None:
+                               seed: int | None = None,
+                               client_iterations: int | None = None) -> AlgorithmicDefender | None:
     """Build the round-rotating defender described by ``cfg`` (the whole base config).
 
     Returns ``None`` when ``defense.mode`` is ``llm`` — the caller then keeps the
     defender-LLM path. ``root_loader`` (or ``root_loader_factory``, called only if
     needed) supplies FLTrust's clean root dataset.
+
+    ``client_iterations`` is how many SGD steps an honest client takes per round
+    (``local_epochs * batches_per_client``). It is used only to size FLTrust's root
+    fine-tuning when ``defense.fltrust.root_epochs`` is null — see
+    :func:`resolve_root_epochs`.
     """
     if defense_mode(cfg) != "algorithmic":
         return None
@@ -221,13 +259,29 @@ def build_algorithmic_defender(cfg: dict, *, root_loader=None,
     seed = int(fl.get("poison_seed", 0)) if seed is None else int(seed)
     dnc_seed = seed if dn.get("seed") is None else int(dn["seed"])
 
+    # R_l: null (the default) sizes the root fine-tuning to match an honest client's
+    # ITERATION count, so FLTrust's ||g0|| — which sets the whole system's step size —
+    # is not ~60x too small. See resolve_root_epochs.
+    root_epochs = resolve_root_epochs(
+        ft.get("root_epochs"),
+        root_batches=(len(root_loader) if root_loader is not None else 0),
+        client_iterations=client_iterations,
+    )
+    if "fltrust" in names:
+        logger.info(
+            f"FLTrust root fine-tuning: root_epochs={root_epochs} over "
+            f"{len(root_loader) if root_loader is not None else 0} batch(es) "
+            f"= ~{root_epochs * (len(root_loader) if root_loader is not None else 0)} "
+            f"SGD iterations (honest client: ~{client_iterations or 'unknown'})"
+        )
+
     from benchmark.defenses import build_defenses
     defenses = build_defenses(
         names,
         device=fl.get("device", "cpu"),
         root_loader=root_loader,
         root_lr=float(ft.get("root_lr") or fl.get("lr", 0.002)),
-        root_epochs=int(ft.get("root_epochs", 1)),
+        root_epochs=root_epochs,
         eta=float(ft.get("eta", 1.0)),
         defl_delta=float(dl.get("delta", 0.05)),
         defl_tau=float(dl.get("tau", 2.5)),

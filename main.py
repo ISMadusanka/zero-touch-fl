@@ -201,8 +201,16 @@ def run_phase2(
     # defender LLM is disabled and one published algorithm — FLTrust / DeFL / DnC /
     # Multi-Krum — defends each round, drawn at random; only the attacker trains.
     # ``defense.mode: llm`` restores the trainable defender LLM.
+    # An honest client's per-round SGD iteration count. FLTrust's root fine-tuning is
+    # sized to match it (defense.fltrust.root_epochs: null), because FLTrust rescales
+    # every accepted update to ||g0|| — so the server's reference update, not the
+    # clients', sets how far the global model can move per round. See
+    # server.algo_defender.resolve_root_epochs.
+    client_iterations = (
+        int(fl["local_epochs"]) * len(client_loaders[0]) if client_loaders else None
+    )
     defense = build_algorithmic_defender(
-        config, seed=seed,
+        config, seed=seed, client_iterations=client_iterations,
         root_loader_factory=lambda: build_root_loader(
             root_size=int(((config.get("defense") or {}).get("fltrust") or {})
                           .get("root_size", 100)),

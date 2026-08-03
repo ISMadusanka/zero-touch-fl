@@ -247,24 +247,50 @@ class LLMPolicy:
             messages, add_generation_prompt=True, tokenize=False,
         )
 
-    def _last_logits(self, ids):
-        """Logits for the LAST position only — skips the 128k-vocab projection
-        over every position, a big saving in the no-KV-cache decode loop. Falls
-        back gracefully if the model's forward doesn't accept the kwarg."""
+    def _forward_logits(self, ids, keep: int):
+        """Logits for the LAST ``keep`` positions only — shape ``(B, keep, V)``.
+
+        Asks the model to skip the vocab projection over every earlier position
+        (``logits_to_keep`` / ``num_logits_to_keep``, whichever this Transformers
+        version accepts — resolved once and cached). Falls back to slicing the full
+        logits if neither kwarg exists, so the RESULT is identical either way and
+        callers never have to care.
+
+        This matters most in the GRPO log-prob pass, where ``ids`` is
+        ``prompt + completion``: Qwen2.5's vocab is ~152k, so a full-sequence
+        forward materializes ``(1, L, 152k)`` logits (~0.85 GB in bf16 at L=2800)
+        of which only the last ``len(completion)+1`` positions are ever read — and
+        that tensor is retained for the backward. Requesting just the tail cuts it
+        by roughly ``L / (comp_len + 1)``.
+        """
+        keep = max(1, int(keep))
         if self._logits_kw is None:
             for kw in ("logits_to_keep", "num_logits_to_keep"):
                 try:
-                    out = self.model(ids, **{kw: 1})
-                    self._logits_kw = kw
-                    return out.logits[:, -1, :].float()
+                    out = self.model(ids, **{kw: keep})
                 except TypeError:
-                    continue
-            self._logits_kw = ""  # unsupported → full logits
+                    continue          # this Transformers version lacks the kwarg
+                except Exception as e:
+                    # Something else went wrong (e.g. an Unsloth patch that does not
+                    # forward the kwarg cleanly). Don't let a memory optimization take
+                    # the run down — record "unsupported" and use the full-logits path.
+                    logger.warning(
+                        f"{kw} probe failed ({type(e).__name__}: {e}); using full logits."
+                    )
+                    break
+                self._logits_kw = kw
+                return out.logits[:, -keep:, :]
+            self._logits_kw = ""      # unsupported -> full logits
         if self._logits_kw:
-            out = self.model(ids, **{self._logits_kw: 1})
+            out = self.model(ids, **{self._logits_kw: keep})
         else:
             out = self.model(ids)
-        return out.logits[:, -1, :].float()
+        return out.logits[:, -keep:, :]
+
+    def _last_logits(self, ids):
+        """Logits for the LAST position only, as ``(B, V)`` float32 — the decode-loop
+        entry point into :meth:`_forward_logits`."""
+        return self._forward_logits(ids, 1)[:, -1, :].float()
 
     def _eos_ids(self) -> set:
         ids = set()
@@ -424,8 +450,13 @@ class LLMPolicy:
                 texts, ids, completed = texts * n, ids * n, completed * n
             self.last_generation_ids = ids
             self.last_generation_completed = completed
+            # No empty_cache() here. Freeing `out` returns the KV cache to PyTorch's
+            # caching allocator, which reuses those blocks for the GRPO backward
+            # within this same process; empty_cache() only hands them back to the
+            # driver, forcing fresh cudaMallocs, and it synchronizes — a real cost
+            # G+ times per round. If fragmentation ever does bite, the lever is
+            # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, not this.
             del out
-            torch.cuda.empty_cache()   # release the KV cache before the GRPO backward
             return texts
         finally:
             if was_training:
@@ -485,8 +516,7 @@ class LLMPolicy:
             texts, gen_ids, completed = texts * n, gen_ids * n, completed * n
         self.last_generation_ids = gen_ids
         self.last_generation_completed = completed
-        del ids
-        torch.cuda.empty_cache()
+        del ids                      # see _fast_generate: no empty_cache() needed
         return texts
 
     def _completion_ids(self, completion, completion_ids, append_eos):
@@ -552,12 +582,13 @@ class LLMPolicy:
         n_pred = min(comp_ids.shape[1], full.shape[1] - 1)
         ctx = torch.enable_grad() if with_grad else torch.no_grad()
         with ctx:
-            logits = self.model(full).logits
-            # Only the positions that PREDICT the completion matter. Slicing before
-            # the softmax (instead of taking log_softmax over the whole sequence and
-            # discarding the prompt part) keeps the fp32 vocab-sized tensors at
-            # completion length rather than prompt+completion length.
-            logits = logits[:, -(n_pred + 1):-1, :]
+            # Only the positions that PREDICT the completion matter, so ask the model
+            # for just those (n_pred + 1, then drop the final position which predicts
+            # past the end). Previously this ran the vocab projection over the whole
+            # prompt+completion and took log_softmax over all of it in fp32 — at
+            # Qwen2.5's ~152k vocab that is gigabytes of logits per rollout, retained
+            # for the backward, of which the prompt part was immediately discarded.
+            logits = self._forward_logits(full, n_pred + 1)[:, :-1, :]
             if float(temperature) != 1.0:
                 logits = logits / max(float(temperature), 1e-6)
             logp = torch.log_softmax(logits.float(), dim=-1)

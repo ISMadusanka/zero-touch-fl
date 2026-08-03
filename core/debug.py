@@ -518,17 +518,26 @@ class DebugLogger:
                    "(greedy) opponent:")
 
     @_guard
-    def commit_summary(self, learner, best_index, info, reference_acc, post_acc, drop,
+    def commit_summary(self, learner, committed_index, info, reference_acc, post_acc, drop,
                        success, attacker_reward, defender_reward, poisoned_ids,
-                       global_acc=None):
+                       global_acc=None, best_index=None):
         """``reference_acc`` is the round's CLEAN counterfactual (the accuracy the
         aggregate reaches unpoisoned) — the baseline ``drop`` is measured from.
         ``global_acc`` is the accuracy of the global model the round started on,
-        shown for context only."""
+        shown for context only.
+
+        ``committed_index`` is the rollout that ADVANCED the environment — an
+        on-policy draw from the group, not necessarily the best-scoring one
+        (``best_index``, shown alongside when it differs). See
+        ``rl.schedule._committed_index``."""
         verdicts = info.get("verdicts", [])
         flagged = sorted({v.client_id for v in verdicts if v.is_suspicious})
         averaged = sorted({v.client_id for v in verdicts if not v.is_suspicious})
-        self._line(f"    committed rollout #{best_index} (best reward)")
+        note = ""
+        if best_index is not None:
+            note = (" (also the best-scoring)" if best_index == committed_index
+                    else f" (best-scoring was #{best_index})")
+        self._line(f"    committed rollout #{committed_index}{note}")
         self._line(f"    flagged_by_defender={flagged}   averaged_into_global={averaged}")
         self._line("    committed verdicts:")
         for ln in self._verdict_lines(verdicts, poisoned_ids):

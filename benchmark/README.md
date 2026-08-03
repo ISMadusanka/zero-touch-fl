@@ -67,7 +67,7 @@ multikrum     ...      ...    ...   ...   ...        ...       ...       ...
 |---|---|
 | `fedavg` | **No defense** — plain FedAvg over all clients (flags nobody). Lower bound + the state the attacker observes each round. Always included. |
 | `oracle` | Cheats by flagging exactly the ground-truth poisoned clients. **Upper bound** on detection + robustness. |
-| `llm_defender` | Your **trained defender adapter** — the model under test. |
+| `llm_defender` | Your **trained defender adapter** — the model under test. The only column needing a *defender* checkpoint: it is **skipped with a warning** (not an error) when none exists, which is the normal case under `defense.mode: algorithmic`, where the defender LLM is disabled and only the attacker trains. Point at one with `--defender-adapter <dir>`, or set `defense.mode: llm` and train one. |
 | `fltrust` | **FLTrust** (Cao et al., NDSS 2021): trust-bootstrapped robust aggregation using a small clean root dataset. |
 | `defl` | **DeFL** (Yan et al., AAAI 2023): CLP-aware defense. Inspects the DNN layer-by-layer via a Federated Gradient Norm Vector (FGNV) to (a) detect the *critical learning period*, (b) flag malicious clients by per-layer outlier voting (MOUD-Vote), then hard-remove them during the CLP and soft-down-weight them after via a per-client Bayesian (Beta) trust. **Needs no clean root set and no LLM.** |
 | `dnc` | **DnC** (Shejwalkar & Houmansadr, NDSS 2021): Divide-and-Conquer spectral aggregator. Subsamples dimensions, centers the updates, projects them onto their top singular vector, and filters out the `c·m` clients that project furthest (the spectral outliers), then averages the rest. **Needs no clean root set and no LLM** (assumes a known #malicious `m`). |

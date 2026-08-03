@@ -123,6 +123,36 @@ def _argmax(xs: list[float]) -> int:
     return bi
 
 
+def _committed_index(rewards: list[float], mode: str, rng) -> int:
+    """Which of the G scored rollouts actually advances the environment.
+
+    ``sample`` (default) — a uniformly random member of the group, i.e. a genuine
+    draw from the policy. ``argmax`` — the best-scoring one (the legacy behaviour).
+
+    Committing the argmax is a best-of-G evaluation dressed up as a policy rollout,
+    and it distorts three things at once:
+
+    * **The success gate lies.** ``rl/switch.py`` counts a "win" on the committed
+      round, so every phase switch, every ``learner_success`` in the logs, and the
+      whole arms-race ratchet were measuring max-of-G rather than the policy. The
+      benchmark samples ONCE, so those numbers do not reproduce at eval.
+    * **Selection amplifies reward noise.** Taking the max over G noisy scores is
+      biased upward by roughly the noise scale (and the argmax is chosen on scores
+      whose defense draw is re-run at commit time anyway).
+    * **The state trajectory is off-policy-optimistic.** The learner only ever sees
+      the world its best rollout produced, never the consequences of its median
+      behaviour — which is what it will be judged on.
+
+    The argmax is still recorded (``best_index``) so the gap between the two is
+    visible in the round logs.
+    """
+    if not rewards:
+        return 0
+    if str(mode).lower() == "argmax":
+        return _argmax(rewards)
+    return rng.randrange(len(rewards))
+
+
 def train(
     env,
     policy,
@@ -172,6 +202,9 @@ def train(
     resample_temp = float(rl.get("resample_temperature", 1.3))
     min_reward_spread = float(rl.get("min_reward_spread", DEFAULT_MIN_REWARD_SPREAD))
     advantage_std_floor = float(rl.get("advantage_std_floor", DEFAULT_ADVANTAGE_STD_FLOOR))
+    commit_selection = str(rl.get("commit_selection", "sample")).lower()
+    if commit_selection not in ("sample", "argmax"):
+        raise ValueError(f"rl.commit_selection must be sample|argmax, got {commit_selection!r}")
     switch_mode = str(rl.get("switch_mode", "best_response"))
     first_learner = str(rl.get("first_learner", "attacker"))
     curriculum_on_cap = bool(rl.get("curriculum_on_cap", True))
@@ -225,6 +258,7 @@ def train(
         skip_zero_adv=skip_zero_adv, resample_zero_adv=resample_zero_adv,
         resample_temp=resample_temp, reward_att=reward_att, reward_def=reward_def,
         min_reward_spread=min_reward_spread, advantage_std_floor=advantage_std_floor,
+        commit_selection=commit_selection,
     )
 
     state = dict(
@@ -309,9 +343,11 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
         advantage_std_floor=k["advantage_std_floor"],
     )
 
-    # Advance the env by committing the best-scoring candidate action.
+    # Advance the env with an ON-POLICY draw from the group (see _committed_index):
+    # committing the argmax made every logged win a best-of-G result.
     best = _argmax(stats["rewards"]) if stats["rewards"] else 0
-    info = turn.commit(stats["completions"][best])
+    committed = _committed_index(stats["rewards"], k["commit_selection"], state["rng"])
+    info = turn.commit(stats["completions"][committed])
     poisoned_ids = info["poisoned_ids"]        # the attacker's committed choice
 
     # Damage vs THIS round's clean counterfactual (what the aggregate would have
@@ -324,7 +360,7 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     _log_round(env, ctx, info, learner, stats, state["metrics_tracker"],
                state["save_round_log"], reward_att=k["reward_att"], reward_def=k["reward_def"],
                phase_index=phase_index, phase_round=phase_round, success=success,
-               best_index=best, poisoned_ids=poisoned_ids,
+               best_index=best, committed_index=committed, poisoned_ids=poisoned_ids,
                defense_algorithm=env.round_defense)
     return stats, drop, success
 
@@ -569,7 +605,7 @@ def _save_adapters(state):
 
 def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                reward_att=None, reward_def=None, phase_index=0, phase_round=0,
-               success=False, best_index=0, poisoned_ids=None,
+               success=False, best_index=0, committed_index=0, poisoned_ids=None,
                defense_algorithm=None):
     verdicts = info["verdicts"]
     post_acc = info["post_accuracy"]
@@ -637,6 +673,15 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                 # Raw within-group reward span: the quantity the degeneracy gate
                 # tests, so a run of skipped steps is diagnosable from the logs.
                 "reward_spread": stats.get("reward_spread"),
+                # Which rollout advanced the env vs which scored best. They now
+                # differ by design (an on-policy draw, not best-of-G), so the gap is
+                # the honest measure of how optimistic the old argmax commit was.
+                "committed_index": committed_index,
+                "best_index": best_index,
+                "committed_reward": (stats["rewards"][committed_index]
+                                     if stats["rewards"] else None),
+                "total_tokens": stats.get("total_tokens"),
+                "completion_tokens": stats.get("completion_tokens"),
                 "zero_advantage_fraction": stats["zero_advantage_fraction"],
                 "stepped": stats.get("stepped", True),
                 "resampled": stats.get("resampled", False),
@@ -644,9 +689,9 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
         },
     ))
     dbg.commit_summary(
-        learner, best_index, info, ctx.clean_accuracy, post_acc,
+        learner, committed_index, info, ctx.clean_accuracy, post_acc,
         ctx.clean_accuracy - post_acc, success, a_rew, d_rew, poisoned_ids,
-        global_acc=ctx.global_accuracy,
+        global_acc=ctx.global_accuracy, best_index=best_index,
     )
     dbg.flush()
     logger.info(

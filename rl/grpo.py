@@ -2,16 +2,28 @@
 
 For the current turn's prompt we sample ``G`` completions, score each with the
 verifiable reward, and form a group-relative advantage (z-score within the
-group — no value/critic network, which is GRPO's whole point vs PPO). The loss
-is the single-iteration, length-normalized policy-gradient term plus a per-token
-KL penalty to the frozen base model (k3 estimator):
+group — no value/critic network, which is GRPO's whole point vs PPO). The loss is
+the single-iteration policy-gradient term plus a per-token KL penalty to the
+frozen base model (k3 estimator), normalized over the group's TOKENS:
 
-    loss = mean_i [ -A_i * mean_t logπ(o_i,t)  +  β * mean_t KL_t ]
+    loss = (1 / Σ_i L_i) * Σ_i Σ_t [ -A_i * logπ(o_i,t)  +  β * KL_t ]
     KL_t = exp(refLP_t - LP_t) - (refLP_t - LP_t) - 1
 
 Single-iteration (we update on freshly sampled data) means the importance ratio
 is 1, so no clipping is needed — the PPO-style clip only matters when reusing a
 batch for multiple gradient steps.
+
+**Token-level, not sequence-mean.** The normalizer is the group's total token count
+``Σ_i L_i``, so every sampled token carries the same weight. The earlier form —
+``mean_i [ -A_i * mean_t logπ ]`` — divided each rollout by its OWN length, which
+weights a short rollout's tokens more heavily than a long one's (the length bias
+DAPO / Dr. GRPO identify). That is not a cosmetic concern here: output length is
+tied to the action itself, since a 5-client attack plan is several times longer
+than a 1-client plan. The bias therefore pushed on client-count selection
+independently of the reward, confounding exactly what ``rl.reward.attacker.delta``
+(the minimal-clients penalty) is supposed to measure. When all rollouts happen to
+be the same length the two forms are identical, so this does not change the
+effective learning rate — only the relative weighting across unequal lengths.
 """
 
 import logging
@@ -143,7 +155,16 @@ def grpo_step(
     stepped = not (zero_frac >= 1.0 and skip_zero_advantage)
 
     # 4. Accumulate the GRPO loss; backward per-sample to bound memory.
+    #
+    #    Token-level normalization without a lookahead pass: each rollout backwards an
+    #    UNNORMALIZED token SUM, and because gradients are linear we rescale the
+    #    accumulated .grad by 1/total_tokens once the group is done (just before
+    #    clipping). That is exactly `(1/Σ_i L_i) Σ_i Σ_t [...]` while keeping the
+    #    per-sample backward that bounds activation memory — and it removes the need
+    #    to know the group's token count up front.
     total_loss = 0.0
+    total_tokens = 0
+    token_lengths: list[int] = []
     n_used = 0
     if stepped:
         optimizer.zero_grad()
@@ -165,15 +186,26 @@ def grpo_step(
             lp, ref = lp[-L:], ref[-L:]
 
             log_ratio = ref - lp
-            kl = (torch.exp(log_ratio) - log_ratio - 1.0).mean()
-            pg = -(adv * lp.mean())
-            loss_i = (pg + kl_beta * kl) / max(1, G)
+            # Token SUMS (not means): the group-wide 1/total_tokens is applied below,
+            # so a rollout contributes in proportion to how many tokens it actually
+            # sampled instead of being rescaled by its own length.
+            kl = (torch.exp(log_ratio) - log_ratio - 1.0).sum()
+            pg = -(adv * lp.sum())
+            loss_i = pg + kl_beta * kl
             loss_i.backward()
             total_loss += float(loss_i.detach())
+            total_tokens += int(L)
+            token_lengths.append(int(L))
             n_used += 1
 
-        if n_used > 0:
-            torch.nn.utils.clip_grad_norm_(policy.adapter_parameters(adapter), grad_clip)
+        if n_used > 0 and total_tokens > 0:
+            params = policy.adapter_parameters(adapter)
+            scale = 1.0 / total_tokens
+            for p in params:
+                if p.grad is not None:
+                    p.grad.mul_(scale)          # the 1/Σ_i L_i normalizer
+            total_loss *= scale                 # report the normalized loss
+            torch.nn.utils.clip_grad_norm_(params, grad_clip)
             optimizer.step()
         else:
             stepped = False
@@ -192,6 +224,11 @@ def grpo_step(
         "stepped": stepped,
         "resampled": resampled,
         "temperature": eff_temperature,
+        # Tokens the update was normalized over, and the per-rollout lengths behind
+        # it — the length spread is what the token-level loss exists to handle, so
+        # keep it visible.
+        "total_tokens": total_tokens,
+        "completion_tokens": token_lengths,
     }
     if zero_frac >= 1.0 and not stepped:
         logger.warning(
