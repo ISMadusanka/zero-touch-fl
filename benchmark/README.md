@@ -117,6 +117,14 @@ multikrum     ...      ...    ...   ...   ...        ...       ...       ...
   clean Phase-1 baseline (lower is better).
 - `atk_thru` / `attack_success_rate` = fraction of rounds a poisoned client
   slipped through.
+- `atk_succ` / `goal_success_rate` = **weighted** attack success against the goal's
+  requested drop: each round scores `min(1, acc_drop / target)` and those are
+  averaged, so with `--goal 'untargeted_degrade=0.1'` a round that cost the model
+  0.1 accuracy counts as 100%, one that cost 0.05 counts as 50%, and one that cost
+  nothing counts as 0%. Overshoot is capped at 100% and an *improvement* floors at
+  0% (never negative). `goal_full_success_rate` (JSON/CSV) keeps the all-or-nothing
+  reading — the fraction of rounds that reached the target in full — and each
+  round's own weight is saved in `history.json` as `goal_success`.
 
 ### Reading the detection numbers (important caveat)
 

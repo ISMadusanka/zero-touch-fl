@@ -58,17 +58,40 @@ def test_partial_detection_and_false_positives():
     assert s["attack_success_rate"] == 0.5      # 1 of 2 rounds had a miss
 
 
-def test_goal_success_rate():
-    # baseline 0.8, target drop 0.1 -> goal threshold 0.7: acc <= 0.7 == attack succeeded.
+def test_goal_success_rate_is_weighted_by_how_much_of_the_drop_landed():
+    # baseline 0.8, target drop 0.1. atk_succ is WEIGHTED: each round scores
+    # min(1, acc_drop / 0.1), so a half-strength attack is 50% successful — it is not
+    # written off as a failure just because it fell short of the full target.
     m = DefenseMetrics("d", baseline_accuracy=0.8, target_drop=0.1)
-    m.record(0, _verdicts(set(), [0, 1]), {0}, accuracy=0.65)   # below threshold -> goal met
-    m.record(1, _verdicts(set(), [0, 1]), {0}, accuracy=0.70)   # exactly at threshold -> met
-    m.record(2, _verdicts(set(), [0, 1]), {0}, accuracy=0.75)   # above threshold -> not met
+    m.record(0, _verdicts(set(), [0, 1]), {0}, accuracy=0.65)   # drop 0.15 -> capped 1.0
+    m.record(1, _verdicts(set(), [0, 1]), {0}, accuracy=0.70)   # drop 0.10 -> exactly 1.0
+    m.record(2, _verdicts(set(), [0, 1]), {0}, accuracy=0.75)   # drop 0.05 -> 0.5
     s = m.summary()
-    assert abs(s["goal_success_rate"] - (2 / 3)) < 1e-9
+    assert abs(s["goal_success_rate"] - (1.0 + 1.0 + 0.5) / 3) < 1e-9
+    # The all-or-nothing view is still available (2 of 3 rounds hit the full target).
+    assert abs(s["goal_full_success_rate"] - (2 / 3)) < 1e-9
     assert abs(s["goal_threshold"] - 0.7) < 1e-9 and s["target_drop"] == 0.1
+    # Per-round weights are recorded too, so the history shows the partial credit.
+    assert [round(h["goal_success"], 6) for h in m.history] == [1.0, 1.0, 0.5]
+    assert [h["goal_hit"] for h in m.history] == [True, True, False]
     # Evasion (atk_thru) is independent: nobody was flagged, so it's 1.0 every round.
     assert s["attack_success_rate"] == 1.0
+
+
+def test_goal_success_partial_credit_edges():
+    # A drop of 0.02 against a 0.1 target is 20% success; a round that leaves the model
+    # no worse (or better) than the clean baseline scores 0, never negative.
+    m = DefenseMetrics("d", baseline_accuracy=0.8, target_drop=0.1)
+    assert abs(m.goal_score(0.78) - 0.2) < 1e-9
+    assert m.goal_score(0.80) == 0.0
+    assert m.goal_score(0.85) == 0.0        # the attack HELPED -> not negative success
+    assert m.goal_score(0.20) == 1.0        # gross overshoot stays capped at 100%
+    # Averaged: 20% + 0% over two rounds -> 10%.
+    m.record(0, _verdicts(set(), [0, 1]), {0}, accuracy=0.78)
+    m.record(1, _verdicts(set(), [0, 1]), {0}, accuracy=0.85)
+    s = m.summary()
+    assert abs(s["goal_success_rate"] - 0.1) < 1e-9
+    assert s["goal_full_success_rate"] == 0.0
 
 
 def test_goal_success_rate_none_without_target():
@@ -77,7 +100,17 @@ def test_goal_success_rate_none_without_target():
     m.record(0, _verdicts(set(), [0, 1]), {0}, accuracy=0.1)
     s = m.summary()
     assert s["goal_success_rate"] is None and s["goal_threshold"] is None
+    assert s["goal_full_success_rate"] is None
+    assert m.history[0]["goal_success"] is None and m.history[0]["goal_hit"] is False
     assert "n/a" in report.format_table([s]) and "atk_succ" in report.format_table([s])
+
+
+def test_report_legend_describes_the_weighted_metric():
+    s = [DefenseMetrics("fedavg", 0.8, target_drop=0.1).summary()]
+    text = report.render(s, n_rounds=10, baseline_accuracy=0.8,
+                         goal={"type": "untargeted_degrade", "target_accuracy_drop": 0.1})
+    assert "WEIGHTED attack success" in text
+    assert "0.100" in text and "0.700" in text      # the target and the full-credit acc
 
 
 def test_report_table_has_all_defenses():

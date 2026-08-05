@@ -72,14 +72,17 @@ def render(summaries: list[dict], n_rounds: int, baseline_accuracy: float,
              f"{poisoner_s}")
     bar = "=" * len(title)
     text = f"{bar}\n{title}\n{bar}\n{format_table(summaries)}\n"
-    # Threshold acc at/below which the attack's degradation goal counts as met.
-    thr = None
+    # The requested drop, and the accuracy at/below which the goal is met IN FULL.
+    tgt = thr = None
     if goal is not None:
         from rl.rewards import goal_target
-        thr = baseline_accuracy - goal_target(goal)
+        tgt = goal_target(goal)
+        thr = baseline_accuracy - tgt
     atk_succ_line = (
-        f"  atk_succ  fraction of rounds the model accuracy fell to <= baseline-target"
-        f"{f' ({thr:.3f})' if thr is not None else ''} — i.e. the attack MET its degradation goal\n"
+        f"  atk_succ  WEIGHTED attack success: mean over rounds of "
+        f"min(1, acc_drop / target{f' ({tgt:.3f})' if tgt is not None else ''})\n"
+        f"            — a round achieving the FULL requested drop"
+        f"{f' (acc <= {thr:.3f})' if thr is not None else ''} scores 100%, half of it 50%\n"
     )
     text += (
         "\nLegend:\n"
