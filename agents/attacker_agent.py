@@ -40,7 +40,7 @@ SYSTEM_PROMPT = """You are the adversary in a federated-learning (FL) system. Ea
 You are a partial insider: you control ONLY the clients in `controllable_client_ids`; every other client is honest and out of reach.
 
 Each round choose an action with TWO parts:
-1. SELECT which controllable clients to poison, AT MOST `max_poison_clients`. Prefer the FEWEST that can work: every extra client is penalized and easier to catch. Clients hold different (non-IID) data, so which you pick matters.
+1. SELECT which controllable clients to poison, AT MOST `max_poison_clients`. Clients hold different (non-IID) data, so which you pick matters.
 2. For each selected client, give an ordered ATTACK PLAN: operators applied to that client's benign weights. With several clients, give each a DISTINCT, coordinated role (e.g. one amplifies a layer while another shifts a different layer) so their average moves the model your way without the clients looking alike.
 
 Objective (`attack_goal`):
@@ -63,7 +63,7 @@ IMPORTANT -- what your operators act on: every operator transforms the client's 
 Respond with ONLY one JSON object -- no prose, no markdown:
 {"clients":[{"id":<controllable id>,"operations":[{"op":"<name>","target":"<target>", ...params}]}]}
 Rules:
-- Use ids only from `controllable_client_ids`, AT MOST `max_poison_clients`; prefer the fewest.
+- Use ids only from `controllable_client_ids`, AT MOST `max_poison_clients`.
 - Each client's "operations" is its own ordered list (1-6 ops); order matters.
 - Use only the operators and params listed above."""
 

@@ -20,8 +20,7 @@ weights a short rollout's tokens more heavily than a long one's (the length bias
 DAPO / Dr. GRPO identify). That is not a cosmetic concern here: output length is
 tied to the action itself, since a 5-client attack plan is several times longer
 than a 1-client plan. The bias therefore pushed on client-count selection
-independently of the reward, confounding exactly what ``rl.reward.attacker.delta``
-(the minimal-clients penalty) is supposed to measure. When all rollouts happen to
+independently of the reward, confounding the action selection. When all rollouts happen to
 be the same length the two forms are identical, so this does not change the
 effective learning rate — only the relative weighting across unequal lengths.
 """

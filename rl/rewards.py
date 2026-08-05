@@ -85,7 +85,6 @@ def attacker_reward(
     alpha: float = 1.0,
     beta: float = 0.5,
     gamma: float = 1.0,
-    delta: float = 0.0,
     zeta: float = 0.0,
     pool_size: int | None = None,
     diversity: float | None = None,
@@ -96,7 +95,6 @@ def attacker_reward(
     reward = alpha * drop_term(drop, target)
            + beta  * stealth
            - gamma * malformed_fraction
-           - delta * client_cost
            + zeta  * collab_bonus
 
     ``drop = reference_accuracy - post_accuracy``.
@@ -125,9 +123,7 @@ def attacker_reward(
     (``n_used + n_malformed``), not over the ones that landed, so selecting three
     clients and wasting two is penalized twice as hard as wasting one.
 
-    ``client_cost`` = ``(n_used - 1) / (pool_size - 1)`` in [0, 1] penalizes using
-    more of the controllable pool than necessary (0 for a single client), so the
-    attacker learns to achieve the goal with the fewest clients. ``collab_bonus``
+    ``collab_bonus``
     = ``diversity`` in [0, 1] (only when >1 client) rewards distinct, coordinated
     per-client perturbations over identical clones — see ``perturbation_diversity``.
     """
@@ -151,12 +147,6 @@ def attacker_reward(
     n_selected = n_used + max(0, int(n_malformed))
     malformed_fraction = n_malformed / n_selected if n_selected else 0.0
 
-    # Minimal-clients penalty: using more of the controllable pool than needed is
-    # costly. Normalized to [0, 1] by the pool size so it is budget-independent.
-    client_cost = 0.0
-    if pool_size and pool_size > 1 and n_used > 1:
-        client_cost = _clip((n_used - 1) / (pool_size - 1), 0.0, 1.0)
-
     # Collaboration bonus: reward diverse (coordinated) multi-client attacks. Only
     # meaningful with >1 client; `diversity` in [0, 1].
     collab_bonus = 0.0
@@ -164,7 +154,7 @@ def attacker_reward(
         collab_bonus = _clip(float(diversity), 0.0, 1.0)
 
     return (alpha * damage + beta * stealth - gamma * malformed_fraction
-            - delta * client_cost + zeta * collab_bonus)
+            + zeta * collab_bonus)
 
 
 def perturbation_diversity(poisoned_by_client: dict, references: dict) -> float:

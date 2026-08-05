@@ -626,7 +626,6 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                             alpha=reward_att.get("alpha", 1.0),
                             beta=reward_att.get("beta", 0.5),
                             gamma=reward_att.get("gamma", 1.0),
-                            delta=reward_att.get("delta", 0.0),
                             zeta=reward_att.get("zeta", 0.0),
                             pool_size=env.n_compromisable,
                             diversity=diversity)

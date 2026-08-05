@@ -38,8 +38,7 @@ attack:
   target_choices: [0.05, 0.10, 0.20, 0.30]  # per-round target pool (untargeted_degrade only)
   # --- Client-selection budget (the attacker chooses WHICH & HOW MANY to poison) ---
   max_poison_clients: 5           # TRAINING budget cap: attacker may poison up to this many of its
-                                  # pool each round (must be <= n_compromisable). Reward penalizes
-                                  # using more than needed (see rl.reward.attacker.delta).
+                                  # pool each round (must be <= n_compromisable).
   sample_budget_in_training: true # true = randomize the per-round cap in [1..max_poison_clients] so
                                   # the policy is BUDGET-AWARE (generalizes to any eval budget).
   eval_poison_clients: 1          # EVALUATION default budget (benchmark --max-poison-clients override)
@@ -206,8 +205,9 @@ rl:
       alpha: 1.0                  # weight on accuracy-drop term
       beta: 0.5                   # weight on evasion term
       gamma: 1.0                  # penalty for malformed weight output
-      delta: 0.3                  # penalty for using MORE poison clients than needed
-                                  # (client_cost = (n_used-1)/(n_compromisable-1) in [0,1])
+      delta: 0.0                  # penalty for using MORE poison clients than needed
+                                  # (client_cost = (n_used-1)/(n_compromisable-1) in [0,1]);
+                                  # set to 0 to remove the fewer-clients pressure.
       zeta: 0.2                   # bonus for COLLABORATIVE multi-client attacks: diversity =
                                   # 1 - mean pairwise cosine of chosen clients' perturbations
                                   # (0 for a single client). Rewards distinct, coordinated roles.

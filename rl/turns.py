@@ -136,7 +136,6 @@ class AttackerTurn:
             alpha=self.reward_cfg.get("alpha", 1.0),
             beta=self.reward_cfg.get("beta", 0.5),
             gamma=self.reward_cfg.get("gamma", 1.0),
-            delta=self.reward_cfg.get("delta", 0.0),
             zeta=self.reward_cfg.get("zeta", 0.0),
             pool_size=self.pool_size,
             diversity=diversity,
