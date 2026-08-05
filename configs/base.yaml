@@ -39,9 +39,11 @@ attack:
   # --- Client-selection budget (the attacker chooses WHICH & HOW MANY to poison) ---
   max_poison_clients: 5           # TRAINING budget cap: attacker may poison up to this many of its
                                   # pool each round (must be <= n_compromisable).
-  sample_budget_in_training: true # true = randomize the per-round cap in [1..max_poison_clients] so
-                                  # the policy is BUDGET-AWARE (generalizes to any eval budget).
-  eval_poison_clients: 1          # EVALUATION default budget (benchmark --max-poison-clients override)
+  sample_budget_in_training: false # false = always use the full max_poison_clients budget every round.
+                                  # (was true = randomize the per-round cap in [1..max_poison_clients]
+                                  # for budget-aware generalization; now fixed to always use the full budget.)
+  eval_poison_clients: 5          # EVALUATION default budget — matches max_poison_clients so the
+                                  # benchmark uses all 5 poisoners (benchmark --max-poison-clients override)
 
 # Server-side defense — what the attacker actually faces every Phase-2 round.
 defense:
