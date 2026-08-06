@@ -48,7 +48,7 @@ def run_inference(
     for _ in range(n_rounds):
         ctx = env.begin_round()
 
-        # Attacker SELECTS which of its controllable pool to poison (<= budget) and how.
+        # Attacker selects exactly the budgeted number from its controllable pool.
         a_sys = attacker_agent.system_prompt()
         a_user = attacker_agent.build_user_prompt(
             ctx.round_num, ctx.global_accuracy, ctx.pool_benign, env.global_weights,
@@ -82,7 +82,7 @@ def run_inference(
         # training (see FLArmsRaceEnv.clean_reference_accuracy).
         a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal, chosen_ids,
                                 verdicts, n_malformed,
-                                pool_size=env.n_compromisable, diversity=diversity)
+                                diversity=diversity)
         d_rew = defender_reward(verdicts, chosen_ids)
 
         metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))

@@ -13,11 +13,10 @@ Two phases:
    checkpointed.
 2. **Phase 2 (`simulation_rounds`):** The attacker is a **partial insider** — it
    controls only the first `n_compromisable` clients (default 5 of 20) and
-   **chooses which of them to poison** each round, up to a per-round budget,
-   optimizing to use **as few clients as possible** (and to coordinate them when
-   it uses more than one).
+   **chooses which of them to poison** each round while always using the round's
+   exact poison-client budget (and coordinating them when it uses more than one).
    - **Attacker LLM** — input: round number, its `controllable_client_ids`, this
-     round's `max_poison_clients` budget, per-layer **statistics** of each pool
+     round's exact `max_poison_clients` quota, per-layer **statistics** of each pool
      client's benign weights, current global accuracy, and a configurable attack
      goal. Output: a **client selection + a per-client attack plan** — for each
      chosen client, an ordered list of primitive weight operators (scale,
@@ -35,7 +34,8 @@ Two phases:
      FedAvg-aggregates the clients it did not flag.
    - Because we know the ground-truth poisoned set, the agents get an exact
      **verifiable reward** and are trained online with **GRPO**.
-   - A selected client counts as poisoned only if its plan **actually changed its
+   - Usable under-filled selections are expanded to the exact quota with remaining
+     pool IDs. A client counts as poisoned only if its plan **actually changed its
      weights**; no-ops (unparseable output, empty plans, ops all skipped as
      invalid, `scale factor=1.0`) send honest weights, so they are charged as
      *wasted* clients rather than entering the ground truth. The attacker's damage
@@ -246,9 +246,9 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
   `n_compromisable: 5`, `poison_seed`, `benign_retrain_each_round`), the
   `data.noniid_bias` (FLTrust `q`), the `attack` block (`goal`,
   `max_poison_clients`, `sample_budget_in_training`, `eval_poison_clients`), and
-  the `rl:` block — GRPO + LoRA + league + reward weights, including
-  `reward.attacker.delta` (use-fewer-clients penalty) and `.zeta` (multi-client
-  collaboration/diversity bonus), and `league_max_snapshots` (the ring-buffer cap
+  the `rl:` block — GRPO + LoRA + league + reward weights, including the
+  `.zeta` multi-client collaboration/diversity bonus and `league_max_snapshots`
+  (the ring-buffer cap
   on retained opponent snapshots — each costs ~115 MB of host RAM, so leaving it
   unbounded OOMs a long run).
 - **`configs/attacker_agent.yaml`** — attacker goal fallback, layer-detail
@@ -269,7 +269,7 @@ Attack goals (configurable; `untargeted_degrade` is the first experiment):
 target, training randomizes `target_accuracy_drop` each round from
 `attack.target_choices` (default `[0.05, 0.10, 0.20, 0.30]`) when
 `attack.sample_target_in_training: true` — the same domain-randomization idea as
-the per-round poison budget, so the policy becomes **target-aware** and generalizes
+an optionally sampled exact poison quota, so the policy becomes **target-aware** and generalizes
 to any requested drop. The sampled target is placed in the attacker's prompt AND
 used by its reward every round (sampled once per round, so all `G` GRPO rollouts in
 a group share it). The arms-race success gate is likewise **relative**: an attack

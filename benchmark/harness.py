@@ -1,8 +1,8 @@
 """Benchmark harness: run the trained attacker against multiple defenses.
 
 Each round:
-  1. the env (reused UNMODIFIED, purely as a generator) samples the poisoned
-     client subset + builds the benign updates;
+  1. the env (reused UNMODIFIED, purely as a generator) builds the controllable
+     pool and benign updates for an exact poison-client quota;
   2. the trained attacker LLM produces ONE attack plan from the reference
      (no-defense) accuracy;
   3. that single set of client updates is fed to EVERY defense, each evolving its
@@ -83,8 +83,8 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
     for r in range(1, n_rounds + 1):
         ctx = env.begin_round()
 
-        # The trained attacker SELECTS which of its controllable pool to poison
-        # (<= the eval budget) and plans ONE attack against the reference state;
+        # The trained attacker SELECTS exactly the eval-budget count from its
+        # controllable pool and plans ONE attack against the reference state;
         # the SAME poisoned updates go to every defense (vary defense, hold attack).
         system = attacker_agent.system_prompt()
         user = attacker_agent.build_user_prompt(ctx.round_num, reference_acc,
@@ -95,6 +95,13 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
                                temperature=attack_temperature, max_new_tokens=max_new_tokens)[0]
         poisoned, chosen_ids, _n_malformed = attacker_agent.select_and_apply(
             text, ctx.pool_benign, ctx.budget)
+        if len(chosen_ids) != ctx.budget:
+            raise RuntimeError(
+                f"round {ctx.round_num}: attacker could not satisfy the exact "
+                f"poison quota {ctx.budget}; only {len(chosen_ids)} effective "
+                f"plan(s) were produced ({_n_malformed} malformed quota slots). "
+                f"Increase rl.max_new_tokens or inspect the attacker output."
+            )
         poisoned_ids = set(chosen_ids)
         env.set_committed_poison(chosen_ids)
         updates = env.build_updates(poisoned)

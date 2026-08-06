@@ -208,7 +208,7 @@ A round is orchestrated by `_step_round` in [rl/schedule.py](rl/schedule.py).
 Here is the end-to-end flow:
 
 ```
-1. ctx = env.begin_round()              # env.py:106 — pick the poisoned client(s),
+1. ctx = env.begin_round()              # build benign updates + exact poison quota,
                                         #   build the 5 honest client updates
 2. turn = AttackerTurn(...) or DefenderTurn(...)   # turns.py — freeze the opponent,
                                         #   build the learner's prompt

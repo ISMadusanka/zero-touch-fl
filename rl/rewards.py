@@ -86,11 +86,10 @@ def attacker_reward(
     beta: float = 0.5,
     gamma: float = 1.0,
     zeta: float = 0.0,
-    pool_size: int | None = None,
     diversity: float | None = None,
 ) -> float:
-    """Reward the attacker for degrading accuracy while staying stealthy, using
-    the FEWEST clients, and (when it uses several) collaborating with them.
+    """Reward the attacker for degrading accuracy while staying stealthy and,
+    when the exact quota contains several clients, coordinating their plans.
 
     reward = alpha * drop_term(drop, target)
            + beta  * stealth

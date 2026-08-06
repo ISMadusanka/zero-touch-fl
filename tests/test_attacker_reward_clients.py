@@ -1,5 +1,5 @@
-"""Tests for the minimal-clients penalty + collaboration (diversity) bonus in the
-attacker reward (rl/rewards.py). Needs torch (perturbation_diversity).
+"""Tests that client count is not penalized and that the collaboration (diversity)
+bonus works in the attacker reward. Needs torch (perturbation_diversity).
 
 Run on any box with torch:  python tests/test_attacker_reward_clients.py
 """
@@ -21,23 +21,13 @@ def _benign_verdicts(ids):
     return [DetectionVerdict(cid, False, 1.0, "") for cid in ids]
 
 
-def test_more_clients_lowers_reward_via_client_cost():
-    # Same drop (0.1 -> drop_term 0.5) and stealth; isolate client_cost (beta=gamma=0).
+def test_more_clients_do_not_lower_reward():
+    # Same drop and mean stealth; there is no fewer-clients/client-cost term.
     r1 = attacker_reward(0.9, 0.8, GOAL, [0], _benign_verdicts([0]), 0,
-                         alpha=1.0, beta=0.0, gamma=0.0, delta=1.0, zeta=0.0, pool_size=5)
+                         alpha=1.0, beta=0.0, gamma=0.0, zeta=0.0)
     r2 = attacker_reward(0.9, 0.8, GOAL, [0, 1], _benign_verdicts([0, 1]), 0,
-                         alpha=1.0, beta=0.0, gamma=0.0, delta=1.0, zeta=0.0, pool_size=5)
-    assert r2 < r1
-    # client_cost(2 of pool 5) = (2-1)/(5-1) = 0.25 ; delta=1.0 -> exactly -0.25.
-    assert abs((r1 - r2) - 0.25) < 1e-6
-
-
-def test_single_client_unaffected_by_delta():
-    base = attacker_reward(0.9, 0.8, GOAL, [0], _benign_verdicts([0]), 0,
-                           alpha=1.0, beta=0.0, gamma=0.0, delta=0.0, zeta=0.0, pool_size=5)
-    penalized = attacker_reward(0.9, 0.8, GOAL, [0], _benign_verdicts([0]), 0,
-                                alpha=1.0, beta=0.0, gamma=0.0, delta=5.0, zeta=0.0, pool_size=5)
-    assert abs(base - penalized) < 1e-9              # one client -> no client_cost
+                         alpha=1.0, beta=0.0, gamma=0.0, zeta=0.0)
+    assert abs(r2 - r1) < 1e-9
 
 
 def test_perturbation_diversity_orthogonal_vs_identical():
@@ -54,20 +44,19 @@ def test_perturbation_diversity_orthogonal_vs_identical():
 def test_collab_bonus_rewards_diverse_multiclient():
     v = _benign_verdicts([0, 1])
     diverse = attacker_reward(0.9, 0.8, GOAL, [0, 1], v, 0,
-                              alpha=1.0, beta=0.0, gamma=0.0, delta=0.0, zeta=1.0,
-                              pool_size=5, diversity=1.0)
+                              alpha=1.0, beta=0.0, gamma=0.0, zeta=1.0,
+                              diversity=1.0)
     redundant = attacker_reward(0.9, 0.8, GOAL, [0, 1], v, 0,
-                                alpha=1.0, beta=0.0, gamma=0.0, delta=0.0, zeta=1.0,
-                                pool_size=5, diversity=0.0)
+                                alpha=1.0, beta=0.0, gamma=0.0, zeta=1.0,
+                                diversity=0.0)
     assert abs((diverse - redundant) - 1.0) < 1e-6  # zeta=1.0 * (1.0 - 0.0)
 
 
 def test_collab_bonus_ignored_for_single_client():
     r = attacker_reward(0.9, 0.8, GOAL, [0], _benign_verdicts([0]), 0,
-                        alpha=1.0, beta=0.0, gamma=0.0, delta=0.0, zeta=1.0,
-                        pool_size=5, diversity=1.0)
+                        alpha=1.0, beta=0.0, gamma=0.0, zeta=1.0, diversity=1.0)
     base = attacker_reward(0.9, 0.8, GOAL, [0], _benign_verdicts([0]), 0,
-                           alpha=1.0, beta=0.0, gamma=0.0, delta=0.0, zeta=0.0, pool_size=5)
+                           alpha=1.0, beta=0.0, gamma=0.0, zeta=0.0)
     assert abs(r - base) < 1e-9                      # no collaboration with one client
 
 

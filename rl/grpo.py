@@ -18,10 +18,9 @@ batch for multiple gradient steps.
 ``mean_i [ -A_i * mean_t logπ ]`` — divided each rollout by its OWN length, which
 weights a short rollout's tokens more heavily than a long one's (the length bias
 DAPO / Dr. GRPO identify). That is not a cosmetic concern here: output length is
-tied to the action itself, since a 5-client attack plan is several times longer
-than a 1-client plan. The bias therefore pushed on client-count selection
-independently of the reward, confounding the action selection. When all rollouts happen to
-be the same length the two forms are identical, so this does not change the
+tied to the configured action size: larger poison quotas require longer plans.
+The old bias therefore changed optimization behavior across budget settings.
+When all rollouts happen to be the same length the two forms are identical, so this does not change the
 effective learning rate — only the relative weighting across unequal lengths.
 """
 

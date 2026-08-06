@@ -6,9 +6,9 @@ frozen opponent (the Stackelberg structure: the leader/attacker moves, the
 follower/defender best-responds).
 
 The attacker's action now includes CLIENT SELECTION: from its controllable pool
-(``env.pool_benign``) it picks up to ``env.round_budget`` clients and poisons each
-(see ``AttackerAgent.select_and_apply``). Different rollouts may pick different
-subsets, so each rollout's reward is computed against ITS OWN chosen set.
+(``env.pool_benign``) it picks exactly ``env.round_budget`` clients and poisons
+each (see ``AttackerAgent.select_and_apply``). Different rollouts may pick
+different exact-size subsets, so each reward uses ITS OWN chosen set.
 
 Generators are duck-typed: any object with
 ``generate(system, user, n, temperature) -> list[str]`` works — a
@@ -68,11 +68,10 @@ class AttackerTurn:
             else scoring_opponent_temperature
         )
 
-        # The controllable pool + this round's budget (the attacker chooses which
-        # of these to poison, and how).
+        # The controllable pool + this round's exact quota (the attacker chooses
+        # which clients fill it, and how to poison each).
         self.pool_references = env.pool_benign            # {cid: benign state_dict}
         self.budget = env.round_budget
-        self.pool_size = env.n_compromisable
         # Damage is scored against THIS round's clean counterfactual (the accuracy
         # the aggregate reaches with no poison), not against the current global's
         # accuracy — see FLArmsRaceEnv.clean_reference_accuracy. All G rollouts
@@ -137,7 +136,6 @@ class AttackerTurn:
             beta=self.reward_cfg.get("beta", 0.5),
             gamma=self.reward_cfg.get("gamma", 1.0),
             zeta=self.reward_cfg.get("zeta", 0.0),
-            pool_size=self.pool_size,
             diversity=diversity,
         )
         dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed,
@@ -182,8 +180,8 @@ class DefenderTurn:
         self.defender_agent = defender_agent
         self.reward_cfg = reward_cfg or {}
 
-        # Frozen attacker plays its move for this round: it selects which of its
-        # pool to poison (<= budget) and how.
+        # Frozen attacker plays its move for this round: it selects exactly the
+        # budgeted number from its pool and decides how to poison each.
         dbg.opponent_move(opponent_temperature)
         a_sys = attacker_agent.system_prompt()
         a_user = attacker_agent.build_user_prompt(

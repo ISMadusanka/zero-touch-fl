@@ -1,8 +1,8 @@
 """Tests for the attacker's client-SELECTION parsing + application.
 
 Covers agents/attack_ops.extract_selection and AttackerAgent.select_and_apply:
-pool filtering, dedup, budget truncation, distinct per-client plans, and the
-benign fallback on garbage. Needs torch (apply_plan operates on tensors).
+exact-quota filling, pool filtering, dedup, budget truncation, distinct
+per-client plans, and the benign fallback on garbage. Needs torch.
 
 Run on any box with torch:  python tests/test_attacker_select.py
 """
@@ -52,7 +52,7 @@ def test_per_client_distinct_plans_applied():
     pool = _pool()
     text = ('{"clients":[{"id":0,"operations":[{"op":"scale","factor":2.0}]},'
             '{"id":3,"operations":[{"op":"scale","factor":0.0}]}]}')
-    poisoned, chosen, n_malformed = agent.select_and_apply(text, pool, budget=5)
+    poisoned, chosen, n_malformed = agent.select_and_apply(text, pool, budget=2)
     assert chosen == [0, 3] and n_malformed == 0
     # client 0 doubled, client 3 zeroed -> distinct, coordinated per-client plans.
     assert torch.allclose(poisoned[0]["net.2.weight"], pool[0]["net.2.weight"] * 2.0)
@@ -77,7 +77,21 @@ def test_pool_filtering_and_dedup():
             '{"id":1,"operations":[{"op":"scale","factor":2}]},'
             '{"id":1,"operations":[{"op":"scale","factor":3}]}]}')
     _poisoned, chosen, _ = agent.select_and_apply(text, pool, budget=5)
-    assert chosen == [1]                        # 99 dropped (not in pool), 1 deduped
+    # Invalid 99 is dropped and duplicate 1 is deduped; the remaining exact-quota
+    # slots are filled from the pool using the emitted valid operation plan.
+    assert chosen == [1, 0, 2, 3, 4]
+
+
+def test_underfilled_selection_is_expanded_to_exact_budget():
+    agent = AttackerAgent()
+    pool = _pool()
+    text = ('{"clients":[{"id":3,"operations":['
+            '{"op":"scale","target":"all","factor":2.0}]}]}')
+    poisoned, chosen, n_malformed = agent.select_and_apply(text, pool, budget=3)
+    assert chosen == [3, 0, 1]
+    assert list(poisoned) == chosen and n_malformed == 0
+    assert all(torch.allclose(poisoned[c]["net.2.weight"],
+                              pool[c]["net.2.weight"] * 2.0) for c in chosen)
 
 
 def test_budget_clamped_to_pool():
@@ -98,7 +112,7 @@ def test_garbage_poisons_nobody():
     agent = AttackerAgent()
     pool = _pool()
     poisoned, chosen, n_malformed = agent.select_and_apply("total garbage", pool, budget=3)
-    assert poisoned == {} and chosen == [] and n_malformed == 1
+    assert poisoned == {} and chosen == [] and n_malformed == 3
 
 
 def test_empty_plan_client_counts_malformed_and_is_not_poisoned():
@@ -106,7 +120,7 @@ def test_empty_plan_client_counts_malformed_and_is_not_poisoned():
     pool = _pool()
     poisoned, chosen, n_malformed = agent.select_and_apply(
         '{"clients":[{"id":2,"operations":[]}]}', pool, budget=3)
-    assert poisoned == {} and chosen == [] and n_malformed == 1
+    assert poisoned == {} and chosen == [] and n_malformed == 3
 
 
 def test_noop_plan_is_malformed_not_poison():
@@ -119,18 +133,19 @@ def test_noop_plan_is_malformed_not_poison():
         '{"clients":[{"id":1,"operations":[{"op":"scale","target":"no.such.layer","factor":9}]}]}',
     ):
         poisoned, chosen, n_malformed = agent.select_and_apply(text, _pool(), budget=3)
-        assert poisoned == {} and chosen == [] and n_malformed == 1, text
+        assert poisoned == {} and chosen == [] and n_malformed == 3, text
 
 
-def test_partial_noop_keeps_only_the_effective_client():
-    """One real plan + one no-op -> exactly one poisoned client, one wasted."""
+def test_partial_noop_is_repaired_to_keep_exact_quota():
+    """A real emitted plan repairs another quota slot whose own plan is a no-op."""
     agent = AttackerAgent()
     pool = _pool()
     text = ('{"clients":[{"id":0,"operations":[{"op":"scale","target":"all","factor":3.0}]},'
             '{"id":1,"operations":[{"op":"scale","target":"all","factor":1.0}]}]}')
     poisoned, chosen, n_malformed = agent.select_and_apply(text, pool, budget=2)
-    assert chosen == [0] and list(poisoned) == [0] and n_malformed == 1
+    assert chosen == [0, 1] and list(poisoned) == [0, 1] and n_malformed == 0
     assert torch.allclose(poisoned[0]["net.2.weight"], pool[0]["net.2.weight"] * 3.0)
+    assert torch.allclose(poisoned[1]["net.2.weight"], pool[1]["net.2.weight"] * 3.0)
 
 
 def test_invalid_ops_alongside_a_real_one_still_poison():
@@ -142,6 +157,16 @@ def test_invalid_ops_alongside_a_real_one_still_poison():
     poisoned, chosen, n_malformed = agent.select_and_apply(text, pool, budget=1)
     assert chosen == [4] and n_malformed == 0
     assert torch.allclose(poisoned[4]["net.2.weight"], pool[4]["net.2.weight"] * 2.0)
+
+
+def test_prompt_declares_budget_as_exact_quota():
+    import json
+
+    agent = AttackerAgent()
+    assert "EXACTLY `max_poison_clients`" in agent.system_prompt()
+    assert "AT MOST `max_poison_clients`" not in agent.system_prompt()
+    payload = json.loads(agent.build_user_prompt(1, 0.9, _pool(5), _sd(), budget=2))
+    assert payload["max_poison_clients"] == 2
 
 
 def _run():

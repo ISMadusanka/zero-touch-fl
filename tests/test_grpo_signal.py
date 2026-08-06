@@ -67,8 +67,8 @@ def test_stealth_increases_as_a_surviving_client_looks_more_honest():
     inverted, so the attacker was trained to sit ON the detection boundary."""
     nearly_caught = [DetectionVerdict(0, False, 0.98, "trust=0.01", p_malicious=0.99)]
     comfortable = [DetectionVerdict(0, False, 0.20, "trust=0.60", p_malicious=0.40)]
-    r_nearly = attacker_reward(0.9, 0.7, GOAL, [0], nearly_caught, 0, pool_size=5)
-    r_comfy = attacker_reward(0.9, 0.7, GOAL, [0], comfortable, 0, pool_size=5)
+    r_nearly = attacker_reward(0.9, 0.7, GOAL, [0], nearly_caught, 0)
+    r_comfy = attacker_reward(0.9, 0.7, GOAL, [0], comfortable, 0)
     assert r_comfy > r_nearly, (r_comfy, r_nearly)
 
     # The inverted mapping the fix removed, shown explicitly: it ranked the
@@ -140,8 +140,8 @@ def test_test_set_quantization_noise_is_treated_as_degenerate():
     that through and z-scored it to A = +-1.2."""
     posts = [0.7000, 0.7001, 0.6999, 0.7000]        # one example apart
     rs = [attacker_reward(0.9, p, GOAL, [0],
-                          [DetectionVerdict(0, False, 0.0, "x", p_malicious=0.2)], 0,
-                          pool_size=5) for p in posts]
+                          [DetectionVerdict(0, False, 0.0, "x", p_malicious=0.2)], 0)
+          for p in posts]
     assert 0 < (max(rs) - min(rs)) < DEFAULT_MIN_REWARD_SPREAD, rs   # real but tiny
     adv, zero_frac = group_advantages(rs)
     assert zero_frac == 1.0 and adv == [0.0] * 4
@@ -166,8 +166,8 @@ def test_a_genuinely_separated_group_still_learns():
     """The noise gate must not swallow real signal: a 1% accuracy difference at the
     default target clears it comfortably."""
     rs = [attacker_reward(0.9, p, GOAL, [0],
-                          [DetectionVerdict(0, False, 0.0, "x", p_malicious=0.2)], 0,
-                          pool_size=5) for p in (0.75, 0.74, 0.73, 0.72)]
+                          [DetectionVerdict(0, False, 0.0, "x", p_malicious=0.2)], 0)
+          for p in (0.75, 0.74, 0.73, 0.72)]
     adv, zero_frac = group_advantages(rs)
     assert zero_frac == 0.0 and max(abs(a) for a in adv) > 1.0
 

@@ -41,15 +41,15 @@ def test_identical_attack_scores_identically_every_round():
     """The memoryless env rebuilds the same aggregate each round, so the same
     attack must earn the same reward each round."""
     clean, post = 0.90, 0.60          # this round's unpoisoned acc vs achieved acc
-    r = [attacker_reward(clean, post, GOAL, [0], _evaded([0]), 0, pool_size=5)
+    r = [attacker_reward(clean, post, GOAL, [0], _evaded([0]), 0)
          for _ in range(3)]
     assert r[0] == r[1] == r[2]
     assert r[0] > 1.0                 # a 0.30 drop against a 0.20 target
 
 
 def test_reward_tracks_goal_attainment_not_round_over_round_change():
-    half = attacker_reward(0.90, 0.80, GOAL, [0], _evaded([0]), 0, pool_size=5)
-    full = attacker_reward(0.90, 0.70, GOAL, [0], _evaded([0]), 0, pool_size=5)
+    half = attacker_reward(0.90, 0.80, GOAL, [0], _evaded([0]), 0)
+    full = attacker_reward(0.90, 0.70, GOAL, [0], _evaded([0]), 0)
     assert full > half
     # drop == target -> damage term is exactly 1.0 (plus the 0.5 stealth bonus).
     assert abs(full - (1.0 + 0.5)) < 1e-9
@@ -73,7 +73,7 @@ def test_competent_group_keeps_a_learning_signal():
     """Four rollouts that all overshoot the target used to tie at the 1.5 clip →
     zero advantage → grpo_step skipped the step. They must now separate."""
     posts = [0.45, 0.30, 0.18, 0.09]          # drops 0.45 / 0.60 / 0.72 / 0.81
-    rs = [attacker_reward(0.90, p, GOAL, [0], _evaded([0]), 0, pool_size=5)
+    rs = [attacker_reward(0.90, p, GOAL, [0], _evaded([0]), 0)
           for p in posts]
     assert len(set(rs)) == len(rs), rs
     _adv, zero_frac = group_advantages(rs)
@@ -111,19 +111,19 @@ def test_defender_still_scored_on_f1_when_poison_exists():
 
 def test_attacker_punished_for_a_wasted_round():
     """No effective poison: no damage, no stealth, full waste penalty."""
-    r = attacker_reward(0.90, 0.90, GOAL, [], _evaded([]), 1, pool_size=5)
+    r = attacker_reward(0.90, 0.90, GOAL, [], _evaded([]), 1)
     assert abs(r - (-1.0)) < 1e-9
     # Selecting three clients and wasting all three is no worse per-client...
-    assert abs(attacker_reward(0.90, 0.90, GOAL, [], _evaded([]), 3, pool_size=5)
+    assert abs(attacker_reward(0.90, 0.90, GOAL, [], _evaded([]), 3)
                - (-1.0)) < 1e-9
     # ...but wasting 1 of 2 selected is only half the penalty.
-    half = attacker_reward(0.90, 0.90, GOAL, [1], _evaded([1]), 1, pool_size=5)
+    half = attacker_reward(0.90, 0.90, GOAL, [1], _evaded([1]), 1)
     assert abs(half - (0.0 + 0.5 * 1.0 - 1.0 * 0.5)) < 1e-9
 
 
 def test_doing_nothing_scores_worse_than_a_real_attack():
-    nothing = attacker_reward(0.90, 0.90, GOAL, [], _evaded([]), 1, pool_size=5)
-    real = attacker_reward(0.90, 0.75, GOAL, [0], _evaded([0]), 0, pool_size=5)
+    nothing = attacker_reward(0.90, 0.90, GOAL, [], _evaded([]), 1)
+    real = attacker_reward(0.90, 0.75, GOAL, [0], _evaded([0]), 0)
     assert real > nothing + 1.0
 
 

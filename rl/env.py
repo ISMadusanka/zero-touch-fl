@@ -11,7 +11,7 @@ Round protocol (driven by the schedule / inference loop):
     env.reset(global, client_weights, baseline_acc)
     ctx = env.begin_round()                 # builds honest updates; exposes the attacker's
                                             # controllable pool (ctx.pool_benign) + budget
-    # the attacker SELECTS <= ctx.budget clients from the pool and poisons them
+    # the attacker SELECTS exactly ctx.budget clients from the pool and poisons them
     updates = env.build_updates(poisoned_by_client)
     acc = env.evaluate_updates(updates, verdicts)   # no commit (used to score rollouts)
     ...
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 class RoundContext:
     """Per-round observation handed to the agents.
 
-    The attacker controls a fixed ``pool`` of clients and may poison up to
+    The attacker controls a fixed ``pool`` of clients and must poison exactly
     ``budget`` of them; it CHOOSES which (see ``AttackerAgent.select_and_apply``),
     so ``poisoned_ids`` is empty here and filled in once the choice is committed.
     """
@@ -45,7 +45,7 @@ class RoundContext:
         self.global_accuracy = global_accuracy            # accuracy of the CURRENT global model
         self.pool_ids = pool_ids                          # list[int] controllable pool
         self.pool_benign = pool_benign                    # {cid: state_dict} for the pool
-        self.budget = budget                              # max clients that may be poisoned
+        self.budget = budget                              # exact poison-client quota
         self.goal = goal                                  # this round's attack goal (maybe sampled)
         self.poisoned_ids = []                            # set at commit (attacker's choice)
         # The clean counterfactual: what this round's aggregate scores with NO
@@ -79,7 +79,7 @@ class FLArmsRaceEnv:
         # Attacker is a partial insider: it may only touch clients [0 .. n_compromisable).
         self.n_compromisable = max(1, min(
             int(fl.get("n_compromisable", self.n_clients)), self.n_clients))
-        # Per-round poison budget (max clients the attacker may poison). Training
+        # Per-round poison budget (exact number of clients to poison). Training
         # randomizes it in [1, budget_cap]; eval fixes it (set sample_budget=False,
         # budget_cap=<desired>). These attributes are overridable by the benchmark.
         self.budget_cap = max(1, min(
@@ -178,7 +178,7 @@ class FLArmsRaceEnv:
 
     # ------------------------------------------------------------------
     def _round_budget(self) -> int:
-        """This round's poison budget: randomized in [1, cap] when sampling, else the cap."""
+        """Draw this round's exact poison quota in [1, cap], or use the cap."""
         if self.sample_budget:
             return self.rng.randint(1, self.budget_cap)
         return self.budget_cap
@@ -201,7 +201,7 @@ class FLArmsRaceEnv:
 
     def begin_round(self) -> RoundContext:
         """Produce this round's honest updates and expose the attacker's controllable
-        pool + poison budget. The poisoned SET is chosen by the attacker, not here."""
+        pool + exact poison quota. The poisoned SET is chosen by the attacker, not here."""
         self.round_index += 1
         round_num = self.training_rounds + self.round_index
 

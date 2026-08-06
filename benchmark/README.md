@@ -39,23 +39,22 @@ python -m benchmark.run_benchmark --rounds 200 \
 
 # sweep the adversary's size: 1 .. fl.n_clients (20) poisoners per round.
 # Evaluation is NOT limited to fl.n_compromisable (5) the way training is — the
-# controllable pool is widened to match the budget, so `10` really does give the
-# attacker 10 clients to work with (clients 0..9).
+# controllable pool is widened to match the quota, so `10` really does poison
+# exactly 10 clients (clients 0..9 in that widened case).
 for k in 1 3 5 10 15 20; do
   python -m benchmark.run_benchmark --rounds 50 --max-poison-clients $k \
       --out logs/benchmark/poisoners_$k
 done
 ```
 
-### `--max-poison-clients` (the eval poison budget)
+### `--max-poison-clients` (the exact eval poison quota)
 
 Valid range is **1 .. `fl.n_clients`** (20 by default). Two things to keep in mind:
 
-- It is a **ceiling, not a quota.** How many of its pool the attacker actually
-  recruits is part of its action, and it trained with `rl.reward.attacker.delta`
-  charging it for every extra client — so it may well use fewer. The report header
-  prints the realised count next to the budget (`Num of poisoners=10 budget, 3.0
-  used/round`), and each summary carries `mean_poisoned`.
+- It is an **exact quota, not a ceiling.** The attacker chooses which clients and
+  their plans, but not how many: `--max-poison-clients 10` means exactly 10
+  effective poisoned updates each completed round. The report labels this as an
+  exact quota and each summary retains `mean_poisoned` as an audit field.
 - **Past ~50% the defenses have no guarantee left.** Multi-Krum (needs `n ≥ 2f+3`),
   DnC and DeFL all assume the adversary is a minority; at or above half the
   federation, weak detection is the expected result rather than a defect. FLTrust is
@@ -181,7 +180,7 @@ also give a softer view than the binary flag.
   benign replay), so the benign client updates are identical across all defenses
   each round (the source of the "same attack to everyone" fairness). The runner
   warns if it is `true`.
-- Runs in the project's native regime (1-of-5 poisoned by default per
+- Runs in the project's native regime (5-of-5 controllable clients poisoned by default per
   `configs/base.yaml`), which keeps the LLM defender in-distribution. FLTrust
   still works here: benign client deltas point toward good weights and so align
   with the server's root update, while poison points away (negative cosine → zero
@@ -201,9 +200,8 @@ fewer early rounds declared critical ⇒ fewer hard removals) · `--defl-tau` (M
 per-layer outlier z-threshold, default **2.5** — lower ⇒ more aggressive flagging,
 higher TPR but higher FPR). DeFL takes **no** root set: it derives everything from
 the per-layer FGNV of the submitted updates. A "layer" = one module (its weight +
-bias grouped), so MnistNet has L = 2 layers. With the default eval budget of 1
-poisoned client, MOUD's adaptive vote isolates the single outlier; the Beta trust
-then keeps the run robust to the occasional false positive.
+bias grouped), so MnistNet has L = 2 layers. The Beta trust then keeps the run
+robust to the occasional false positive.
 
 ## DnC knobs
 

@@ -335,6 +335,25 @@ def test_selection_is_still_truncated_to_the_budget():
     assert len(set(chosen)) == len(chosen)          # deduped
 
 
+def test_benchmark_sized_pool_underselection_is_filled_to_exact_budget():
+    """The benchmark must not silently turn a quota of 10 into one poisoner."""
+    import json
+
+    import torch
+    from agents.attacker_agent import AttackerAgent
+
+    env = _FakeEnv(n_clients=20, n_compromisable=5)
+    budget = _resolve_budget(env, 10)
+    pool = {cid: {"w": torch.ones(3)} for cid in env.pool_ids()}
+    one_client_plan = {"clients": [{"id": 7, "operations": [
+        {"op": "scale", "target": "all", "factor": 2.0}]}]}
+    poisoned, chosen, malformed = AttackerAgent().select_and_apply(
+        json.dumps(one_client_plan), pool, budget)
+    assert len(chosen) == len(poisoned) == budget == 10
+    assert chosen[0] == 7 and len(set(chosen)) == budget
+    assert malformed == 0
+
+
 def test_honest_majority_warnings_fire_at_the_right_thresholds():
     import io
     import logging

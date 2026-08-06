@@ -627,7 +627,6 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                             beta=reward_att.get("beta", 0.5),
                             gamma=reward_att.get("gamma", 1.0),
                             zeta=reward_att.get("zeta", 0.0),
-                            pool_size=env.n_compromisable,
                             diversity=diversity)
     d_rew = defender_reward(verdicts, poisoned_ids,
                             mode=reward_def.get("mode", "soft_f1"),

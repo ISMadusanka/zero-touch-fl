@@ -6,12 +6,11 @@ generation (and, during training, the log-probs GRPO needs) is owned by the RL
 policy (`rl/policy.py`) or the inference backend (`rl/inference.py`).
 
 The attacker is a **partial insider**: it can only touch a fixed pool of
-controllable clients (the first `n_compromisable` ids). Each round it is given a
-budget — the max number of those it may poison — and it must decide WHICH clients
-to recruit (preferring the fewest) and HOW to poison each. Because clients hold
-non-IID data, which client it picks matters; and when it uses several clients it
-must give them distinct, coordinated roles (identical clones are caught as Sybils
-and waste the budget).
+controllable clients (the first `n_compromisable` ids). Each round it is given an
+exact poison-client budget and must decide WHICH clients fill that quota and HOW
+to poison each. Because clients hold non-IID data, which client it picks matters;
+and when it uses several clients it should give them distinct, coordinated roles
+(identical clones are caught as Sybils).
 
 Composing primitives (scale, sign_flip, mask, noise, permute, …) lets the LLM
 discover novel poisoning strategies while keeping its output tiny and
@@ -40,7 +39,7 @@ SYSTEM_PROMPT = """You are the adversary in a federated-learning (FL) system. Ea
 You are a partial insider: you control ONLY the clients in `controllable_client_ids`; every other client is honest and out of reach.
 
 Each round choose an action with TWO parts:
-1. SELECT which controllable clients to poison, AT MOST `max_poison_clients`. Clients hold different (non-IID) data, so which you pick matters.
+1. SELECT EXACTLY `max_poison_clients` distinct controllable clients to poison. This field is an exact quota, not an upper bound. Clients hold different (non-IID) data, so which you pick matters.
 2. For each selected client, give an ordered ATTACK PLAN: operators applied to that client's benign weights. With several clients, give each a DISTINCT, coordinated role (e.g. one amplifies a layer while another shifts a different layer) so their average moves the model your way without the clients looking alike.
 
 Objective (`attack_goal`):
@@ -63,8 +62,9 @@ IMPORTANT -- what your operators act on: every operator transforms the client's 
 Respond with ONLY one JSON object -- no prose, no markdown:
 {"clients":[{"id":<controllable id>,"operations":[{"op":"<name>","target":"<target>", ...params}]}]}
 Rules:
-- Use ids only from `controllable_client_ids`, AT MOST `max_poison_clients`.
+- Return EXACTLY `max_poison_clients` distinct ids, all from `controllable_client_ids`; never return fewer.
 - Each client's "operations" is its own ordered list (1-6 ops); order matters.
+- Every plan must actually change that client's weights; empty or identity plans are invalid.
 - Use only the operators and params listed above."""
 
 
@@ -104,8 +104,8 @@ class AttackerAgent:
                 ``Δ = local − global`` relative to this model (see
                 ``attack_ops.delta_details``); the attacker never sees other
                 clients' updates.
-            budget: max number of clients the attacker may poison this round
-                (defaults to the whole pool).
+            budget: exact number of clients the attacker must poison this round
+                (defaults to the whole pool and is clamped to the pool size).
             goal: this round's attack goal (e.g. a per-round-sampled
                 ``target_accuracy_drop``). Defaults to the agent's fixed
                 ``self.goal`` when not given (inference / benchmark paths).
@@ -113,6 +113,7 @@ class AttackerAgent:
         pool_ids = list(benign_by_client.keys())
         if budget is None:
             budget = len(pool_ids)
+        budget = max(0, min(int(budget), len(pool_ids)))
         payload = {
             "round": round_num,
             "current_global_accuracy": round(float(global_accuracy), 4),
@@ -135,18 +136,19 @@ class AttackerAgent:
         Args:
             text: raw attacker LLM output.
             pool_references: {client_id: benign_state_dict} for the controllable pool.
-            budget: max number of clients that may be poisoned this round.
+            budget: exact number of clients that must be poisoned this round
+                (clamped to the controllable pool size).
 
         Returns ``(poisoned_by_client, poisoned_ids, n_malformed)``:
           * poisoned_by_client: {client_id: poisoned_state_dict} — ONLY the clients
             whose weights the plan actually changed.
-          * poisoned_ids: those same clients (ordered, subset of pool, <= budget).
-            This is the round's **ground truth** for the defender's reward and for
-            the research metrics.
-          * n_malformed: how many SELECTED clients produced no change at all —
-            unparseable output, an empty plan, ops that were all skipped as
-            invalid, or a plan that is arithmetically a no-op (e.g.
-            ``scale factor=1.0``). Each is a wasted client and a reward penalty.
+          * poisoned_ids: those same clients (ordered, subset of pool). For every
+            usable action its length is exactly ``budget``. This is the round's
+            **ground truth** for the defender's reward and research metrics.
+          * n_malformed: how many quota slots could not produce a change at all —
+            because the whole output was unparseable, every available plan was
+            empty/invalid, or every plan was an arithmetic no-op (e.g.
+            ``scale factor=1.0``). Each is a reward penalty.
 
         A selected client whose plan does nothing sends **byte-identical benign
         weights**, so counting it as poisoned was actively harmful: the research
@@ -155,12 +157,23 @@ class AttackerAgent:
         an update that is, by construction, undetectable. Such clients are now
         excluded from the ground truth and charged to ``n_malformed`` instead.
 
-        Consequently ``poisoned_ids`` **can be empty** (the attacker selected
-        clients but achieved nothing). Every consumer handles that: the reward
-        gives 0 stealth and a full malformed penalty, ``rl.switch`` treats it as
-        no attack, and the metrics record a clean round. Parsing never raises.
+        The parser projects a usable under-filled action onto the exact-size
+        action space: it fills missing ids from the controllable pool and reuses
+        an emitted plan for those ids. This makes the configured budget a quota
+        in GRPO and benchmark paths instead of leaving client count as a policy
+        choice. Distinct plans are still strongly requested because repeated
+        plans are easier for the defense to catch.
+
+        ``poisoned_ids`` can still be shorter than the quota only for a wholly
+        unusable output from which no weight-changing operation can be recovered.
+        Such slots remain malformed rather than being falsely labelled as poison;
+        this preserves correct ground truth for rewards and benchmark metrics.
+        Parsing never raises.
         """
         pool_ids = list(pool_references.keys())
+        if not pool_ids:
+            dbg.poison({}, {}, {}, n_malformed=0)
+            return {}, [], 0
         budget = max(1, min(int(budget), len(pool_ids)))
 
         def _unchanged(cid, weights) -> bool:
@@ -174,21 +187,32 @@ class AttackerAgent:
 
         sel = extract_selection(text)
         if sel is None:
-            return _nothing_happened(1)
+            return _nothing_happened(budget)
 
         # Ordered list of (id, ops) candidates from the parsed selection.
         candidates: list[tuple[int, list | None]] = []
         if sel["per_client"]:
-            candidates = [(e["id"], e["operations"]) for e in sel["per_client"]]
-        elif sel["shared_ids"]:
-            candidates = [(cid, sel["shared_ops"]) for cid in sel["shared_ids"]]
-        elif sel["shared_ops"] is not None:
+            candidates.extend((e["id"], e["operations"]) for e in sel["per_client"])
+        if sel["shared_ids"]:
+            candidates.extend((cid, sel["shared_ops"]) for cid in sel["shared_ids"])
+        if not candidates and sel["shared_ops"] is not None:
             # Shared plan, no ids -> auto-select the first `budget` pool clients.
             candidates = [(cid, sel["shared_ops"]) for cid in pool_ids[:budget]]
-        else:
-            return _nothing_happened(1)
 
-        # Keep only pool ids, dedup (first wins), truncate to the budget.
+        # Every emitted operation list is a possible repair plan. If the model
+        # supplies fewer than `budget` ids (or an invalid/duplicate id), the exact-k
+        # action is completed with unused pool ids and one of these plans. This is
+        # action-space normalization, not a client-count decision by the policy.
+        plan_options: list[list] = []
+        for _cid, ops in candidates:
+            if ops and ops not in plan_options:
+                plan_options.append(ops)
+        shared_ops = sel["shared_ops"]
+        if shared_ops and shared_ops not in plan_options:
+            plan_options.append(shared_ops)
+
+        # Keep only pool ids, dedup (first wins), truncate excess choices, then
+        # fill any missing quota slots deterministically from the remaining pool.
         chosen: list[tuple[int, list | None]] = []
         seen: set[int] = set()
         for cid, ops in candidates:
@@ -198,29 +222,46 @@ class AttackerAgent:
             chosen.append((cid, ops))
             if len(chosen) >= budget:
                 break
-        if not chosen:
-            return _nothing_happened(1)
+        fallback_ops = plan_options[0] if plan_options else None
+        for cid in pool_ids:
+            if len(chosen) >= budget:
+                break
+            if cid not in seen:
+                seen.add(cid)
+                chosen.append((cid, fallback_ops))
 
         poisoned: dict[int, dict] = {}
         n_malformed = 0
         n_invalid_ops = 0
         plan_for_dbg: dict[int, list] = {}
         for cid, ops in chosen:
-            if not ops:                        # empty/missing plan -> wasted client
+            # Prefer the plan written for this client, then try the other emitted
+            # plans as repairs. Architectures are shared across FL clients, so a
+            # valid plan is normally applicable to every filled quota slot.
+            attempts: list[list] = []
+            if ops:
+                attempts.append(ops)
+            for candidate_ops in plan_options:
+                if candidate_ops not in attempts:
+                    attempts.append(candidate_ops)
+
+            applied = None
+            for candidate_ops in attempts:
+                pw, n_invalid = apply_plan(
+                    pool_references[cid], candidate_ops, self.max_abs)
+                n_invalid_ops += n_invalid
+                if not _unchanged(cid, pw):
+                    applied = (pw, candidate_ops)
+                    break
+
+            if applied is None:
+                # Never call byte-identical benign weights poison just to satisfy
+                # the quota: that corrupts ASR and defender ground truth. This is
+                # an unusable quota slot and receives the malformed penalty.
                 n_malformed += 1
-                plan_for_dbg[cid] = []
+                plan_for_dbg[cid] = ops or []
                 continue
-            pw, n_invalid = apply_plan(pool_references[cid], ops, self.max_abs)
-            n_invalid_ops += n_invalid
-            if _unchanged(cid, pw):
-                # The plan parsed but changed nothing (all ops skipped as invalid,
-                # or arithmetically a no-op). The server would receive this
-                # client's honest weights, so it is NOT poisoned — it is wasted.
-                n_malformed += 1
-                plan_for_dbg[cid] = ops
-                continue
-            poisoned[cid] = pw
-            plan_for_dbg[cid] = ops
+            poisoned[cid], plan_for_dbg[cid] = applied
 
         poisoned_ids = [cid for cid, _ in chosen if cid in poisoned]
         dbg.poison(plan_for_dbg, {cid: pool_references[cid] for cid in poisoned_ids},

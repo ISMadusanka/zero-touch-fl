@@ -4,7 +4,7 @@ Two phases:
   Phase 1 (training_rounds): honest FedAvg training, then checkpoint.
   Phase 2 (simulation_rounds): LLM-direct adversarial arms race with RL.
 
-In Phase 2 a random subset of clients is poisoned each round. An attacker LLM
+In Phase 2 an exact-budget subset of clients is poisoned each round. An attacker LLM
 emits an attack plan (primitive weight operators) applied to the benign weights,
 and the server defends.
 

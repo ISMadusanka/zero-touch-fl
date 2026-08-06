@@ -43,11 +43,11 @@ def _parse_args():
     ap.add_argument("--defender-temperature", type=float, default=0.0,
                     help="LLM-defender sampling temperature")
     ap.add_argument("--max-poison-clients", type=int, default=None, metavar="N",
-                    help="eval poison budget: max clients the attacker may poison per round "
-                         "(the attacker chooses WHICH of its pool). Anything from 1 up to "
+                    help="exact eval poison quota per round (the attacker chooses WHICH "
+                         "clients fill it). Anything from 1 up to "
                          "fl.n_clients (20) is allowed here — the controllable pool is widened "
                          "to match, so this is NOT limited to fl.n_compromisable the way "
-                         "training is. Default: attack.eval_poison_clients (=1)")
+                         "training is. Default: attack.eval_poison_clients")
     ap.add_argument("--root-size", type=int, default=100, help="FLTrust clean root-set size")
     ap.add_argument("--root-epochs", type=int, default=None,
                     help="FLTrust server local epochs R_l (default: defense.fltrust.root_epochs, "
@@ -121,13 +121,9 @@ def _resolve_eval_budget(env, requested, log=None):
     mutates only THIS env instance, after ``reset()``: training reads
     ``fl.n_compromisable`` from the config and is untouched.
 
-    Also switches off the per-round budget/target randomisation that training uses, so
-    every evaluated round faces the same requested budget and the same goal.
-
-    Note this sets the budget (the max the attacker MAY poison), not a quota: choosing
-    how many of its pool to actually recruit is part of the policy's action, and the
-    reward it trained under charged ``rl.reward.attacker.delta`` for each extra client.
-    The realised count per round is logged and reported as ``mean_poisoned``.
+    Also switches off the per-round budget/target randomisation that training can use,
+    so every evaluated round must poison exactly the requested count and faces the
+    same goal. The attacker chooses WHICH clients fill the quota, never how many.
     """
     log = log or logging.getLogger("benchmark")
     n_all = int(env.n_clients)
@@ -151,7 +147,7 @@ def _resolve_eval_budget(env, requested, log=None):
     env.sample_budget = False       # eval never randomises the budget
     env.budget_cap = budget
     env.sample_target = False       # ...nor the goal
-    log.info(f"Eval poison budget = {budget} of pool {env.n_compromisable} "
+    log.info(f"Eval poison quota = exactly {budget} of pool {env.n_compromisable} "
              f"(clients {list(range(env.n_compromisable))}); "
              f"attacker selects which to poison")
     _warn_about_adversary_share(budget, n_all, log)
@@ -336,8 +332,12 @@ def main():
     env = FLArmsRaceEnv(base_cfg, client_loaders, test_loader, rng)
     env.reset(copy.deepcopy(global_weights), client_weights, baseline_accuracy)
 
-    requested_budget = (args.max_poison_clients if args.max_poison_clients is not None
-                        else int(base_cfg.get("attack", {}).get("eval_poison_clients", 1)))
+    attack_cfg = base_cfg.get("attack", {})
+    requested_budget = (
+        args.max_poison_clients if args.max_poison_clients is not None
+        else int(attack_cfg.get(
+            "eval_poison_clients", attack_cfg.get("max_poison_clients", 1)))
+    )
     eval_budget = _resolve_eval_budget(env, requested_budget)
 
     # Load the trained policy: the attacker adapter is always needed; the defender
@@ -410,7 +410,7 @@ def main():
                  f"~{int(fl['local_epochs']) * len(client_loaders[0])})")
 
     # DnC / Multi-Krum assume a known upper bound on #malicious; default it to the
-    # eval poison budget (the max clients the attacker may actually poison), clamped
+    # eval poison quota (the exact number of clients the attacker must poison), clamped
     # to a benign majority. This is an assumed adversary budget, NOT per-round truth.
     #
     # The clamp stays even when --max-poison-clients exceeds it: both algorithms are
