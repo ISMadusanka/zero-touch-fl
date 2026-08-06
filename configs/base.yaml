@@ -4,7 +4,7 @@ fl:
   training_rounds: 45             # Phase 1: honest training rounds
   simulation_rounds: 2000000         # Phase 2: adversarial RL rounds
   n_clients: 20                   # total federated clients (honest majority)
-  n_compromisable: 10             # the attacker can ONLY access clients [0 .. n_compromisable-1];
+  n_compromisable: 5              # the attacker can ONLY access clients [0 .. n_compromisable-1];
                                   # the remaining clients are always honest & out of reach.
   poison_fraction: 0.2            # DEPRECATED for selection: the attacker now CHOOSES which of
                                   # its pool to poison (see attack.max_poison_clients). Kept only
@@ -37,7 +37,7 @@ attack:
                                   # false = always use goal.target_accuracy_drop. Eval always fixes it.
   target_choices: [0.05, 0.10, 0.20, 0.30]  # per-round target pool (untargeted_degrade only)
   # --- Exact client-selection quota (the attacker chooses WHICH clients) ---
-  max_poison_clients: 10          # TRAINING quota cap: per-round exact count is sampled in [1, 10]
+  max_poison_clients: 5           # TRAINING quota cap: per-round exact count is sampled in [1, 5]
                                   # each round (legacy key name; must be <= n_compromisable).
   sample_budget_in_training: true # randomly draw the exact per-round quota in
                                   # [1..max_poison_clients] for budget-aware generalization.
