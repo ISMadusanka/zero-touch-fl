@@ -40,6 +40,11 @@ def _parse_args():
     ap.add_argument("--defender-adapter", default=None, help="override defender checkpoint dir")
     ap.add_argument("--attack-temperature", type=float, default=0.7,
                     help="attacker sampling temperature (0 = greedy/deterministic)")
+    ap.add_argument("--attack-retries", type=int, default=3, metavar="N",
+                    help="extra attacker samples to draw when a round's action does not "
+                         "fill the exact poison quota (truncated or no-op plan). A round "
+                         "with no usable action after these is skipped and excluded from "
+                         "the metrics, not fatal. 0 = one attempt per round")
     ap.add_argument("--defender-temperature", type=float, default=0.0,
                     help="LLM-defender sampling temperature")
     ap.add_argument("--max-poison-clients", type=int, default=None, metavar="N",
@@ -453,10 +458,21 @@ def main():
         n_rounds=args.rounds, attack_temperature=args.attack_temperature,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)), device=device,
         log_every=args.log_every, target_drop=target_drop,
+        attack_retries=max(0, args.attack_retries),
     )
 
+    # Rounds the harness could not get a usable attacker action for are skipped, so
+    # report the MEASURED count rather than the requested one — the table's header
+    # and its per-defense columns then describe the same set of rounds.
+    measured_rounds = max((s.get("rounds", 0) for s in summaries.values()),
+                          default=args.rounds)
+    skipped_rounds = args.rounds - measured_rounds
+    if skipped_rounds > 0:
+        log.warning(f"{skipped_rounds} of {args.rounds} round(s) had no usable attacker "
+                    f"action and are excluded; the report covers {measured_rounds} round(s)")
+
     out_dir = args.out or None
-    print("\n" + report.render([summaries[n] for n in defenses], args.rounds,
+    print("\n" + report.render([summaries[n] for n in defenses], measured_rounds,
                                 baseline_accuracy, out_dir=out_dir, goal=goal,
                                 n_poisoners=eval_budget))
 
@@ -468,8 +484,13 @@ def main():
             _json.dump({"baseline_accuracy": baseline_accuracy,
                         "defenses": list(defenses),
                         # Recorded so a saved result is self-describing: a missing
-                        # llm_defender column is a deliberate skip, not a lost run.
+                        # llm_defender column is a deliberate skip, not a lost run,
+                        # and a measured count below --rounds is skipped attack
+                        # rounds rather than a truncated run.
                         "llm_defender_skipped": skipped_llm_defender,
+                        "requested_rounds": args.rounds,
+                        "measured_rounds": measured_rounds,
+                        "unusable_attack_rounds": skipped_rounds,
                         "history": history}, f, indent=2)
         log.info(f"[saved] {os.path.join(out_dir, 'history.json')}")
         if not args.no_plot:

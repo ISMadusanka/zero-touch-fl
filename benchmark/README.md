@@ -68,6 +68,30 @@ threat model it was fitted to (it trained against a 5-client foothold). That is 
 legitimate generalization test, and the run says so — raise `fl.n_compromisable` and
 retrain if you want it in-distribution.
 
+### Unusable attacker rounds (`--attack-retries`)
+
+A single attacker generation can come back unusable: truncated mid-JSON at
+`rl.max_new_tokens`, or a plan that parses fine but changes no weight (`scale`
+with `factor: 1.0`, an unknown operator, a target no layer matches).
+`select_and_apply` will not label byte-identical benign weights as poison, so such
+a round produces fewer effective plans than the quota and cannot be measured.
+
+That is sampling noise, not a broken run, so the round's action is **resampled**
+up to `--attack-retries` times (default **3**; retries are drawn at temperature
+≥ 0.7 even under `--attack-temperature 0`, since a greedy redraw would return the
+identical text). The run log names the cause — including whether the generation hit
+the token cap — and quotes the offending output.
+
+A round with no usable action after every retry is **skipped**: logged at ERROR,
+excluded from every defense's metrics, and the run continues. It is not scored,
+because feeding the panel an all-honest round whose ground truth claims `budget`
+poisoners would depress `detect%` and `acc_drop` for an attack that never happened.
+The report header and each summary's `rounds` therefore count **measured** rounds,
+and `history.json` records `requested_rounds` / `measured_rounds` /
+`unusable_attack_rounds`. Persistent skips mean the attacker output is too long for
+its budget (raise `rl.max_new_tokens`) or the adapter is degenerate — not a defense
+result.
+
 Output: a console table + `logs/benchmark/benchmark.{json,csv}` + per-round
 `history.json` + a 4-panel graph `benchmark.png` (accuracy per round, rolling
 detection-rate, rolling FPR, and attack-strength per round). Re-plot a saved run
@@ -175,7 +199,10 @@ also give a softer view than the binary flag.
   defense's model fares over the run. A round a defense **skips** (produces no new
   global — e.g. FLTrust with all-zero trust) keeps its previous model; that
   round's accuracy is its held accuracy and still counts toward `mean_acc`. The
-  count of such rounds is reported as `skipped_rounds` (JSON/CSV).
+  count of such rounds is reported as `skipped_rounds` (JSON/CSV). Distinct from
+  that: a round the *attacker* could not produce a usable action for is dropped for
+  **every** defense at once, so the panel is always compared over the same rounds
+  (see [Unusable attacker rounds](#unusable-attacker-rounds---attack-retries)).
 - **Assumes `benign_retrain_each_round: false`** (the project default — frozen
   benign replay), so the benign client updates are identical across all defenses
   each round (the source of the "same attack to everyone" fairness). The runner
@@ -243,6 +270,9 @@ does (a client is "rejected" when it's excluded / trimmed from the aggregate).
 
 - `tests/test_benchmark.py` — torch-free (metrics + report). Runs anywhere:
   `python tests/test_benchmark.py`.
+- `tests/test_benchmark_retry.py` — the harness's unusable-attacker-action path:
+  resample, then skip the round instead of aborting the run (needs torch):
+  `python tests/test_benchmark_retry.py`.
 - `tests/test_fltrust.py` — the FLTrust trust/aggregation math (needs torch; run
   on the GPU box): `python tests/test_fltrust.py`.
 - `tests/test_defl_logic.py` — DeFL's layer grouping, CLP rule, MOUD-Vote and Beta
