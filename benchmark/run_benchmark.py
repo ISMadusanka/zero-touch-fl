@@ -6,12 +6,19 @@ for N rounds and prints how much of the attack each defense detected + how well 
 preserved accuracy. Must run on the GPU box (needs torch/unsloth/peft + the
 trained adapters in checkpoints/).
 
+``--dataset`` picks which dataset to evaluate on. It resolves exactly the way
+``main.py`` does (same per-dataset config overrides, same ``checkpoints/<dataset>/``
+Phase-1 state), so a benchmark always measures the same federation the training run
+built. The attacker adapter is shared across datasets, so the same trained policy is
+what gets evaluated either way.
+
 Examples
 --------
 python -m benchmark.run_benchmark --rounds 200
+python -m benchmark.run_benchmark --rounds 200 --dataset cifar10
 python -m benchmark.run_benchmark --rounds 200 \
     --defenses fedavg,oracle,fltrust,llm_defender \
-    --attack-temperature 0.7 --root-size 100 --out logs/benchmark
+    --attack-temperature 0.7 --root-size 100 --out logs/mnist/benchmark
 """
 import argparse
 import copy
@@ -24,12 +31,21 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import yaml
 
+# Torch-free imports only at module scope, so --help works without a DL stack.
+from core.run_config import apply_dataset, describe_run, run_paths
+from data.datasets import DATASET_NAMES, describe
+
 
 def _parse_args():
     ap = argparse.ArgumentParser(description="Defense benchmark for zero-touch-fl",
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rounds", type=int, default=200, help="number of attack rounds")
     ap.add_argument("--config", default="configs/base.yaml")
+    ap.add_argument("--dataset", default=None, metavar="NAME",
+                    help=f"dataset to evaluate on: {', '.join(DATASET_NAMES)} "
+                         f"(default: data.dataset in --config). Selects the model "
+                         f"architecture and reads Phase-1 state from "
+                         f"checkpoints/<dataset>/; the attacker adapter is shared.")
     ap.add_argument("--goal", default=None,
                     help="attack goal the attacker aims for, e.g. 'untargeted_degrade=0.1', "
                          "'slow_degrade=0.02', or 'targeted_label=7'. Fixed for the whole run "
@@ -70,7 +86,9 @@ def _parse_args():
                     help="Multi-Krum #selected/averaged (default: n - f)")
     ap.add_argument("--device", default=None, help="override fl.device")
     ap.add_argument("--seed", type=int, default=None, help="override fl.poison_seed")
-    ap.add_argument("--out", default="logs/benchmark", help="output dir for json/csv/png (or '' to skip)")
+    ap.add_argument("--out", default=None,
+                    help="output dir for json/csv/png (default: logs/<dataset>/benchmark; "
+                         "'' to skip)")
     ap.add_argument("--no-plot", action="store_true", help="skip drawing per-round graphs")
     ap.add_argument("--fresh", action="store_true", help="force fresh Phase-1 instead of loading checkpoint")
     ap.add_argument("--log-every", type=int, default=10)
@@ -98,11 +116,10 @@ def _parse_goal(spec: str) -> dict:
                      f"untargeted_degrade=<drop> | slow_degrade=<drop> | targeted_label=<label>")
 
 
-def _build_root_loader(data_cfg, root_size, batch_size, seed):
-    from data.mnist_loader import build_root_loader
-    return build_root_loader(root_size=root_size, batch_size=batch_size,
-                             data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
-                             seed=seed)
+def _build_root_loader(dataset, data_cfg, root_size, batch_size, seed):
+    from data.loaders import build_root_loader
+    return build_root_loader(dataset, root_size=root_size, batch_size=batch_size,
+                             data_dir=data_cfg.get("data_dir"), seed=seed)
 
 
 def _resolve_eval_budget(env, requested, log=None):
@@ -256,7 +273,7 @@ def main():
     log = logging.getLogger("benchmark")
 
     # Heavy / FL imports are deferred so --help works without torch.
-    from data.mnist_loader import get_data_loaders
+    from data.loaders import get_data_loaders
     from storage.checkpoint import state_exists, load_state, adapter_exists
     from agents.attacker_agent import AttackerAgent
     from agents.defender_agent import DefenderAgent
@@ -269,6 +286,13 @@ def main():
     from rl.rewards import goal_target
 
     base_cfg = yaml.safe_load(open(args.config))
+    # Same resolution path main.py uses: --dataset > data.dataset, then the
+    # datasets.<name> overrides are merged in. Evaluating with different FL
+    # hyperparameters than training used would silently change what is measured.
+    base_cfg, dataset = apply_dataset(base_cfg, args.dataset)
+    paths = run_paths(dataset)
+    log.info(f"Dataset: {describe(dataset)}")
+    log.info(f"Resolved run config: {describe_run(base_cfg, dataset)}")
     attacker_cfg = yaml.safe_load(open("configs/attacker_agent.yaml"))
     defender_cfg = yaml.safe_load(open("configs/defender_agent.yaml"))
     # Attack goal: --goal overrides the config. Set it on BOTH the base config (so the
@@ -302,9 +326,10 @@ def main():
     torch.manual_seed(seed)
 
     client_loaders, test_loader = get_data_loaders(
-        n_clients=fl["n_clients"], batch_size=fl["batch_size"],
-        data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), iid=data_cfg.get("iid", True),
+        dataset, n_clients=fl["n_clients"], batch_size=fl["batch_size"],
+        data_dir=data_cfg.get("data_dir"), iid=data_cfg.get("iid", True),
         bias_q=float(data_cfg.get("noniid_bias", 0.5)), seed=seed,
+        n_classes=data_cfg.get("n_classes"),
     )
 
     if fl.get("benign_retrain_each_round", False):
@@ -314,16 +339,19 @@ def main():
 
     # Phase-1 start state (reuse the saved honest-FedAvg checkpoint, or train fresh).
     # load_state() returns None on a partial/corrupt checkpoint, so guard the unpack.
-    state = load_state() if (state_exists() and not args.fresh) else None
+    state = (load_state(dataset=dataset)
+             if (state_exists(dataset=dataset) and not args.fresh) else None)
     if state is not None and len(state[1]) != fl["n_clients"]:
         log.warning(f"Checkpoint has {len(state[1])} client(s) but config n_clients={fl['n_clients']} "
                     f"— ignoring the stale checkpoint and re-running Phase-1.")
         state = None
     if state is not None:
-        log.info("Loading saved Phase-1 state (global model + client weights + baseline acc)")
+        log.info(f"Loading saved Phase-1 state for '{dataset}' "
+                 f"(global model + client weights + baseline acc)")
         global_weights, client_weights, baseline_accuracy = state
     else:
-        log.info("No (usable) checkpoint or --fresh — running Phase-1 honest training")
+        log.info(f"No (usable) '{dataset}' checkpoint or --fresh — "
+                 f"running Phase-1 honest training")
         global_weights, client_weights, baseline_accuracy = run_phase1(
             base_cfg, client_loaders, test_loader)
 
@@ -389,7 +417,8 @@ def main():
     root_loader = None
     root_epochs = 1
     if "fltrust" in names:
-        root_loader = _build_root_loader(data_cfg, args.root_size, fl["batch_size"], seed)
+        root_loader = _build_root_loader(dataset, data_cfg, args.root_size,
+                                         fl["batch_size"], seed)
         # R_l must match what the attacker TRAINED against, or the FLTrust column
         # measures a different defense than the one the policy learned to beat.
         # --root-epochs wins; otherwise fall back to the config, whose default (null)
@@ -432,7 +461,8 @@ def main():
     mk_f = args.multikrum_f if args.multikrum_f is not None else assumed_byz
 
     defenses = build_defenses(
-        names, device=device, policy=policy, defender_agent=defender_agent,
+        names, device=device, dataset=dataset,
+        policy=policy, defender_agent=defender_agent,
         root_loader=root_loader, root_lr=args.root_lr or float(fl["lr"]),
         root_epochs=root_epochs, eta=args.eta,
         defender_temperature=args.defender_temperature,
@@ -443,7 +473,8 @@ def main():
         multikrum_num_byzantine=mk_f, multikrum_m=args.multikrum_m,
     )
 
-    log.info(f"Benchmark: {args.rounds} rounds | defenses={list(defenses)} | "
+    log.info(f"Benchmark: {args.rounds} rounds | dataset={dataset} | "
+             f"defenses={list(defenses)} | "
              f"baseline_acc={baseline_accuracy:.4f} | attack_temp={args.attack_temperature}"
              + (" | llm_defender SKIPPED (no defender adapter)"
                 if skipped_llm_defender else ""))
@@ -452,10 +483,12 @@ def main():
         init_global=copy.deepcopy(global_weights), baseline_accuracy=baseline_accuracy,
         n_rounds=args.rounds, attack_temperature=args.attack_temperature,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)), device=device,
-        log_every=args.log_every, target_drop=target_drop,
+        dataset=dataset, log_every=args.log_every, target_drop=target_drop,
     )
 
-    out_dir = args.out or None
+    # ``--out ''`` disables saving; omitting it uses this dataset's own directory
+    # so an mnist and a cifar10 benchmark never overwrite each other's results.
+    out_dir = paths["benchmark_dir"] if args.out is None else (args.out or None)
     print("\n" + report.render([summaries[n] for n in defenses], args.rounds,
                                 baseline_accuracy, out_dir=out_dir, goal=goal,
                                 n_poisoners=eval_budget))

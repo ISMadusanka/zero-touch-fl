@@ -347,9 +347,9 @@ There are two questions, and they use different data:
 ### 7.1 Run the monitor
 
 ```bash
-python monitor.py                       # reads logs/round_data/, prints report + writes logs/monitor/health.png
+python monitor.py                       # reads logs/<dataset>/round_data/, writes logs/<dataset>/monitor/health.png
 python monitor.py --window 50           # bigger 'recent' window for the rolling stats
-python monitor.py --log-dir logs/round_data --out logs/monitor/health.png
+python monitor.py --dataset cifar10     # the same report for the other dataset
 ```
 
 It reads the per-round JSON files (written every round), so you can run it **while
@@ -376,7 +376,7 @@ The report prints a `✓` or `⚠` for each collapse check (reward not improving
 high zero-advantage, do-nothing collapse, malformed degeneration, flag-all/none,
 stuck variance). All `✓` = healthy.
 
-### 7.3 The four graphs (`logs/monitor/health.png`)
+### 7.3 The four graphs (`logs/<dataset>/monitor/health.png`)
 
 1. **GRPO mean reward per agent — want UP.** Both lines should *trend* up over
    their own phases. (They won't rise at the same time — see 7.4.)
@@ -431,10 +431,10 @@ A healthy attacker phase shows `WIN` appearing more often as the phase goes on,
 
 ### 7.6 Other data sources
 
-- **`logs/metrics/` (`metrics.tracker`)** — per-round `tp/fn/fp/tn`, `tpr`, `fpr`,
+- **`logs/<dataset>/metrics/` (`metrics.tracker`)** — per-round `tp/fn/fp/tn`, `tpr`, `fpr`,
   `apr` (accuracy-preservation ratio = current/baseline), and `attack_success`
   (was any poisoned client missed). Good for a ground-truth view of detection.
-- **`logs/round_data/round_*.json`** — the raw record per round. Beyond what the
+- **`logs/<dataset>/round_data/`** — the raw record per round. Beyond what the
   monitor charts, each file now also stores `attack_metadata.phase_index`,
   `phase_round`, `learner_success`, and `train.stepped` / `train.resampled` — useful
   if you want to chart phase outcomes or count skipped rounds yourself.

@@ -24,6 +24,7 @@ import logging
 
 from clients.benign_client import BenignClient
 from core.types import ModelUpdate, DetectionVerdict
+from data.datasets import DEFAULT_DATASET, canonical
 from detector.features import compute_client_features
 from server.aggregation import FedAvgAggregator
 from server.fed_server import FedServer
@@ -69,6 +70,10 @@ class FLArmsRaceEnv:
         """
         fl = config["fl"]
         attack = config.get("attack", {})
+        # Which dataset this run federates over. Decides the model architecture
+        # (via FedServer) and is surfaced to the attacker LLM so one shared policy
+        # can tell the two regimes apart instead of inferring them from layer shapes.
+        self.dataset = canonical((config.get("data") or {}).get("dataset", DEFAULT_DATASET))
         self.n_clients = int(fl["n_clients"])
         self.device = fl.get("device", "cpu")
         self.benign_retrain = bool(fl.get("benign_retrain_each_round", True))
@@ -96,7 +101,7 @@ class FLArmsRaceEnv:
         self.test_loader = test_loader
         self.rng = rng
         self.aggregator = FedAvgAggregator()
-        self.server = FedServer(device=self.device)
+        self.server = FedServer(device=self.device, dataset=self.dataset)
         # Algorithmic (non-LLM) defense, or None when the defender LLM defends.
         self.defense = defense
 
@@ -136,7 +141,8 @@ class FLArmsRaceEnv:
         self.current_accuracy = float(baseline_accuracy)
         self.round_index = 0
         logger.info(
-            f"Env reset — n_clients={self.n_clients}, n_compromisable={self.n_compromisable}, "
+            f"Env reset [{self.dataset}] — n_clients={self.n_clients}, "
+            f"n_compromisable={self.n_compromisable}, "
             f"budget_cap={self.budget_cap}, sample_budget={self.sample_budget}, "
             f"benign_retrain={self.benign_retrain}, baseline_acc={baseline_accuracy:.4f}"
         )

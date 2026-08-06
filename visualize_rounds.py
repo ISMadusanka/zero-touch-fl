@@ -12,7 +12,8 @@ Round JSON schema (see core.types.RoundLog):
 
 Usage:
     python visualize_rounds.py
-    python visualize_rounds.py --log-dir ./logs/round_data --out-dir ./logs/visualizations
+    python visualize_rounds.py --dataset cifar10
+    python visualize_rounds.py --log-dir ./logs/mnist/round_data --out-dir ./logs/mnist/visualizations
 """
 
 import argparse
@@ -346,11 +347,24 @@ def generate_html_report(rounds, out_dir, summary=None):
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    from core.run_config import run_paths
+    from data.datasets import DATASET_NAMES, DEFAULT_DATASET
+
     parser = argparse.ArgumentParser(description="Visualize Zero-Touch FL round data logs")
-    parser.add_argument("--log-dir", default="logs/round_data")
-    parser.add_argument("--out-dir", default="logs/visualizations")
-    parser.add_argument("--metrics-summary", default="logs/metrics/summary.json")
+    parser.add_argument("--dataset", default=DEFAULT_DATASET, metavar="NAME",
+                        help=f"which run to visualize: {', '.join(DATASET_NAMES)} "
+                             f"(default: {DEFAULT_DATASET}). Sets the default paths to "
+                             f"logs/<dataset>/; the explicit path flags still override.")
+    parser.add_argument("--log-dir", default=None)
+    parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--metrics-summary", default=None)
     args = parser.parse_args()
+
+    paths = run_paths(args.dataset)
+    args.log_dir = args.log_dir or paths["round_data_dir"]
+    args.out_dir = args.out_dir or paths["visualizations_dir"]
+    args.metrics_summary = args.metrics_summary or os.path.join(
+        paths["metrics_dir"], "summary.json")
     # This script prints ✓ marks; on Windows stdout defaults to cp1252 (especially
     # when piped), which raises UnicodeEncodeError. Same fix as main.setup_logging.
     try:

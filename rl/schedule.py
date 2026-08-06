@@ -273,7 +273,7 @@ def train(
         trainable=trainable, algorithmic_defense=algorithmic_defense,
     )
 
-    # Resume the FL round-number counter so round labels + logs/round_data advance
+    # Resume the FL round-number counter so round labels + logs/<dataset>/round_data advance
     # across restarts instead of overwriting from the first Phase-2 round. Prefer the
     # saved round_index; fall back to start_round for old progress files that only
     # stored rounds_done. (env.reset() zeroed round_index just before this.)
@@ -437,7 +437,7 @@ def _run_fl_interlude(state, next_learner, phase_index):
     dbg.fl_round(round_num, [], updates, info["post_accuracy"], benign_retrain=True)
     dbg.flush()
 
-    # Persist a round log so the interlude shows up in logs/round_data/round_NNN.json.
+    # Persist a round log so the interlude shows up in the round-data JSONL stream.
     state["save_round_log"](RoundLog(
         round_num=round_num,
         attack_goal=env.goal,

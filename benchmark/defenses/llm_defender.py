@@ -17,13 +17,16 @@ class LLMDefender(Defense):
 
     def __init__(self, policy, defender_agent, device: str = "cpu",
                  temperature: float = 0.0, max_new_tokens: int = 512,
-                 adapter: str = "defender"):
+                 adapter: str = "defender", dataset: str | None = None):
         super().__init__(device)
         self.policy = policy
         self.agent = defender_agent
         self.temperature = float(temperature)
         self.max_new_tokens = int(max_new_tokens)
         self.adapter = adapter
+        # Named in the prompt so the shared defender adapter knows which task's
+        # feature scales it is looking at (same reason as the attacker's).
+        self.dataset = dataset
         self._agg = FedAvgAggregator()
 
     def step(self, updates, poisoned_ids) -> StepResult:
@@ -31,7 +34,7 @@ class LLMDefender(Defense):
         feats = compute_client_features(updates, self._global)
         client_ids = [u.client_id for u in updates]
         system = self.agent.system_prompt()
-        user = self.agent.build_user_prompt(feats)
+        user = self.agent.build_user_prompt(feats, dataset=self.dataset)
         text = self.policy.generate(
             self.adapter, system, user, n=1,
             temperature=self.temperature, max_new_tokens=self.max_new_tokens,

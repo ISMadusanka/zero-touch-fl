@@ -6,7 +6,7 @@ calling it from the hot path costs nothing in normal runs. When enabled (via
 ``python main.py --debug``) it:
 
   * prints clean, sectioned, human-readable events to the console, and
-  * mirrors every event as a structured record into ``logs/debug.json``
+  * mirrors every event as a structured record into ``logs/<dataset>/debug.json``
     (a single JSON object rewritten after each round, so a crash still leaves a
     valid, complete-up-to-the-last-round file).
 

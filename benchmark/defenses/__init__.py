@@ -4,6 +4,8 @@ Defense classes import torch / FL components, so they are imported LAZILY inside
 ``build_defenses`` — importing this package stays cheap and torch-free.
 """
 
+from data.datasets import DEFAULT_DATASET      # torch-free registry lookup
+
 AVAILABLE = ["fedavg", "oracle", "llm_defender", "fltrust", "defl", "dnc", "multikrum"]
 
 
@@ -11,6 +13,7 @@ def build_defenses(
     names,
     *,
     device: str = "cpu",
+    dataset: str = DEFAULT_DATASET,
     policy=None,
     defender_agent=None,
     root_loader=None,
@@ -30,7 +33,12 @@ def build_defenses(
     multikrum_m=None,
 ):
     """Instantiate the requested defenses, preserving order. Returns an ordered
-    dict {name: Defense}. Raises on an unknown name or missing dependency."""
+    dict {name: Defense}. Raises on an unknown name or missing dependency.
+
+    ``dataset`` is only consumed by the two defenses that are not pure
+    ``state_dict`` arithmetic: FLTrust (which owns a model to fine-tune on the
+    root set) and the LLM defender (which names the task in its prompt). The
+    rest are architecture-agnostic by construction."""
     from benchmark.defenses.fedavg import NoDefense
     from benchmark.defenses.oracle import Oracle
     from benchmark.defenses.llm_defender import LLMDefender
@@ -49,12 +57,13 @@ def build_defenses(
             if policy is None or defender_agent is None:
                 raise ValueError("llm_defender requires a loaded policy + defender_agent")
             out[name] = LLMDefender(policy, defender_agent, device=device,
-                                    temperature=defender_temperature, max_new_tokens=max_new_tokens)
+                                    temperature=defender_temperature,
+                                    max_new_tokens=max_new_tokens, dataset=dataset)
         elif name == "fltrust":
             if root_loader is None:
                 raise ValueError("fltrust requires a root_loader (clean root dataset)")
             out[name] = FLTrust(root_loader, lr=root_lr, local_epochs=root_epochs,
-                                device=device, eta=eta)
+                                device=device, eta=eta, dataset=dataset)
         elif name == "defl":
             out[name] = DeFL(device=device, delta=defl_delta, tau=defl_tau)
         elif name == "dnc":

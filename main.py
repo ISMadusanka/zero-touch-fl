@@ -17,8 +17,17 @@ defender LLM classifies each client benign/malicious from per-client per-layer
 statistics and both sides get a verifiable per-round reward and train with GRPO
 (separate LoRA adapters over one frozen Qwen2.5-3B-Instruct base).
 
+Datasets:
+  ``--dataset {mnist,cifar10}`` selects what the federation trains on. The FL
+  model architecture, the data directory, the Phase-1 checkpoint and the logs are
+  all per-dataset (``checkpoints/<dataset>/``, ``logs/<dataset>/``), so the two
+  runs never overwrite each other. The **LLM is not**: the attacker LoRA adapter
+  lives at ``checkpoints/attacker_adapter`` and is shared, so every run — MNIST or
+  CIFAR-10 — continues fine-tuning the same policy from its last checkpoint.
+
 Modes:
   python main.py --env linux                 # full GRPO training (needs a GPU)
+  python main.py --env linux --dataset cifar10   # ...on CIFAR-10, same LLM
   python main.py --env linux --dry-run       # frozen-LLM round loop, no training
   python main.py --baseline                  # best-of-N reward-harness sanity (no LLM)
   python main.py --fresh                      # force fresh Phase-1 training
@@ -38,7 +47,8 @@ from dataclasses import asdict
 
 import yaml
 
-from data.mnist_loader import get_data_loaders, build_root_loader
+from data.datasets import DATASET_NAMES, describe
+from data.loaders import get_data_loaders, build_root_loader
 from clients.benign_client import BenignClient
 from server.fed_server import FedServer
 from server.aggregation import FedAvgAggregator
@@ -50,6 +60,7 @@ from storage.checkpoint import (
     save_state, load_state, state_exists, save_progress, load_progress, adapter_exists,
     save_fl_state, load_fl_state,
 )
+from core.run_config import apply_dataset, describe_run, run_paths
 from core.types import RoundLog, DetectionVerdict
 from core.debug import dbg
 from metrics import MetricsTracker
@@ -59,9 +70,15 @@ from rl.env import FLArmsRaceEnv
 # Logging / config
 # ---------------------------------------------------------------------------
 
-def setup_logging(debug: bool = False):
-    os.makedirs("logs/round_data", exist_ok=True)
-    file_handler = logging.FileHandler("logs/system.log", mode="a", encoding="utf-8")
+def setup_logging(paths: dict, debug: bool = False):
+    """Configure logging into this run's per-dataset log directory.
+
+    ``paths`` comes from ``core.run_config.run_paths(dataset)``, so MNIST and
+    CIFAR-10 runs write to ``logs/mnist/`` and ``logs/cifar10/`` and never
+    interleave rounds (round numbering restarts per dataset).
+    """
+    os.makedirs(paths["round_data_dir"], exist_ok=True)
+    file_handler = logging.FileHandler(paths["system_log"], mode="a", encoding="utf-8")
     stream_handler = logging.StreamHandler(
         open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)
     )
@@ -116,33 +133,47 @@ def load_config(path: str) -> dict:
 # Per-round logs are APPENDED to one JSONL file rather than written as
 # ``round_NNN.json`` per round. At the shipped ``fl.simulation_rounds`` a
 # file-per-round sink produces millions of tiny files (and the same again under
-# logs/metrics/), which exhausts inodes and makes the directory unusable. One
-# append-only stream is O(1) per round and stays greppable. ``monitor.py`` and
-# ``visualize_rounds.py`` read this file, and still read legacy
+# logs/<dataset>/metrics/), which exhausts inodes and makes the directory
+# unusable. One append-only stream is O(1) per round and stays greppable.
+# ``monitor.py`` and ``visualize_rounds.py`` read this file, and still read legacy
 # ``round_NNN.json`` files so older runs keep working.
-ROUND_LOG_PATH = "logs/round_data/rounds.jsonl"
 
 
-def _save_round_log(log: RoundLog):
+def make_round_log_saver(path: str):
+    """Return a ``RoundLog -> None`` sink appending to ``path``.
+
+    A factory rather than a module constant because the path is per dataset
+    (``logs/<dataset>/round_data/rounds.jsonl``) and only known once the run's
+    dataset is resolved.
+    """
     import json
-    os.makedirs(os.path.dirname(ROUND_LOG_PATH), exist_ok=True)
-    with open(ROUND_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(asdict(log), default=str) + "\n")
-    logger.info(f"Round {log.round_num} appended to {ROUND_LOG_PATH}")
+
+    def save_round_log(log: RoundLog):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(log), default=str) + "\n")
+        logger.info(f"Round {log.round_num} appended to {path}")
+
+    return save_round_log
 
 
 # ---------------------------------------------------------------------------
 # Phase 1: honest FedAvg training
 # ---------------------------------------------------------------------------
 
-def run_training_phase(config: dict, client_loaders, test_loader):
-    """Train all clients honestly for ``training_rounds`` rounds; checkpoint."""
+def run_training_phase(config: dict, client_loaders, test_loader, dataset: str):
+    """Train all clients honestly for ``training_rounds`` rounds; checkpoint.
+
+    The resulting state is saved under ``checkpoints/<dataset>/`` — it is one
+    dataset's global model plus the per-client weights that match it, and a
+    CIFAR-10 conv ``state_dict`` cannot be loaded into the MNIST MLP.
+    """
     fl = config["fl"]
     logger.info("=" * 60)
-    logger.info("PHASE 1: Honest Federated Learning Training")
+    logger.info(f"PHASE 1: Honest Federated Learning Training [{dataset}]")
     logger.info("=" * 60)
 
-    server = FedServer(device=fl["device"])
+    server = FedServer(device=fl["device"], dataset=dataset)
     clients = [
         BenignClient(
             client_id=i,
@@ -170,8 +201,9 @@ def run_training_phase(config: dict, client_loaders, test_loader):
     logger.info(f"Baseline accuracy after Phase 1: {baseline_accuracy:.4f}")
 
     client_weights = [u.weights for u in updates]
-    save_state(server.get_global_weights(), client_weights, baseline_accuracy)
-    logger.info("Phase 1 state saved to checkpoints/")
+    save_state(server.get_global_weights(), client_weights, baseline_accuracy,
+               dataset=dataset)
+    logger.info(f"Phase 1 state saved to checkpoints/{dataset}/")
     return server.get_global_weights(), client_weights, baseline_accuracy
 
 
@@ -183,12 +215,13 @@ def run_phase2(
     global_weights, client_weights, baseline_accuracy,
     client_loaders, test_loader, config, attacker_config, defender_config,
     mode: str, n_rounds: int, llm_backend: str,
+    dataset: str, paths: dict, save_round_log,
     max_new_rounds: int | None = None,
 ):
     fl = config["fl"]
     logger.info("=" * 60)
     attack_cfg = config.get("attack", {})
-    logger.info(f"PHASE 2: LLM-direct arms race  (mode={mode})")
+    logger.info(f"PHASE 2: LLM-direct arms race  (mode={mode}, dataset={dataset})")
     logger.info(f"  simulation_rounds={n_rounds}, n_compromisable={fl.get('n_compromisable')}, "
                 f"max_poison_clients={attack_cfg.get('max_poison_clients')}, "
                 f"sample_budget={attack_cfg.get('sample_budget_in_training')}")
@@ -212,23 +245,25 @@ def run_phase2(
     defense = build_algorithmic_defender(
         config, seed=seed, client_iterations=client_iterations,
         root_loader_factory=lambda: build_root_loader(
+            dataset,
             root_size=int(((config.get("defense") or {}).get("fltrust") or {})
                           .get("root_size", 100)),
             batch_size=int(fl["batch_size"]),
-            data_dir=config.get("data", {}).get("data_dir", "./data/mnist_raw"),
+            data_dir=config.get("data", {}).get("data_dir"),
             seed=seed,
         ),
     )
     env = FLArmsRaceEnv(config, client_loaders, test_loader, rng, defense=defense)
     env.reset(global_weights, client_weights, baseline_accuracy)
 
-    metrics_tracker = MetricsTracker(baseline_accuracy=baseline_accuracy, output_dir="logs/metrics")
+    metrics_tracker = MetricsTracker(baseline_accuracy=baseline_accuracy,
+                                     output_dir=paths["metrics_dir"])
     attacker_agent = AttackerAgent(attacker_config)
     defender_agent = DefenderAgent(defender_config)
 
     if mode == "baseline":
         from rl.baseline import run_baseline
-        run_baseline(env, n_rounds, metrics_tracker, _save_round_log)
+        run_baseline(env, n_rounds, metrics_tracker, save_round_log)
 
     elif mode == "dry-run":
         from rl.inference import InferenceGenerator, run_inference
@@ -241,13 +276,16 @@ def run_phase2(
         )
         gen = InferenceGenerator(backend, max_new_tokens=int(config.get("rl", {}).get("max_new_tokens", 2048)))
         run_inference(env, attacker_agent, defender_agent, gen, n_rounds,
-                      metrics_tracker, _save_round_log,
+                      metrics_tracker, save_round_log,
                       temperature=float(llm_cfg.get("temperature", 0.7)))
 
     else:  # full GRPO training
         from rl.policy import LLMPolicy
         from rl.schedule import train
         rl_cfg = config.get("rl", {})
+        # NOT dataset-scoped, deliberately: the same attacker adapter keeps
+        # fine-tuning across datasets, so an mnist run and a cifar10 run resume
+        # the identical policy checkpoint. Only the FL state below is per dataset.
         adapter_paths = rl_cfg.get("adapter_paths", {
             "attacker": "checkpoints/attacker_adapter",
             "defender": "checkpoints/defender_adapter",
@@ -268,19 +306,23 @@ def run_phase2(
             attn_implementation=rl_cfg.get("attn_implementation", "eager"),
             use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
         )
-        # Resume adapters if present.
+        # Resume adapters if present. This is the continual-fine-tuning hinge:
+        # the adapter path does not depend on `dataset`, so switching datasets
+        # keeps training the SAME policy rather than restarting from the base model.
         for name, path in adapter_paths.items():
             if name in adapter_names and adapter_exists(path):
+                logger.info(f"Continuing {name} LoRA from {path} "
+                            f"(shared across datasets; this run: {dataset})")
                 policy.load_adapter(name, path)
-        progress = load_progress()
+        progress = load_progress(dataset=dataset)
         start_round = progress["rounds_done"]
         if start_round:
-            logger.info(f"Resuming Phase-2 training from round {start_round}")
+            logger.info(f"Resuming Phase-2 training from round {start_round} [{dataset}]")
             # Restore the LIVE shared FL state (the evolving global model + per-client
             # weights) so the arms race continues from where it stopped instead of
             # rewinding to the Phase-1 baseline. env.reset() above already loaded the
             # Phase-1 baseline; this overrides it with the saved Phase-2 state.
-            saved_fl = load_fl_state()
+            saved_fl = load_fl_state(dataset=dataset)
             if saved_fl is not None:
                 env.restore_fl_state(saved_fl)
             else:
@@ -290,13 +332,14 @@ def run_phase2(
                 )
 
         def progress_cb(done, round_index=None, controller=None):
-            save_progress(done, round_index=round_index, controller=controller)
+            save_progress(done, round_index=round_index, controller=controller,
+                          dataset=dataset)
 
         def fl_state_cb(fl_state):
-            save_fl_state(fl_state)
+            save_fl_state(fl_state, dataset=dataset)
 
         train(env, policy, attacker_agent, defender_agent, config,
-              metrics_tracker, _save_round_log, rng,
+              metrics_tracker, save_round_log, rng,
               progress_cb=progress_cb, fl_state_cb=fl_state_cb,
               start_round=start_round, resume=progress,
               total_rounds=n_rounds, max_new_rounds=max_new_rounds)
@@ -319,6 +362,13 @@ def main():
                         help="Path to the base config (default: configs/base.yaml)")
     parser.add_argument("--env", choices=["linux", "windows"], default="linux",
                         help="'linux' uses Ollama (qwen2.5), 'windows' uses OpenAI (default: linux)")
+    parser.add_argument("--dataset", default=None, metavar="NAME",
+                        help=f"which dataset the federation trains on: "
+                             f"{', '.join(DATASET_NAMES)} (default: data.dataset in "
+                             f"the config). FL state and logs are per dataset "
+                             f"(checkpoints/<dataset>/, logs/<dataset>/); the LLM "
+                             f"adapter is SHARED, so the same policy keeps "
+                             f"fine-tuning from its last checkpoint either way.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run the Phase-2 loop with a frozen LLM (no training, no GPU needed)")
     parser.add_argument("--baseline", action="store_true",
@@ -328,15 +378,27 @@ def main():
     parser.add_argument("--debug", action="store_true",
                         help="Verbose Phase-2 debug run: print every attacker/defender LLM "
                              "prompt+output, poisoning step, FL update and reward to the console "
-                             "AND to logs/debug.json. Library noise is silenced. If --rounds is "
-                             f"not given, Phase 2 is capped at {DEBUG_DEFAULT_ROUNDS} rounds.")
+                             "AND to logs/<dataset>/debug.json. Library noise is silenced. "
+                             "If --rounds is not given, Phase 2 is capped at "
+                             f"{DEBUG_DEFAULT_ROUNDS} rounds.")
     args = parser.parse_args()
 
-    setup_logging(debug=args.debug)
+    # Resolve the dataset (and its config overrides) BEFORE logging is configured:
+    # the log directory itself is per-dataset. An unknown --dataset raises here,
+    # with the valid names, rather than after Phase 1 has started.
+    base_config = load_config(args.config)
+    base_config, dataset = apply_dataset(base_config, args.dataset)
+    paths = run_paths(dataset)
+
+    setup_logging(paths, debug=args.debug)
     quiet_noisy_warnings()
     logger.info("Starting Zero-Touch Federated Learning System")
+    logger.info(f"Dataset: {describe(dataset)}")
+    logger.info(f"Resolved run config: {describe_run(base_config, dataset)}")
+    logger.info(f"Artifacts: checkpoints={paths['checkpoint_dir']}/ logs={paths['log_dir']}/ "
+                f"| LLM adapters are SHARED across datasets (checkpoints/*_adapter)")
+    save_round_log = make_round_log_saver(paths["round_log"])
 
-    base_config = load_config(args.config)
     attacker_config = load_config("configs/attacker_agent.yaml")
     defender_config = load_config("configs/defender_agent.yaml")
 
@@ -366,12 +428,16 @@ def main():
     fl = base_config["fl"]
     data_cfg = base_config["data"]
     client_loaders, test_loader = get_data_loaders(
-        n_clients=fl["n_clients"], batch_size=fl["batch_size"],
-        data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), iid=data_cfg.get("iid", True),
+        dataset, n_clients=fl["n_clients"], batch_size=fl["batch_size"],
+        data_dir=data_cfg.get("data_dir"), iid=data_cfg.get("iid", True),
         bias_q=float(data_cfg.get("noniid_bias", 0.5)), seed=seed,
+        n_classes=data_cfg.get("n_classes"),
     )
 
-    state = load_state() if (state_exists() and not args.fresh) else None
+    # Phase-1 state is looked up in THIS dataset's checkpoint dir, so switching
+    # datasets never loads a state_dict the model cannot accept.
+    state = (load_state(dataset=dataset)
+             if (state_exists(dataset=dataset) and not args.fresh) else None)
     if state is not None and len(state[1]) != fl["n_clients"]:
         logger.warning(
             f"Checkpoint has {len(state[1])} client(s) but config n_clients={fl['n_clients']} "
@@ -379,12 +445,12 @@ def main():
         )
         state = None
     if state is not None:
-        logger.info("Checkpoint found — skipping Phase 1, loading saved state")
+        logger.info(f"Checkpoint found for '{dataset}' — skipping Phase 1, loading saved state")
         global_weights, client_weights, baseline_accuracy = state
     else:
-        logger.info("No (usable) checkpoint or --fresh — running Phase 1")
+        logger.info(f"No (usable) '{dataset}' checkpoint or --fresh — running Phase 1")
         global_weights, client_weights, baseline_accuracy = run_training_phase(
-            base_config, client_loaders, test_loader
+            base_config, client_loaders, test_loader, dataset
         )
 
     mode = "baseline" if args.baseline else ("dry-run" if args.dry_run else "train")
@@ -403,8 +469,9 @@ def main():
                     f"{DEBUG_DEFAULT_ROUNDS} Phase-2 round(s)")
     if args.debug:
         dbg.enable(
-            output_dir="logs", filename="debug.json", mode=mode,
+            output_dir=paths["debug_dir"], filename="debug.json", mode=mode,
             config_summary={
+                "dataset": dataset,
                 "model": base_config.get("rl", {}).get("model"),
                 "defense_mode": (base_config.get("defense", {}) or {}).get("mode", "algorithmic"),
                 "defense_algorithms": (base_config.get("defense", {}) or {}).get("algorithms"),
@@ -438,6 +505,9 @@ def main():
             mode=mode,
             n_rounds=n_rounds,
             llm_backend=llm_backend,
+            dataset=dataset,
+            paths=paths,
+            save_round_log=save_round_log,
             max_new_rounds=max_new_rounds,
         )
     finally:

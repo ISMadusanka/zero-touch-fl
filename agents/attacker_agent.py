@@ -47,6 +47,8 @@ Objective (`attack_goal`):
 - slow_degrade: lower accuracy only slightly (`per_round_drop`) to stay stealthy.
 - targeted_label: harm class `label` while keeping overall accuracy high.
 
+`dataset` names the learning task the federation is training on (e.g. "mnist" = 28x28 grayscale digits with a small MLP, "cifar10" = 32x32 colour images with a small CNN). The model architecture and the layer names in `client_update_stats` change with it, and so does how much damage a given perturbation does -- read the stats, do not assume a fixed architecture.
+
 `client_update_stats` gives, per controllable client, dimensionless stats of its HONEST update D = local - global (per layer and whole-model), normalized to the global model only:
 - rel_update: norm(D)/norm(global) for the layer -- how large the honest change already is; your poison adds to it, and bigger stands out more.
 - rms_delta: per-weight step size. energy_frac: share of the update in that layer.
@@ -90,6 +92,7 @@ class AttackerAgent:
         global_weights: dict,
         budget: int | None = None,
         goal: dict | None = None,
+        dataset: str | None = None,
     ) -> str:
         """Serialize the attacker's per-round observation into a user message.
 
@@ -109,6 +112,13 @@ class AttackerAgent:
             goal: this round's attack goal (e.g. a per-round-sampled
                 ``target_accuracy_drop``). Defaults to the agent's fixed
                 ``self.goal`` when not given (inference / benchmark paths).
+            dataset: which learning task the federation is training on
+                ("mnist", "cifar10", ...). ONE attacker adapter is fine-tuned
+                continually across datasets, so the regime has to be observable:
+                without it the policy sees a mixture of two tasks whose layer
+                names and damage scales differ and cannot tell which it is in.
+                Omitted from the payload when not supplied, so older callers and
+                tests keep their exact prompt.
         """
         pool_ids = list(benign_by_client.keys())
         if budget is None:
@@ -125,6 +135,8 @@ class AttackerAgent:
                 for cid, sd in benign_by_client.items()
             },
         }
+        if dataset:
+            payload["dataset"] = str(dataset)
         return json.dumps(payload)
 
     # ------------------------------------------------------------------

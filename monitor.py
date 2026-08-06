@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """RL health monitor — is each LLM actually learning, or collapsing?
 
-Reads logs/round_data/round_*.json (written every round, so this works WHILE
+Reads logs/<dataset>/round_data/ (written every round, so this works WHILE
 training runs) and reports per-agent learning trends + collapse flags, plus a
 health.png. Run it any time:  python monitor.py
 
@@ -22,6 +22,7 @@ Collapse (bad):
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -389,22 +390,35 @@ def plot_clients(log_dir: str, out: str):
 
 
 def main():
+    from core.run_config import run_paths
+    from data.datasets import DATASET_NAMES, DEFAULT_DATASET
+
     ap = argparse.ArgumentParser(description="RL learning/collapse monitor")
-    ap.add_argument("--log-dir", default="logs/round_data")
-    ap.add_argument("--out", default="logs/monitor/health.png")
-    ap.add_argument("--clients-out", default="logs/monitor/poison_vs_detection.png",
+    ap.add_argument("--dataset", default=DEFAULT_DATASET, metavar="NAME",
+                    help=f"which run to monitor: {', '.join(DATASET_NAMES)} "
+                         f"(default: {DEFAULT_DATASET}). Sets the default log/output "
+                         f"paths to logs/<dataset>/; --log-dir/--out still override.")
+    ap.add_argument("--log-dir", default=None)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--clients-out", default=None,
                     help="per-client poisoned-vs-flagged map")
     ap.add_argument("--window", type=int, default=20, help="rolling/recent window")
     args = ap.parse_args()
     _utf8_stdout()
 
-    rows = load_rounds(args.log_dir)
+    paths = run_paths(args.dataset)
+    log_dir = args.log_dir or paths["round_data_dir"]
+    out = args.out or os.path.join(paths["monitor_dir"], "health.png")
+    clients_out = args.clients_out or os.path.join(paths["monitor_dir"],
+                                                   "poison_vs_detection.png")
+
+    rows = load_rounds(log_dir)
     if not rows:
-        print(f"No round_*.json in {args.log_dir}")
+        print(f"No round logs in {log_dir}")
         return
     analyze(rows, args.window)
-    plot(rows, args.out, args.window)
-    plot_clients(args.log_dir, args.clients_out)
+    plot(rows, out, args.window)
+    plot_clients(log_dir, clients_out)
 
 
 if __name__ == "__main__":

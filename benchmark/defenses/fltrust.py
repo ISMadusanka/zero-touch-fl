@@ -35,6 +35,7 @@ import torch
 
 from core.types import DetectionVerdict
 from clients.benign_client import BenignClient
+from data.datasets import DEFAULT_DATASET
 from server.fed_server import FedServer
 
 from benchmark.defenses.base import Defense, StepResult
@@ -92,12 +93,15 @@ class FLTrust(Defense):
 
     def __init__(self, root_loader, lr: float, local_epochs: int = 1,
                  device: str = "cpu", eta: float = 1.0,
-                 trust_flag_threshold: float = 0.0):
+                 trust_flag_threshold: float = 0.0,
+                 dataset: str = DEFAULT_DATASET):
         super().__init__(device)
         self.eta = float(eta)
         self.trust_flag_threshold = float(trust_flag_threshold)
-        # FLTrust holds its own model (to fine-tune on the root set each round).
-        self.server = FedServer(device=device)
+        # FLTrust holds its own model (to fine-tune on the root set each round),
+        # so it is the one defense that must know the dataset: its architecture
+        # has to match the clients' and the root loader's data.
+        self.server = FedServer(device=device, dataset=dataset)
         self.root_client = BenignClient(client_id=-1, data_loader=root_loader,
                                         lr=lr, local_epochs=local_epochs, device=device)
         self._g0_cache: tuple[bytes, "torch.Tensor"] | None = None

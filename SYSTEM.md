@@ -8,8 +8,10 @@ checkpoint layout. It supersedes the old feedback/episodic-memory design.
 
 | Layer | Module | Role |
 |-------|--------|------|
-| Model | `model/mnist_net.py` | `MnistNet`, ~970 params. State_dict keys: `net.2.weight [16,49]`, `net.2.bias [16]`, `net.4.weight [10,16]`, `net.4.bias [10]`. The schema both LLMs operate over. |
-| Data | `data/mnist_loader.py` | MNIST load + per-client partition: IID, or the FLTrust non-IID bias-`q` scheme (`partition_noniid_fltrust`). |
+| Datasets | `data/datasets.py` | Registry: name → torchvision class, normalization, class count, input shape, data dir. The only place a dataset is defined. |
+| Model | `model/__init__.py` (`build_model`) | Per-dataset FL model — the schema both LLMs operate over. `mnist` → `MnistNet` (~970 params; `net.2.weight [16,49]`, `net.2.bias`, `net.4.weight [10,16]`, `net.4.bias`). `cifar10` → `Cifar10Net` (~33.8k params, 3 conv blocks + linear head; `net.0/3/6/10.{weight,bias}`, no BatchNorm so every state_dict tensor is a learnable parameter). |
+| Data | `data/loaders.py` | Dataset-agnostic load + per-client partition: IID, or the FLTrust non-IID bias-`q` scheme (`partition_noniid_fltrust`), which reads only the label list and is therefore identical for every dataset. |
+| Run config | `core/run_config.py` | Resolves `--dataset`, deep-merges `datasets.<name>` overrides, and owns the per-dataset `checkpoints/<dataset>/` + `logs/<dataset>/` layout. |
 | Clients | `clients/benign_client.py` | Honest local SGD → `ModelUpdate`. |
 | Server | `server/fed_server.py`, `server/aggregation.py` | Global model + eval; FedAvg over non-flagged clients. |
 | Features | `detector/features.py` | Per-client, per-layer statistical feature vectors (no decisions). |
@@ -95,7 +97,9 @@ env's poison / budget / target sampling.
 ## Attacker contract (client selection + attack-plan DSL)
 
 - **Input** (`agents/attacker_agent.build_user_prompt`): `round`,
-  `current_global_accuracy`, `attack_goal`, `controllable_client_ids` (the pool it
+  `current_global_accuracy`, `attack_goal`, `dataset` (which task the federation is
+  training on — one adapter is fine-tuned across datasets, so the regime must be
+  observable), `controllable_client_ids` (the pool it
   may touch), `max_poison_clients` (this round's exact quota; legacy key name), and `client_update_stats`
   — per-layer + whole-model **statistics of each pool client's HONEST UPDATE**
   `Δ = local − global` (`agents/attack_ops.delta_details`): `rel_update`
@@ -231,9 +235,9 @@ Both continuous, so GRPO group advantages don't collapse.
   weights REPLACE the frozen benign references. So each new attacker/defender
   phase (and the frozen opponent + aggregator) trains against an advanced client
   state rather than the same frozen Phase-1 weights. The interlude gets its own
-  sequential round number and is logged to `logs/system.log`,
-  `logs/round_data/rounds.jsonl` (`attack_metadata.event="benign_fl_round"`)
-  and `logs/debug.json`.
+  sequential round number and is logged to `logs/<dataset>/system.log`,
+  `logs/<dataset>/round_data/rounds.jsonl` (`attack_metadata.event="benign_fl_round"`)
+  and `logs/<dataset>/debug.json`.
 
 ## Modes (`main.py`)
 
@@ -254,16 +258,45 @@ and `--config <path>`. `--debug` without `--rounds` caps how many rounds **this
 run** adds on top of `rounds_done`, so debugging a resumed run still executes
 rounds instead of exiting immediately.
 
+## Datasets (`--dataset`)
+
+`python main.py --env linux --dataset {mnist,cifar10}` (same flag on
+`python -m benchmark.run_benchmark`) chooses what the federation trains on. The
+split is deliberate:
+
+| Scope | What | Why |
+|---|---|---|
+| **Per dataset** | model architecture, raw data dir, Phase-1 checkpoint, live FL state, `rounds_done`/`round_index`/`controller`, logs | None of it is portable — a CIFAR-10 conv `state_dict` cannot load into the MNIST MLP, and round numbering indexes one dataset's FL state. |
+| **Shared** | `checkpoints/attacker_adapter/` (and `defender_adapter/`) | The policy observes dimensionless per-layer statistics and emits architecture-agnostic operator plans. **Continual fine-tuning is the point of the switch**: an MNIST run and a CIFAR-10 run resume the same LoRA from its last checkpoint. |
+
+Because one adapter sees both regimes, `dataset` is part of the observation — the
+attacker's and defender's user prompts carry a `"dataset"` field, so the policy is
+never fed an unlabelled mixture of two tasks.
+
+Everything between the model and the reward is architecture-agnostic and needed no
+change: the operator DSL addresses layers by `state_dict` key, `delta_details` and
+`detector/features.py` are normalized/dimensionless, and every defense is pure
+`state_dict` arithmetic. The two exceptions both take a `dataset` argument: FLTrust
+(it fine-tunes its own model on the root set) and the LLM defender (it names the
+task in its prompt).
+
+Per-dataset hyperparameters live in `configs/base.yaml` → `datasets.<name>`, which
+is deep-merged over the shared `fl`/`data`/`attack`/`defense`/`rl` blocks with the
+per-dataset value winning (CIFAR-10 ships `training_rounds: 80`, `lr: 0.01`).
+Adding a third dataset is one `DatasetSpec` in `data/datasets.py`, one entry in
+`model/__init__.py:_BUILDERS`, and optionally a `datasets:` override block.
+
 ## Checkpoints & resume
 
-- `checkpoints/global_model.pt`, `client_updates.pt`, `baseline.json` — Phase 1.
+- `checkpoints/<dataset>/global_model.pt`, `client_updates.pt`, `baseline.json` — Phase 1.
 - `checkpoints/attacker_adapter/`, `checkpoints/defender_adapter/` — LoRA adapters
-  (`adapter_model.safetensors` + `adapter_config.json`).
-- `checkpoints/rl_progress.json` — resume state:
+  (`adapter_model.safetensors` + `adapter_config.json`). **Not** under `<dataset>/`:
+  see the table above.
+- `checkpoints/<dataset>/rl_progress.json` — resume state:
   `{"rounds_done", "round_index", "controller"}`. `rounds_done` is the GRPO-step
   counter; `round_index` is the FL round-number counter (so round labels and
-  `logs/round_data/rounds.jsonl` continue instead of restarting from the first
-  Phase-2 round); `controller` is the `PhaseController` snapshot
+  `logs/<dataset>/round_data/rounds.jsonl` continue instead of restarting from the
+  first Phase-2 round); `controller` is the `PhaseController` snapshot
   (`learner`, `phase_index`, `phase_round`, `streak`, `capped`) so the arms-race
   schedule continues where it left off. Written together with the adapters on the
   `rl.save_every` cadence and on exit. Older files with only `rounds_done` still
@@ -273,8 +306,18 @@ rounds instead of exiting immediately.
   reloaded. The env still re-derives its weights from the Phase-1 baseline (the model
   state lives in the adapters), but the round counter and schedule pick up in place.
   **Not** persisted: the in-memory opponent **league** (snapshots restart empty).
+- A checkpoint tree written before multi-dataset support (files flat under
+  `checkpoints/`) is MNIST by construction, so an MNIST run reads it in place rather
+  than re-running Phase 1; the next save writes to `checkpoints/mnist/`, which then
+  wins. A CIFAR-10 run never touches it.
 
 ## Logs
+
+Everything below lives under `logs/<dataset>/`, so an MNIST and a CIFAR-10 run
+never interleave: round numbering restarts per dataset, and one shared
+`rounds.jsonl` would hand `monitor.py` / `visualize_rounds.py` duplicate round
+numbers from incomparable runs. Both tools take `--dataset` (defaulting to
+`mnist`) and still accept explicit `--log-dir` / `--out-dir` overrides.
 
 Per-round records are **appended to a JSONL stream** (one JSON object per line)
 rather than written one file per round. At the configured `fl.simulation_rounds`
@@ -283,20 +326,20 @@ exhausting inodes and making the directories unusable; appending is O(1) per rou
 and stays greppable. `monitor.py` and `visualize_rounds.py` read the JSONL **and**
 legacy `round_NNN.json` files, so logs from older runs still load.
 
-- `logs/system.log` — run log.
-- `logs/round_data/rounds.jsonl` — per round: `attack_goal`,
+- `logs/<dataset>/system.log` — run log.
+- `logs/<dataset>/round_data/rounds.jsonl` — per round: `attack_goal`,
   `poisoned_client_ids`, `predicted_labels`, accuracies, `attacker_reward`,
   `defender_reward`, `learning_agent`, and an `attack_metadata` block with
   `clean_accuracy` / `induced_drop` (the counterfactual and the damage the reward
   actually uses), `n_malformed`, `budget`, `n_used`, `defense` (which algorithm
   faced the round, or `"llm"` — rounds are only comparable within one defense),
   plus a `train` sub-block (loss, mean reward, zero-advantage fraction).
-- `logs/metrics/rounds.jsonl` + `summary.json` — ground-truth confusion / TPR /
+- `logs/<dataset>/metrics/rounds.jsonl` + `summary.json` — ground-truth confusion / TPR /
   FPR / ASR / APR. `summary.json`'s `aggregate` covers every round; its
   `per_round` block is the retained tail (`MetricsTracker.keep_rounds`, default
   2000) — the full history is in `rounds.jsonl`.
-- `logs/debug.json` (`--debug`) — structured event stream, capped at the most
+- `logs/<dataset>/debug.json` (`--debug`) — structured event stream, capped at the most
   recent `DebugLogger.MAX_EVENTS` events (the file is rewritten in full each
   round, so an unbounded buffer made long debug runs O(n²)). `events_dropped`
   records how many were evicted.
-- `logs/visualizations/report.html` — `python visualize_rounds.py`.
+- `logs/<dataset>/visualizations/report.html` — `python visualize_rounds.py`.

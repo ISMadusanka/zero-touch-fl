@@ -16,6 +16,12 @@ On the GPU box (needs torch / unsloth / peft + the trained adapters in `checkpoi
 ```bash
 python -m benchmark.run_benchmark --rounds 200
 
+# Pick the dataset (default: data.dataset from the config). It resolves exactly the
+# way main.py does — same datasets.<name> overrides, Phase-1 state read from
+# checkpoints/<dataset>/, results written to logs/<dataset>/benchmark/. The attacker
+# adapter is shared, so this evaluates the same trained policy on the other task.
+python -m benchmark.run_benchmark --rounds 200 --dataset cifar10
+
 # Pick the attack goal the attacker aims for (fixed for the whole run, no per-round
 # sampling). The trained attacker generalizes across targets, so you can evaluate it
 # at any requested drop and read each defense's acc_drop against that target:
@@ -35,7 +41,7 @@ python -m benchmark.run_benchmark --rounds 200 \
     --defenses fedavg,oracle,fltrust,llm_defender,defl,dnc,multikrum \
     --attack-temperature 0.7 --root-size 100 --eta 1.0 \
     --defl-delta 0.05 --defl-tau 2.5 --dnc-c 1.0 --dnc-sub-dim 10000 \
-    --multikrum-m 4 --out logs/benchmark
+    --multikrum-m 4 --out logs/mnist/benchmark
 
 # sweep the adversary's size: 1 .. fl.n_clients (20) poisoners per round.
 # Evaluation is NOT limited to fl.n_compromisable (5) the way training is — the
@@ -43,7 +49,7 @@ python -m benchmark.run_benchmark --rounds 200 \
 # exactly 10 clients (clients 0..9 in that widened case).
 for k in 1 3 5 10 15 20; do
   python -m benchmark.run_benchmark --rounds 50 --max-poison-clients $k \
-      --out logs/benchmark/poisoners_$k
+      --out logs/mnist/benchmark/poisoners_$k
 done
 ```
 
@@ -68,13 +74,13 @@ threat model it was fitted to (it trained against a 5-client foothold). That is 
 legitimate generalization test, and the run says so — raise `fl.n_compromisable` and
 retrain if you want it in-distribution.
 
-Output: a console table + `logs/benchmark/benchmark.{json,csv}` + per-round
+Output: a console table + `logs/<dataset>/benchmark/benchmark.{json,csv}` + per-round
 `history.json` + a 4-panel graph `benchmark.png` (accuracy per round, rolling
 detection-rate, rolling FPR, and attack-strength per round). Re-plot a saved run
 without re-running (the 200 rounds are slow + need the GPU):
 
 ```bash
-python -m benchmark.plot --history logs/benchmark/history.json   # -> benchmark.png
+python -m benchmark.plot --dataset mnist                        # -> benchmark.png
 ```
 
 Disable graphing with `--no-plot`. Example table shape:
@@ -191,7 +197,7 @@ also give a softer view than the binary flag.
 `--root-size` (clean root samples, default 100, the paper's default) · `--root-epochs`
 (server local epochs `R_l`, default 1) · `--root-lr` (default `fl.lr`) · `--eta`
 (global learning rate, default 1.0). The root set is carved once from the clean
-MNIST train set with a fixed seed.
+train set of the selected `--dataset`, with a fixed seed.
 
 ## DeFL knobs
 

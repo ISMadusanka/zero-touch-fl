@@ -85,6 +85,7 @@ class AttackerTurn:
         self.user = attacker_agent.build_user_prompt(
             env.round_index + env.training_rounds, env.current_accuracy,
             self.pool_references, env.global_weights, self.budget, goal=self.goal,
+            dataset=getattr(env, "dataset", None),
         )
         dbg.attacker_prompt(self.system, self.user, who="learner")
 
@@ -96,7 +97,8 @@ class AttackerTurn:
         feats = self.env.features(updates)
         client_ids = [u.client_id for u in updates]
         d_sys = self.defender_agent.system_prompt()
-        d_user = self.defender_agent.build_user_prompt(feats)
+        d_user = self.defender_agent.build_user_prompt(
+            feats, dataset=getattr(self.env, "dataset", None))
         text = self.defender_gen.generate(d_sys, d_user, n=1, temperature=temperature)[0]
         verdicts = self.defender_agent.parse(text, client_ids)
         dbg.defender_io(d_sys, d_user, text, verdicts, who="opponent",
@@ -187,6 +189,7 @@ class DefenderTurn:
         a_user = attacker_agent.build_user_prompt(
             env.round_index + env.training_rounds, env.current_accuracy,
             env.pool_benign, env.global_weights, env.round_budget, goal=env.round_goal,
+            dataset=getattr(env, "dataset", None),
         )
         dbg.attacker_prompt(a_sys, a_user, who="frozen-opponent")
         a_text = attacker_gen.generate(a_sys, a_user, n=1, temperature=opponent_temperature)[0]
@@ -202,7 +205,8 @@ class DefenderTurn:
         self.features = env.features(self.updates)
 
         self.system = defender_agent.system_prompt()
-        self.user = defender_agent.build_user_prompt(self.features)
+        self.user = defender_agent.build_user_prompt(
+            self.features, dataset=getattr(env, "dataset", None))
         dbg.defender_prompt(self.system, self.user, who="learner")
 
     def messages(self) -> tuple[str, str]:

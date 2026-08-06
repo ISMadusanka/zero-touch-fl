@@ -1,6 +1,7 @@
-"""Tests for the FLTrust non-IID partition (data/mnist_loader.partition_noniid_fltrust).
+"""Tests for the FLTrust non-IID partition (data/loaders.partition_noniid_fltrust).
 
-Uses a tiny fake dataset (a `.targets` list), so no MNIST download is needed.
+The partition is dataset-agnostic — it reads only the label list — so a tiny fake
+dataset (a `.targets` list) covers it for MNIST and CIFAR-10 alike; no download.
 Run on any box with torch/torchvision installed:  python tests/test_partition.py
 """
 import os
@@ -8,7 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.mnist_loader import partition_noniid_fltrust  # noqa: E402
+from data.loaders import partition_noniid_fltrust  # noqa: E402
 
 
 class FakeDS:

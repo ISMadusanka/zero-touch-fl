@@ -1,5 +1,6 @@
 # Runtime artifacts
-data/mnist_raw/
+# One raw-data dir per dataset (data/datasets.py: DatasetSpec.data_dir).
+data/*_raw/
 checkpoints/
 logs/
 

@@ -1,8 +1,10 @@
 # Zero-Touch Federated Learning — LLM-Direct Adversarial RL
 
 A research testbed where two LLMs **directly generate** the attack and the
-defense in a federated-learning arms race on MNIST, and are **reinforcement-
-trained** against each other with verifiable rewards.
+defense in a federated-learning arms race, and are **reinforcement-trained**
+against each other with verifiable rewards. Runs on **MNIST or CIFAR-10** —
+`--dataset` switches the federation while the **same LLM keeps fine-tuning from
+its last checkpoint** (see [Datasets](#datasets-mnist--cifar-10)).
 
 ## Overview
 
@@ -46,6 +48,55 @@ Two phases:
 There are no hardcoded attack plugins and no episodic-memory feedback loop — the
 attacker learns everything via RL.
 
+## Datasets (MNIST / CIFAR-10)
+
+```bash
+python main.py --env linux --dataset mnist      # 28x28 digits,  MnistNet   (~970 params)
+python main.py --env linux --dataset cifar10    # 32x32 colour,  Cifar10Net (~33.8k params)
+```
+
+Same flag on the benchmark: `python -m benchmark.run_benchmark --dataset cifar10`.
+Omit it and `data.dataset` from the config is used. (`ciffar10`, `cifar-10` and
+`CIFAR10` are all accepted spellings of `cifar10`.)
+
+**What is per dataset, and what is shared:**
+
+| Scope | What | Why |
+|---|---|---|
+| **Per dataset** | model architecture, raw data dir, Phase-1 checkpoint, live FL state, round/phase counters (`checkpoints/<dataset>/`), and all logs (`logs/<dataset>/`) | None of it is portable. A CIFAR-10 conv `state_dict` cannot load into the MNIST MLP, and round numbering indexes one dataset's FL state. |
+| **Shared** | the LLM: `checkpoints/attacker_adapter/` (and `defender_adapter/`) | **This is the point of the switch.** Whichever dataset you run, training *continues* from the last adapter checkpoint — it never restarts from the base model. |
+
+The policy can be shared because it never sees weights: it reads dimensionless
+per-layer statistics and emits architecture-agnostic operator plans. Since one
+adapter now sees two regimes, the regime is part of the observation — a
+`"dataset"` field is included in the attacker's and defender's prompts.
+
+**Per-dataset hyperparameters** live in `configs/base.yaml` → `datasets.<name>`,
+deep-merged over the shared `fl` / `data` / `attack` / `defense` / `rl` blocks with
+the per-dataset value winning. What CIFAR-10 ships, and why:
+
+- `fl.training_rounds: 80`, `fl.lr: 0.01` — a conv net under plain SGD barely moves
+  at MNIST's `0.002`. Tune from there once you see the clean baseline your Phase 1
+  actually reaches.
+- `attack.target_choices` trimmed to `[0.05, 0.10, 0.15, 0.20]` — a CIFAR-10
+  baseline sits far below MNIST's, so an absolute `target_accuracy_drop` is a much
+  larger share of the available headroom.
+- `rl.max_seq_len: 16384` — the attacker prompt carries `delta_details` for every
+  client in the pool, and `Cifar10Net` has 8 parameter tensors to `MnistNet`'s 4, so
+  the same pool costs about twice the tokens (~3.2k at the training pool of 5, but
+  ~9k+ if the benchmark widens it to all 20 clients). Past `max_seq_len`,
+  generations truncate and the attack JSON stops parsing — which reads as a weak
+  attacker rather than as a context error. `benchmark/harness.py` logs the real
+  token count on round 1 regardless.
+
+**Adding a third dataset**: one `DatasetSpec` in
+[`data/datasets.py`](data/datasets.py), one entry in
+[`model/__init__.py`](model/__init__.py)`:_BUILDERS`, and (optionally) a
+`datasets:` override block. Nothing in the round loop, the operator DSL, the
+rewards or the defenses is dataset-aware — the two exceptions, FLTrust (it
+fine-tunes its own model on the root set) and the LLM defender (it names the task
+in its prompt), take a `dataset` argument.
+
 ## Defense: the defender LLM is currently disabled
 
 `configs/base.yaml` ships with **`defense.mode: algorithmic`**. The defender LLM
@@ -83,7 +134,7 @@ Details that matter:
   `defense.selection: round_robin` for even coverage, or list a single algorithm
   to pin one for a controlled run.
 - Every round log records which defense faced it
-  (`attack_metadata.defense` in `logs/round_data/rounds.jsonl`). Compare rounds
+  (`attack_metadata.defense` in `logs/<dataset>/round_data/rounds.jsonl`). Compare rounds
   **within** a defense — accuracy drops are not comparable across them.
 
 To restore the original two-sided LLM arms race, set `defense.mode: llm`. Nothing
@@ -118,21 +169,24 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   reward, KL penalty to the frozen base) on top of Unsloth + PEFT — no TRL
   trainer dependency required.
 - **Resume**: rerun the same command. Existing adapters and
-  `checkpoints/rl_progress.json` are reloaded and training continues where it left
-  off — not just the trained adapters and the round count (`rounds_done`), but also
-  the FL round number (`round_index`, so round labels and `logs/round_data` keep
-  advancing instead of restarting from the first Phase-2 round) and the arms-race
+  `checkpoints/<dataset>/rl_progress.json` are reloaded and training continues where
+  it left off — not just the trained adapters and the round count (`rounds_done`),
+  but also the FL round number (`round_index`, so round labels and
+  `logs/<dataset>/round_data` keep advancing instead of restarting from the first
+  Phase-2 round) and the arms-race
   schedule (`controller`: which agent is learning, phase index, win streak). The
   in-memory opponent league is the one piece not persisted (it restarts empty). Old
   progress files that only hold `rounds_done` still load (the rest falls back safely).
+  The **adapter** is not dataset-scoped, so switching `--dataset` resumes the same
+  policy against a different federation; only the FL state and counters restart.
 - **Switching the base model invalidates old adapters.** A LoRA adapter is
   dimensioned for the exact base it was trained on, so adapters from a previous
   base (e.g. the earlier `Qwen2.5-1.5B-Instruct` run) **cannot** load onto
   `Qwen2.5-3B-Instruct`. If `checkpoints/attacker_adapter/` or
-  `checkpoints/defender_adapter/` exist from an old base, delete them (and
-  `checkpoints/rl_progress.json` + `checkpoints/fl_state.pt`) and retrain from
-  scratch. The Phase-1 MNIST checkpoint (`global_model.pt`, `client_updates.pt`,
-  `baseline.json`) is model-agnostic and can stay.
+  `checkpoints/defender_adapter/` exist from an old base, delete them (and every
+  `checkpoints/<dataset>/rl_progress.json` + `fl_state.pt`) and retrain from
+  scratch. The Phase-1 FL checkpoints (`checkpoints/<dataset>/global_model.pt`,
+  `client_updates.pt`, `baseline.json`) are LLM-agnostic and can stay.
 - **`gpt-4o-mini` (OpenAI) and Ollama `qwen2.5` are inference/baseline only** —
   used by `--dry-run` and `--baseline`. They are **not** fine-tuned.
 - **Serving a trained adapter**: use **vLLM** (multi-LoRA hot-swap), or **merge**
@@ -169,6 +223,11 @@ pip install torch torchvision numpy pyyaml matplotlib openai requests
 # Full GRPO training (GPU). Phase 1 runs once, then the RL arms race.
 python main.py --env linux
 
+# Pick the dataset. The SAME attacker adapter is fine-tuned by both — each keeps
+# its own Phase-1 checkpoint, FL state, round counters and logs.
+python main.py --env linux --dataset mnist
+python main.py --env linux --dataset cifar10
+
 # Quick smoke run: few rounds. --rounds is an ABSOLUTE budget overriding
 # fl.simulation_rounds, so on a resumed run the rounds already done count toward it.
 python main.py --env linux --rounds 8
@@ -177,7 +236,7 @@ python main.py --env linux --rounds 8
 python main.py --env linux --config configs/my_experiment.yaml
 
 # Verbose DEBUG run (GPU) — print EVERYTHING for one short run, to the console AND
-# logs/debug.json: the exact attacker/defender LLM prompts + raw outputs, each
+# logs/<dataset>/debug.json: the exact attacker/defender LLM prompts + raw outputs, each
 # poisoning step (attack plan + per-layer poisoned-weight deltas), the per-round
 # FL fine-tuning data, and all rewards / GRPO advantages / commit outcomes.
 # Third-party library noise is silenced. Without --rounds it runs 3 MORE rounds
@@ -195,11 +254,13 @@ python main.py --baseline --rounds 10
 # Force fresh Phase-1 training
 python main.py --env linux --fresh
 
-# Visualize results
+# Visualize results (both default to the mnist run; pass --dataset for the other)
 python visualize_rounds.py
+python visualize_rounds.py --dataset cifar10
 
 # MONITOR LLM training
-python monitor.py                 # prints a health report + saves logs/monitor/health.png
+python monitor.py                 # health report + logs/mnist/monitor/health.png
+python monitor.py --dataset cifar10
 python monitor.py --window 50     # smooth over a larger recent window for long runs
 ```
 
@@ -234,7 +295,7 @@ alternation lengths `K_a`/`K_d`, learning rate, league) in
 
 ```bash
 # On server:
-cd <repo>/logs/visualizations && python -m http.server 8084
+cd <repo>/logs/<dataset>/visualizations && python -m http.server 8084
 # On your machine:
 ssh -i <key> -L 8084:<server>:8084 <user>@<server>
 # Open http://localhost:8084/report.html
@@ -242,9 +303,12 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
 
 ## Configuration
 
+- **`configs/base.yaml` → `datasets:`** — per-dataset overrides of the shared
+  `fl` / `data` / `attack` / `defense` / `rl` blocks, applied once `--dataset` is
+  resolved (the per-dataset value wins). See [Datasets](#datasets-mnist--cifar-10).
 - **`configs/base.yaml`** — FL hyperparameters (`n_clients: 20`,
   `n_compromisable: 5`, `poison_seed`, `benign_retrain_each_round`), the
-  `data.noniid_bias` (FLTrust `q`), the `attack` block (`goal`,
+  `data.dataset` default and `data.noniid_bias` (FLTrust `q`), the `attack` block (`goal`,
   `max_poison_clients`, `sample_budget_in_training`, `eval_poison_clients`), and
   the `rl:` block — GRPO + LoRA + league + reward weights, including the
   `.zeta` multi-client collaboration/diversity bonus and `league_max_snapshots`
@@ -295,14 +359,20 @@ python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.1'
 
 python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.1' --max-poison-clients 3
 # forms: untargeted_degrade=<drop> | slow_degrade=<drop> | targeted_label=<label>
+
+# Evaluate the same trained attacker on the other dataset. Results land in
+# logs/<dataset>/benchmark/, so the two never overwrite each other.
+python -m benchmark.run_benchmark --rounds 200 --dataset cifar10
 ```
 
 ## Project structure
 
 ```
-core/         Shared types (ModelUpdate, DetectionVerdict, RoundLog) + aggregator interface
-model/        Tiny MLP (~970 params) — the schema both LLMs operate over
-data/         MNIST loading & partitioning
+core/         Shared types (ModelUpdate, DetectionVerdict, RoundLog) + aggregator interface,
+              run_config.py (dataset resolution + per-dataset checkpoint/log layout)
+model/        build_model(dataset) -> the FL model both LLMs operate over:
+              mnist_net.py (MLP, ~970 params) / cifar_net.py (CNN, ~33.8k params)
+data/         datasets.py (the dataset registry) + loaders.py (download & partitioning)
 clients/      Honest client local training
 server/       Central server + FedAvg aggregation + algo_defender.py (the round-rotating
               algorithmic defense that currently replaces the defender LLM)
@@ -310,10 +380,12 @@ detector/     features.py — per-client per-layer statistical feature extractor
 agents/       attacker_agent.py / defender_agent.py (pure prompt+parse), attack_ops.py (operator DSL), llm_client.py
 rl/           env, rewards, turns, inference (dry-run), policy (Unsloth+LoRA), grpo, schedule, baseline
 metrics/      Ground-truth confusion/TPR/FPR/ASR/APR (research evaluation + reward source)
-storage/      Phase-1 checkpoint + RL progress
+storage/      Phase-1 checkpoint + RL progress, scoped per dataset
 configs/      YAML configuration
-logs/         system.log, debug.json (--debug), round_data/rounds.jsonl,
-              metrics/rounds.jsonl + summary.json, visualizations/
+checkpoints/  <dataset>/ (FL state per dataset) + attacker_adapter/, defender_adapter/
+              (the LoRA policies — SHARED across datasets)
+logs/         <dataset>/{system.log, debug.json (--debug), round_data/rounds.jsonl,
+              metrics/rounds.jsonl + summary.json, visualizations/, benchmark/}
 ```
 
 See [`SYSTEM.md`](SYSTEM.md) for the full architecture (round loop, reward

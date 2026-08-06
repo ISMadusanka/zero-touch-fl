@@ -17,11 +17,65 @@ fl:
   device: "cuda"                  # RL training needs a GPU; use "cpu" only for --dry-run/--baseline
 
 data:
-  dataset: "mnist"
+  dataset: "mnist"                # DEFAULT dataset; override per run with
+                                  #   python main.py --env linux --dataset cifar10
+                                  # See the `datasets:` block below for per-dataset
+                                  # hyperparameters, and data/datasets.py for the registry.
   iid: false
   noniid_bias: 0.5                # FLTrust bias probability q (iid=false only). 1/n_classes=0.1
                                   # is IID; larger = more non-IID; paper default 0.5.
-  data_dir: "./data/mnist_raw"
+  data_dir: null                  # null = the selected dataset's own directory
+                                  # (./data/mnist_raw, ./data/cifar10_raw). Setting one
+                                  # dataset's path here while running the other is
+                                  # rejected — two datasets must not share a cache.
+  # n_classes: 10                 # non-IID GROUP count (iid=false only); defaults to
+                                  # the dataset's own class count. Both shipped
+                                  # datasets have 10, so this is normally left unset.
+
+# --- Per-dataset overrides -------------------------------------------------
+# Deep-merged over the shared blocks above once --dataset is resolved, and the
+# per-dataset value WINS. Only fl / data / attack / defense / rl may be overridden;
+# anything else is a typo and raises rather than being silently ignored.
+#
+# What is per-dataset and what is not:
+#   PER DATASET  the FL model architecture (model/__init__.py:build_model), the raw
+#                data dir, the Phase-1 checkpoint + live FL state + round counters
+#                (checkpoints/<dataset>/), and the logs (logs/<dataset>/).
+#   SHARED       the LLM. checkpoints/attacker_adapter is NOT dataset-scoped, so
+#                every run — mnist or cifar10 — continues fine-tuning the same
+#                LoRA from its last checkpoint. That is the point of the switch.
+datasets:
+  mnist:
+    fl:
+      training_rounds: 45         # ~970-param MLP converges fast
+      lr: 0.002
+      local_epochs: 3
+  cifar10:
+    fl:
+      training_rounds: 80         # 33.8k-param CNN on a harder task needs more rounds
+      lr: 0.01                    # plain SGD (no momentum) on a conv net: 0.002 barely moves
+      local_epochs: 3
+    # A CIFAR-10 clean baseline lands well below MNIST's, so an absolute
+    # `target_accuracy_drop` of 0.30 is a much larger share of the headroom there.
+    # The sampled target pool is trimmed accordingly; raise it once you see the
+    # baseline your Phase 1 actually reaches.
+    attack:
+      target_choices: [0.05, 0.10, 0.15, 0.20]
+    rl:
+      max_seq_len: 16384          # The attacker prompt carries delta_details for EVERY
+                                  # client in the pool, and Cifar10Net has 8 parameter
+                                  # tensors to MnistNet's 4 — so the same pool costs
+                                  # roughly twice the tokens. Training (pool = 5) needs
+                                  # only ~3.2k, but the benchmark can widen the pool to
+                                  # all 20 clients (--max-poison-clients 20), which lands
+                                  # near/over the 8192 default BEFORE max_new_tokens.
+                                  # Past the limit generations are truncated and the
+                                  # attack JSON stops parsing, which reads as a
+                                  # mysteriously weak attacker rather than as a context
+                                  # error. Qwen2.5's native context is 32k, and raising
+                                  # the cap costs nothing on the short training prompts.
+                                  # benchmark.harness._check_prompt_fits logs the real
+                                  # token count on round 1 either way.
 
 # Attack goal (configurable). First experiment = untargeted accuracy reduction.
 attack:

@@ -9,7 +9,8 @@ Draws a 4-panel figure from the per-round history each defense recorded:
 Auto-invoked by run_benchmark. Also runnable standalone to RE-PLOT a saved history
 without re-running the (slow, GPU) benchmark:
 
-    python -m benchmark.plot --history logs/benchmark/history.json
+    python -m benchmark.plot --dataset cifar10
+    python -m benchmark.plot --history logs/mnist/benchmark/history.json
 """
 import argparse
 import json
@@ -99,11 +100,23 @@ def plot_history(history: dict, baseline_accuracy: float, out_path: str, window:
 
 
 def main():
+    import os
+
+    from core.run_config import run_paths
+    from data.datasets import DATASET_NAMES, DEFAULT_DATASET
+
     ap = argparse.ArgumentParser(description="Re-plot benchmark per-round history")
-    ap.add_argument("--history", default="logs/benchmark/history.json")
-    ap.add_argument("--out", default="logs/benchmark/benchmark.png")
+    ap.add_argument("--dataset", default=DEFAULT_DATASET, metavar="NAME",
+                    help=f"which benchmark run to re-plot: {', '.join(DATASET_NAMES)} "
+                         f"(default: {DEFAULT_DATASET}); sets the default paths to "
+                         f"logs/<dataset>/benchmark/")
+    ap.add_argument("--history", default=None)
+    ap.add_argument("--out", default=None)
     ap.add_argument("--window", type=int, default=20)
     args = ap.parse_args()
+    bench_dir = run_paths(args.dataset)["benchmark_dir"]
+    args.history = args.history or os.path.join(bench_dir, "history.json")
+    args.out = args.out or os.path.join(bench_dir, "benchmark.png")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
     with open(args.history) as f:
         blob = json.load(f)

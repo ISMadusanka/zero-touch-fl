@@ -15,6 +15,7 @@ makes the comparison fair.
 """
 import logging
 
+from data.datasets import DEFAULT_DATASET
 from server.fed_server import FedServer
 
 from benchmark.metrics import DefenseMetrics
@@ -63,7 +64,8 @@ def _check_prompt_fits(policy, system, user, max_new_tokens, pool_size):
 def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
                   init_global, baseline_accuracy, n_rounds, *,
                   attack_temperature: float = 0.7, max_new_tokens: int = 512,
-                  device: str = "cpu", attacker_adapter: str = "attacker",
+                  device: str = "cpu", dataset: str | None = None,
+                  attacker_adapter: str = "attacker",
                   log_every: int = 10, target_drop: float | None = None):
     """Run ``n_rounds`` of attacker-vs-defenses. Returns (summaries, metrics) where
     summaries = {name: summary-dict} and metrics = {name: DefenseMetrics}.
@@ -76,7 +78,12 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
                        "will stay frozen at the clean baseline for the whole run.")
     for d in defenses.values():
         d.reset(init_global)
-    eval_server = FedServer(device=device)
+    # The scoring model must have the same architecture as the weights every
+    # defense produces; default to the env's dataset so callers can't desync them.
+    eval_server = FedServer(
+        device=device,
+        dataset=dataset or getattr(env, "dataset", DEFAULT_DATASET),
+    )
     metrics = {name: DefenseMetrics(name, baseline_accuracy, target_drop) for name in defenses}
     reference_acc = float(baseline_accuracy)   # what the attacker observes (no-defense world)
 
@@ -87,8 +94,9 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
         # controllable pool and plans ONE attack against the reference state;
         # the SAME poisoned updates go to every defense (vary defense, hold attack).
         system = attacker_agent.system_prompt()
-        user = attacker_agent.build_user_prompt(ctx.round_num, reference_acc,
-                                                ctx.pool_benign, env.global_weights, ctx.budget)
+        user = attacker_agent.build_user_prompt(
+            ctx.round_num, reference_acc, ctx.pool_benign, env.global_weights,
+            ctx.budget, dataset=getattr(env, "dataset", None))
         if r == 1:
             _check_prompt_fits(policy, system, user, max_new_tokens, len(ctx.pool_benign))
         text = policy.generate(attacker_adapter, system, user, n=1,

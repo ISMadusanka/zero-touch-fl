@@ -5,18 +5,27 @@ import torch
 import torch.nn as nn
 
 from core.types import ModelUpdate
-from model.mnist_net import MnistNet, count_parameters
+from data.datasets import DEFAULT_DATASET, canonical
+from model import build_model, count_parameters
 
 logger = logging.getLogger(__name__)
 
 
 class FedServer:
-    """Holds the global model and provides evaluation."""
+    """Holds the global model and provides evaluation.
 
-    def __init__(self, device: str = "cpu"):
+    ``dataset`` selects the architecture via ``model.build_model`` — the only
+    dataset-dependent choice in the whole server/defense stack; everything
+    downstream operates on the resulting ``state_dict`` and is architecture-
+    agnostic.
+    """
+
+    def __init__(self, device: str = "cpu", dataset: str = DEFAULT_DATASET):
         self.device = device
-        self.model = MnistNet().to(device)
-        logger.info(f"Global model initialized — {count_parameters(self.model)} params")
+        self.dataset = canonical(dataset)
+        self.model = build_model(self.dataset).to(device)
+        logger.info(f"Global model initialized [{self.dataset}] — "
+                    f"{count_parameters(self.model)} params")
 
     def get_global_weights(self) -> dict:
         """Return a CPU copy of the global model state dict."""

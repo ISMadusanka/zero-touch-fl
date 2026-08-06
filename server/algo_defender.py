@@ -38,6 +38,7 @@ import random
 from dataclasses import dataclass, field
 
 from core.types import DetectionVerdict
+from data.datasets import DEFAULT_DATASET, canonical
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +280,9 @@ def build_algorithmic_defender(cfg: dict, *, root_loader=None,
     defenses = build_defenses(
         names,
         device=fl.get("device", "cpu"),
+        # FLTrust builds its own model to fine-tune on the root set, so it needs
+        # the same architecture the clients train — i.e. the run's dataset.
+        dataset=canonical((cfg.get("data") or {}).get("dataset", DEFAULT_DATASET)),
         root_loader=root_loader,
         root_lr=float(ft.get("root_lr") or fl.get("lr", 0.002)),
         root_epochs=root_epochs,

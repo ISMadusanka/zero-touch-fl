@@ -10,6 +10,7 @@ import logging
 
 from clients.benign_client import BenignClient
 from core.types import DetectionVerdict
+from data.datasets import DEFAULT_DATASET
 from server.aggregation import FedAvgAggregator
 from server.fed_server import FedServer
 
@@ -23,7 +24,8 @@ def run_phase1(config: dict, client_loaders, test_loader):
     shape ``storage.checkpoint.load_state`` returns.
     """
     fl = config["fl"]
-    server = FedServer(device=fl["device"])
+    dataset = (config.get("data") or {}).get("dataset", DEFAULT_DATASET)
+    server = FedServer(device=fl["device"], dataset=dataset)
     clients = [
         BenignClient(client_id=i, data_loader=client_loaders[i], lr=fl["lr"],
                      local_epochs=fl["local_epochs"], device=fl["device"])

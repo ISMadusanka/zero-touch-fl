@@ -23,6 +23,8 @@ SYSTEM_PROMPT = """You are the defender in a federated-learning system. Each rou
 
 Honest clients are the MAJORITY, so median-based references describe honest behaviour and outliers are suspicious.
 
+`dataset` names the learning task the federation is training on (e.g. "mnist", "cifar10"). It changes the model architecture, so the layer names and the typical magnitudes below shift with it -- judge every client against the OTHER clients this round, never against remembered absolute numbers.
+
 Features per client:
 - `layers` -- per-layer stats:
   * l2_norm: this layer's update magnitude. rel_norm: l2_norm / median over clients (>> 1 = abnormally large).
@@ -74,15 +76,20 @@ class DefenderAgent:
     def system_prompt(self) -> str:
         return self._system
 
-    def build_user_prompt(self, features: dict[int, dict]) -> str:
+    def build_user_prompt(self, features: dict[int, dict],
+                          dataset: str | None = None) -> str:
         """Serialize per-client feature vectors into a user message.
 
         ``features`` is keyed by client_id (from ``compute_client_features``).
+        ``dataset`` names the task being federated; like the attacker's, it is
+        included only when supplied so existing callers keep their exact prompt.
         """
         payload = {
             "client_ids": list(features.keys()),
             "features": {str(cid): feats for cid, feats in features.items()},
         }
+        if dataset:
+            payload["dataset"] = str(dataset)
         return json.dumps(payload)
 
     def parse(self, text, client_ids: list[int]) -> list[DetectionVerdict]:

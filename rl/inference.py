@@ -52,7 +52,7 @@ def run_inference(
         a_sys = attacker_agent.system_prompt()
         a_user = attacker_agent.build_user_prompt(
             ctx.round_num, ctx.global_accuracy, ctx.pool_benign, env.global_weights,
-            ctx.budget, goal=ctx.goal,
+            ctx.budget, goal=ctx.goal, dataset=getattr(env, "dataset", None),
         )
         a_text = generator.generate(a_sys, a_user, n=1, temperature=temperature)[0]
         poisoned, chosen_ids, n_malformed = attacker_agent.select_and_apply(
@@ -71,7 +71,8 @@ def run_inference(
             feats = env.features(updates)
             client_ids = [u.client_id for u in updates]
             d_sys = defender_agent.system_prompt()
-            d_user = defender_agent.build_user_prompt(feats)
+            d_user = defender_agent.build_user_prompt(
+                feats, dataset=getattr(env, "dataset", None))
             d_text = generator.generate(d_sys, d_user, n=1, temperature=temperature)[0]
             verdicts = defender_agent.parse(d_text, client_ids)
             new_acc = env.commit(updates, verdicts)

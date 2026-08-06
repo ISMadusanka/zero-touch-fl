@@ -1,4 +1,17 @@
-"""MNIST data loading and partitioning across clients (IID + FLTrust non-IID)."""
+"""Dataset loading and per-client partitioning (IID + FLTrust non-IID).
+
+Dataset-agnostic: which dataset is downloaded, how it is normalized and how many
+classes it has all come from :mod:`data.datasets`, so MNIST and CIFAR-10 (and any
+future entry in the registry) go through exactly the same partition, root-set and
+DataLoader code. Only the ``dataset`` argument changes.
+
+    client_loaders, test_loader = get_data_loaders("cifar10", n_clients=20,
+                                                   batch_size=64, iid=False)
+
+The partition functions themselves never touch pixels — they work off the label
+list — so they are identical for every dataset and are covered by
+``tests/test_partition.py`` without any download.
+"""
 
 import random
 
@@ -6,28 +19,52 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
+from data.datasets import DEFAULT_DATASET, resolve
 
-def load_mnist(data_dir: str = "./data/mnist_raw"):
-    """Download MNIST and return train/test datasets."""
-    transform = transforms.Compose([
+
+def build_transform(spec):
+    """The evaluation/training transform for ``spec``: tensor + normalization.
+
+    Deliberately augmentation-free for every dataset. Random crops/flips would
+    raise CIFAR-10's clean accuracy, but they would also make each client's local
+    training (and FLTrust's root fine-tuning, which draws from the same train set)
+    non-reproducible run to run — and this testbed compares a poisoned aggregate
+    against a *clean counterfactual* computed from the same weights, so injected
+    randomness shows up directly as reward noise.
+    """
+    return transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
+        transforms.Normalize(spec.mean, spec.std),
     ])
-    train_dataset = datasets.MNIST(data_dir, train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST(data_dir, train=False, download=True, transform=transform)
+
+
+def load_dataset(dataset: str = DEFAULT_DATASET, data_dir: str | None = None):
+    """Download (if needed) and return ``(train_dataset, test_dataset)``.
+
+    ``data_dir`` defaults to the registry's per-dataset directory
+    (``./data/mnist_raw``, ``./data/cifar10_raw``), so two datasets never share a
+    download cache.
+    """
+    spec = resolve(dataset)
+    root = data_dir or spec.data_dir
+    cls = getattr(datasets, spec.torchvision_name)
+    transform = build_transform(spec)
+    train_dataset = cls(root, train=True, download=True, transform=transform)
+    test_dataset = cls(root, train=False, download=True, transform=transform)
     return train_dataset, test_dataset
 
 
-def build_root_loader(root_size: int = 100, batch_size: int = 64,
-                      data_dir: str = "./data/mnist_raw", seed: int = 0):
+def build_root_loader(dataset: str = DEFAULT_DATASET, root_size: int = 100,
+                      batch_size: int = 64, data_dir: str | None = None,
+                      seed: int = 0):
     """A small CLEAN root dataset held by the server, for FLTrust.
 
     FLTrust (Cao et al., NDSS 2021) bootstraps trust from a handful of clean
     examples the server collects itself; we sample ``root_size`` of them from the
-    MNIST training set with a fixed seed so runs are reproducible. Used by both
-    the benchmark panel and the arms race's algorithmic defender.
+    training set with a fixed seed so runs are reproducible. Used by both the
+    benchmark panel and the arms race's algorithmic defender.
     """
-    train_dataset, _ = load_mnist(data_dir)
+    train_dataset, _ = load_dataset(dataset, data_dir)
     g = torch.Generator().manual_seed(int(seed))
     idx = torch.randperm(len(train_dataset), generator=g)[:int(root_size)].tolist()
     # The same seeded generator drives the shuffle, so FLTrust's root fine-tuning
@@ -47,7 +84,8 @@ def partition_iid(dataset, n_clients: int):
 
 
 def _dataset_targets(dataset) -> list:
-    """Integer labels for every sample, robust across torchvision versions."""
+    """Integer labels for every sample, robust across torchvision versions and
+    datasets (MNIST exposes a tensor, CIFAR-10 a plain Python list)."""
     targets = getattr(dataset, "targets", None)
     if targets is None:
         targets = getattr(dataset, "train_labels", None)
@@ -69,7 +107,8 @@ def partition_noniid_fltrust(dataset, n_clients: int, n_classes: int = 10,
 
     ``bias_q = 1/M`` reproduces an IID split; a larger ``bias_q`` gives a stronger
     non-IID skew (each group is dominated by its own class). The paper's default
-    is ``0.5``. For MNIST with 20 clients this yields 10 groups of 2 clients each.
+    is ``0.5``. For a 10-class dataset with 20 clients this yields 10 groups of 2
+    clients each.
 
     Returns a list of ``n_clients`` index lists (shards), ordered by client id;
     the shards are disjoint and cover every sample.
@@ -119,29 +158,36 @@ def partition_noniid_fltrust(dataset, n_clients: int, n_classes: int = 10,
     return shards
 
 
-def get_data_loaders(n_clients: int, batch_size: int, data_dir: str = "./data/mnist_raw",
+def get_data_loaders(dataset: str = DEFAULT_DATASET, *, n_clients: int,
+                     batch_size: int, data_dir: str | None = None,
                      iid: bool = True, bias_q: float = 0.5, seed: int = 0,
-                     n_classes: int = 10):
+                     n_classes: int | None = None):
     """Return per-client train loaders and a global test loader.
 
     Args:
+        dataset: registry name ("mnist", "cifar10", ...). Decides what is
+             downloaded, how it is normalized, and the default ``data_dir``.
         n_clients: Number of federated clients.
         batch_size: Training batch size.
-        data_dir: Path to MNIST data directory.
+        data_dir: Override the dataset's default data directory.
         iid: If True, use IID partitioning. If False, use the FLTrust non-IID
              partition (``partition_noniid_fltrust``).
         bias_q: FLTrust bias probability (only used when ``iid=False``). ``1/M``
              is IID; larger is more non-IID; paper default ``0.5``.
         seed: RNG seed for the non-IID partition (reproducibility).
-        n_classes: Number of label classes (MNIST = 10); also the group count.
+        n_classes: Label-class count (also the non-IID group count). Defaults to
+             the dataset's own class count from the registry.
     """
-    train_dataset, test_dataset = load_mnist(data_dir)
+    spec = resolve(dataset)
+    train_dataset, test_dataset = load_dataset(spec.name, data_dir)
 
     if iid:
         shards = partition_iid(train_dataset, n_clients)
     else:
         shards = partition_noniid_fltrust(
-            train_dataset, n_clients, n_classes=n_classes, bias_q=bias_q, seed=seed
+            train_dataset, n_clients,
+            n_classes=spec.n_classes if n_classes is None else int(n_classes),
+            bias_q=bias_q, seed=seed,
         )
 
     client_loaders = [

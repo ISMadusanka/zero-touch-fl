@@ -1,16 +1,25 @@
-# Data Partitioning (`data/mnist_loader.py`)
+# Data Partitioning (`data/loaders.py`)
 
-Before any training begins, the central server downloads the standard MNIST
-training dataset (60,000 images) and test dataset (10,000 images).
+Before any training begins, the central server downloads the dataset selected by
+`--dataset` (see [`data/datasets.py`](data/datasets.py) for the registry):
+
+| `--dataset` | Train / test | Input |
+|---|---|---|
+| `mnist` (default) | 60,000 / 10,000 | 1×28×28 grayscale digits |
+| `cifar10` | 50,000 / 10,000 | 3×32×32 colour images |
+
+Both have **10 classes**, and the partitioning below reads only the label list —
+so it is *identical* for either dataset. Everything that follows says "images" and
+"digit class" from the MNIST default; substitute "object class" for CIFAR-10.
 
 ## Non-IID split — the FLTrust scheme (default)
 
-With `data.iid: false` the 60,000 training images are partitioned across the
+With `data.iid: false` the training images are partitioned across the
 **20 clients** using the method from **FLTrust** (Cao et al., *"FLTrust:
 Byzantine-robust Federated Learning via Trust Bootstrapping"*, NDSS 2021),
 implemented in `partition_noniid_fltrust`:
 
-1. **Groups.** The clients are split into `M = 10` groups (one per digit class) —
+1. **Groups.** The clients are split into `M = 10` groups (one per class) —
    with 20 clients that is **2 clients per group** (client `g` and client `g+10`
    form group `g`).
 2. **Biased routing.** A training image with label `l` is assigned to **group `l`
