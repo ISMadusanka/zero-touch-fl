@@ -208,8 +208,9 @@ A round is orchestrated by `_step_round` in [rl/schedule.py](rl/schedule.py).
 Here is the end-to-end flow:
 
 ```
-1. ctx = env.begin_round()              # build benign updates + exact poison quota,
-                                        #   build the 5 honest client updates
+1. ctx = env.begin_round()              # fix this round's defense algorithm + exact
+                                        #   poison quota (from the curriculum sweep),
+                                        #   build the honest client updates
 2. turn = AttackerTurn(...) or DefenderTurn(...)   # turns.py — freeze the opponent,
                                         #   build the learner's prompt
 3. stats = grpo_step(policy, learner, optimizer, turn, ...)   # grpo.py:26
@@ -242,6 +243,13 @@ Key points:
 - **Who learns each round** is decided by the schedule (`best_response` by
   default): train one agent until it wins, freeze it, switch. See `rl/schedule.py`
   and [HOWATTACKDEFEND.md](HOWATTACKDEFEND.md) §6.
+- **What the learner FACES each round** is decided by the curriculum
+  (`rl/curriculum.py`), not by chance: one defense algorithm and one poisoner
+  count are held for 10 consecutive rounds, then the count steps 1→5, then the
+  next algorithm. Both quantities move the reward *scale*, so drawing them
+  independently per round (the old behaviour) added variance to the very signal
+  step 3 normalizes within a group. The attack target stays pinned at 0.10 for
+  the same reason. See the README's *Training curriculum* section.
 
 ---
 

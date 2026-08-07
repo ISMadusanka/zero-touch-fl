@@ -282,6 +282,21 @@ def train(
     elif start_round:
         env.round_index = int(start_round)
 
+    # Resume the (defense x poisoner-count) sweep cursor for the same reason: without
+    # it every restart would replay the first algorithm's 1-poisoner block, so a run
+    # checkpointed often would never reach the later blocks at all.
+    curriculum = getattr(env, "curriculum", None)
+    if curriculum is not None:
+        if resume and resume.get("curriculum"):
+            curriculum.load_state_dict(resume["curriculum"])
+        elif start_round:
+            logger.warning(
+                f"Resuming {start_round} round(s) in, but the progress file holds no "
+                f"curriculum cursor (it predates the curriculum). Starting the sweep "
+                f"from the beginning."
+            )
+        logger.info(f"Training curriculum: {curriculum.describe()}")
+
     if switch_mode == "best_response":
         logger.info(
             f"Schedule=best_response: success-gated iterated best response "
@@ -307,12 +322,14 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     k = state["knobs"]
     ctx = env.begin_round()
 
-    # With an algorithmic defense the "opponent" is this round's drawn algorithm,
-    # not a frozen adapter — label it as such in the debug view.
+    # With an algorithmic defense the "opponent" is this round's algorithm, not a
+    # frozen adapter — label it as such in the debug view.
     opp_label = (f"algo:{env.round_defense}" if state.get("algorithmic_defense") else opp)
+    slot = getattr(env, "round_slot", None)
     dbg.round_header(ctx.round_num, learner, opp_label, phase_index, phase_round,
                      ctx.pool_ids, ctx.budget, ctx.global_accuracy, k["G"],
-                     k["scoring_opp_temp"], k["opp_temp"])
+                     k["scoring_opp_temp"], k["opp_temp"],
+                     curriculum=(slot.as_dict() if slot is not None else None))
     # The poison SET is chosen per-rollout by the attacker, so it is unknown at
     # begin_round — show only the federated fine-tuning here (poison at commit).
     dbg.fl_round(ctx.round_num, [], env.honest_updates,
@@ -361,7 +378,7 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
                state["save_round_log"], reward_att=k["reward_att"], reward_def=k["reward_def"],
                phase_index=phase_index, phase_round=phase_round, success=success,
                best_index=best, committed_index=committed, poisoned_ids=poisoned_ids,
-               defense_algorithm=env.round_defense)
+               defense_algorithm=env.round_defense, curriculum_slot=slot)
     return stats, drop, success
 
 
@@ -572,16 +589,19 @@ def _train_fixed(state, K_a, K_d, start_round):
 
 def _checkpoint(state, done):
     """Atomically-ish save: adapters + the shared FL state, then the resume state
-    (round count, FL round index, and the PhaseController snapshot) so a resume is
-    always consistent — the saved round count never points past the saved weights,
-    and the shared model continues instead of rewinding to the Phase-1 baseline."""
+    (round count, FL round index, the PhaseController snapshot and the curriculum
+    cursor) so a resume is always consistent — the saved round count never points
+    past the saved weights, the shared model continues instead of rewinding to the
+    Phase-1 baseline, and the (defense x poisoner-count) sweep picks up mid-block."""
     _save_adapters(state)
     if state.get("fl_state_cb"):
         state["fl_state_cb"](state["env"].snapshot_fl_state())
     if state["progress_cb"]:
         ctrl = state.get("controller")
+        cur = getattr(state["env"], "curriculum", None)
         state["progress_cb"](done, state["env"].round_index,
-                             ctrl.state_dict() if ctrl is not None else None)
+                             ctrl.state_dict() if ctrl is not None else None,
+                             cur.state_dict() if cur is not None else None)
 
 
 def _save_adapters(state):
@@ -606,7 +626,7 @@ def _save_adapters(state):
 def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                reward_att=None, reward_def=None, phase_index=0, phase_round=0,
                success=False, best_index=0, committed_index=0, poisoned_ids=None,
-               defense_algorithm=None):
+               defense_algorithm=None, curriculum_slot=None):
     verdicts = info["verdicts"]
     post_acc = info["post_accuracy"]
     n_malformed = info["n_malformed"]
@@ -663,6 +683,11 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             # Which defense faced this round: an algorithm name, or "llm" when the
             # defender LLM is in charge. Rounds are only comparable within a defense.
             "defense": defense_algorithm or "llm",
+            # The (defense, poisoner-count) block this round belongs to, or None
+            # when the curriculum is off. Lets an analysis group rounds by regime
+            # without re-deriving the sweep from round numbers.
+            "curriculum": (curriculum_slot.as_dict()
+                           if curriculum_slot is not None else None),
             "attack_diversity": round(float(diversity), 4),
             # The clean counterfactual and the damage measured against it — the
             # quantities the reward and the win-gate actually use, so monitor.py
@@ -700,9 +725,11 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
         global_acc=ctx.global_accuracy, best_index=best_index,
     )
     dbg.flush()
+    block = (f"cur={curriculum_slot.label}#{curriculum_slot.round_in_block} "
+             if curriculum_slot is not None else "")
     logger.info(
         f"Round {ctx.round_num} [learn={learner} ph={phase_index}.{phase_round} "
-        f"def={defense_algorithm or 'llm'} "
+        f"def={defense_algorithm or 'llm'} {block}"
         f"{'WIN' if success else '...'}]: acc {ctx.global_accuracy:.4f}->{post_acc:.4f} "
         f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - post_acc:+.4f}) "
         f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} "

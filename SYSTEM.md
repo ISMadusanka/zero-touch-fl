@@ -29,10 +29,15 @@ the realized updates.
 ```
 reset env from Phase-1 checkpoint (per-client benign weights, global, baseline acc)
 for each round:
-  0. DRAW this round's defense algorithm            # algorithmic mode; fixed for the whole round
+  0. FIX this round's defense algorithm + poison quota b   # fixed for the whole round
+     curriculum on (default) — the next slot of the repeating sweep: one algorithm
+       held for `rounds_per_block` rounds at b=1, then b=2 ... b=5, then the next
+       algorithm, wrapping forever (rl/curriculum.py)
+     curriculum off — two independent draws: a random algorithm (defense.selection)
+       and b = randint(1, max_poison_clients)
+     eval — the algorithm is the column under test and b is the fixed eval budget
   1. honest updates for all N clients               # retrain from global, or replay Phase-1 weights
-  2. expose the attacker's controllable pool [0..n_compromisable) + exact poison quota b
-     (b = randint(1, max_poison_clients) in training; fixed = eval budget at eval time)
+  2. expose the attacker's controllable pool [0..n_compromisable) + the exact quota b
   3. ATTACKER LLM → SELECT exactly b clients from the pool + a per-client attack plan
      (input: round, controllable_client_ids, max_poison_clients, per-client LAYER STATS, acc, goal)
      → apply_plan(benign_i, plan_i) → poisoned weights for the CHOSEN clients

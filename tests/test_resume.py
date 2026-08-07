@@ -141,7 +141,8 @@ def _run_driver(cfg, sim_rounds, successes, resume, td, max_phase=None):
     try:
         sched.train(env, _FakePolicy(), None, None, cfg, object(), lambda log: None,
                     random.Random(0),
-                    progress_cb=lambda d, round_index=None, controller=None: plog.append(copy.deepcopy(controller)),
+                    progress_cb=lambda d, round_index=None, controller=None, curriculum=None: (
+                        plog.append(copy.deepcopy(controller))),
                     fl_state_cb=lambda s: fl.__setitem__("n", fl["n"] + 1),
                     start_round=resume["rounds_done"] if resume else 0, resume=resume)
     finally:

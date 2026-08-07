@@ -17,6 +17,12 @@ Round protocol (driven by the schedule / inference loop):
     ...
     env.set_committed_poison(chosen_ids)            # record the committed poison set
     new_acc = env.commit(updates, verdicts)         # advance the global model one round
+
+Two per-round quantities — which defense algorithm faces the round and how many
+clients the attacker must poison — are set in :meth:`FLArmsRaceEnv.begin_round`.
+They are either drawn independently at random (the legacy behaviour) or dictated
+by a :class:`rl.curriculum.TrainingCurriculum`, a fixed repeating sweep that gives
+every (defense, poisoner-count) pair the same number of consecutive rounds.
 """
 
 import copy
@@ -56,7 +62,8 @@ class RoundContext:
 
 
 class FLArmsRaceEnv:
-    def __init__(self, config: dict, client_loaders, test_loader, rng, defense=None):
+    def __init__(self, config: dict, client_loaders, test_loader, rng, defense=None,
+                 curriculum=None):
         """``defense`` is an optional :class:`server.algo_defender.AlgorithmicDefender`.
 
         When present the defender LLM is disabled and the server side of every
@@ -67,6 +74,15 @@ class FLArmsRaceEnv:
         callers use :meth:`defend` + :meth:`evaluate_state` / :meth:`commit_state`
         instead of the verdict-driven :meth:`evaluate_updates` / :meth:`commit`.
         ``defense=None`` keeps the original FedAvg-over-unflagged path.
+
+        ``curriculum`` is an optional :class:`rl.curriculum.TrainingCurriculum`.
+        When present it REPLACES the two per-round random draws — the defense
+        algorithm and the poison quota — with a fixed repeating sweep so every
+        (defense, poisoner-count) pair gets the same number of consecutive rounds.
+        It also pins the attack goal (no per-round target sampling). ``None``
+        keeps the legacy independent random draws. Evaluation never uses one: the
+        benchmark builds its env without a defense or a curriculum, and
+        ``benchmark.run_benchmark._resolve_eval_budget`` clears any that is set.
         """
         fl = config["fl"]
         attack = config.get("attack", {})
@@ -104,6 +120,19 @@ class FLArmsRaceEnv:
         self.server = FedServer(device=self.device, dataset=self.dataset)
         # Algorithmic (non-LLM) defense, or None when the defender LLM defends.
         self.defense = defense
+        # Deterministic (defense x poisoner-count) sweep, or None for random draws.
+        self.curriculum = curriculum
+        if curriculum is not None and self.sample_target:
+            # The curriculum's whole point is that only ONE thing varies per block.
+            # A target drop that also moves each round would rescale the reward
+            # (every damage term is normalized by the round's target) for reasons
+            # the policy cannot observe — the exact confound the sweep removes.
+            logger.warning(
+                "attack.sample_target_in_training is true but a training curriculum "
+                "is active — per-round target sampling is DISABLED. Every round asks "
+                f"for the fixed attack.goal target ({self.goal.get('target_accuracy_drop')})."
+            )
+            self.sample_target = False
 
         # Benign clients (used only when benign_retrain is True).
         self._clients = [
@@ -143,6 +172,8 @@ class FLArmsRaceEnv:
         self.poisoned_ids: list[int] = []                 # attacker's committed choice
         self._clean_ref_acc: float | None = None          # cached per-round clean counterfactual
         self.round_defense: str | None = None             # this round's defense algorithm (if any)
+        self.round_slot = None                            # this round's CurriculumSlot (if any)
+        self._clamped_slot_warned = False                 # one-shot guard for the clamp below
 
     # ------------------------------------------------------------------
     def reset(self, global_weights, client_weights, baseline_accuracy):
@@ -156,6 +187,8 @@ class FLArmsRaceEnv:
             f"n_compromisable={self.n_compromisable}, "
             f"budget_cap={self.budget_cap}, sample_budget={self.sample_budget}, "
             f"benign_retrain={self.benign_retrain}, baseline_acc={baseline_accuracy:.4f}"
+            + (f", curriculum={self.curriculum.describe()}"
+               if self.curriculum is not None else ", curriculum=off (random draws)")
         )
 
     # ------------------------------------------------------------------
@@ -200,6 +233,24 @@ class FLArmsRaceEnv:
             return self.rng.randint(1, self.budget_cap)
         return self.budget_cap
 
+    def _slot_budget(self, slot) -> int:
+        """The curriculum block's poison quota, clamped to the reachable pool.
+
+        ``rl.curriculum.build_curriculum`` already rejects counts larger than
+        ``fl.n_compromisable``, so this only fires if the pool was narrowed on a
+        live env — and then it says so once rather than quietly running a
+        "3 poisoners" block with 2.
+        """
+        budget = min(int(slot.n_poisoners), len(self.pool_ids))
+        if budget != int(slot.n_poisoners) and not self._clamped_slot_warned:
+            self._clamped_slot_warned = True
+            logger.warning(
+                f"Curriculum block asks for {slot.n_poisoners} poisoner(s) but the "
+                f"controllable pool holds {len(self.pool_ids)} — running this and any "
+                f"later oversized block at {budget}."
+            )
+        return max(1, budget)
+
     def _round_goal(self) -> dict:
         """This round's attack goal. When target sampling is on (untargeted_degrade),
         draw ``target_accuracy_drop`` from ``target_choices`` so the policy becomes
@@ -232,21 +283,38 @@ class FLArmsRaceEnv:
         self.honest_updates = [self._honest_update(cid) for cid in range(self.n_clients)]
         self.pool_ids = list(range(self.n_compromisable))
         self.pool_benign = {cid: self.honest_updates[cid].weights for cid in self.pool_ids}
-        self.round_budget = self._round_budget()
+        # This round's (defense algorithm, poison quota). With a curriculum both
+        # come from the fixed sweep — one block of consecutive rounds per pair, so
+        # each regime gets equal, contiguous training time. Without one they are
+        # two independent uniform draws (the legacy behaviour). Consume exactly one
+        # curriculum slot per round: the honest between-phase FL interlude does not
+        # come through here, so it never advances the sweep.
+        slot = self.curriculum.take() if self.curriculum is not None else None
+        self.round_slot = slot
+        self.round_budget = (self._slot_budget(slot) if slot is not None
+                             else self._round_budget())
         self.round_goal = self._round_goal()
         self.poisoned_ids = []                            # attacker decides at commit
         self._clean_ref_acc = None                        # recomputed lazily for this round
-        # Draw this round's defense BEFORE anything is scored (the clean
+        # Fix this round's defense BEFORE anything is scored (the clean
         # counterfactual below already goes through it), so the counterfactual,
         # every rollout and the commit all face the SAME algorithm.
-        self.round_defense = self.defense.choose() if self.defense is not None else None
+        if self.defense is None:
+            self.round_defense = None
+        elif slot is not None and slot.algorithm is not None:
+            self.round_defense = self.defense.select(slot.algorithm)
+        else:
+            self.round_defense = self.defense.choose()
 
         clean_acc = self.clean_reference_accuracy()
         logger.info(
             f"Round {round_num}: controllable_pool={self.pool_ids} "
             f"budget={self.round_budget} goal={self.round_goal} "
             f"defense={self.round_defense or 'llm'} "
-            f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_acc:.4f})"
+            + (f"curriculum=cycle{slot.cycle + 1}/block{slot.block_index + 1}"
+               f"[{slot.label} {slot.round_in_block}/{self.curriculum.rounds_per_block}] "
+               if slot is not None else "")
+            + f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_acc:.4f})"
         )
         return RoundContext(
             round_num=round_num,

@@ -150,15 +150,18 @@ def load_fl_state(dataset: str | None = None):
 # ---------------------------------------------------------------------------
 
 def save_progress(rounds_done: int, round_index: int | None = None,
-                  controller: dict | None = None, dataset: str | None = None):
+                  controller: dict | None = None, dataset: str | None = None,
+                  curriculum: dict | None = None):
     """Persist Phase-2 resume state for ``dataset``.
 
     Backward compatible: ``rounds_done`` is always written. For a FULL resume we also
     persist ``round_index`` (the FL round-number counter, so round labels and
     ``logs/<dataset>/round_data`` continue across restarts instead of overwriting from
-    the first Phase-2 round) and ``controller`` (the arms-race ``PhaseController``
+    the first Phase-2 round), ``controller`` (the arms-race ``PhaseController``
     snapshot, so the learner/phase/streak resume instead of restarting at the first
-    attacker phase).
+    attacker phase), and ``curriculum`` (the ``TrainingCurriculum`` cursor, so the
+    (defense x poisoner-count) sweep continues mid-block instead of restarting at
+    the first algorithm with one poisoner on every restart).
 
     Counted PER DATASET, matching ``fl.simulation_rounds`` (a per-run budget) and the
     ``round_index`` that labels this dataset's FL rounds. The LoRA adapter is what
@@ -169,13 +172,15 @@ def save_progress(rounds_done: int, round_index: int | None = None,
         payload["round_index"] = int(round_index)
     if controller is not None:
         payload["controller"] = controller
+    if curriculum is not None:
+        payload["curriculum"] = curriculum
     with open(_write_path(_PROGRESS_FILE, dataset), "w") as f:
         json.dump(payload, f)
 
 
 def load_progress(dataset: str | None = None) -> dict:
-    """Return the Phase-2 resume state as a dict:
-    ``{"rounds_done": int, "round_index": int|None, "controller": dict|None}``.
+    """Return the Phase-2 resume state as a dict: ``{"rounds_done": int,
+    "round_index": int|None, "controller": dict|None, "curriculum": dict|None}``.
 
     Old progress files that only hold ``rounds_done`` load fine (the new keys come
     back ``None`` → the caller falls back gracefully); a missing or corrupt file
@@ -188,9 +193,11 @@ def load_progress(dataset: str | None = None) -> dict:
             "rounds_done": int(data.get("rounds_done", 0)),
             "round_index": data.get("round_index"),
             "controller": data.get("controller"),
+            "curriculum": data.get("curriculum"),
         }
     except (FileNotFoundError, ValueError, TypeError):
-        return {"rounds_done": 0, "round_index": None, "controller": None}
+        return {"rounds_done": 0, "round_index": None, "controller": None,
+                "curriculum": None}
 
 
 def adapter_exists(path: str) -> bool:

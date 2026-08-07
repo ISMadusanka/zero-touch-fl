@@ -413,18 +413,24 @@ trends. Look for three things:
 ### 7.5 Decoding a single training log line
 
 ```
-Round 23 [learn=attacker ph=4.7 WIN]: acc 0.5596->0.7493 | att_reward=-0.500 def_reward=0.500 | mean_r=-0.359 zero_adv=0.00 step
+Round 23 [learn=attacker ph=4.7 def=fltrust cur=fltrust/3p#4 WIN]: acc 0.5596->0.7493 (clean_ref=0.7601 drop=+0.0108) | att_reward=-0.500 def_reward=0.500 | grpo_loss=0.0142 mean_r=-0.359 zero_adv=0.00 step
 ```
 
 | Field | Meaning |
 |---|---|
 | `learn=attacker` | who is learning this round |
 | `ph=4.7` | phase **4**, round **7** within the phase |
+| `def=fltrust` | which defense algorithm faced this round (`llm` = the defender LLM) |
+| `cur=fltrust/3p#4` | curriculum block: FLTrust with **3** poisoners, round **4** of the block (absent when `curriculum.enabled: false`) |
 | `WIN` / `...` | did the learner win this committed round (per the success-gate) |
-| `acc 0.5596->0.7493` | global accuracy **before → after** the committed move (the true marginal) |
+| `acc 0.5596->0.7493` | global accuracy **before → after** the committed move |
+| `clean_ref` / `drop` | this round's unpoisoned counterfactual and the damage measured against it — the quantities the reward and the win-gate actually use |
 | `mean_r` | group-average reward over the 4 attempts (the training signal) |
 | `zero_adv` | 1.0 = all 4 tied (dead round); 0.0 = healthy spread |
 | `step` / `SKIP` | `SKIP` = a zero-advantage round was skipped (the guard working) |
+
+Rounds are only comparable **within** a `cur=` block: a different defense or a
+different poisoner count changes both what is achievable and the reward scale.
 
 A healthy attacker phase shows `WIN` appearing more often as the phase goes on,
 `zero_adv` near 0, and mostly `step` (few `SKIP`s).
@@ -436,8 +442,10 @@ A healthy attacker phase shows `WIN` appearing more often as the phase goes on,
   (was any poisoned client missed). Good for a ground-truth view of detection.
 - **`logs/<dataset>/round_data/`** — the raw record per round. Beyond what the
   monitor charts, each file now also stores `attack_metadata.phase_index`,
-  `phase_round`, `learner_success`, and `train.stepped` / `train.resampled` — useful
-  if you want to chart phase outcomes or count skipped rounds yourself.
+  `phase_round`, `learner_success`, `train.stepped` / `train.resampled`, and
+  `attack_metadata.curriculum` (the round's `algorithm`, `n_poisoners`, `cycle`,
+  `block_index`, `round_in_block`) — useful if you want to chart phase outcomes,
+  count skipped rounds, or group results by curriculum block yourself.
 
 ### 7.7 Quick "is it healthy?" checklist
 

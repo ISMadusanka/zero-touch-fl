@@ -34,7 +34,7 @@ LOG_ROOT = "logs"
 #: Config sections a ``datasets.<name>`` block may override. Anything else in it
 #: is a typo, and silently ignoring it would mean training with settings the user
 #: believes are in effect.
-OVERRIDABLE_SECTIONS = ("fl", "data", "attack", "defense", "rl")
+OVERRIDABLE_SECTIONS = ("fl", "data", "attack", "defense", "rl", "curriculum")
 
 
 # ---------------------------------------------------------------------------

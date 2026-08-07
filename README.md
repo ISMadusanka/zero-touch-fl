@@ -28,8 +28,10 @@ Two phases:
      sent to the server.
    - **Defense** — see [Defense: the defender LLM is currently
      disabled](#defense-the-defender-llm-is-currently-disabled). By default the
-     server defends with a published **algorithm** drawn at random each round
-     (FLTrust / DeFL / DnC / Multi-Krum), and only the attacker trains. The
+     server defends with a published **algorithm** (FLTrust / DeFL / DnC /
+     Multi-Krum) chosen by the [training
+     curriculum](#training-curriculum-defense-x-poisoner-count), and only the
+     attacker trains. The
      alternative (`defense.mode: llm`) is the **defender LLM** — input:
      per-client, per-layer statistical feature vectors; output: a direct
      **benign/malicious classification** per client, after which the server
@@ -101,7 +103,8 @@ in its prompt), take a `dataset` argument.
 
 `configs/base.yaml` ships with **`defense.mode: algorithmic`**. The defender LLM
 is switched off and the server defends with the published algorithms already
-implemented for the benchmark, **one drawn at random per round**:
+implemented for the benchmark, **one per round** (which one is set by the
+[curriculum](#training-curriculum-defense-x-poisoner-count)):
 
 | Algorithm | What it does |
 |---|---|
@@ -112,7 +115,7 @@ implemented for the benchmark, **one drawn at random per round**:
 
 Details that matter:
 
-- **One algorithm defends the whole round.** It is drawn in `env.begin_round()`
+- **One algorithm defends the whole round.** It is fixed in `env.begin_round()`
   and used for the round's clean counterfactual, every one of the `G` scored
   GRPO rollouts, and the commit — so the group's rewards stay comparable and the
   advantage is "which plan beat *this* defense", not "which plan got the softer
@@ -130,15 +133,64 @@ Details that matter:
   is never overwritten**. A phase still ends on a sustained win or the cap, which
   is what schedules the honest FL interlude between phases.
 - **Rotation is stateful per algorithm.** A rotating algorithm's memory (DeFL)
-  only advances on the rounds it is actually selected. Use
-  `defense.selection: round_robin` for even coverage, or list a single algorithm
-  to pin one for a controlled run.
+  only advances on the rounds it is actually selected. The curriculum's
+  10-round blocks give it a contiguous stretch to build that memory in; with the
+  curriculum off, `defense.selection: round_robin` gives even (but interleaved)
+  coverage, and listing a single algorithm pins one for a controlled run.
 - Every round log records which defense faced it
   (`attack_metadata.defense` in `logs/<dataset>/round_data/rounds.jsonl`). Compare rounds
   **within** a defense — accuracy drops are not comparable across them.
 
 To restore the original two-sided LLM arms race, set `defense.mode: llm`. Nothing
 else changes; the defender adapter resumes from where it left off.
+
+## Training curriculum: defense x poisoner count
+
+Two things about a Phase-2 round used to be independent coin flips: which
+algorithm defends it (`defense.selection: random`) and how many clients the
+attacker must poison (`attack.sample_budget_in_training`, uniform in
+`[1, max_poison_clients]`). That is 4 x 5 = **20 regimes visited in random
+order** — the policy almost never got two consecutive rounds in the same one, and
+particular pairs ("FLTrust with 5 poisoners") could go hundreds of rounds unseen
+while others repeated back to back. Both knobs also move the reward *scale*, so
+shuffling them per round injected variance into exactly the signal GRPO
+normalizes within a group.
+
+`curriculum.enabled: true` (the shipped default, see `rl/curriculum.py`) replaces
+both draws with one fixed, repeating sweep:
+
+```
+fltrust    1 poisoner x10 rounds,  2 x10,  3 x10,  4 x10,  5 x10    (50 rounds)
+defl       1 poisoner x10 rounds,  2 x10,  3 x10,  4 x10,  5 x10    (50 rounds)
+dnc        ... the same five blocks ...                             (50 rounds)
+multikrum  ... the same five blocks ...                             (50 rounds)
+-> wrap back to (fltrust, 1 poisoner) and repeat forever
+```
+
+Every `(defense, poisoner-count)` pair gets exactly `rounds_per_block`
+**consecutive** rounds per 200-round cycle — equal opportunity by construction,
+not in expectation.
+
+- **Only GRPO rounds advance it.** The honest between-phase FL interlude does not
+  call `env.begin_round()`, so a run with many phase switches still covers every
+  block.
+- **The cursor is checkpointed** alongside `rounds_done` in
+  `checkpoints/<dataset>/rl_progress.json`, so a restart continues mid-block
+  instead of replaying the first block forever. Editing the sweep takes effect on
+  resume (the shape comes from the config, only the cursor from the checkpoint).
+- **The attack goal stays fixed.** The curriculum varies *who* and *how many*,
+  never *how hard*: every round asks for `attack.goal.target_accuracy_drop`
+  (0.10). Per-round target sampling is force-disabled while it is active.
+- **`defense.assumed_byzantine` does not track it.** DnC / Multi-Krum keep one
+  fixed assumed adversary budget across the 1..5-poisoner blocks — a defense told
+  the round's true poisoner count would not be a defense.
+- **Evaluation never uses it.** `benchmark/run_benchmark.py` pins one exact quota
+  and scores each defense in its own column.
+- Each round log carries its block (`attack_metadata.curriculum`: algorithm,
+  `n_poisoners`, cycle, block index, round-in-block), so results can be grouped by
+  regime without re-deriving the sweep from round numbers.
+
+Set `curriculum.enabled: false` to go back to the independent random draws.
 
 ## Why GRPO (not PPO / DPO)
 
@@ -304,8 +356,9 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
 ## Configuration
 
 - **`configs/base.yaml` → `datasets:`** — per-dataset overrides of the shared
-  `fl` / `data` / `attack` / `defense` / `rl` blocks, applied once `--dataset` is
-  resolved (the per-dataset value wins). See [Datasets](#datasets-mnist--cifar-10).
+  `fl` / `data` / `attack` / `defense` / `rl` / `curriculum` blocks, applied once
+  `--dataset` is resolved (the per-dataset value wins). See
+  [Datasets](#datasets-mnist--cifar-10).
 - **`configs/base.yaml`** — FL hyperparameters (`n_clients: 20`,
   `n_compromisable: 5`, `poison_seed`, `benign_retrain_each_round`), the
   `data.dataset` default and `data.noniid_bias` (FLTrust `q`), the `attack` block (`goal`,
@@ -319,9 +372,16 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
   precision, poisoned-weight clamp, attacker adapter path.
 - **`configs/base.yaml` → `defense:`** — who defends. `mode` (`algorithmic`, the
   shipped default, vs `llm`), the `algorithms` rotation pool, `selection`
-  (`random` / `round_robin`), the algorithm-draw `seed`, `assumed_byzantine`
-  (DnC / Multi-Krum's assumed adversary budget), and each algorithm's own knobs.
+  (`random` / `round_robin` — inert while the curriculum is on), the
+  algorithm-draw `seed`, `assumed_byzantine` (DnC / Multi-Krum's assumed adversary
+  budget), and each algorithm's own knobs.
   See [Defense](#defense-the-defender-llm-is-currently-disabled).
+- **`configs/base.yaml` → `curriculum:`** — the fixed `(defense algorithm x
+  poisoner count)` training sweep: `enabled`, `rounds_per_block` (10),
+  `poisoner_counts` (`[1,2,3,4,5]`) and `algorithms` (null = `defense.algorithms`,
+  in order). Overrides `defense.selection` and
+  `attack.sample_budget_in_training`. See [Training
+  curriculum](#training-curriculum-defense-x-poisoner-count).
 - **`configs/defender_agent.yaml`** — defender-LLM defaults + adapter path. Only
   read when `defense.mode: llm`.
 

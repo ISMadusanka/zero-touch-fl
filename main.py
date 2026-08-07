@@ -10,8 +10,14 @@ and the server defends.
 
 The DEFENDER LLM IS CURRENTLY DISABLED (``defense.mode: algorithmic`` in
 configs/base.yaml). The server instead defends with the published algorithms —
-FLTrust, DeFL, DnC and Multi-Krum — using ONE of them, drawn at random, per
-round (see ``server/algo_defender.py``). Only the attacker is trained with GRPO.
+FLTrust, DeFL, DnC and Multi-Krum — using ONE of them per round (see
+``server/algo_defender.py``). Only the attacker is trained with GRPO.
+
+Which algorithm defends a round, and how many clients the attacker must poison in
+it, follow a fixed **curriculum** (``curriculum:`` in configs/base.yaml, see
+``rl/curriculum.py``): one algorithm is held for 10 rounds at 1 poisoner, 10 at 2,
+... up to 5, then the next algorithm, and so on, wrapping forever. Set
+``curriculum.enabled: false`` to go back to drawing both at random each round.
 Setting ``defense.mode: llm`` restores the original two-sided arms race, where a
 defender LLM classifies each client benign/malicious from per-client per-layer
 statistics and both sides get a verifiable per-round reward and train with GRPO
@@ -64,6 +70,7 @@ from core.run_config import apply_dataset, describe_run, run_paths
 from core.types import RoundLog, DetectionVerdict
 from core.debug import dbg
 from metrics import MetricsTracker
+from rl.curriculum import build_curriculum
 from rl.env import FLArmsRaceEnv
 
 # ---------------------------------------------------------------------------
@@ -253,7 +260,14 @@ def run_phase2(
             seed=seed,
         ),
     )
-    env = FLArmsRaceEnv(config, client_loaders, test_loader, rng, defense=defense)
+    # Deterministic (defense algorithm x poisoner count) sweep. When enabled it
+    # replaces BOTH per-round random draws — which algorithm defends and how many
+    # clients get poisoned — with fixed blocks of consecutive rounds, so every pair
+    # gets the same training time instead of the same expected training time. None
+    # when `curriculum.enabled` is false (legacy random draws).
+    curriculum = build_curriculum(config, defender=defense)
+    env = FLArmsRaceEnv(config, client_loaders, test_loader, rng, defense=defense,
+                        curriculum=curriculum)
     env.reset(global_weights, client_weights, baseline_accuracy)
 
     metrics_tracker = MetricsTracker(baseline_accuracy=baseline_accuracy,
@@ -331,9 +345,9 @@ def run_phase2(
                     "Phase-1 baseline (older checkpoint predating fl_state.pt)."
                 )
 
-        def progress_cb(done, round_index=None, controller=None):
+        def progress_cb(done, round_index=None, controller=None, curriculum=None):
             save_progress(done, round_index=round_index, controller=controller,
-                          dataset=dataset)
+                          curriculum=curriculum, dataset=dataset)
 
         def fl_state_cb(fl_state):
             save_fl_state(fl_state, dataset=dataset)
@@ -476,10 +490,15 @@ def main():
                 "defense_mode": (base_config.get("defense", {}) or {}).get("mode", "algorithmic"),
                 "defense_algorithms": (base_config.get("defense", {}) or {}).get("algorithms"),
                 "defense_selection": (base_config.get("defense", {}) or {}).get("selection", "random"),
+                # The curriculum overrides defense_selection + sample_budget when on.
+                "curriculum": base_config.get("curriculum", {}) or {},
                 "n_clients": fl.get("n_clients"),
                 "n_compromisable": fl.get("n_compromisable"),
                 "max_poison_clients": base_config.get("attack", {}).get("max_poison_clients"),
                 "sample_budget": base_config.get("attack", {}).get("sample_budget_in_training"),
+                "target_accuracy_drop": (base_config.get("attack", {}).get("goal", {}) or {})
+                    .get("target_accuracy_drop"),
+                "sample_target": base_config.get("attack", {}).get("sample_target_in_training"),
                 "noniid_bias": base_config.get("data", {}).get("noniid_bias"),
                 "G": base_config.get("rl", {}).get("G"),
                 "switch_mode": base_config.get("rl", {}).get("switch_mode"),

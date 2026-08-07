@@ -111,6 +111,22 @@ class AlgorithmicDefender:
             self._current = self._rng.choice(self._names)
         return self._current
 
+    def select(self, name: str) -> str:
+        """PIN this round's algorithm instead of drawing one.
+
+        Same contract as :meth:`choose` — call exactly once per FL round, before
+        anything is scored — but the algorithm is dictated by the caller. This is
+        what ``rl/curriculum.py``'s fixed sweep uses in place of the random draw;
+        ``defense.selection`` is then inert. Unknown names raise rather than
+        falling back, so a curriculum naming an algorithm outside the pool fails
+        at the block boundary instead of silently defending with the previous one.
+        """
+        key = str(name).strip().lower()
+        if key not in self._defenses:
+            raise KeyError(f"unknown defense algorithm {name!r} (have {self._names})")
+        self._current = key
+        return key
+
     # ------------------------------------------------------------------
     def run(self, updates, global_weights: dict, *, commit: bool = False,
             algorithm: str | None = None) -> DefenseOutcome:

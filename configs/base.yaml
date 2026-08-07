@@ -83,12 +83,53 @@ datasets:
                                   # benchmark.harness._check_prompt_fits logs the real
                                   # token count on round 1 either way.
 
+# --- Training curriculum: the (defense algorithm x poisoner count) sweep --------
+# What the attacker faces each GRPO round used to be TWO independent coin flips:
+# `defense.selection: random` drew the algorithm and `attack.sample_budget_in_training`
+# drew the poison quota in [1, max_poison_clients]. With 4 algorithms x 5 quotas that
+# is 20 distinct regimes visited in random order, so the policy almost never got two
+# consecutive rounds in the same one, and specific PAIRS ("FLTrust with 5 poisoners")
+# could go hundreds of rounds unseen while others repeated back to back. Both knobs
+# also move the reward SCALE, so shuffling them per round injected variance straight
+# into the signal GRPO normalizes within a group.
+#
+# The curriculum replaces both draws with one fixed, repeating sweep:
+#
+#   fltrust    1 poisoner x10 rounds, 2 x10, 3 x10, 4 x10, 5 x10   (50 rounds)
+#   defl       1 poisoner x10 rounds, 2 x10, 3 x10, 4 x10, 5 x10   (50 rounds)
+#   dnc        ... the same five blocks ...                        (50 rounds)
+#   multikrum  ... the same five blocks ...                        (50 rounds)
+#   -> wrap back to (fltrust, 1 poisoner) and repeat forever
+#
+# so every pair gets exactly `rounds_per_block` CONSECUTIVE rounds per 200-round
+# cycle — equal opportunity by construction rather than in expectation. The cursor is
+# checkpointed with the rest of the resume state, so a restart continues mid-block.
+# See rl/curriculum.py.
+curriculum:
+  enabled: true                   # false = the legacy independent random draws
+  rounds_per_block: 10            # consecutive GRPO rounds per (defense, poisoner-count) pair
+  poisoner_counts: [1, 2, 3, 4, 5] # swept INSIDE each algorithm, in this order. Every entry
+                                  # must be <= fl.n_compromisable (5) or the build fails
+                                  # loudly. null = 1..attack.max_poison_clients.
+  algorithms: null                # null = defense.algorithms, in the order listed there
+                                  # (fltrust -> defl -> dnc -> multikrum). Give an explicit
+                                  # subset/order to change which algorithms are swept; every
+                                  # name must also appear in defense.algorithms.
+                                  #
+                                  # NOT affected by the sweep: defense.assumed_byzantine stays
+                                  # a fixed server-side ASSUMPTION (DnC/Multi-Krum must never
+                                  # be told the round's true poisoner count), and the attack
+                                  # goal stays pinned at attack.goal.target_accuracy_drop —
+                                  # the curriculum varies who and how many, never how hard.
+
 # Attack goal (configurable). First experiment = untargeted accuracy reduction.
 attack:
   goal:
     type: "untargeted_degrade"    # untargeted_degrade | slow_degrade | targeted_label
-    target_accuracy_drop: 0.10    # THE training + eval target. With sample_target_in_training
-                                  # false (below) every round asks for exactly this drop.
+    target_accuracy_drop: 0.10    # THE training + eval target — ONE fixed value for the whole
+                                  # run. With sample_target_in_training false (below) every
+                                  # round asks for exactly this drop, and a curriculum forces
+                                  # that even if the flag is flipped on.
     # per_round_drop: 0.02        # slow_degrade
     # label: 7                    # targeted_label (per-class eval is a TODO; falls back to overall)
   # --- Attack-goal target sampling (generalize instead of overfitting a single target) ---
@@ -96,6 +137,9 @@ attack:
                                   # true = randomize it each round from `target_choices`, making the
                                   # policy TARGET-AWARE so it generalizes to any requested drop
                                   # (mirrors sample_budget_in_training). Eval always fixes it.
+                                  # IGNORED (forced false, with a warning) while the curriculum
+                                  # above is enabled: a target that moves per round rescales the
+                                  # damage term, which is exactly the confound the sweep removes.
                                   #
                                   # Fixed is the right default while the attacker cannot reliably
                                   # reach ONE target: sampling spends capacity on target-awareness
@@ -108,10 +152,16 @@ attack:
   target_choices: [0.05, 0.10, 0.20, 0.30]  # per-round target pool — INERT unless
                                   # sample_target_in_training is true
   # --- Exact client-selection quota (the attacker chooses WHICH clients) ---
-  max_poison_clients: 5           # TRAINING quota cap: per-round exact count is sampled in [1, 5]
-                                  # each round (legacy key name; must be <= n_compromisable).
+  max_poison_clients: 5           # TRAINING quota cap (legacy key name; must be <=
+                                  # n_compromisable). With the curriculum on, this is only the
+                                  # default upper end of curriculum.poisoner_counts and the
+                                  # basis for defense.assumed_byzantine; the per-round quota
+                                  # comes from the sweep. With it off, the quota is sampled in
+                                  # [1, 5] each round.
   sample_budget_in_training: true # randomly draw the exact per-round quota in
                                   # [1..max_poison_clients] for budget-aware generalization.
+                                  # IGNORED while the curriculum is enabled — the sweep visits
+                                  # 1..5 in fixed blocks instead of drawing i.i.d.
   eval_poison_clients: 5          # EVALUATION exact quota — matches max_poison_clients so the
                                   # benchmark uses all 5 poisoners (benchmark --max-poison-clients override)
 
@@ -137,12 +187,16 @@ defense:
   selection: "random"             # random = draw one algorithm per round (uniform).
                                   # round_robin = cycle them in listed order (controlled
                                   # comparisons / even coverage).
+                                  # IGNORED while `curriculum.enabled` is true — the sweep
+                                  # pins the algorithm for a whole block of rounds instead.
   seed: null                      # RNG seed for the algorithm draw; null = fl.poison_seed.
                                   # A dedicated stream, so it never shifts the env's
                                   # poison/budget/target sampling.
   assumed_byzantine: null         # DnC / Multi-Krum assumed #malicious (a hyperparameter,
                                   # never per-round truth). null = attack.max_poison_clients
-                                  # clamped to keep an honest majority.
+                                  # clamped to keep an honest majority. Deliberately CONSTANT
+                                  # across the curriculum's 1..5-poisoner blocks: a defense
+                                  # handed the round's real count would not be a defense.
   fltrust:
     root_size: 100                # clean server-side root examples (FLTrust bootstrap)
     root_epochs: null             # server local epochs R_l on the root set.
