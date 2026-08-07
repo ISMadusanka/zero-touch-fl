@@ -18,6 +18,8 @@ import logging
 
 import torch
 
+from agents.attack_ops import perturbation_size, update_ratios
+from agents.attacker_agent import DEFAULT_MIN_PERTURBATION
 from core.types import DetectionVerdict, RoundLog
 from rl.rewards import attacker_reward, defender_reward
 
@@ -37,8 +39,16 @@ def _sign_flip(sd):
 
 
 def _same_weights(a: dict, b: dict) -> bool:
-    """True when two state_dicts are element-wise identical (a no-op 'attack')."""
-    return all(torch.equal(a[k].float(), b[k].float()) for k in b)
+    """True when ``a`` is not a real edit of ``b`` — a no-op 'attack'.
+
+    Element-wise identity (the ``none`` control action), or an edit below
+    ``DEFAULT_MIN_PERTURBATION`` of ``b``'s own norm. Exactly the rule
+    ``AttackerAgent.select_and_apply`` applies, so a scripted action's ground truth
+    is decided the same way a learned one's is.
+    """
+    if all(torch.equal(a[k].float(), b[k].float()) for k in b):
+        return True
+    return perturbation_size(b, a)["rel_weights"] <= DEFAULT_MIN_PERTURBATION
 
 
 def fixed_attacker_actions(benign_by_client: dict[int, dict]) -> list[tuple[str, dict]]:
@@ -100,10 +110,16 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             else:
                 verdicts = fixed_defender(env.features(updates))
                 post_acc = env.evaluate_updates(updates, verdicts)
-            # Same reference as training: this round's clean (unpoisoned) aggregate.
-            reward = attacker_reward(ctx.clean_accuracy, post_acc, ctx.goal,
-                                     effective, verdicts, n_malformed)
-            scored.append((label, effective, n_malformed, updates, verdicts, post_acc, reward))
+            # Same reference and the same stealth gate as training, so a scripted
+            # action's score is directly comparable to a learned one.
+            reward = attacker_reward(
+                ctx.clean_accuracy, post_acc, ctx.goal, effective, verdicts,
+                n_malformed,
+                perturbation_ratios=update_ratios(
+                    {cid: poisoned[cid] for cid in effective},
+                    selected_benign, env.global_weights))
+            scored.append((label, effective, n_malformed, updates, verdicts, post_acc,
+                           reward, poisoned))
             logger.info(
                 f"[baseline] round {ctx.round_num} action={label:9s} "
                 f"def={env.round_defense or 'fixed_heuristic'} "
@@ -112,9 +128,13 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             )
 
         # Commit the best attacker action.
-        label, chosen_ids, n_malformed, updates, verdicts, _, _ = max(
+        label, chosen_ids, n_malformed, updates, verdicts, _, _, won = max(
             scored, key=lambda s: s[6])
         env.set_committed_poison(chosen_ids)
+        # Measured before the commit replaces the global these updates were trained
+        # against — it is the denominator of the attack-size ratio.
+        ratios = update_ratios({cid: won[cid] for cid in chosen_ids},
+                               selected_benign, env.global_weights)
         if env.defense is not None:
             # Re-run the winning action through the defense, this time letting its
             # cross-round state advance exactly once.
@@ -122,8 +142,9 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             new_acc = env.commit_state(state)
         else:
             new_acc = env.commit(updates, verdicts)
-        a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal,
-                                chosen_ids, verdicts, n_malformed)
+        a_rew = attacker_reward(
+            ctx.clean_accuracy, new_acc, ctx.goal, chosen_ids, verdicts, n_malformed,
+            perturbation_ratios=ratios)
         d_rew = defender_reward(verdicts, chosen_ids)
 
         metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))

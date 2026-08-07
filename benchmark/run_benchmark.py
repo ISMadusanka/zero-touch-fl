@@ -90,6 +90,15 @@ def _parse_args():
                     help="output dir for json/csv/png (default: logs/<dataset>/benchmark; "
                          "'' to skip)")
     ap.add_argument("--no-plot", action="store_true", help="skip drawing per-round graphs")
+    ap.add_argument("--no-clean-counterfactual", action="store_true",
+                    help="skip the per-round unpoisoned probe of each defense. That probe "
+                         "is what separates the accuracy a defense costs ITSELF on an "
+                         "honest round (def_cost) from the accuracy the ATTACK cost "
+                         "(atk_drop), and atk_succ is scored on the latter. Without it "
+                         "both collapse into acc_drop vs the single clean baseline, which "
+                         "credits the attacker with the defense's own cost. Costs one "
+                         "extra aggregation + test-set evaluation per defense per round "
+                         "(plus one extra generation for the llm_defender column).")
     ap.add_argument("--fresh", action="store_true", help="force fresh Phase-1 instead of loading checkpoint")
     ap.add_argument("--log-every", type=int, default=10)
     return ap.parse_args()
@@ -336,6 +345,20 @@ def main():
         log.warning("benign_retrain_each_round=true: the benchmark assumes frozen benign "
                     "replay (false). With retrain on, benign updates are retrained against a "
                     "stale env global and the cross-defense comparison may be skewed.")
+    else:
+        # Not a defect — it is what makes the "same attack to every defense"
+        # comparison exact — but it decides what a multi-round run can measure, and
+        # that is easy to misread as a campaign that failed to compound.
+        log.info(
+            "benign_retrain_each_round=false (frozen benign replay): clients submit the "
+            "same Phase-1 weights every round, and the weight-averaging defenses "
+            "(fedavg/oracle/dnc/multikrum) rebuild their global from those weights each "
+            "round. Their model therefore carries NO memory between rounds, so "
+            f"{args.rounds} rounds measure {args.rounds} INDEPENDENT one-shot attacks "
+            "rather than a campaign — damage cannot accumulate, and mean_acc will equal "
+            "final_acc. Only FLTrust (and, partly, DeFL) integrates across rounds. Set "
+            "benign_retrain_each_round: true if you want a compounding degradation goal."
+        )
 
     # Phase-1 start state (reuse the saved honest-FedAvg checkpoint, or train fresh).
     # load_state() returns None on a partial/corrupt checkpoint, so guard the unpack.
@@ -484,6 +507,7 @@ def main():
         n_rounds=args.rounds, attack_temperature=args.attack_temperature,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)), device=device,
         dataset=dataset, log_every=args.log_every, target_drop=target_drop,
+        clean_counterfactual=not args.no_clean_counterfactual,
     )
 
     # ``--out ''`` disables saving; omitting it uses this dataset's own directory

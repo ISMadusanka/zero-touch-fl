@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.loaders import partition_noniid_fltrust  # noqa: E402
+from data.loaders import partition_iid, partition_noniid_fltrust  # noqa: E402
 
 
 class FakeDS:
@@ -94,6 +94,28 @@ def test_fewer_clients_than_classes_still_covers():
     assert len(shards) == 5
     flat = [i for s in shards for i in s]
     assert sorted(flat) == list(range(len(targets)))
+
+
+def test_iid_partition_is_reproducible_from_its_seed():
+    """The IID split used to shuffle from the ambient global torch RNG, so
+    get_data_loaders(seed=...) was honoured for non-IID and silently ignored for
+    IID — two same-seed runs could partition differently depending on what had
+    consumed the global RNG first."""
+    ds = FakeDS(_balanced_targets(20))               # 200 samples
+    a = partition_iid(ds, 4, seed=7)
+    b = partition_iid(ds, 4, seed=7)
+    c = partition_iid(ds, 4, seed=8)
+    assert a == b                                    # same seed -> same shards
+    assert a != c                                    # different seed -> different shards
+    flat = sorted(i for s in a for i in s)
+    assert flat == list(range(len(ds)))              # still a full, disjoint cover
+    assert all(len(s) == 50 for s in a)
+
+
+def test_iid_partition_without_a_seed_still_works():
+    ds = FakeDS(_balanced_targets(10))
+    shards = partition_iid(ds, 5)                    # legacy global-RNG path
+    assert sorted(i for s in shards for i in s) == list(range(len(ds)))
 
 
 def _run():

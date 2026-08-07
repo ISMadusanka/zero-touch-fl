@@ -119,6 +119,34 @@ def test_clean_reference_refreshes_after_a_benign_fl_round():
     assert before is not None
 
 
+def test_build_updates_carries_the_client_sample_counts():
+    """DeFL weights by |D_i| (Eq. 3) and reads it from ``metadata["train_samples"]``.
+    ``build_updates`` used to REPLACE the metadata with {"poisoned": bool}, which
+    silently degraded that weighting to uniform for every round of both training and
+    the benchmark. The frozen-replay path has no BenignClient metadata at all, so the
+    counts are restated from the partition."""
+    env = _env(benign_retrain=False)          # the project default
+    env.begin_round()
+    poisoned = {0: _wreck(env.pool_benign[0])}
+    updates = env.build_updates(poisoned)
+
+    assert len(updates) == N_CLIENTS
+    for u in updates:
+        assert u.metadata["train_samples"] == 64          # the shard size from _loader
+    assert updates[0].metadata["poisoned"] is True        # ...and the flag still lands
+    assert all(u.metadata["poisoned"] is False for u in updates[1:])
+
+
+def test_build_updates_keeps_metadata_when_clients_retrain():
+    env = _env(benign_retrain=True)
+    env.begin_round()
+    updates = env.build_updates({})
+    for u in updates:
+        # Straight from BenignClient.train, not restated.
+        assert u.metadata["train_samples"] == 64
+        assert "train_accuracy" in u.metadata and u.metadata["poisoned"] is False
+
+
 def test_league_is_a_bounded_ring_buffer():
     class _FakePolicy:
         adapters = ("attacker", "defender")

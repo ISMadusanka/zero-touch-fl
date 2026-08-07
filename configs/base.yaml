@@ -263,6 +263,21 @@ rl:
       zeta: 0.2                   # bonus for COLLABORATIVE multi-client attacks: diversity =
                                   # 1 - mean pairwise cosine of chosen clients' perturbations
                                   # (0 for a single client). Rewards distinct, coordinated roles.
+      stealth_floor: 1.0          # HOW BIG an edit has to be before evading detection pays.
+                                  # Per client, stealth is scaled by min(1, r / stealth_floor)
+                                  # where r = ||poisoned - benign|| / ||benign - global||, i.e.
+                                  # the edit measured against the honest update it replaces.
+                                  # Ungated, `beta * stealth` is a guaranteed 0.5 for submitting
+                                  # a rounding error: undetectable by construction, and better
+                                  # than attacking, because a robust aggregator rescales
+                                  # magnitudes and drops outliers so the damage term is hard to
+                                  # move. Policies converge to exactly that -- perturbations
+                                  # below the honest client-to-client spread, which Multi-Krum /
+                                  # DnC then rank as MORE central than a real client (they
+                                  # survive every filter and cost the model nothing), after
+                                  # which the zero-advantage guard freezes them there. 1.0 =
+                                  # full credit needs an edit at least as large as the honest
+                                  # update. Set 0 to disable the gate (pre-fix behaviour).
     defender:
       mode: "soft_f1"             # soft_f1 | tpr_minus_fpr
       fpr_penalty: 1.0

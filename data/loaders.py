@@ -76,9 +76,20 @@ def build_root_loader(dataset: str = DEFAULT_DATASET, root_size: int = 100,
                       shuffle=True, generator=g)
 
 
-def partition_iid(dataset, n_clients: int):
-    """Split dataset into n_clients equal IID shards."""
-    indices = torch.randperm(len(dataset)).tolist()
+def partition_iid(dataset, n_clients: int, seed: int | None = None):
+    """Split dataset into n_clients equal IID shards.
+
+    ``seed`` drives a dedicated generator, so the split is reproducible from the
+    argument alone. Without it the shuffle came from the ambient global torch RNG,
+    which meant ``get_data_loaders(seed=...)`` was honoured under ``iid=False`` and
+    silently ignored under ``iid=True`` — two runs with the same seed could then
+    partition differently depending on what had consumed the global RNG first.
+    ``None`` keeps the old global-RNG behaviour for callers that want it.
+    """
+    g = None
+    if seed is not None:
+        g = torch.Generator().manual_seed(int(seed))
+    indices = torch.randperm(len(dataset), generator=g).tolist()
     shard_size = len(dataset) // n_clients
     return [indices[i * shard_size : (i + 1) * shard_size] for i in range(n_clients)]
 
@@ -174,7 +185,8 @@ def get_data_loaders(dataset: str = DEFAULT_DATASET, *, n_clients: int,
              partition (``partition_noniid_fltrust``).
         bias_q: FLTrust bias probability (only used when ``iid=False``). ``1/M``
              is IID; larger is more non-IID; paper default ``0.5``.
-        seed: RNG seed for the non-IID partition (reproducibility).
+        seed: RNG seed for the partition (reproducibility) — honoured by BOTH the
+             IID and the non-IID path.
         n_classes: Label-class count (also the non-IID group count). Defaults to
              the dataset's own class count from the registry.
     """
@@ -182,7 +194,7 @@ def get_data_loaders(dataset: str = DEFAULT_DATASET, *, n_clients: int,
     train_dataset, test_dataset = load_dataset(spec.name, data_dir)
 
     if iid:
-        shards = partition_iid(train_dataset, n_clients)
+        shards = partition_iid(train_dataset, n_clients, seed=seed)
     else:
         shards = partition_noniid_fltrust(
             train_dataset, n_clients,

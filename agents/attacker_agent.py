@@ -24,6 +24,7 @@ import torch
 
 from agents.attack_ops import (
     OPERATOR_DOCS, apply_plan, delta_details, extract_plan, extract_selection,
+    perturbation_size,
 )
 from core.debug import dbg
 
@@ -32,6 +33,14 @@ logger = logging.getLogger(__name__)
 
 # Default goal for the first experiment (untargeted accuracy reduction).
 DEFAULT_GOAL = {"type": "untargeted_degrade", "target_accuracy_drop": 0.20}
+
+#: Smallest edit that still counts as POISON, as ``‖poisoned − benign‖ / ‖benign‖``.
+#: Anything at or below it is a numerical no-op — the resulting update is
+#: indistinguishable from the honest one, so recording it as ground-truth poison
+#: inflates ASR and charges the defender with missing something that is not there.
+#: See :meth:`AttackerAgent.select_and_apply`. Shared with ``rl.baseline`` so the
+#: scripted control actions are judged by exactly the same rule.
+DEFAULT_MIN_PERTURBATION = 1e-6
 
 
 SYSTEM_PROMPT = """You are the adversary in a federated-learning (FL) system. Each round, clients send model updates and the server averages the accepted ones (FedAvg) into a global model. A defender inspects statistics of every update and drops the ones it judges malicious before averaging: updates that stand out from the honest majority (much larger norm, flipped signs, low cosine similarity) get caught, and several of your clients that look nearly identical get caught as colluding Sybils.
@@ -78,6 +87,8 @@ class AttackerAgent:
         self.goal = config.get("attack_goal", dict(DEFAULT_GOAL))
         self.detail_precision = int(config.get("detail_precision", 4))
         self.max_abs = float(config.get("max_weight_abs", 100.0))
+        self.min_perturbation = float(
+            config.get("min_perturbation", DEFAULT_MIN_PERTURBATION))
         self._system = SYSTEM_PROMPT.replace("%OPERATOR_DOCS%", OPERATOR_DOCS)
 
     # ------------------------------------------------------------------
@@ -162,8 +173,9 @@ class AttackerAgent:
             empty/invalid, or every plan was an arithmetic no-op (e.g.
             ``scale factor=1.0``). Each is a reward penalty.
 
-        A selected client whose plan does nothing sends **byte-identical benign
-        weights**, so counting it as poisoned was actively harmful: the research
+        A selected client whose plan does nothing sends **effectively benign
+        weights** (byte-identical, or an edit below ``min_perturbation`` of its own
+        weight norm), so counting it as poisoned was actively harmful: the research
         ASR metric (``fn > 0``) reported a 100% success rate for an attack that
         did nothing, and the defender's reward punished it for failing to detect
         an update that is, by construction, undetectable. Such clients are now
@@ -189,8 +201,25 @@ class AttackerAgent:
         budget = max(1, min(int(budget), len(pool_ids)))
 
         def _unchanged(cid, weights) -> bool:
+            """Did this plan fail to produce a real edit?
+
+            Byte-equality alone is too weak a bar. A plan like ``scale
+            factor=1.0000001`` or ``quantize step=1e-9`` changes the tensors, so it
+            passed the old test, yet the resulting update is indistinguishable from
+            the honest one — it would be recorded as ground-truth poison, counted as
+            a fully successful evasion by the ASR metric, and charged to the
+            defender as a miss for failing to detect something that is not there.
+            That is the same corruption the byte-equality guard already exists to
+            prevent, just below the resolution it was written at.
+
+            So the bar is a RELATIVE magnitude: an edit worth less than
+            ``min_perturbation`` of the client's own weight norm is a wasted quota
+            slot, not an attack.
+            """
             ref = pool_references[cid]
-            return all(torch.equal(weights[k], ref[k]) for k in ref)
+            if all(torch.equal(weights[k], ref[k]) for k in ref):
+                return True
+            return perturbation_size(ref, weights)["rel_weights"] <= self.min_perturbation
 
         def _nothing_happened(n_malformed: int):
             """No client was effectively poisoned this round."""

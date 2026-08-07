@@ -127,6 +127,80 @@ def test_doing_nothing_scores_worse_than_a_real_attack():
     assert real > nothing + 1.0
 
 
+# --- 4. stealth has to be earned --------------------------------------------
+#
+# Ungated, `beta * stealth` is a guaranteed 0.5 for submitting a rounding error:
+# undetectable by construction, and better than attacking, because a robust
+# aggregator rescales magnitudes and drops outliers so the damage term is hard to
+# move. Policies collapse into exactly that. The gate scales each client's stealth
+# by min(1, ||poisoned-benign|| / ||benign-global|| / stealth_floor).
+
+def test_stealth_is_not_paid_for_a_negligible_perturbation():
+    """Same evasion, same (zero) damage — a real edit must out-earn a token one."""
+    inert = attacker_reward(0.90, 0.90, GOAL, [0], _evaded([0]), 0,
+                            perturbation_ratios={0: 0.001}, stealth_floor=1.0)
+    real = attacker_reward(0.90, 0.90, GOAL, [0], _evaded([0]), 0,
+                           perturbation_ratios={0: 1.0}, stealth_floor=1.0)
+    assert abs(inert - 0.5 * 0.001) < 1e-9      # ~0: nothing was hidden
+    assert abs(real - 0.5) < 1e-9              # full stealth for a real edit
+    assert real > inert
+
+
+def test_stealth_credit_is_continuous_in_the_attack_size():
+    """The gradient stealth exists to provide must survive the gate."""
+    rs = [attacker_reward(0.90, 0.90, GOAL, [0], _evaded([0]), 0,
+                          perturbation_ratios={0: x}, stealth_floor=1.0)
+          for x in (0.1, 0.25, 0.5, 0.75)]
+    assert rs == sorted(rs) and rs[0] < rs[-1]
+
+
+def test_stealth_credit_saturates_at_the_floor():
+    at = attacker_reward(0.90, 0.90, GOAL, [0], _evaded([0]), 0,
+                         perturbation_ratios={0: 1.0}, stealth_floor=1.0)
+    over = attacker_reward(0.90, 0.90, GOAL, [0], _evaded([0]), 0,
+                           perturbation_ratios={0: 25.0}, stealth_floor=1.0)
+    assert abs(at - over) < 1e-9               # no reward for gratuitous size
+
+
+def test_a_caught_client_earns_no_stealth_however_big_its_edit():
+    caught = [DetectionVerdict(0, True, 1.0, "")]
+    r = attacker_reward(0.90, 0.90, GOAL, [0], caught, 0,
+                        perturbation_ratios={0: 5.0}, stealth_floor=1.0)
+    assert abs(r - 0.0) < 1e-9                 # gate is a multiplier, not a bonus
+
+
+def test_the_gate_is_off_by_default_and_switchable():
+    """Callers that cannot measure the perturbation, and stealth_floor<=0, keep the
+    original ungated reward exactly."""
+    ungated = attacker_reward(0.90, 0.90, GOAL, [0], _evaded([0]), 0)
+    assert abs(ungated - 0.5) < 1e-9
+    disabled = attacker_reward(0.90, 0.90, GOAL, [0], _evaded([0]), 0,
+                               perturbation_ratios={0: 0.0}, stealth_floor=0.0)
+    assert abs(disabled - 0.5) < 1e-9
+    unmeasured = attacker_reward(0.90, 0.90, GOAL, [0, 1], _evaded([0, 1]), 0,
+                                 perturbation_ratios={0: 1.0}, stealth_floor=1.0)
+    assert abs(unmeasured - 0.5) < 1e-9        # client 1 has no ratio -> full credit
+
+
+def test_an_infinite_ratio_earns_full_credit():
+    """||benign - global|| == 0 (the honest update was zero), so ANY edit is
+    infinitely larger than it — that is a real attack, not an undefined one."""
+    r = attacker_reward(0.90, 0.90, GOAL, [0], _evaded([0]), 0,
+                        perturbation_ratios={0: float("inf")}, stealth_floor=1.0)
+    assert abs(r - 0.5) < 1e-9
+
+
+def test_damage_still_dominates_the_gated_stealth():
+    """The gate must not let a stealthy no-op beat a caught, effective attack."""
+    inert_but_hidden = attacker_reward(0.90, 0.90, GOAL, [0], _evaded([0]), 0,
+                                       perturbation_ratios={0: 0.001},
+                                       stealth_floor=1.0)
+    caught_but_effective = attacker_reward(
+        0.90, 0.70, GOAL, [0], [DetectionVerdict(0, True, 1.0, "")], 0,
+        perturbation_ratios={0: 2.0}, stealth_floor=1.0)
+    assert caught_but_effective > inert_but_hidden
+
+
 def _run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

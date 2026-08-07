@@ -617,17 +617,25 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     goal = ctx.goal if getattr(ctx, "goal", None) is not None else env.goal
 
     # Diversity of the committed (possibly multi-client) attack; 0 for one client.
-    diversity = perturbation_diversity(
-        info.get("poisoned_by_client", {}),
-        {cid: env.pool_benign[cid] for cid in poisoned_ids if cid in env.pool_benign},
-    )
+    committed_refs = {cid: env.pool_benign[cid] for cid in poisoned_ids
+                      if cid in env.pool_benign}
+    poisoned_by_client = info.get("poisoned_by_client", {})
+    diversity = perturbation_diversity(poisoned_by_client, committed_refs)
+    # Must match rl.turns.AttackerTurn.reward exactly: the logged reward for the
+    # committed round has to be the same function the group was scored with, or the
+    # run's own logs disagree with what the policy actually optimised. The ratios come
+    # from ``info`` because the turn measured them BEFORE committing — by the time we
+    # are here ``env.global_weights`` is the NEXT round's reference. A DefenderTurn's
+    # info has no ratios, which leaves the gate off, as it was for the defender.
     a_rew = attacker_reward(ctx.clean_accuracy, post_acc, goal,
                             poisoned_ids, verdicts, n_malformed,
                             alpha=reward_att.get("alpha", 1.0),
                             beta=reward_att.get("beta", 0.5),
                             gamma=reward_att.get("gamma", 1.0),
                             zeta=reward_att.get("zeta", 0.0),
-                            diversity=diversity)
+                            diversity=diversity,
+                            perturbation_ratios=info.get("perturbation_ratios"),
+                            stealth_floor=reward_att.get("stealth_floor", 1.0))
     d_rew = defender_reward(verdicts, poisoned_ids,
                             mode=reward_def.get("mode", "soft_f1"),
                             fpr_penalty=reward_def.get("fpr_penalty", 1.0))

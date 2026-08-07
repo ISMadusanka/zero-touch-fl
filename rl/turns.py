@@ -26,6 +26,7 @@ from FedAvg over the un-flagged clients.
 
 import logging
 
+from agents.attack_ops import update_ratios
 from core.debug import dbg
 from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
 
@@ -129,8 +130,12 @@ class AttackerTurn:
             attacker_text, self.scoring_opp_temp, commit=False)
         post_acc = (self.env.evaluate_state(state) if self.algorithmic
                     else self.env.evaluate_updates(updates, verdicts))
-        diversity = perturbation_diversity(
-            poisoned, {cid: self.pool_references[cid] for cid in chosen_ids})
+        chosen_refs = {cid: self.pool_references[cid] for cid in chosen_ids}
+        diversity = perturbation_diversity(poisoned, chosen_refs)
+        # Each edit measured against the honest update it replaces, so stealth is
+        # only paid for an attack big enough to have been worth hiding — see
+        # ``rl.rewards.attacker_reward``.
+        ratios = update_ratios(poisoned, chosen_refs, self.env.global_weights)
         r = attacker_reward(
             self.reference_accuracy, post_acc, self.goal, chosen_ids,
             verdicts, n_malformed,
@@ -139,6 +144,8 @@ class AttackerTurn:
             gamma=self.reward_cfg.get("gamma", 1.0),
             zeta=self.reward_cfg.get("zeta", 0.0),
             diversity=diversity,
+            perturbation_ratios=ratios,
+            stealth_floor=self.reward_cfg.get("stealth_floor", 1.0),
         )
         dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed,
                             verdicts=verdicts, poisoned_ids=chosen_ids)
@@ -149,6 +156,13 @@ class AttackerTurn:
         updates, verdicts, state, n_malformed, chosen_ids, poisoned = self._apply(
             attacker_text, self.opp_temp, commit=True)
         self.env.set_committed_poison(chosen_ids)
+        # Measured BEFORE committing: the ratio's denominator is ||benign - global||
+        # for the global these updates were trained against, and ``commit_state``
+        # replaces it. Recomputing after the commit would divide by the NEXT round's
+        # reference and quietly report the wrong attack size.
+        ratios = update_ratios(
+            poisoned, {cid: self.pool_references[cid] for cid in chosen_ids},
+            self.env.global_weights)
         new_acc = (self.env.commit_state(state) if self.algorithmic
                    else self.env.commit(updates, verdicts))
         return {
@@ -158,6 +172,7 @@ class AttackerTurn:
             "post_accuracy": new_acc,
             "poisoned_ids": chosen_ids,
             "poisoned_by_client": poisoned,
+            "perturbation_ratios": ratios,
             "defense_algorithm": self.env.round_defense,
         }
 

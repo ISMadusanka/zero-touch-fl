@@ -13,6 +13,7 @@ attacker calls the LLM here.
 
 import logging
 
+from agents.attack_ops import update_ratios
 from core.types import RoundLog
 from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
 
@@ -64,6 +65,9 @@ def run_inference(
         # produces the aggregate) or the defender LLM classifying every client
         # from the feature vectors, with FedAvg over the un-flagged.
         prev_acc = ctx.global_accuracy
+        # The global these updates were trained against. Captured before the commit
+        # replaces it, because it is the denominator of the attack-size ratio below.
+        pre_commit_global = env.global_weights
         if env.defense is not None:
             verdicts, state = env.defend(updates, commit=True)
             new_acc = env.commit_state(state)
@@ -77,13 +81,16 @@ def run_inference(
             verdicts = defender_agent.parse(d_text, client_ids)
             new_acc = env.commit(updates, verdicts)
 
-        diversity = perturbation_diversity(
-            poisoned, {cid: ctx.pool_benign[cid] for cid in chosen_ids})
-        # Damage is scored against the round's clean counterfactual, exactly as in
-        # training (see FLArmsRaceEnv.clean_reference_accuracy).
+        refs = {cid: ctx.pool_benign[cid] for cid in chosen_ids}
+        diversity = perturbation_diversity(poisoned, refs)
+        # Damage is scored against the round's clean counterfactual and stealth is
+        # gated on the attack's actual size, exactly as in training (see
+        # FLArmsRaceEnv.clean_reference_accuracy and rl.rewards.attacker_reward).
         a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal, chosen_ids,
                                 verdicts, n_malformed,
-                                diversity=diversity)
+                                diversity=diversity,
+                                perturbation_ratios=update_ratios(
+                                    poisoned, refs, pre_commit_global))
         d_rew = defender_reward(verdicts, chosen_ids)
 
         metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))

@@ -352,6 +352,14 @@ signal: the mean over poisoned clients of `1 − P(malicious)`, where `P(malicio
 is derived from the defender's **confidence** (`_soft_malicious_prob`). Continuous
 (not 0/1) on purpose — it gives GRPO a usable spread even when the hard flags tie.
 
+Each client's stealth is additionally scaled by `min(1, r / stealth_floor)`, where
+`r` is that client's perturbation over the honest update it replaced. Without the
+gate, `β·stealth` pays a flat 0.5 for submitting a rounding error — undetectable by
+construction, and better than attacking, since the damage term is hard to move
+against an aggregator that rescales magnitudes and drops outliers. Policies collapse
+into that local optimum and the zero-advantage guard then freezes them in it. See
+`rl.reward.attacker.stealth_floor` (default 1.0; 0 disables).
+
 **`defender_reward`** ([rl/rewards.py](rl/rewards.py), default `soft_f1`):
 a confidence-weighted F1 of "flagged the poisoned clients, spared the honest ones."
 Range [0, 1].

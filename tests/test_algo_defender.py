@@ -338,6 +338,65 @@ def test_attacker_turn_needs_no_generator_with_an_algorithmic_defense():
     assert turn.reference_accuracy == env.clean_reference_accuracy()
 
 
+class _PlanAgent:
+    """Stand-in attacker agent that always emits one fixed plan."""
+
+    def __init__(self, factor):
+        from agents.attacker_agent import AttackerAgent
+        self._real = AttackerAgent()
+        self.factor = factor
+
+    def system_prompt(self):
+        return "sys"
+
+    def build_user_prompt(self, *a, **k):
+        return "user"
+
+    def select_and_apply(self, text, pool_references, budget):
+        ids = list(pool_references)[:budget]
+        plan = ('{"clients":[' + ",".join(
+            f'{{"id":{cid},"operations":[{{"op":"scale","target":"all",'
+            f'"factor":{self.factor}}}]}}' for cid in ids) + ']}')
+        return self._real.select_and_apply(plan, pool_references, budget)
+
+
+def test_attacker_turn_commit_measures_the_attack_before_it_advances_the_global():
+    """The stealth gate divides by ||benign - global||, and ``commit_state`` replaces
+    that global. Measuring after the commit would divide by the NEXT round's
+    reference, so ``commit`` has to hand the ratios back itself."""
+    from rl.turns import AttackerTurn
+
+    env = _env()
+    env.begin_round()
+    before = env.global_weights
+    turn = AttackerTurn(env, _PlanAgent(3.0), _PlanAgent(3.0), None)
+    info = turn.commit("ignored")
+
+    ratios = info["perturbation_ratios"]
+    assert set(ratios) == set(info["poisoned_ids"]) and ratios
+    assert all(r > 1.0 for r in ratios.values())        # scale x3 is a big edit
+
+    # The global really did move, so a post-hoc measurement would have used a
+    # different denominator — which is the bug this guards.
+    after = env.global_weights
+    assert any(not torch.equal(before[k], after[k]) for k in before)
+
+
+def test_attacker_turn_scores_an_inert_plan_below_a_real_one():
+    """End-to-end through the real reward: same evasion, different attack size."""
+    from rl.turns import AttackerTurn
+
+    def _reward(factor):
+        env = _env()
+        env.begin_round()
+        turn = AttackerTurn(env, _PlanAgent(factor), _PlanAgent(factor), None,
+                            reward_cfg={"alpha": 1.0, "beta": 0.5, "gamma": 1.0,
+                                        "stealth_floor": 1.0})
+        return turn.reward("ignored")
+
+    assert _reward(1.000001) < _reward(3.0)
+
+
 def test_the_driver_trains_the_attacker_only_and_never_writes_the_defender():
     """The full GRPO driver with a stubbed round body + fake policy: with an
     algorithmic defense it must build one optimizer, keep every phase on the

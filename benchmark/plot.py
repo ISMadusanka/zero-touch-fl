@@ -4,7 +4,17 @@ Draws a 4-panel figure from the per-round history each defense recorded:
   1. test accuracy per round (per defense) — see when the attack lands / who holds up;
   2. rolling detection rate (TPR) per defense — how much of the attack each caught;
   3. rolling false-positive rate (FPR) per defense — how often each cried wolf;
-  4. attack strength per round = the undefended (fedavg) accuracy (dips = strong attacks).
+  4. attack strength per round = the attacker's actual perturbation, measured against
+     the honest update it replaced.
+
+Panel 4 used to plot the undefended (fedavg) accuracy as a proxy for attack strength.
+Under the project default (``benign_retrain_each_round: false``) the weight-averaging
+defenses rebuild their global from the same frozen benign weights every round, so
+that line is flat whether the attacker is devastating or doing nothing at all — it
+measured the environment, not the attack. It now plots the perturbation the attacker
+actually produced, with the threshold below which an attack cannot be distinguished
+from honest non-IID variation. Histories saved before that was recorded fall back to
+the old panel.
 
 Auto-invoked by run_benchmark. Also runnable standalone to RE-PLOT a saved history
 without re-running the (slow, GPU) benchmark:
@@ -27,6 +37,22 @@ _COLORS = {
     "dnc": "#00897B",           # teal
     "multikrum": "#8E24AA",     # violet
 }
+
+
+#: Shared with the harness's warning and the report's note so the plot's threshold
+#: line cannot drift from them. ``benchmark.metrics`` is torch-free, which keeps this
+#: module importable without a DL stack (tests/test_benchmark.py relies on that).
+from benchmark.metrics import INERT_POISON_RATIO  # noqa: E402
+
+
+def _mean_poison(round_record: dict):
+    """Mean perturbation ratio for one round, or ``None`` when it was not recorded
+    (a history saved before the measurement existed, or a round with no poison)."""
+    ratios = round_record.get("poison_ratios")
+    if not ratios:
+        return None
+    finite = [float(x) for x in ratios if float(x) == float(x) and float(x) != float("inf")]
+    return (sum(finite) / len(finite)) if finite else None
 
 
 def _rolling_rate(num, den, window):
@@ -83,14 +109,31 @@ def plot_history(history: dict, baseline_accuracy: float, out_path: str, window:
     ax[1, 0].set_title(f"False-positive rate (rolling FPR, window={window}) — lower = better")
     ax[1, 0].set_xlabel("round"); ax[1, 0].set_ylim(-0.05, 1.05); ax[1, 0].legend(fontsize=8)
 
-    # 4: attack strength per round = undefended (fedavg) accuracy (dips = strong attacks)
+    # 4: attack strength per round — the attacker's actual perturbation size. The
+    #    attack is held fixed across defenses, so any defense's history carries it.
     ref = "fedavg" if "fedavg" in history else names[0]
     h = history[ref]
-    ax[1, 1].plot([r["round"] for r in h], [r["accuracy"] for r in h],
-                  color=_COLORS.get(ref, "#9AA0A6"), lw=1.2)
-    ax[1, 1].axhline(baseline_accuracy, color="#999999", ls="--", lw=0.8)
-    ax[1, 1].set_title(f"Attack strength: undefended ({ref}) accuracy per round — dips = strong attacks")
-    ax[1, 1].set_xlabel("round"); ax[1, 1].set_ylim(-0.03, 1.03)
+    strength = [_mean_poison(r) for r in h]
+    if any(s is not None for s in strength):
+        rounds = [r["round"] for r in h if _mean_poison(r) is not None]
+        values = [s for s in strength if s is not None]
+        ax[1, 1].plot(rounds, values, color="#D7263D", lw=1.2, label="poison size")
+        ax[1, 1].axhline(INERT_POISON_RATIO, color="#999999", ls="--", lw=0.8,
+                         label=f"inert below {INERT_POISON_RATIO}")
+        ax[1, 1].set_yscale("log")
+        ax[1, 1].set_title("Attack strength: poison perturbation / honest update\n"
+                           "(below the dashed line the attack is indistinguishable "
+                           "from non-IID noise)")
+        ax[1, 1].set_xlabel("round"); ax[1, 1].set_ylabel("x honest update")
+        ax[1, 1].legend(fontsize=8)
+    else:
+        # Pre-measurement history: fall back to the old undefended-accuracy proxy.
+        ax[1, 1].plot([r["round"] for r in h], [r["accuracy"] for r in h],
+                      color=_COLORS.get(ref, "#9AA0A6"), lw=1.2)
+        ax[1, 1].axhline(baseline_accuracy, color="#999999", ls="--", lw=0.8)
+        ax[1, 1].set_title(f"Attack strength: undefended ({ref}) accuracy per round "
+                           f"(no poison-size data in this history)")
+        ax[1, 1].set_xlabel("round"); ax[1, 1].set_ylim(-0.03, 1.03)
 
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

@@ -172,6 +172,19 @@ Both continuous, so GRPO group advantages don't collapse.
   Sybil-like clones. See `rl/rewards.py` (`attacker_reward`, `drop_term`,
   `perturbation_diversity`).
 
+  - **`stealth` is gated on the attack's SIZE.** Each client's evasion is scaled by
+    `min(1, r / stealth_floor)` where `r = ‖poisoned − benign‖ / ‖benign − global‖`
+    — the edit measured against the honest update it replaced
+    (`agents.attack_ops.update_ratios`). Ungated, `β·stealth` is a guaranteed 0.5
+    for submitting a rounding error: undetectable by construction, and strictly
+    better than attacking, because a robust aggregator rescales magnitudes and
+    drops outliers so the damage term is hard to move. Policies collapse into
+    exactly that — perturbations below the honest client-to-client spread, which
+    Multi-Krum/DnC then rank as *more* central than a real client, so they survive
+    every filter and cost the model nothing — after which the zero-advantage guard
+    freezes them there. `rl.reward.attacker.stealth_floor` (default 1.0) sets the
+    bar; 0 disables the gate.
+
   - **`drop = clean_reference_accuracy − post_accuracy`** — the damage measured
     against **this round's clean counterfactual**: the accuracy the aggregate
     reaches with no poison (`FLArmsRaceEnv.clean_reference_accuracy`, one extra

@@ -69,6 +69,71 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.dot(a, b) / denom)
 
 
+def perturbation_size(benign_sd: dict, poisoned_sd: dict,
+                      global_sd: dict | None = None) -> dict:
+    """How big is the attacker's edit, in the two scales that mean something?
+
+    The plan operators transform a client's FULL weight vector ``W``, but what the
+    server actually receives from that client is the update ``W - G``. So "how
+    strong is this attack" has two natural, dimensionless answers, and the second
+    is the one that decides whether the attack is even visible:
+
+      ``rel_weights``  ``‖P − B‖ / ‖B‖``      the edit against the model's own scale
+      ``rel_update``   ``‖P − B‖ / ‖B − G‖``  the edit against the HONEST update it
+                                              replaces (``None`` without ``global_sd``,
+                                              ``inf`` if the honest update is zero)
+
+    ``rel_update`` is the meaningful bar. A perturbation far below 1.0 is smaller
+    than the round-to-round variation the aggregator already sees between honest
+    non-IID clients, which is exactly the regime where a robust aggregator ranks a
+    poisoned update as MORE central than a legitimate one — it survives every
+    filter and moves the global by nothing. It is also the scale the attacker's own
+    prompt is calibrated in (``delta_details`` reports the honest ``rel_update``),
+    so policy, reward and report all speak one language.
+
+    Keys are taken from ``benign_sd``; ``abs`` is the raw L2 for completeness.
+    """
+    keys = list(benign_sd.keys())
+    b = torch.cat([benign_sd[k].reshape(-1).float() for k in keys])
+    p = torch.cat([poisoned_sd[k].reshape(-1).float() for k in keys])
+    pert = float((p - b).norm())
+    out = {
+        "abs": pert,
+        "rel_weights": pert / (float(b.norm()) + _EPS),
+        "rel_update": None,
+    }
+    if global_sd is not None:
+        g = torch.cat([global_sd[k].reshape(-1).float() for k in keys])
+        honest = float((b - g).norm())
+        out["rel_update"] = (pert / honest) if honest > _EPS else float("inf")
+    return out
+
+
+def perturbation_sizes(poisoned_by_client: dict, references: dict,
+                       global_sd: dict | None = None) -> dict:
+    """:func:`perturbation_size` for every poisoned client. Clients absent from
+    ``references`` are skipped."""
+    return {
+        cid: perturbation_size(references[cid], pw, global_sd)
+        for cid, pw in poisoned_by_client.items()
+        if cid in references
+    }
+
+
+def update_ratios(poisoned_by_client: dict, references: dict, global_sd: dict) -> dict:
+    """``{client_id: rel_update}`` — just the "how big is this edit vs the honest
+    update it replaces" scale from :func:`perturbation_size`.
+
+    This is the quantity ``rl.rewards.attacker_reward`` gates its stealth term on, so
+    every caller that computes a reward derives it from here rather than reimplementing
+    it — a logged reward that used a different definition than the trained one would be
+    silently misleading about what the policy is optimising.
+    """
+    return {cid: size["rel_update"]
+            for cid, size in perturbation_sizes(
+                poisoned_by_client, references, global_sd).items()}
+
+
 def delta_details(client_sd: dict, global_sd: dict, precision: int = 4) -> dict:
     """Summarize a client's HONEST UPDATE ``Δ = client − global`` for the attacker.
 

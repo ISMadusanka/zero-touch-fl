@@ -111,6 +111,36 @@ class Defense(ABC):
         """Undo every mutation made since :meth:`state_snapshot`. No-op by default."""
         return None
 
+    def probe(self, updates: list[ModelUpdate], poisoned_ids: set[int]) -> "StepResult":
+        """Run one :meth:`step` and undo everything it changed.
+
+        Used for the benchmark's per-round CLEAN COUNTERFACTUAL: "what would this
+        defense's model score if nobody had poisoned this round?". Answering that
+        requires actually running the defense's own aggregation (FLTrust rescales
+        and trust-weights, DeFL Beta-weights, Multi-Krum/DnC drop a fixed count),
+        so a probe is a real ``step`` — it just must not be allowed to advance the
+        defense's world.
+
+        Two kinds of state have to be rolled back, and ``state_snapshot`` alone
+        only covers one of them:
+
+        * the CROSS-ROUND memory (DeFL's Beta counts + S(t-1), DnC's subsampling
+          RNG) — ``state_snapshot`` / ``state_restore``;
+        * the GLOBAL MODEL, which every ``step`` overwrites. Missing this would
+          make the counterfactual the thing that advances the model and the real
+          step a no-op on top of it.
+
+        Rebinding ``self._global`` is enough: every implementation builds a fresh
+        state_dict rather than mutating the current one in place.
+        """
+        saved_global = self._global
+        snapshot = self.state_snapshot()
+        try:
+            return self.step(updates, poisoned_ids)
+        finally:
+            self._global = saved_global
+            self.state_restore(snapshot)
+
     @abstractmethod
     def step(self, updates: list[ModelUpdate], poisoned_ids: set[int]) -> StepResult:
         """Process one round of client updates against this defense's current

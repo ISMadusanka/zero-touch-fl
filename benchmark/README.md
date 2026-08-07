@@ -86,15 +86,17 @@ python -m benchmark.plot --dataset mnist                        # -> benchmark.p
 Disable graphing with `--no-plot`. Example table shape:
 
 ```
-defense       detect%  FPR    prec  F1    final_acc  mean_acc  acc_drop  atk_thru
-------------  -------  -----  ----  ----  ---------  --------  --------  --------
-fedavg        0.0%     0.0%   0.00  0.00  0.71       0.70      +0.10     100.0%
-oracle        100.0%   0.0%   1.00  1.00  0.80       0.80      +0.00     0.0%
-llm_defender  ...      ...    ...   ...   ...        ...       ...       ...
-fltrust       ...      ...    ...   ...   ...        ...       ...       ...
-defl          ...      ...    ...   ...   ...        ...       ...       ...
-dnc           ...      ...    ...   ...   ...        ...       ...       ...
-multikrum     ...      ...    ...   ...   ...        ...       ...       ...
+defense       detect%  FPR    prec  F1    final_acc  mean_acc  acc_drop  def_cost  atk_drop  atk_thru  atk_succ
+------------  -------  -----  ----  ----  ---------  --------  --------  --------  --------  --------  --------
+fedavg        0.0%     0.0%   0.00  0.00  0.71       0.70      +0.10     +0.00     +0.10     100.0%    100.0%
+oracle        100.0%   0.0%   1.00  1.00  0.80       0.80      +0.00     +0.00     +0.00     0.0%      0.0%
+llm_defender  ...      ...    ...   ...   ...        ...       ...       ...       ...       ...       ...
+fltrust       ...      ...    ...   ...   ...        ...       ...       ...       ...       ...       ...
+defl          ...      ...    ...   ...   ...        ...       ...       ...       ...       ...       ...
+dnc           ...      ...    ...   ...   ...        ...       ...       ...       ...       ...       ...
+multikrum     ...      ...    ...   ...   ...        ...       ...       ...       ...       ...       ...
+
+Attack strength: mean poison perturbation = 1.4x the honest update it replaced
 ```
 
 ## The defenses
@@ -120,16 +122,59 @@ multikrum     ...      ...    ...   ...   ...        ...       ...       ...
 **Robustness** (the resulting model under attack):
 - `final_acc`, `mean_acc` (test accuracy), `acc_drop` = mean accuracy lost vs the
   clean Phase-1 baseline (lower is better).
+- `def_cost` / `mean_defense_cost` and `atk_drop` / `mean_attack_drop` = the two
+  halves of `acc_drop`. See **Attribution** below; `atk_drop` is the honest
+  robustness number.
 - `atk_thru` / `attack_success_rate` = fraction of rounds a poisoned client
   slipped through.
 - `atk_succ` / `goal_success_rate` = **weighted** attack success against the goal's
-  requested drop: each round scores `min(1, acc_drop / target)` and those are
-  averaged, so with `--goal 'untargeted_degrade=0.1'` a round that cost the model
-  0.1 accuracy counts as 100%, one that cost 0.05 counts as 50%, and one that cost
-  nothing counts as 0%. Overshoot is capped at 100% and an *improvement* floors at
-  0% (never negative). `goal_full_success_rate` (JSON/CSV) keeps the all-or-nothing
-  reading — the fraction of rounds that reached the target in full — and each
-  round's own weight is saved in `history.json` as `goal_success`.
+  requested drop: each round scores `min(1, atk_drop / target)` and those are
+  averaged, so with `--goal 'untargeted_degrade=0.1'` a round where the attack cost
+  the model 0.1 accuracy counts as 100%, one that cost 0.05 counts as 50%, and one
+  that cost nothing counts as 0%. Overshoot is capped at 100% and an *improvement*
+  floors at 0% (never negative). `goal_full_success_rate` (JSON/CSV) keeps the
+  all-or-nothing reading — the fraction of rounds that reached the target in full —
+  and each round's own weight is saved in `history.json` as `goal_success`.
+
+**Attack strength** — `mean_poison_ratio`, printed under the table as
+`Attack strength: mean poison perturbation = Nx the honest update it replaced`:
+`‖poisoned − benign‖ / ‖benign − global‖`, i.e. the attacker's edit measured against
+the honest update it replaced. **Read this before anything else in the table.**
+Every other column is about the defense and quietly assumes there was an attack to
+defend against. When the perturbation is well below the spread between honest
+non-IID clients (< `0.05`), a robust aggregator ranks a poisoned update as *more
+central* than a real one — it survives every filter and moves the global by nothing.
+`0% detected / 100% throughput` then means "there was nothing to detect", not "the
+defense failed", and the run says so explicitly (a `WARNING` in the log and under
+the table). Panel 4 of `benchmark.png` plots it per round.
+
+### Attribution: `acc_drop` = `def_cost` + `atk_drop`
+
+Measuring every defense against one global baseline conflates *what the attack cost*
+with *what the defense costs by itself*. They are not close to equal: a defense that
+rejects most of an honest non-IID federation loses several points of accuracy on a
+round with no poison in it at all, and against a single baseline the attacker is
+credited for all of it. FLTrust is the standard case — it can exclude every poisoner
+in 80% of rounds and still be reported as suffering a successful attack.
+
+So each round every defense is *also* run on the **unpoisoned** updates
+(`Defense.probe` — a real `step` whose effects on the global model and cross-round
+memory are rolled back), giving that defense's own clean counterfactual:
+
+| column | meaning |
+|---|---|
+| `def_cost` | `baseline − clean_accuracy` — the price of running this defense on an honest federation |
+| `atk_drop` | `clean_accuracy − post_accuracy` — what the **attack** actually cost |
+| `acc_drop` | their sum: the total loss vs the clean baseline |
+
+`atk_succ` is scored on `atk_drop`. This is the same definition the training reward
+already uses (`rl.env.FLArmsRaceEnv.clean_reference_accuracy`) — the benchmark was
+the odd one out. It costs one extra aggregation + test-set evaluation per defense per
+round; `--no-clean-counterfactual` skips it and reverts every drop to the
+single-baseline measurement, in which case `def_cost`/`atk_drop` read `n/a`.
+
+Per round, `history.json` carries `clean_accuracy`, `attack_drop` and
+`poison_ratios` alongside the confusion counts.
 
 ### Reading the detection numbers (important caveat)
 
@@ -161,11 +206,21 @@ read them with care:
   `m=n−f` → drops `f`), so its TPR/FPR are pinned to that budget — read `acc_drop`
   as the primary signal.
 
-**Therefore: treat `acc_drop` / `final_acc` (robustness) as the primary,
+**Therefore: treat `atk_drop` / `final_acc` (robustness) as the primary,
 cross-paradigm comparison** — it's well-defined for every defense regardless of
-whether it flags or re-weights — and use `detect%` as a secondary, within-style
+whether it flags or re-weights, and unlike `acc_drop` it does not include the
+accuracy each defense costs itself — and use `detect%` as a secondary, within-style
 signal. For FLTrust the per-round `info.trust_sum` and the verdict confidences
 also give a softer view than the binary flag.
+
+One more trap worth naming, because it makes the whole table look flat: under the
+project default `benign_retrain_each_round: false`, the weight-averaging defenses
+(`fedavg`, `oracle`, `dnc`, `multikrum`) rebuild their global from the same frozen
+benign weights every round, so **their model carries no memory between rounds** — an
+N-round run measures N *independent one-shot attacks* and damage cannot accumulate.
+The giveaway is `mean_acc == final_acc`. Only FLTrust (`w ← w + η·g`) and, partly,
+DeFL (Beta counts) integrate across rounds. The runner logs this at startup; set
+`benign_retrain_each_round: true` if you want a degradation goal that compounds.
 
 ## How the comparison is kept fair
 
@@ -249,6 +304,9 @@ does (a client is "rejected" when it's excluded / trimmed from the aggregate).
 
 - `tests/test_benchmark.py` — torch-free (metrics + report). Runs anywhere:
   `python tests/test_benchmark.py`.
+- `tests/test_attack_attribution.py` — the `def_cost`/`atk_drop` split, `Defense.probe`
+  non-destructiveness, perturbation measurement and the negligible-poison floor (needs
+  torch): `python tests/test_attack_attribution.py`.
 - `tests/test_fltrust.py` — the FLTrust trust/aggregation math (needs torch; run
   on the GPU box): `python tests/test_fltrust.py`.
 - `tests/test_defl_logic.py` — DeFL's layer grouping, CLP rule, MOUD-Vote and Beta

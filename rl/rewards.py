@@ -87,6 +87,8 @@ def attacker_reward(
     gamma: float = 1.0,
     zeta: float = 0.0,
     diversity: float | None = None,
+    perturbation_ratios: dict | None = None,
+    stealth_floor: float = 1.0,
 ) -> float:
     """Reward the attacker for degrading accuracy while staying stealthy and,
     when the exact quota contains several clients, coordinating their plans.
@@ -118,6 +120,28 @@ def attacker_reward(
     with the SAME hard flag. It is 0 when the attacker poisoned nobody — there
     was nothing to sneak past the defender.
 
+    **Stealth has to be earned.** Passing as benign is only an achievement if
+    there was something to hide. Left ungated, ``beta * stealth`` is a guaranteed
+    payout for submitting an update that is a rounding error away from the honest
+    one — no risk, no detection, and (because ``drop_term`` is near 0 and hard to
+    move against a robust aggregator that rescales magnitudes and drops outliers)
+    strictly better than trying. That is a genuine local optimum and policies fall
+    into it: they converge on perturbations SMALLER than the honest client-to-client
+    spread, which every robust aggregator then ranks as more central than a real
+    client, so the attack survives every filter and costs the model nothing. The
+    zero-advantage guard then freezes them there, because once every rollout is
+    equally harmless the group spread collapses and ``grpo_step`` stops stepping.
+
+    ``perturbation_ratios`` closes it: ``{client_id: ‖poisoned − benign‖ / ‖benign
+    − global‖}`` (see ``agents.attack_ops.perturbation_size``), i.e. each edit
+    measured against the honest update it replaces. A client's stealth is scaled by
+    ``min(1, ratio / stealth_floor)``, so full credit needs an edit at least
+    ``stealth_floor`` times the honest update — the same scale the attacker's own
+    prompt is calibrated in. The term stays continuous in BOTH inputs (detector
+    confidence and attack size), so the gradient it exists to provide survives; what
+    disappears is the payout for doing nothing. Omit ``perturbation_ratios`` (or set
+    ``stealth_floor <= 0``) to restore the ungated behaviour.
+
     ``malformed_fraction`` is over the clients the attacker SELECTED
     (``n_used + n_malformed``), not over the ones that landed, so selecting three
     clients and wasting two is penalized twice as hard as wasting one.
@@ -137,7 +161,8 @@ def attacker_reward(
     for cid in poisoned_ids:
         v = verdict_by_id.get(cid)
         # No verdict for a poisoned client => treat as undetected (passed).
-        stealth += 1.0 if v is None else (1.0 - _soft_malicious_prob(v))
+        evaded = 1.0 if v is None else (1.0 - _soft_malicious_prob(v))
+        stealth += evaded * _stealth_credit(cid, perturbation_ratios, stealth_floor)
     stealth = stealth / n_used if n_used else 0.0
 
     # Normalize the waste penalty by how many clients were SELECTED — a client
@@ -154,6 +179,30 @@ def attacker_reward(
 
     return (alpha * damage + beta * stealth - gamma * malformed_fraction
             + zeta * collab_bonus)
+
+
+def _stealth_credit(client_id, perturbation_ratios: dict | None,
+                    stealth_floor: float) -> float:
+    """How much of this client's evasion counts, in [0, 1].
+
+    ``1.0`` (ungated) when no ratio is available or the gate is switched off, so
+    callers that cannot measure the perturbation — and the legacy call signature —
+    behave exactly as before. Otherwise ``min(1, ratio / stealth_floor)``: an edit
+    at or above ``stealth_floor`` times the honest update earns full credit, a
+    tenth of that earns a tenth. A non-finite ratio (the honest update was zero, so
+    ANY edit is infinitely larger than it) earns full credit.
+    """
+    if not perturbation_ratios or stealth_floor <= 0.0:
+        return 1.0
+    ratio = perturbation_ratios.get(client_id)
+    if ratio is None:
+        return 1.0
+    ratio = float(ratio)
+    if ratio != ratio:                       # NaN: undefined, do not pay for it
+        return 0.0
+    if ratio == float("inf"):
+        return 1.0
+    return _clip(ratio / float(stealth_floor), 0.0, 1.0)
 
 
 def perturbation_diversity(poisoned_by_client: dict, references: dict) -> float:

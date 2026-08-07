@@ -117,6 +117,17 @@ class FLArmsRaceEnv:
             for i in range(self.n_clients)
         ] if client_loaders is not None else None
 
+        # |D_i| per client. The frozen-replay path (``benign_retrain_each_round:
+        # false``, the default) rebuilds updates from saved weights and so has no
+        # ``BenignClient.train`` metadata to carry ``train_samples``; without this
+        # DeFL's Eq. 3 data-weighting is uniform in exactly the configuration the
+        # project runs in. Shard sizes are a property of the partition, not of any
+        # round, so they are read once here.
+        self._client_samples = (
+            [len(getattr(loader, "dataset", []) or []) for loader in client_loaders]
+            if client_loaders is not None else []
+        )
+
         # Set by reset().
         self.client_weights: list[dict] = []
         self.baseline_accuracy: float = 0.0
@@ -202,8 +213,15 @@ class FLArmsRaceEnv:
     def _honest_update(self, cid: int) -> ModelUpdate:
         if self.benign_retrain and self._clients is not None:
             return self._clients[cid].train(self.server.model)
-        # Replay frozen Phase-1 weights.
-        return ModelUpdate(client_id=cid, weights=copy.deepcopy(self.client_weights[cid]))
+        # Replay frozen Phase-1 weights. ``train_samples`` is restated from the
+        # partition (see ``self._client_samples``) so a replayed update carries the
+        # same |D_i| a freshly trained one would — DeFL weights by it.
+        meta = {}
+        if cid < len(self._client_samples):
+            meta["train_samples"] = self._client_samples[cid]
+        return ModelUpdate(client_id=cid,
+                           weights=copy.deepcopy(self.client_weights[cid]),
+                           metadata=meta)
 
     def begin_round(self) -> RoundContext:
         """Produce this round's honest updates and expose the attacker's controllable
@@ -284,15 +302,26 @@ class FLArmsRaceEnv:
 
     # ------------------------------------------------------------------
     def build_updates(self, poisoned_by_client: dict[int, dict]) -> list[ModelUpdate]:
-        """Assemble the full client update list for a candidate attacker action."""
+        """Assemble the full client update list for a candidate attacker action.
+
+        The honest update's metadata is CARRIED THROUGH (with ``poisoned`` added on
+        top) rather than replaced. It holds ``train_samples`` — the |D_i| that
+        ``BenignClient.train`` measured — and DeFL's Eq. 3 data-weighting reads
+        exactly that key. Replacing the dict silently degraded DeFL to a uniform
+        weighting for every round of both training and the benchmark, which under
+        the non-IID partition (where shard sizes genuinely differ) is not the
+        algorithm the paper specifies. A poisoned client keeps its host's counts:
+        the attacker perturbs weights, not the shard it claims to have trained on.
+        """
         updates = []
         for cid in range(self.n_clients):
+            meta = dict(self.honest_updates[cid].metadata or {})
             if cid in poisoned_by_client:
                 w = poisoned_by_client[cid]
-                meta = {"poisoned": True}
+                meta["poisoned"] = True
             else:
                 w = self.honest_updates[cid].weights
-                meta = {"poisoned": False}
+                meta["poisoned"] = False
             updates.append(ModelUpdate(client_id=cid, weights=w, metadata=meta))
         return updates
 
