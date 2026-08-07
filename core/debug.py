@@ -257,7 +257,8 @@ class DebugLogger:
 
     @_guard
     def round_header(self, round_num, learner, opponent, phase_index, phase_round,
-                     pool_ids, budget, global_accuracy, G, scoring_opp_temp, opp_temp):
+                     pool_ids, budget, global_accuracy, G, scoring_opp_temp, opp_temp,
+                     curriculum=None):
         self._round = round_num
         self._learner = learner
         self._stage = "setup"
@@ -271,12 +272,22 @@ class DebugLogger:
             f"global_accuracy={_short(global_accuracy)}   "
             f"G={G}  scoring_opp_temp={scoring_opp_temp}  commit_opp_temp={opp_temp}"
         )
+        if curriculum:
+            # Which (defense, #poisoners) block this round belongs to — the schedule
+            # holds both fixed for the whole block, so this is the round's real setting.
+            self._line(
+                f"curriculum: block={curriculum.get('block')} "
+                f"round={curriculum.get('block_round')}  cycle={curriculum.get('cycle')}  "
+                f"defense={curriculum.get('algorithm') or 'llm'}  "
+                f"n_poisoners={curriculum.get('n_poisoners')}"
+            )
         self._record("round_header", "round_start", {
             "round": round_num, "learner": learner, "opponent": opponent,
             "phase_index": phase_index, "phase_round": phase_round,
             "controllable_pool": list(pool_ids), "budget": budget,
             "global_accuracy": _short(global_accuracy),
             "G": G, "scoring_opp_temp": scoring_opp_temp, "commit_opp_temp": opp_temp,
+            "curriculum": curriculum,
         })
 
     @_guard

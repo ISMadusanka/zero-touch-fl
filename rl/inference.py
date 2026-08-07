@@ -103,6 +103,8 @@ def run_inference(
             attack_metadata={"n_malformed": n_malformed, "budget": ctx.budget,
                              "n_used": len(chosen_ids),
                              "defense": env.round_defense or "llm",
+                             "curriculum": (env.round_curriculum.as_log_dict()
+                                            if env.round_curriculum is not None else None),
                              "clean_accuracy": round(float(ctx.clean_accuracy), 6),
                              "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6)},
         ))

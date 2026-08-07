@@ -152,6 +152,11 @@ def _resolve_eval_budget(env, requested, log=None):
     env.sample_budget = False       # eval never randomises the budget
     env.budget_cap = budget
     env.sample_target = False       # ...nor the goal
+    # ...nor sweeps it. The training curriculum walks the poison quota through
+    # 1..5 in blocks; evaluation must hold it at exactly `budget` for every round
+    # so the panel's columns are comparable. (The benchmark builds its env without
+    # a curriculum, so this is belt-and-braces against that changing.)
+    env.curriculum = None
     log.info(f"Eval poison quota = exactly {budget} of pool {env.n_compromisable} "
              f"(clients {list(range(env.n_compromisable))}); "
              f"attacker selects which to poison")

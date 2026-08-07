@@ -50,7 +50,8 @@ attacker learns everything via RL.
 
 `configs/base.yaml` ships with **`defense.mode: algorithmic`**. The defender LLM
 is switched off and the server defends with the published algorithms already
-implemented for the benchmark, **one drawn at random per round**:
+implemented for the benchmark, **one per round** (chosen by the
+[training curriculum](#training-curriculum-fair-defense--poisoner-coverage)):
 
 | Algorithm | What it does |
 |---|---|
@@ -61,7 +62,7 @@ implemented for the benchmark, **one drawn at random per round**:
 
 Details that matter:
 
-- **One algorithm defends the whole round.** It is drawn in `env.begin_round()`
+- **One algorithm defends the whole round.** It is fixed in `env.begin_round()`
   and used for the round's clean counterfactual, every one of the `G` scored
   GRPO rollouts, and the commit — so the group's rewards stay comparable and the
   advantage is "which plan beat *this* defense", not "which plan got the softer
@@ -78,16 +79,73 @@ Details that matter:
   no league snapshots or curriculum for it, and **the defender checkpoint on disk
   is never overwritten**. A phase still ends on a sustained win or the cap, which
   is what schedules the honest FL interlude between phases.
-- **Rotation is stateful per algorithm.** A rotating algorithm's memory (DeFL)
-  only advances on the rounds it is actually selected. Use
-  `defense.selection: round_robin` for even coverage, or list a single algorithm
-  to pin one for a controlled run.
-- Every round log records which defense faced it
-  (`attack_metadata.defense` in `logs/round_data/rounds.jsonl`). Compare rounds
-  **within** a defense — accuracy drops are not comparable across them.
+- **Rotation is stateful per algorithm.** A rotating algorithm's memory (DeFL's
+  Beta counts, DnC's subsampling RNG) only advances on the rounds it is actually
+  selected. The curriculum gives each algorithm a contiguous block of rounds, so
+  that memory now advances the way it would if the algorithm were deployed alone.
+- Every round log records which defense faced it and which curriculum block it
+  belongs to (`attack_metadata.defense` / `attack_metadata.curriculum` in
+  `logs/round_data/rounds.jsonl`). Compare rounds **within** a defense —
+  accuracy drops are not comparable across them.
 
 To restore the original two-sided LLM arms race, set `defense.mode: llm`. Nothing
 else changes; the defender adapter resumes from where it left off.
+
+## Training curriculum: fair defense × poisoner coverage
+
+Phase-2 rounds used to draw their two hardest knobs **independently at random**:
+the defense algorithm (`defense.selection: random`) and the exact poison quota
+(`attack.sample_budget_in_training`, uniform in `[1, max_poison_clients]`). That
+gives every (algorithm, #poisoners) pair the same share of rounds *in
+expectation* only — over 200 rounds with 4 algorithms × 5 quotas each cell is
+`Binomial(200, 1/20)`: mean 10, sd ≈ 3.1, so cells routinely differ 2–3× and the
+attacker's gradient budget lands wherever the RNG pointed. The pair also
+re-rolled every round, so the policy never got a contiguous stretch against one
+defense at one attack strength — the regime it has to learn to exploit.
+
+`curriculum:` in `configs/base.yaml` (on by default) replaces both draws with a
+deterministic sweep — outer loop the algorithm, inner loop the poisoner count:
+
+```
+fltrust   × 1 poisoner  × 10 rounds → × 2 × 10 → × 3 × 10 → × 4 × 10 → × 5 × 10
+defl      × 1 poisoner  × 10 rounds → … (the same five blocks)
+dnc       × …
+multikrum × …
+…then the cycle repeats from fltrust.
+```
+
+One cycle is `4 × 5 × 10 = 200` rounds and **every algorithm gets exactly 50 of
+them, 10 at each attack strength**. Details:
+
+- **The block is fixed for the whole round**, so it applies to the clean
+  counterfactual, all `G` scored rollouts and the commit, exactly like the drawn
+  algorithm did.
+- **The FL interlude between phases does not consume a slot** — it is not a GRPO
+  training round, so a block always gets its full `rounds_per_block` attacker
+  rounds. The arms-race phase machinery (`rl/switch.py`) runs on top of the
+  sweep without perturbing it.
+- **Resume-safe.** The whole position is one integer, checkpointed with the rest
+  of the Phase-2 resume state in `checkpoints/rl_progress.json`, so a restart
+  continues mid-block instead of rewinding to `fltrust` × 1 every time.
+- **The target drop is held fixed too** (`attack.sample_target_in_training:
+  false`, `goal.target_accuracy_drop: 0.10`). A block holds the defense and the
+  poisoner count fixed precisely so its 10 rounds are comparable; a target
+  re-drawn each round changes what "success" means *inside* the block, since the
+  win gate is `win_fraction × the round's target` and the reward is normalized by
+  it. Turning target sampling back on logs a warning.
+- Knobs: `rounds_per_block` (10), `poisoner_counts` (`[1,2,3,4,5]`; `null` =
+  `1..attack.max_poison_clients`), `algorithms` (`null` = `defense.algorithms`,
+  in listed order — set a list to narrow or reorder the outer loop). Counts above
+  `fl.n_compromisable` are dropped with a warning rather than clamped, since
+  clamping would hand the largest quota several blocks per cycle.
+- `curriculum.enabled: false` (or removing the block) restores the random draws;
+  `defense.selection` and `attack.sample_budget_in_training` are ignored while it
+  is on, and the startup log says so.
+
+Each round log records its block in `attack_metadata.curriculum`
+(`algorithm`, `n_poisoners`, `cycle`, `block`, `position`, `block_round`), so a
+run can be sliced per (defense, #poisoners) cell without re-deriving it from the
+round number.
 
 ## Why GRPO (not PPO / DPO)
 
@@ -255,9 +313,14 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
   precision, poisoned-weight clamp, attacker adapter path.
 - **`configs/base.yaml` → `defense:`** — who defends. `mode` (`algorithmic`, the
   shipped default, vs `llm`), the `algorithms` rotation pool, `selection`
-  (`random` / `round_robin`), the algorithm-draw `seed`, `assumed_byzantine`
-  (DnC / Multi-Krum's assumed adversary budget), and each algorithm's own knobs.
+  (`random` / `round_robin`, ignored while the curriculum is on), the
+  algorithm-draw `seed`, `assumed_byzantine` (DnC / Multi-Krum's assumed
+  adversary budget), and each algorithm's own knobs.
   See [Defense](#defense-the-defender-llm-is-currently-disabled).
+- **`configs/base.yaml` → `curriculum:`** — the order training rounds face each
+  (defense, #poisoners) pair: `enabled`, `rounds_per_block`, `poisoner_counts`,
+  `algorithms`. See
+  [Training curriculum](#training-curriculum-fair-defense--poisoner-coverage).
 - **`configs/defender_agent.yaml`** — defender-LLM defaults + adapter path. Only
   read when `defense.mode: llm`.
 
@@ -265,19 +328,25 @@ Attack goals (configurable; `untargeted_degrade` is the first experiment):
 `untargeted_degrade` (target accuracy drop), `slow_degrade` (per-round drop),
 `targeted_label` (per-class — scaffolded).
 
-**Target generalization (untargeted_degrade).** Rather than overfitting a single
-target, training randomizes `target_accuracy_drop` each round from
-`attack.target_choices` (default `[0.05, 0.10, 0.20, 0.30]`) when
-`attack.sample_target_in_training: true` — the same domain-randomization idea as
-an optionally sampled exact poison quota, so the policy becomes **target-aware** and generalizes
-to any requested drop. The sampled target is placed in the attacker's prompt AND
-used by its reward every round (sampled once per round, so all `G` GRPO rollouts in
-a group share it). The arms-race success gate is likewise **relative**: an attack
-"passes" when its committed drop reaches `rl.win_fraction` (default 0.6) of that
-round's target, so phase-switching tracks the sampled target instead of one absolute
-floor (`rl.attacker_min_drop` is only the fallback when no target is known). Set the
-flag to `false` to train against the single fixed `attack.goal.target_accuracy_drop`.
-Evaluation never samples: pick the target at the benchmark with `--goal` (see below).
+**The training target is fixed at `0.10`.** `attack.goal.target_accuracy_drop:
+0.10` with `attack.sample_target_in_training: false` (the shipped default), so
+every training round asks the attacker for the same 10-point drop. It is placed
+in the attacker's prompt AND used by its reward, and the arms-race success gate
+is **relative** to it: an attack "passes" when its committed drop reaches
+`rl.win_fraction` (default 0.6) of the round's target, i.e. 0.06 here
+(`rl.attacker_min_drop` is only the fallback when no target is known). Holding it
+fixed is what makes a curriculum block's 10 rounds — and one block against the
+next — comparable.
+
+*Optional target randomization.* Setting
+`attack.sample_target_in_training: true` draws `target_accuracy_drop` per round
+from `attack.target_choices` (`[0.05, 0.10, 0.20, 0.30]`) instead, making the
+policy **target-aware** across drops (sampled once per round, so all `G` GRPO
+rollouts in a group share it). It is off because it fights the curriculum: with
+the target moving round-to-round, block-to-block differences are partly just
+which targets got drawn. Turning it back on while the curriculum is enabled logs
+a warning. Evaluation never samples: pick the target at the benchmark with
+`--goal` (see below).
 
 Both the reward and this gate measure the committed drop against the round's
 **clean counterfactual** (the accuracy the aggregate reaches with no poison), not

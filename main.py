@@ -53,6 +53,7 @@ from storage.checkpoint import (
 from core.types import RoundLog, DetectionVerdict
 from core.debug import dbg
 from metrics import MetricsTracker
+from rl.curriculum import build_training_curriculum
 from rl.env import FLArmsRaceEnv
 
 # ---------------------------------------------------------------------------
@@ -192,6 +193,10 @@ def run_phase2(
     logger.info(f"  simulation_rounds={n_rounds}, n_compromisable={fl.get('n_compromisable')}, "
                 f"max_poison_clients={attack_cfg.get('max_poison_clients')}, "
                 f"sample_budget={attack_cfg.get('sample_budget_in_training')}")
+    goal_cfg = attack_cfg.get("goal", {}) or {}
+    logger.info(f"  attack_goal={goal_cfg.get('type')} "
+                f"target_accuracy_drop={goal_cfg.get('target_accuracy_drop')} "
+                f"sample_target={attack_cfg.get('sample_target_in_training')}")
     logger.info(f"  baseline_accuracy={baseline_accuracy:.4f}")
     logger.info("=" * 60)
 
@@ -219,7 +224,16 @@ def run_phase2(
             seed=seed,
         ),
     )
-    env = FLArmsRaceEnv(config, client_loaders, test_loader, rng, defense=defense)
+    # Training curriculum: instead of drawing the defense algorithm and the poison
+    # quota at random every round, sweep them — one algorithm held for
+    # `rounds_per_block` rounds at 1 poisoner, then at 2, ... then the next
+    # algorithm, then the cycle repeats. Every (defense, #poisoners) pair therefore
+    # gets an equal, contiguous share of the attacker's training. None = the old
+    # random draws (no `curriculum:` block, or `enabled: false`).
+    curriculum = build_training_curriculum(
+        config, algorithms=(defense.names if defense is not None else None))
+    env = FLArmsRaceEnv(config, client_loaders, test_loader, rng,
+                        defense=defense, curriculum=curriculum)
     env.reset(global_weights, client_weights, baseline_accuracy)
 
     metrics_tracker = MetricsTracker(baseline_accuracy=baseline_accuracy, output_dir="logs/metrics")
@@ -289,8 +303,9 @@ def run_phase2(
                     "Phase-1 baseline (older checkpoint predating fl_state.pt)."
                 )
 
-        def progress_cb(done, round_index=None, controller=None):
-            save_progress(done, round_index=round_index, controller=controller)
+        def progress_cb(done, round_index=None, controller=None, curriculum=None):
+            save_progress(done, round_index=round_index, controller=controller,
+                          curriculum=curriculum)
 
         def fl_state_cb(fl_state):
             save_fl_state(fl_state)
@@ -409,6 +424,7 @@ def main():
                 "defense_mode": (base_config.get("defense", {}) or {}).get("mode", "algorithmic"),
                 "defense_algorithms": (base_config.get("defense", {}) or {}).get("algorithms"),
                 "defense_selection": (base_config.get("defense", {}) or {}).get("selection", "random"),
+                "curriculum": (base_config.get("curriculum") or None),
                 "n_clients": fl.get("n_clients"),
                 "n_compromisable": fl.get("n_compromisable"),
                 "max_poison_clients": base_config.get("attack", {}).get("max_poison_clients"),

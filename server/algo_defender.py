@@ -3,8 +3,11 @@
 The defender LLM is currently DISABLED (``defense.mode: algorithmic`` in
 ``configs/base.yaml``). In its place the server runs the published defense
 algorithms already implemented for the benchmark — **FLTrust**, **DeFL**, **DnC**
-and **Multi-Krum** — and draws **one of them at random per FL round**. That one
-algorithm defends the whole round: the clean counterfactual, every GRPO rollout
+and **Multi-Krum** — and uses **one of them per FL round**: normally the one the
+training curriculum's current block pins (:meth:`AlgorithmicDefender.select`, see
+``rl/curriculum.py``), or, without a curriculum, one drawn per
+``defense.selection``. That one algorithm defends the whole round: the clean
+counterfactual, every GRPO rollout
 scored in that round, and the committed aggregate all go through it, so the
 attacker's G candidate plans stay comparable and the round's reward means "how
 well did this plan do *against this defense*".
@@ -26,8 +29,9 @@ subsampling RNG. Scoring a candidate rollout must not disturb that memory, so a
 non-committing :meth:`run` snapshots and restores it (``Defense.state_snapshot`` /
 ``state_restore``). Because only one algorithm runs per round, a rotating
 algorithm's memory advances only on the rounds it is actually selected — that is
-inherent to rotation and is why ``round_robin`` selection exists as an
-alternative to ``random``.
+inherent to rotation, and it is why the training curriculum gives each algorithm
+a CONTIGUOUS block of rounds (and why ``round_robin`` selection exists as an
+alternative to ``random`` when no curriculum is active).
 
 The ground-truth-reading ``oracle`` and the ``llm_defender`` are deliberately not
 selectable here (see :data:`ALGORITHMS`).
@@ -109,6 +113,22 @@ class AlgorithmicDefender:
         else:
             self._current = self._rng.choice(self._names)
         return self._current
+
+    def select(self, name: str) -> str:
+        """Pin THIS round's algorithm explicitly, instead of drawing one.
+
+        Used by the training curriculum (``rl/curriculum.py``), which sweeps the
+        pool deterministically — one algorithm per block of rounds — so
+        ``defense.selection`` does not apply. Setting ``_current`` here keeps
+        :meth:`run` correct when it is called without an explicit ``algorithm``,
+        and leaves the ``round_robin`` cursor and the draw RNG untouched so
+        switching back mid-run is not skewed by the curriculum's rounds.
+        """
+        key = str(name).strip().lower()
+        if key not in self._defenses:
+            raise KeyError(f"unknown defense algorithm {name!r} (have {self._names})")
+        self._current = key
+        return key
 
     # ------------------------------------------------------------------
     def run(self, updates, global_weights: dict, *, commit: bool = False,

@@ -27,10 +27,13 @@ the realized updates.
 ```
 reset env from Phase-1 checkpoint (per-client benign weights, global, baseline acc)
 for each round:
-  0. DRAW this round's defense algorithm            # algorithmic mode; fixed for the whole round
+  0. FIX this round's defense algorithm + poison quota b from the training CURRICULUM
+     (algorithmic mode; both held for the whole 10-round block — see below.
+      No curriculum: the algorithm is drawn per defense.selection and
+      b = randint(1, max_poison_clients))
   1. honest updates for all N clients               # retrain from global, or replay Phase-1 weights
   2. expose the attacker's controllable pool [0..n_compromisable) + exact poison quota b
-     (b = randint(1, max_poison_clients) in training; fixed = eval budget at eval time)
+     (curriculum block's count in training; fixed = eval budget at eval time)
   3. ATTACKER LLM → SELECT exactly b clients from the pool + a per-client attack plan
      (input: round, controllable_client_ids, max_poison_clients, per-client LAYER STATS, acc, goal)
      → apply_plan(benign_i, plan_i) → poisoned weights for the CHOSEN clients
@@ -68,11 +71,12 @@ interlude keeps firing between them.
 
 The shipped config is **`defense.mode: algorithmic`** — the defender LLM is off.
 `AlgorithmicDefender` holds the pool named by `defense.algorithms` (default
-`fltrust, defl, dnc, multikrum`, the same classes the benchmark panel uses) and
-`choose()`s one per round from a dedicated RNG, so the draw never shifts the
-env's poison / budget / target sampling.
+`fltrust, defl, dnc, multikrum`, the same classes the benchmark panel uses). The
+training curriculum `select()`s one per round; without a curriculum it
+`choose()`s one from a dedicated RNG, so the draw never shifts the env's poison /
+budget / target sampling.
 
-- **Fixed for the round.** Drawn in `env.begin_round()`, so the clean
+- **Fixed for the round.** Set in `env.begin_round()`, so the clean
   counterfactual, all `G` scored rollouts and the commit face the same defense —
   GRPO advantages stay meaningful.
 - **Verdicts + aggregate together.** `env.defend(updates, commit=)` returns both;
@@ -91,6 +95,36 @@ env's poison / budget / target sampling.
   two-sided race — the defender adapter resumes untouched.
 - Each round log carries `attack_metadata.defense` (the algorithm name, or
   `"llm"`); rounds are only comparable within one defense.
+
+## Training curriculum (`curriculum:`, `rl/curriculum.py`)
+
+Which (defense, #poisoners) pair each Phase-2 round faces. Enabled by default; it
+replaces `defense.selection` **and** `attack.sample_budget_in_training`, whose two
+independent uniform draws split the rounds evenly only in expectation (per-cell
+counts are `Binomial(rounds, 1/20)`, sd ≈ 3.1 per 200 rounds) and re-rolled the
+pair every round, so the policy never trained contiguously in any one regime.
+
+```
+for algorithm in defense.algorithms:            # fltrust, defl, dnc, multikrum
+    for k in curriculum.poisoner_counts:        # 1, 2, 3, 4, 5
+        curriculum.rounds_per_block (10) consecutive GRPO rounds at (algorithm, k)
+# 4 x 5 x 10 = 200 rounds per cycle; every algorithm gets exactly 50, 10 per k.
+```
+
+- **One slot per round, consumed in `env.begin_round()`.** The between-phase
+  benign FL round does not go through it, so a block always gets its full 10
+  attacker rounds; the phase machinery runs on top of the sweep unchanged.
+- **Position is one integer**, saved in `checkpoints/rl_progress.json` next to
+  `rounds_done` / `controller`, so a resume continues mid-block. Older progress
+  files fall back to `rounds_done`, which counts exactly the same rounds.
+- **The attack target is pinned** (`attack.goal.target_accuracy_drop: 0.10`,
+  `sample_target_in_training: false`) so a block's rounds — and one block against
+  the next — are comparable: the win gate is `win_fraction x the round's target`
+  and the reward is normalized by it, so a moving target would change what
+  "success" means inside a block.
+- Each round log carries `attack_metadata.curriculum`
+  (`algorithm`, `n_poisoners`, `cycle`, `block`, `position`, `block_round`).
+- `curriculum.enabled: false` (or no `curriculum:` block) restores the random draws.
 
 ## Attacker contract (client selection + attack-plan DSL)
 

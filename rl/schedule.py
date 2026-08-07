@@ -26,8 +26,16 @@ opponent responses — this restores the within-group reward spread GRPO needs.
 The COMMITTED round uses the greedy ``opponent_temperature`` so each win/loss is
 measured against the real, deterministic opponent.
 
+**Training curriculum.** Orthogonally to the phase schedule, ``rl/curriculum.py``
+fixes WHICH defense algorithm and HOW MANY poisoners each round faces: one
+(algorithm, #poisoners) pair per block of consecutive rounds, sweeping every pair
+in turn. Phases, wins, caps and the FL interlude are unaffected — the interlude in
+particular does not consume a curriculum slot, so a block always gets its full
+complement of training rounds. The sweep position is checkpointed with the rest of
+the resume state (see :func:`_resume_curriculum`).
+
 **Defender LLM disabled.** When ``env.defense`` is set (``defense.mode:
-algorithmic``), the defender is a published algorithm drawn per round rather than
+algorithmic``), the defender is a published algorithm fixed per round rather than
 a policy, so there is nothing on that side to train: the rotation collapses to
 attacker-only phases, no opponent adapter is loaded/borrowed/snapshotted, and the
 defender checkpoint on disk is left untouched. The phase machinery still runs —
@@ -113,6 +121,44 @@ def resolve_round_budget(configured: int, total_rounds=None, max_new_rounds=None
     if max_new_rounds is not None:
         budget = min(budget, int(start_round) + int(max_new_rounds))
     return budget
+
+
+def _curriculum_slot(env) -> dict | None:
+    """This round's curriculum block as a log-friendly dict, or ``None`` when the
+    run has no curriculum (the defense/quota are drawn at random)."""
+    slot = getattr(env, "round_curriculum", None)
+    return slot.as_log_dict() if slot is not None else None
+
+
+def _resume_curriculum(env, resume: dict | None, start_round: int) -> None:
+    """Put the (defense, #poisoners) sweep back where it stopped.
+
+    Prefer the saved ``curriculum`` snapshot. Older progress files predate it, so
+    fall back to ``start_round``: the curriculum advances exactly once per
+    committed GRPO round (``begin_round``) and ``rounds_done`` counts exactly
+    those rounds — the FL interlude between phases advances neither — so the two
+    counters are the same number. Without this a restart would rewind the sweep
+    to block 0 and re-train the first algorithm at one poisoner every time.
+    """
+    curriculum = getattr(env, "curriculum", None)
+    if curriculum is None:
+        return
+    saved = (resume or {}).get("curriculum")
+    if saved:
+        curriculum.load_state_dict(saved)
+    elif start_round:
+        curriculum.load_state_dict({"step": int(start_round)})
+        logger.info(
+            f"No saved curriculum position (older checkpoint) — deriving it from "
+            f"rounds_done={start_round}, which counts the same rounds."
+        )
+    slot = curriculum.peek()
+    logger.info(
+        f"Curriculum resumes at step {curriculum.step}: block {slot.block} "
+        f"(cycle {slot.cycle}, {slot.position + 1}/{curriculum.blocks_per_cycle}) "
+        f"round {slot.block_round + 1}/{curriculum.rounds_per_block} — "
+        f"defense={slot.algorithm or 'llm'}, {slot.n_poisoners} poisoner(s)"
+    )
 
 
 def _argmax(xs: list[float]) -> int:
@@ -282,6 +328,8 @@ def train(
     elif start_round:
         env.round_index = int(start_round)
 
+    _resume_curriculum(env, resume, start_round)
+
     if switch_mode == "best_response":
         logger.info(
             f"Schedule=best_response: success-gated iterated best response "
@@ -312,7 +360,8 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     opp_label = (f"algo:{env.round_defense}" if state.get("algorithmic_defense") else opp)
     dbg.round_header(ctx.round_num, learner, opp_label, phase_index, phase_round,
                      ctx.pool_ids, ctx.budget, ctx.global_accuracy, k["G"],
-                     k["scoring_opp_temp"], k["opp_temp"])
+                     k["scoring_opp_temp"], k["opp_temp"],
+                     curriculum=_curriculum_slot(env))
     # The poison SET is chosen per-rollout by the attacker, so it is unknown at
     # begin_round — show only the federated fine-tuning here (poison at commit).
     dbg.fl_round(ctx.round_num, [], env.honest_updates,
@@ -572,16 +621,20 @@ def _train_fixed(state, K_a, K_d, start_round):
 
 def _checkpoint(state, done):
     """Atomically-ish save: adapters + the shared FL state, then the resume state
-    (round count, FL round index, and the PhaseController snapshot) so a resume is
-    always consistent — the saved round count never points past the saved weights,
-    and the shared model continues instead of rewinding to the Phase-1 baseline."""
+    (round count, FL round index, the PhaseController snapshot and the training
+    curriculum's position) so a resume is always consistent — the saved round count
+    never points past the saved weights, the shared model continues instead of
+    rewinding to the Phase-1 baseline, and the (defense, #poisoners) sweep picks up
+    mid-block instead of restarting."""
     _save_adapters(state)
     if state.get("fl_state_cb"):
         state["fl_state_cb"](state["env"].snapshot_fl_state())
     if state["progress_cb"]:
         ctrl = state.get("controller")
+        cur = getattr(state["env"], "curriculum", None)
         state["progress_cb"](done, state["env"].round_index,
-                             ctrl.state_dict() if ctrl is not None else None)
+                             ctrl.state_dict() if ctrl is not None else None,
+                             cur.state_dict() if cur is not None else None)
 
 
 def _save_adapters(state):
@@ -655,6 +708,10 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             # Which defense faced this round: an algorithm name, or "llm" when the
             # defender LLM is in charge. Rounds are only comparable within a defense.
             "defense": defense_algorithm or "llm",
+            # The (defense, #poisoners) block this round belongs to, so a run can be
+            # sliced by block without re-deriving it from the round number. None when
+            # the run draws the defense/quota at random instead of sweeping them.
+            "curriculum": _curriculum_slot(env),
             "attack_diversity": round(float(diversity), 4),
             # The clean counterfactual and the damage measured against it — the
             # quantities the reward and the win-gate actually use, so monitor.py
@@ -692,10 +749,12 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
         global_acc=ctx.global_accuracy, best_index=best_index,
     )
     dbg.flush()
+    slot = getattr(env, "round_curriculum", None)
     logger.info(
         f"Round {ctx.round_num} [learn={learner} ph={phase_index}.{phase_round} "
         f"def={defense_algorithm or 'llm'} "
-        f"{'WIN' if success else '...'}]: acc {ctx.global_accuracy:.4f}->{post_acc:.4f} "
+        + (f"blk={slot.block}.{slot.block_round} n_pois={slot.n_poisoners} " if slot else "")
+        + f"{'WIN' if success else '...'}]: acc {ctx.global_accuracy:.4f}->{post_acc:.4f} "
         f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - post_acc:+.4f}) "
         f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} "
         f"| grpo_loss={stats['loss']:.4f} mean_r={stats['mean_reward']:.3f} "

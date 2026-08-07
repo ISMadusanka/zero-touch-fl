@@ -127,8 +127,9 @@ Two guards separate "the plans really differed" from "the measurement wobbled":
   all-zero advantages and `zero_advantage_fraction = 1.0` (a dead, no-gradient
   round — see §5/§10). The bar is a noise floor, not exact equality: accuracy is
   measured on 10k test examples, so it is quantized to 1e-4, which at the smallest
-  sampled `target_accuracy_drop` (0.05) is ~2e-3 of reward per *single flipped test
-  example*. The old test was `std < 1e-6` — a thousand times below that noise — so
+  `target_accuracy_drop` the config can ask for (0.05) is ~2e-3 of reward per
+  *single flipped test example* — ~1e-3 at the shipped training target of 0.10.
+  The old test was `std < 1e-6` — a thousand times below that noise — so
   two behaviourally identical rollouts were routinely z-scored up to `A = ±1.2` and
   trained on at full strength. A real 1% accuracy gap scores 0.2 at that target, so
   genuine differences clear the bar easily.
@@ -208,8 +209,10 @@ A round is orchestrated by `_step_round` in [rl/schedule.py](rl/schedule.py).
 Here is the end-to-end flow:
 
 ```
-1. ctx = env.begin_round()              # build benign updates + exact poison quota,
-                                        #   build the 5 honest client updates
+1. ctx = env.begin_round()              # consume one CURRICULUM slot -> this round's
+                                        #   defense algorithm + exact poison quota
+                                        #   (rl/curriculum.py; both held for a 10-round
+                                        #   block), build the honest client updates
 2. turn = AttackerTurn(...) or DefenderTurn(...)   # turns.py — freeze the opponent,
                                         #   build the learner's prompt
 3. stats = grpo_step(policy, learner, optimizer, turn, ...)   # grpo.py:26

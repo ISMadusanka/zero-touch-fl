@@ -27,20 +27,29 @@ data:
 attack:
   goal:
     type: "untargeted_degrade"    # untargeted_degrade | slow_degrade | targeted_label
-    target_accuracy_drop: 0.20    # untargeted_degrade: fallback target used at EVAL / when sampling is off
+    target_accuracy_drop: 0.10    # THE training target (sample_target_in_training is off, so every
+                                  # round asks for this exact drop) and the fallback used at EVAL.
     # per_round_drop: 0.02        # slow_degrade
     # label: 7                    # targeted_label (per-class eval is a TODO; falls back to overall)
   # --- Attack-goal target sampling (generalize instead of overfitting a single target) ---
-  sample_target_in_training: true # true = randomize untargeted_degrade's target_accuracy_drop each
-                                  # round from `target_choices`, so the policy is TARGET-AWARE and
-                                  # generalizes to any requested drop (mirrors sample_budget_in_training).
-                                  # false = always use goal.target_accuracy_drop. Eval always fixes it.
-  target_choices: [0.05, 0.10, 0.20, 0.30]  # per-round target pool (untargeted_degrade only)
+  sample_target_in_training: false # OFF. true = randomize untargeted_degrade's target_accuracy_drop
+                                  # each round from `target_choices`. That was on, and it fought the
+                                  # curriculum below: a block holds the defense and the poisoner count
+                                  # fixed for 10 rounds precisely so those 10 rounds are comparable,
+                                  # but a target re-drawn every round changes what "success" means
+                                  # inside the block (the win gate is win_fraction * the round's
+                                  # target, and the reward is normalized by it), so block-to-block
+                                  # differences were partly just which targets got drawn. Training
+                                  # now asks for goal.target_accuracy_drop (0.10) every round.
+  target_choices: [0.05, 0.10, 0.20, 0.30]  # per-round target pool — only read when
+                                  # sample_target_in_training is true (kept for that experiment).
   # --- Exact client-selection quota (the attacker chooses WHICH clients) ---
-  max_poison_clients: 5           # TRAINING quota cap: per-round exact count is sampled in [1, 5]
-                                  # each round (legacy key name; must be <= n_compromisable).
+  max_poison_clients: 5           # TRAINING quota cap; also the default upper end of the curriculum's
+                                  # poisoner sweep (legacy key name; must be <= n_compromisable).
   sample_budget_in_training: true # randomly draw the exact per-round quota in
                                   # [1..max_poison_clients] for budget-aware generalization.
+                                  # IGNORED while the `curriculum:` block below is enabled — the
+                                  # quota is then the block's fixed count, not a draw.
   eval_poison_clients: 5          # EVALUATION exact quota — matches max_poison_clients so the
                                   # benchmark uses all 5 poisoners (benchmark --max-poison-clients override)
 
@@ -66,6 +75,8 @@ defense:
   selection: "random"             # random = draw one algorithm per round (uniform).
                                   # round_robin = cycle them in listed order (controlled
                                   # comparisons / even coverage).
+                                  # IGNORED while the `curriculum:` block below is enabled —
+                                  # the round's algorithm is then the current block's.
   seed: null                      # RNG seed for the algorithm draw; null = fl.poison_seed.
                                   # A dedicated stream, so it never shifts the env's
                                   # poison/budget/target sampling.
@@ -102,6 +113,41 @@ defense:
     seed: null                    # null = defense.seed / fl.poison_seed
   multikrum:
     m: null                       # #selected/averaged; null = n - assumed_byzantine
+
+# Training curriculum — the ORDER Phase-2 rounds face each (defense, #poisoners) pair.
+#
+# Replaces the two per-round random draws (defense.selection + attack.
+# sample_budget_in_training) with a deterministic sweep:
+#
+#   fltrust   x 1 poisoner  x 10 rounds -> x 2 x 10 -> x 3 x 10 -> x 4 x 10 -> x 5 x 10
+#   defl      x 1 poisoner  x 10 rounds -> ... (same five blocks)
+#   dnc       x ...
+#   multikrum x ...
+#   ...then the cycle repeats from fltrust.
+#
+# One cycle is 4 algorithms x 5 counts x 10 rounds = 200 rounds, and EVERY algorithm
+# gets exactly 50 of them, 10 at each attack strength. Two independent uniform draws
+# gave that split only in expectation: per-cell counts are Binomial(200, 1/20), mean
+# 10 with sd ~3.1, so cells routinely differed 2-3x and the attacker's gradient budget
+# went wherever the RNG pointed. The draws also re-rolled every round, so the policy
+# never got a contiguous stretch against one defense at one attack strength — the
+# regime it actually has to exploit. Stateful defenses benefit too: DeFL's Beta
+# reputation counts and DnC's subsampling RNG now advance over 10 consecutive rounds
+# instead of ~1 round in 4, scattered.
+#
+# Resume-safe: the sweep position is one integer, checkpointed with the rest of the
+# Phase-2 resume state, so a restart continues mid-block.
+curriculum:
+  enabled: true                   # false = go back to the random per-round draws
+  rounds_per_block: 10            # consecutive GRPO rounds per (algorithm, #poisoners) pair
+  poisoner_counts: [1, 2, 3, 4, 5]  # the attack strengths swept, in order. null = 1..
+                                  # attack.max_poison_clients. Counts above
+                                  # fl.n_compromisable are dropped (with a warning),
+                                  # never clamped — clamping would silently give the
+                                  # largest quota several blocks per cycle.
+  algorithms: null                # null = defense.algorithms, in listed order. Set a
+                                  # list to narrow or reorder the outer loop; every
+                                  # name must be one defense.algorithms builds.
 
 # Inference-only LLM defaults (used by --dry-run and the OpenAI path).
 llm:
@@ -190,8 +236,10 @@ rl:
   attacker_min_drop: 0.02         # FALLBACK absolute drop bar, used only when the round's goal
                                   # is unknown; normally the relative win_fraction gate applies.
   win_fraction: 0.6               # "attack passed" = committed drop >= win_fraction * the round's
-                                  # requested target_accuracy_drop (so the success gate tracks the
-                                  # per-round sampled target instead of one absolute floor).
+                                  # requested target_accuracy_drop — a RELATIVE bar, so the gate
+                                  # tracks whatever target the round asked for (0.10 by default =>
+                                  # a 0.06 drop wins) rather than one absolute floor. It also
+                                  # stays correct if attack.sample_target_in_training is re-enabled.
   attacker_min_evaded: 1.0        # fraction of poisoned clients that must evade detection
   defender_min_tpr: 0.99          # defender "win": catches the poisoned client(s)...
   defender_max_fpr: 0.10          # ...without over-flagging honest clients

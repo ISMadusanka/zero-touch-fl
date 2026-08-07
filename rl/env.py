@@ -9,8 +9,10 @@ computation.
 Round protocol (driven by the schedule / inference loop):
 
     env.reset(global, client_weights, baseline_acc)
-    ctx = env.begin_round()                 # builds honest updates; exposes the attacker's
-                                            # controllable pool (ctx.pool_benign) + budget
+    ctx = env.begin_round()                 # fixes this round's defense algorithm + poison
+                                            # quota (from the TrainingCurriculum, or drawn),
+                                            # builds honest updates, and exposes the
+                                            # attacker's controllable pool (ctx.pool_benign)
     # the attacker SELECTS exactly ctx.budget clients from the pool and poisons them
     updates = env.build_updates(poisoned_by_client)
     acc = env.evaluate_updates(updates, verdicts)   # no commit (used to score rollouts)
@@ -55,17 +57,25 @@ class RoundContext:
 
 
 class FLArmsRaceEnv:
-    def __init__(self, config: dict, client_loaders, test_loader, rng, defense=None):
+    def __init__(self, config: dict, client_loaders, test_loader, rng, defense=None,
+                 curriculum=None):
         """``defense`` is an optional :class:`server.algo_defender.AlgorithmicDefender`.
 
         When present the defender LLM is disabled and the server side of every
-        round is run by one published defense algorithm, drawn per round in
+        round is run by one published defense algorithm, selected per round in
         :meth:`begin_round` and used for the clean counterfactual, every scored
         rollout and the commit. That algorithm also produces the round's
         AGGREGATE (FLTrust re-weights and rescales, DeFL Beta-weights, ...), so
         callers use :meth:`defend` + :meth:`evaluate_state` / :meth:`commit_state`
         instead of the verdict-driven :meth:`evaluate_updates` / :meth:`commit`.
         ``defense=None`` keeps the original FedAvg-over-unflagged path.
+
+        ``curriculum`` is an optional :class:`rl.curriculum.TrainingCurriculum`.
+        When present it REPLACES the two per-round random draws — the defense
+        algorithm and the exact poison quota — with a deterministic sweep that
+        holds one (algorithm, #poisoners) pair for a whole block of consecutive
+        rounds, so every pair gets an equal, contiguous share of training. The
+        goal/target draw is unaffected (see :meth:`_round_goal`).
         """
         fl = config["fl"]
         attack = config.get("attack", {})
@@ -99,6 +109,8 @@ class FLArmsRaceEnv:
         self.server = FedServer(device=self.device)
         # Algorithmic (non-LLM) defense, or None when the defender LLM defends.
         self.defense = defense
+        # Deterministic (algorithm, #poisoners) sweep, or None for random draws.
+        self.curriculum = curriculum
 
         # Benign clients (used only when benign_retrain is True).
         self._clients = [
@@ -127,6 +139,7 @@ class FLArmsRaceEnv:
         self.poisoned_ids: list[int] = []                 # attacker's committed choice
         self._clean_ref_acc: float | None = None          # cached per-round clean counterfactual
         self.round_defense: str | None = None             # this round's defense algorithm (if any)
+        self.round_curriculum = None                      # this round's CurriculumSlot (if any)
 
     # ------------------------------------------------------------------
     def reset(self, global_weights, client_weights, baseline_accuracy):
@@ -135,9 +148,11 @@ class FLArmsRaceEnv:
         self.baseline_accuracy = float(baseline_accuracy)
         self.current_accuracy = float(baseline_accuracy)
         self.round_index = 0
+        budget_src = ("curriculum" if self.curriculum is not None
+                      else ("sampled" if self.sample_budget else "fixed"))
         logger.info(
             f"Env reset — n_clients={self.n_clients}, n_compromisable={self.n_compromisable}, "
-            f"budget_cap={self.budget_cap}, sample_budget={self.sample_budget}, "
+            f"budget_cap={self.budget_cap}, budget={budget_src}, "
             f"benign_retrain={self.benign_retrain}, baseline_acc={baseline_accuracy:.4f}"
         )
 
@@ -177,11 +192,32 @@ class FLArmsRaceEnv:
         )
 
     # ------------------------------------------------------------------
-    def _round_budget(self) -> int:
-        """Draw this round's exact poison quota in [1, cap], or use the cap."""
+    def _round_budget(self, slot=None) -> int:
+        """This round's exact poison quota.
+
+        A curriculum ``slot`` pins it to the block's count (clamped to the
+        controllable pool, which the attacker's selection clamps to anyway).
+        Otherwise it is drawn in [1, cap] when ``sample_budget`` is on, or fixed
+        at the cap (evaluation).
+        """
+        if slot is not None:
+            return max(1, min(int(slot.n_poisoners), self.n_compromisable))
         if self.sample_budget:
             return self.rng.randint(1, self.budget_cap)
         return self.budget_cap
+
+    def _round_defense(self, slot=None) -> str | None:
+        """This round's defense algorithm, or ``None`` when the defender LLM defends.
+
+        A curriculum ``slot`` pins it to the block's algorithm (via
+        ``AlgorithmicDefender.select``, so the defender's ``current`` stays in
+        sync); otherwise the defender draws one per ``defense.selection``.
+        """
+        if self.defense is None:
+            return None
+        if slot is not None and slot.algorithm is not None:
+            return self.defense.select(slot.algorithm)
+        return self.defense.choose()
 
     def _round_goal(self) -> dict:
         """This round's attack goal. When target sampling is on (untargeted_degrade),
@@ -208,21 +244,28 @@ class FLArmsRaceEnv:
         self.honest_updates = [self._honest_update(cid) for cid in range(self.n_clients)]
         self.pool_ids = list(range(self.n_compromisable))
         self.pool_benign = {cid: self.honest_updates[cid].weights for cid in self.pool_ids}
-        self.round_budget = self._round_budget()
+        # Consume exactly ONE curriculum slot per round, here — the FL interlude
+        # between phases does not go through begin_round(), so it correctly does
+        # not eat a training round out of the block.
+        slot = self.curriculum.advance() if self.curriculum is not None else None
+        self.round_curriculum = slot
+        self.round_budget = self._round_budget(slot)
         self.round_goal = self._round_goal()
         self.poisoned_ids = []                            # attacker decides at commit
         self._clean_ref_acc = None                        # recomputed lazily for this round
-        # Draw this round's defense BEFORE anything is scored (the clean
+        # Fix this round's defense BEFORE anything is scored (the clean
         # counterfactual below already goes through it), so the counterfactual,
         # every rollout and the commit all face the SAME algorithm.
-        self.round_defense = self.defense.choose() if self.defense is not None else None
+        self.round_defense = self._round_defense(slot)
 
         clean_acc = self.clean_reference_accuracy()
         logger.info(
             f"Round {round_num}: controllable_pool={self.pool_ids} "
             f"budget={self.round_budget} goal={self.round_goal} "
             f"defense={self.round_defense or 'llm'} "
-            f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_acc:.4f})"
+            + (f"curriculum=block{slot.block}[{slot.block_round + 1}/"
+               f"{self.curriculum.rounds_per_block}] cycle={slot.cycle} " if slot else "")
+            + f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_acc:.4f})"
         )
         return RoundContext(
             round_num=round_num,

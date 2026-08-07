@@ -215,8 +215,9 @@ each one sees** and **what feedback drives the change**.
 ### The attacker
 
 - **What it sees each round** (`agents/attacker_agent.py` `build_user_prompt`):
-  the round number, the **current global accuracy**, the **attack goal** (e.g.
-  "drop accuracy by 0.20"), which client IDs it controls, and **per-layer
+  the round number, the **current global accuracy**, the **attack goal** (during
+  training, "drop accuracy by 0.10" — fixed, see `attack.goal`), which client IDs
+  it controls, how many of them it must poison this round, and **per-layer
   statistics of the benign weights it is about to poison** (shape, mean, std,
   min, max, L2 norm, abs-mean).
 - **What it is blind to:** the defender's clues, the defender's verdicts, and

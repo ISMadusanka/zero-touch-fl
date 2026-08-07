@@ -144,6 +144,8 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             attack_metadata={"baseline_action": label, "budget": ctx.budget,
                              "n_used": len(chosen_ids), "n_malformed": n_malformed,
                              "defense": env.round_defense or "fixed_heuristic",
+                             "curriculum": (env.round_curriculum.as_log_dict()
+                                            if env.round_curriculum is not None else None),
                              "clean_accuracy": round(float(ctx.clean_accuracy), 6),
                              "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6)},
         ))
