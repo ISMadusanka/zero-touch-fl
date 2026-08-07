@@ -56,9 +56,15 @@ datasets:
       lr: 0.01                    # plain SGD (no momentum) on a conv net: 0.002 barely moves
       local_epochs: 3
     # A CIFAR-10 clean baseline lands well below MNIST's, so an absolute
-    # `target_accuracy_drop` of 0.30 is a much larger share of the headroom there.
-    # The sampled target pool is trimmed accordingly; raise it once you see the
+    # `target_accuracy_drop` is a much larger share of the headroom there: 0.10 off
+    # a ~0.66 baseline is ~15% of the model's accuracy, against ~10% on MNIST. The
+    # shared goal of 0.10 is a reasonable ask on both; revisit it against the
     # baseline your Phase 1 actually reaches.
+    #
+    # `target_choices` is only read when attack.sample_target_in_training is true —
+    # inert under the current fixed-target setting, kept so re-enabling sampling
+    # still gets a CIFAR-appropriate pool rather than the shared one (whose 0.30 is
+    # nearly half this dataset's headroom).
     attack:
       target_choices: [0.05, 0.10, 0.15, 0.20]
     rl:
@@ -81,15 +87,26 @@ datasets:
 attack:
   goal:
     type: "untargeted_degrade"    # untargeted_degrade | slow_degrade | targeted_label
-    target_accuracy_drop: 0.20    # untargeted_degrade: fallback target used at EVAL / when sampling is off
+    target_accuracy_drop: 0.10    # THE training + eval target. With sample_target_in_training
+                                  # false (below) every round asks for exactly this drop.
     # per_round_drop: 0.02        # slow_degrade
     # label: 7                    # targeted_label (per-class eval is a TODO; falls back to overall)
   # --- Attack-goal target sampling (generalize instead of overfitting a single target) ---
-  sample_target_in_training: true # true = randomize untargeted_degrade's target_accuracy_drop each
-                                  # round from `target_choices`, so the policy is TARGET-AWARE and
-                                  # generalizes to any requested drop (mirrors sample_budget_in_training).
-                                  # false = always use goal.target_accuracy_drop. Eval always fixes it.
-  target_choices: [0.05, 0.10, 0.20, 0.30]  # per-round target pool (untargeted_degrade only)
+  sample_target_in_training: false # false = every round uses goal.target_accuracy_drop (0.10).
+                                  # true = randomize it each round from `target_choices`, making the
+                                  # policy TARGET-AWARE so it generalizes to any requested drop
+                                  # (mirrors sample_budget_in_training). Eval always fixes it.
+                                  #
+                                  # Fixed is the right default while the attacker cannot reliably
+                                  # reach ONE target: sampling spends capacity on target-awareness
+                                  # the policy has no use for yet, and it also makes the drop term
+                                  # (which normalizes by the round's target) mean a different thing
+                                  # each round, so the reward scale moves between rounds for reasons
+                                  # the policy cannot control. Turn it back on once a fixed target
+                                  # is being hit — that is when generalizing across targets starts
+                                  # to buy something.
+  target_choices: [0.05, 0.10, 0.20, 0.30]  # per-round target pool — INERT unless
+                                  # sample_target_in_training is true
   # --- Exact client-selection quota (the attacker chooses WHICH clients) ---
   max_poison_clients: 5           # TRAINING quota cap: per-round exact count is sampled in [1, 5]
                                   # each round (legacy key name; must be <= n_compromisable).
