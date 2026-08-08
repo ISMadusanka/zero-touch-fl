@@ -44,17 +44,41 @@ def compute_round_metrics(
     malicious_ids: set[int],
     current_accuracy: float,
     baseline_accuracy: float,
+    clean_accuracy: float | None = None,
+    success_drop: float | None = None,
 ) -> RoundMetrics:
-    """Compute all per-round metrics from raw verdicts and accuracies."""
+    """Compute all per-round metrics from raw verdicts and accuracies.
+
+    ``clean_accuracy`` is THIS round's clean counterfactual — the accuracy the
+    aggregate reaches with no poison (``rl.env.clean_reference_accuracy``) — or
+    ``None`` when it could not be measured. ``success_drop`` is the damage bar the
+    round had to clear, i.e. the schedule's ``win_fraction * target_accuracy_drop``.
+    Both are needed to say whether the attack actually SUCCEEDED; without them the
+    round is recorded as unsuccessful rather than guessed at.
+    """
     tp, fn, fp, tn = confusion_counts(verdicts, malicious_ids)
 
     tpr = _safe_div(tp, tp + fn)
     fpr = _safe_div(fp, fp + tn)
     apr = _safe_div(current_accuracy, baseline_accuracy)
 
-    # An attack "succeeds" in a round when at least one malicious client is
-    # not flagged. With a single attacker this collapses to `fn > 0`.
-    attack_success = fn > 0
+    # Evasion: at least one malicious client was not flagged. This is what
+    # `attack_success` used to mean, and it is NOT attack success — it says nothing
+    # about damage. The logs showed the contradiction plainly: a round where accuracy
+    # ROSE by 1pp was recorded as attack_success=True (one poisoned client slipped
+    # through) while a round where it FELL by 5pp was recorded as False (the poisoned
+    # client was caught). Kept as its own field because evasion is still a real,
+    # separately interesting quantity — it just is not success.
+    evaded = fn > 0
+
+    # Damage relative to the clean counterfactual, and success as "did the attack
+    # cause the damage it was asked for". Unmeasurable -> not a success, never a guess.
+    induced_drop = (None if clean_accuracy is None
+                    else float(clean_accuracy) - float(current_accuracy))
+    apr_vs_clean = (None if not clean_accuracy
+                    else _safe_div(current_accuracy, clean_accuracy))
+    attack_success = (induced_drop is not None and success_drop is not None
+                      and induced_drop >= float(success_drop))
 
     return RoundMetrics(
         round_num=round_num,
@@ -69,4 +93,9 @@ def compute_round_metrics(
         accuracy_preservation_rate=apr,
         current_accuracy=current_accuracy,
         baseline_accuracy=baseline_accuracy,
+        evaded=evaded,
+        clean_accuracy=(None if clean_accuracy is None else float(clean_accuracy)),
+        induced_drop=induced_drop,
+        success_drop=(None if success_drop is None else float(success_drop)),
+        accuracy_preservation_vs_clean=apr_vs_clean,
     )

@@ -8,7 +8,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from benchmark.defenses.defl import (   # noqa: E402
-    group_layers, aggregate_fgnv, is_clp, per_layer_votes, moud_vote, BetaTracker,
+    group_layers, aggregate_fgnv, is_clp, per_layer_votes, per_layer_zscores,
+    moud_vote, BetaTracker,
 )
 
 
@@ -60,22 +61,50 @@ def test_per_layer_votes_zero_spread_flags_any_deviation():
 def test_moud_vote_adaptive_threshold_lowers_to_one():
     # outlier shows up on ONLY one layer -> thr=L finds nobody, drops to thr=1.
     m = [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [10.0, 1.0]]
-    flagged, votes = moud_vote(m, tau=2.5)
+    flagged, votes, thr = moud_vote(m, tau=2.5)
     assert votes[4] == 1 and max(votes[:4]) == 0
     assert flagged == [False, False, False, False, True]
+    # THE threshold that made ``votes/L`` an inverted p_malicious: one vote out of two
+    # is a rejection here, so reporting 1/2 = 0.5 said "coin flip" about a client the
+    # defense had just caught. Consumers need this number to place the boundary.
+    assert thr == 1
 
 
 def test_moud_vote_both_layers_uses_strict_threshold():
     m = [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [10.0, 10.0]]
-    flagged, _ = moud_vote(m, tau=2.5)
+    flagged, _votes, thr = moud_vote(m, tau=2.5)
     assert flagged == [False, False, False, False, True]
+    assert thr == 2                                            # L, not lowered
 
 
 def test_moud_vote_clean_round_flags_nobody():
     m = [[1.0, 1.0]] * 5                                        # no outliers anywhere
-    flagged, votes = moud_vote(m, tau=2.5)
+    flagged, votes, thr = moud_vote(m, tau=2.5)
     assert votes == [0, 0, 0, 0, 0]
     assert flagged == [False] * 5                              # not forced to flag
+    # Reported boundary is still the lowest the loop reaches, and every client is
+    # strictly below it, so a calibrated p_malicious puts them all under 0.5.
+    assert thr == 1
+
+
+def test_per_layer_zscores_matches_the_vote_test():
+    """The vote count is a threshold ON these z-scores, so they must agree."""
+    m = [[1.0, 1.0], [1.1, 0.9], [0.9, 1.1], [1.0, 1.0], [10.0, 10.0]]
+    z = per_layer_zscores(m)
+    votes = per_layer_votes(m, tau=2.5)
+    assert votes == [sum(1 for zij in row if zij > 2.5) for row in z]
+    # The outlier's magnitude is what survives thresholding: with L=2 the vote count
+    # alone takes three values, far too coarse to be a reward gradient on its own.
+    assert z[4][0] > 2.5 and z[4][1] > 2.5
+    assert max(z[0]) < 2.5
+
+
+def test_per_layer_zscores_zero_spread_is_infinite_not_large():
+    """MAD=0 makes the z-score undefined; a deviating client must not be finite-ranked."""
+    m = [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [5.0, 1.0]]
+    z = per_layer_zscores(m)
+    assert z[4][0] == float("inf") and z[4][1] == 0.0
+    assert all(zij == 0.0 for row in z[:4] for zij in row)
 
 
 def test_beta_tracker_updates_and_prob():

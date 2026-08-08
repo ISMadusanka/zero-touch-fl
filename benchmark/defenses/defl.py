@@ -67,7 +67,8 @@ FLTrust this is a detector whose flag and aggregate can disagree post-CLP (flagg
 but kept at small weight); treat ROBUSTNESS (acc_drop) as the primary cross-defense
 metric — see benchmark/README.md.
 
-The pure helpers (``group_layers``, ``is_clp``, ``per_layer_votes``, ``moud_vote``,
+The pure helpers (``group_layers``, ``is_clp``, ``per_layer_zscores``,
+``per_layer_votes``, ``moud_vote``,
 ``BetaTracker``) are torch-free and unit-tested in isolation (tests/test_defl_logic.py);
 torch is imported lazily only where tensors are actually touched, so importing this
 module stays cheap. The end-to-end torch math is tested in tests/test_defl.py.
@@ -75,7 +76,7 @@ module stays cheap. The end-to-end torch math is tested in tests/test_defl.py.
 import math
 
 from core.types import DetectionVerdict
-from benchmark.defenses.base import Defense, StepResult
+from benchmark.defenses.base import Defense, StepResult, boundary_calibrated_p
 
 
 # A "layer" groups a module's parameter tensors (weight + bias + any buffers).
@@ -161,20 +162,26 @@ def _median(xs: list) -> float:
     return s[m] if n % 2 else 0.5 * (s[m - 1] + s[m])
 
 
-def per_layer_votes(fgnv_matrix: list, tau: float, eps: float = 1e-12) -> list:
-    """Per-client count of layers on which it is a robust statistical outlier.
+def per_layer_zscores(fgnv_matrix: list, eps: float = 1e-12) -> list:
+    """Per-(client, layer) robust z-score against the across-client median.
 
-    For each layer, compute a robust z-score against the across-client median:
-    ``z = |v - median| / (1.4826 * MAD)``; a client whose ``z > tau`` on that layer
-    casts one outlier vote. When the spread (MAD) collapses to ~0, only a value that
-    actually differs from the median (by > eps) counts as an outlier. Returns
-    ``list[int]`` (votes per client, 0..L).
+    ``z = |v - median| / (1.4826 * MAD)``. When the spread (MAD) collapses to ~0 the
+    z-score is undefined, so a value that differs from the median at all is reported
+    as ``inf`` and one that does not as ``0.0`` — which is what the ``dev > eps``
+    branch of the vote test means. Returns an ``n x L`` list of floats.
+
+    Split out of :func:`per_layer_votes` so the continuous magnitudes survive the
+    thresholding: the vote COUNT is what the paper's cross-layer threshold compares,
+    but with a two-layer model that count only takes three values, which is far too
+    coarse to be the attacker's stealth gradient on its own (see
+    :meth:`DeFL.step`).
     """
     n = len(fgnv_matrix)
     if n == 0:
         return []
     L = len(fgnv_matrix[0])
-    votes = [0] * n
+    inf = float("inf")
+    z = [[0.0] * L for _ in range(n)]
     for j in range(L):
         col = [fgnv_matrix[i][j] for i in range(n)]
         med = _median(col)
@@ -182,33 +189,80 @@ def per_layer_votes(fgnv_matrix: list, tau: float, eps: float = 1e-12) -> list:
         for i in range(n):
             dev = abs(col[i] - med)
             if scale <= eps:
-                outlier = dev > eps
+                z[i][j] = inf if dev > eps else 0.0
             else:
-                outlier = (dev / scale) > tau
-            if outlier:
-                votes[i] += 1
-    return votes
+                z[i][j] = dev / scale
+    return z
+
+
+def per_layer_votes(fgnv_matrix: list, tau: float, eps: float = 1e-12) -> list:
+    """Per-client count of layers on which it is a robust statistical outlier.
+
+    A client whose robust z-score (see :func:`per_layer_zscores`) exceeds ``tau`` on
+    a layer casts one outlier vote there. Returns ``list[int]`` (votes per client,
+    0..L).
+    """
+    if not fgnv_matrix:
+        return []
+    z = per_layer_zscores(fgnv_matrix, eps)
+    return [sum(1 for zij in row if zij > tau) for row in z]
+
+
+#: Hard bound on the sub-vote tiebreak (see :func:`_subvote_tiebreak`). Must stay
+#: strictly below 0.5 so the tiebreak can never carry a client across the half-vote
+#: gap that separates ``votes >= threshold`` from ``votes <= threshold - 1``.
+_SUBVOTE_BOUND = 0.45
+
+
+def _subvote_tiebreak(zrow: list, tau: float) -> float:
+    """A continuous refinement within one vote count, in ``[0, _SUBVOTE_BOUND)``.
+
+    Two clients with the same number of outlier votes are not equally suspicious —
+    one may sit just over ``tau`` on each flagged layer and the other far past it.
+    This orders them by their mean robust z-score, squashed so the value can never
+    reach 0.5. ``inf`` (a collapsed-MAD layer) saturates to the bound.
+    """
+    if not zrow:
+        return 0.0
+    inf = float("inf")
+    if any(zij == inf for zij in zrow):
+        return _SUBVOTE_BOUND
+    mean_z = sum(zrow) / len(zrow)
+    scale = float(tau) if tau > 0.0 else 1.0
+    return _SUBVOTE_BOUND * math.tanh(mean_z / scale)
 
 
 def moud_vote(fgnv_matrix: list, tau: float) -> tuple:
     """MOUD-Vote with the paper's adaptive cross-layer threshold.
 
-    Returns ``(flagged, votes)`` where ``flagged`` is a per-client list[bool]. The
+    Returns ``(flagged, votes, threshold)`` where ``flagged`` is a per-client
+    list[bool] and ``threshold`` is the vote count the flag test actually used. The
     threshold starts at L (outlier on every layer) and is lowered until at least one
-    client is flagged; if no client is an outlier on any layer, nobody is flagged.
+    client is flagged; if no client is an outlier on any layer, nobody is flagged and
+    the reported threshold is 1 (the lowest the loop reaches), which is still the
+    correct boundary — every client has 0 votes there.
+
+    ``threshold`` is part of the return value because the flag condition is
+    ``votes >= threshold`` and that boundary MOVES between rounds. Without it a
+    consumer cannot tell a flagged client from an accepted one by vote count alone:
+    on a two-layer model the adaptive rule routinely settles at ``threshold = 1``, so
+    one vote out of two is a rejection — which is exactly how a calibrated
+    ``p_malicious`` of 0.5 came to be reported for clients DeFL had just caught.
     """
     n = len(fgnv_matrix)
     if n == 0:
-        return [], []
+        return [], [], 1
     L = len(fgnv_matrix[0])
     votes = per_layer_votes(fgnv_matrix, tau)
     flagged = [False] * n
+    used = 1
     for thr in range(L, 0, -1):
         cand = [v >= thr for v in votes]
         if any(cand):
             flagged = cand
+            used = thr
             break
-    return flagged, votes
+    return flagged, votes, used
 
 
 class BetaTracker:
@@ -284,7 +338,7 @@ class DeFL(Defense):
         self._prev_total_fgnv = total_now
 
         # 2) MOUD-Vote detection, then 3) bump each client's Beta counts.
-        flagged, votes = moud_vote(fgnv, self.tau)
+        flagged, votes, vote_threshold = moud_vote(fgnv, self.tau)
         for i, u in enumerate(updates):
             self._beta.update(u.client_id, benign=not flagged[i])
 
@@ -297,21 +351,33 @@ class DeFL(Defense):
                 p = 0.0
             coeffs.append(p * data_w[i])
 
-        # ``votes/L`` (the fraction of layer groups whose MOUD z-test called this
-        # client an outlier) is already a bounded, monotone P(malicious), and
-        # ``moud_vote`` flags a top slice of it — so it belongs in ``p_malicious``.
-        # ``confidence`` is certainty in the verdict (see core.types); it used to
-        # hold the suspicion score, which inverted the attacker's stealth reward for
-        # every un-flagged client (see ``rl.rewards._soft_malicious_prob``).
-        verdicts = []
-        for i, u in enumerate(updates):
-            p_mal = float(votes[i] / L) if L else 0.0
-            verdicts.append(DetectionVerdict(
+        # ``votes/L`` was reported as P(malicious), and it is NOT one: the flag test
+        # is ``votes >= vote_threshold`` with an ADAPTIVE threshold, so on this
+        # codebase's two-layer model (one group per nn.Linear) the rule settles at
+        # ``votes >= 1`` and a client DeFL just caught reported ``p = 1/2 = 0.5``.
+        # The attacker collected half of its full stealth bonus for being detected.
+        #
+        # The score is therefore the vote count measured against the round's own
+        # threshold, plus a strictly bounded sub-vote tiebreak built from the raw
+        # z-score magnitudes. The tiebreak restores continuity that a 0..L integer
+        # cannot carry (with L=2 the vote count alone takes three values, so the
+        # "continuous" stealth signal the reward is built on was nearly binary), and
+        # because |tiebreak| < 0.5 it can never move a client across the half-vote
+        # gap that separates flagged from accepted.
+        #
+        # ``confidence`` is certainty in the verdict (see core.types) = |2p - 1|.
+        z = per_layer_zscores(fgnv)
+        scores = [votes[i] + _subvote_tiebreak(z[i], self.tau) for i in range(len(updates))]
+        p_mals = boundary_calibrated_p(scores, vote_threshold - 0.5, flags=flagged)
+        verdicts = [
+            DetectionVerdict(
                 u.client_id, bool(flagged[i]),
-                abs(2.0 * p_mal - 1.0),
-                f"votes={votes[i]}/{L} clp={int(in_clp)}",
-                p_malicious=p_mal,
-            ))
+                abs(2.0 * p_mals[i] - 1.0),
+                f"votes={votes[i]}/{L} thr={vote_threshold} clp={int(in_clp)}",
+                p_malicious=p_mals[i],
+            )
+            for i, u in enumerate(updates)
+        ]
 
         # 5) Trust+data-weighted average of ABSOLUTE weights (renormalised).
         wsum = sum(coeffs)

@@ -39,7 +39,9 @@ path is tested in tests/test_multikrum.py.
 """
 from core.types import DetectionVerdict
 
-from benchmark.defenses.base import Defense, StepResult, rank_normalized_scores
+from benchmark.defenses.base import (
+    Defense, StepResult, boundary_calibrated_p, selection_boundary,
+)
 
 
 def k_closest_count(n: int, f: int) -> int:
@@ -134,12 +136,20 @@ class MultiKrum(Defense):
             # non-finite client), so it is not a probability: reporting it as one both
             # saturated the attacker's stealth reward and ran BACKWARDS over the
             # selected clients, and `inf` is not valid JSON in the round logs.
-            # Rank-normalize it; `select_lowest` slices the same ordering, so the hard
-            # flag and the soft score agree. See base.rank_normalized_scores.
-            p_mal = rank_normalized_scores(scores)
+            #
+            # Rank-normalizing it (the previous fix) was bounded and monotone but
+            # purely RELATIVE: the ranks are a fixed 0..1 spread every round, so the
+            # cohort mean was always ~0.5 and a client's p moved whenever OTHER
+            # clients moved. It carried no information about whether this client was
+            # detected. Calibrate against the actual decision boundary instead — the
+            # midpoint between the worst selected and the best dropped score — so
+            # p >= 0.5 means exactly "Multi-Krum dropped me".
+            flags = [i not in selected for i in range(n)]
+            p_mal = boundary_calibrated_p(
+                scores, selection_boundary(scores, selected), flags=flags)
             verdicts = [
                 DetectionVerdict(
-                    u.client_id, i not in selected, abs(2.0 * p_mal[i] - 1.0),
+                    u.client_id, flags[i], abs(2.0 * p_mal[i] - 1.0),
                     f"multikrum {'selected' if i in selected else 'dropped'} score={scores[i]:.3g}",
                     p_malicious=p_mal[i],
                 )

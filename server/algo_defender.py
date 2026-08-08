@@ -201,36 +201,59 @@ def defense_mode(cfg: dict) -> str:
     return mode
 
 
-def resolve_root_epochs(configured, root_batches: int, client_iterations: int | None) -> int:
+#: Ceiling on the ITERATION-MATCHED root epoch count (see :func:`resolve_root_epochs`).
+#: An explicit ``defense.fltrust.root_epochs`` is never capped.
+DEFAULT_MAX_ROOT_EPOCHS = 10
+
+
+def resolve_root_epochs(configured, root_batches: int, client_iterations: int | None,
+                        *, max_epochs: int = DEFAULT_MAX_ROOT_EPOCHS) -> int:
     """FLTrust's server-side local epochs R_l over the root set.
 
     ``configured is None`` means "match an honest client's local training", which is
-    what the paper assumes and what this codebase got wrong. FLTrust rescales EVERY
-    accepted client delta to ``||g0||`` (Eq. 3) and applies ``w <- w + eta*g``, so the
-    global model moves by about ``||g0||`` per round: the server's reference update
-    sets the whole system's learning rate. The paper specifies R_l in *iterations*,
-    but this config expresses local training in *epochs*, and the root set is far
-    smaller than a client shard — 100 examples at batch 64 is 2 iterations/epoch
-    against a client's ~40. At ``root_epochs: 1`` the root update therefore took ~2
-    SGD steps against a client's ~120, making ``||g0||`` roughly 60x too small.
+    what the paper assumes. FLTrust rescales EVERY accepted client delta to
+    ``||g0||`` (Eq. 3) and applies ``w <- w + eta*g``, so the global model moves by
+    about ``||g0||`` per round: the server's reference update sets the whole system's
+    learning rate. The paper specifies R_l in *iterations*, but this config expresses
+    local training in *epochs*, and the root set is far smaller than a client shard —
+    100 examples at batch 64 is 2 iterations/epoch against a client's ~47. At
+    ``root_epochs: 1`` the root update therefore took ~2 SGD steps against a client's
+    ~141, making ``||g0||`` roughly 60x too small, the aggregate barely move, and the
+    damage term ~0 for every candidate in a GRPO group.
 
-    The consequence was not a slightly slow defense but a broken training signal:
-    with the aggregate pinned to a near-zero magnitude, the clean counterfactual and
-    every poisoned rollout landed at essentially the same accuracy, so the damage
-    term was ~0 for all G candidates and the whole group was degenerate. Roughly a
-    quarter of all rounds (FLTrust's share of the rotation) produced no gradient, and
-    the configured ``target_accuracy_drop`` of 0.05-0.30 was not reachable in
-    principle.
+    So the count is matched in ITERATIONS — but **capped**, which is the other half of
+    the fix. Matching iterations un-capped asks for ``141/2 ~ 70`` epochs over 100
+    examples: ~140 SGD steps on a set the model memorises in a handful, so ``g0``
+    stops being a descent direction shared with the clients and becomes a
+    root-set-overfit direction of its own. Trust is ``ReLU(cos(delta_i, g0))``, so
+    once that happens honest clients score ``cos <= 0`` and are DROPPED. In a recorded
+    run FLTrust's false-positive rate sat at 0.9-1.0 for whole curriculum blocks, and
+    on several rounds the only clients it accepted were the poisoned ones — the
+    aggregate was then built exclusively from the attack, and ``drop`` measured the
+    defense's malfunction rather than the attacker's action.
 
-    Matching ITERATIONS instead of epochs fixes the scale while leaving the algorithm
-    and the "server holds only a few clean examples" premise untouched. Pass an
-    explicit integer to override.
+    The cap keeps ``||g0||`` an order of magnitude above the ``root_epochs: 1`` value
+    without letting the reference overfit. ``||g0||`` remains the knob that sets the
+    system's step size, and FLTrust's own ``eta`` (paper Eq. 5) is the documented way
+    to scale it further — prefer raising ``eta`` over raising this. Pass an explicit
+    integer to override the cap entirely.
     """
     if configured is not None:
         return max(1, int(configured))
     if not client_iterations or root_batches <= 0:
         return 1
-    return max(1, round(int(client_iterations) / int(root_batches)))
+    matched = max(1, round(int(client_iterations) / int(root_batches)))
+    capped = max(1, min(matched, max(1, int(max_epochs))))
+    if capped < matched:
+        logger.warning(
+            "FLTrust root_epochs: matching an honest client's %d iteration(s) over %d "
+            "root batch(es) asks for %d epoch(s) on the root set; capped at %d to keep "
+            "g0 from overfitting it (a root-overfit g0 makes FLTrust reject the honest "
+            "majority — see resolve_root_epochs). Raise defense.fltrust.eta if the "
+            "aggregate moves too slowly, or set root_epochs explicitly to override.",
+            int(client_iterations), int(root_batches), matched, capped,
+        )
+    return capped
 
 
 def build_algorithmic_defender(cfg: dict, *, root_loader=None,
@@ -280,12 +303,14 @@ def build_algorithmic_defender(cfg: dict, *, root_loader=None,
     dnc_seed = seed if dn.get("seed") is None else int(dn["seed"])
 
     # R_l: null (the default) sizes the root fine-tuning to match an honest client's
-    # ITERATION count, so FLTrust's ||g0|| — which sets the whole system's step size —
-    # is not ~60x too small. See resolve_root_epochs.
+    # ITERATION count — so FLTrust's ||g0||, which sets the whole system's step size,
+    # is not ~60x too small — but capped so g0 cannot overfit a 100-example root set
+    # and start rejecting the honest majority. See resolve_root_epochs.
     root_epochs = resolve_root_epochs(
         ft.get("root_epochs"),
         root_batches=(len(root_loader) if root_loader is not None else 0),
         client_iterations=client_iterations,
+        max_epochs=int(ft.get("max_root_epochs") or DEFAULT_MAX_ROOT_EPOCHS),
     )
     if "fltrust" in names:
         logger.info(

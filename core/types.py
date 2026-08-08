@@ -43,6 +43,19 @@ class DetectionVerdict:
     detection boundary instead of for looking honest. Producers that can compute a
     calibrated probability set this field; consumers must prefer it over the
     ``(is_suspicious, confidence)`` reconstruction. ``None`` = not supplied.
+
+    **Calibration contract.** When ``p_malicious`` is supplied it MUST satisfy
+
+        p_malicious >= 0.5   if and only if   is_suspicious
+
+    Anything else is not a probability, it is a raw suspicion score wearing one, and
+    it silently inverts every consumer that reads it — most importantly the
+    attacker's ``stealth`` reward, which then pays for being caught. Reporting a raw
+    score here (``1 - ReLU(cos)``, ``votes/L``) is exactly the bug that produced an
+    attacker reward of 0.44 on a round where every poisoned client was detected and
+    no damage was done. ``benchmark.defenses.base.boundary_calibrated_p`` is the
+    shared helper that guarantees the invariant while keeping the value continuous;
+    ``tests/test_p_malicious_calibration.py`` asserts it for every defense.
     """
     client_id: int
     is_suspicious: bool

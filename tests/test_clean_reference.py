@@ -114,9 +114,110 @@ def test_clean_reference_refreshes_after_a_benign_fl_round():
     before = env.clean_reference_accuracy()
     env.run_benign_fl_round()
     assert env._clean_ref_acc is None          # invalidated
+    assert not env.clean_reference_measured    # and so is the "was it measured" flag
     after = env.clean_reference_accuracy()
     assert isinstance(after, float) and after == env.clean_reference_accuracy()
     assert before is not None
+
+
+# --- an unmeasurable counterfactual must be reported, not faked ---------------
+
+class _RefusingDefense:
+    """A defense that declines to aggregate (every client removed).
+
+    FLTrust does this whenever every trust score is 0, DeFL whenever a CLP removes
+    everyone. It happened on roughly a quarter of the rounds in a recorded run.
+    """
+
+    def __init__(self):
+        self.name = "refusing"
+
+    def run(self, updates, global_weights, *, commit=False, algorithm=None):
+        from server.algo_defender import DefenseOutcome
+        verdicts = [DetectionVerdict(u.client_id, True, 1.0, "rejected", p_malicious=1.0)
+                    for u in updates]
+        return DefenseOutcome("refusing", verdicts, None, {})
+
+    def select(self, name):
+        return name
+
+    def choose(self):
+        return "refusing"
+
+
+def test_unmeasurable_clean_reference_is_flagged_not_silently_faked():
+    """The bug: with no clean aggregate, ``clean_reference_accuracy`` returned
+    ``current_accuracy`` — the PREVIOUS round's post-attack accuracy, which is exactly
+    what this method exists not to be. When the poisoned round also produced no
+    aggregate the post accuracy was that same number, so ``drop`` was identically
+    +0.0000 by construction and looked like a clean measurement of "the attack achieved
+    nothing"."""
+    env = _env()
+    env.defense = _RefusingDefense()
+    ctx = env.begin_round()
+
+    # The value is still usable as a placeholder...
+    assert ctx.clean_accuracy == env.current_accuracy
+    # ...but it is explicitly marked as NOT measured, on both the env and the context.
+    assert env.clean_reference_measured is False
+    assert ctx.clean_measured is False
+
+    # And the pathology it produced is reproducible: a round that also fails to
+    # aggregate reports a drop of exactly zero.
+    updates = env.build_updates({})
+    assert env.commit_state(None) == env.current_accuracy
+    assert ctx.clean_accuracy - env.current_accuracy == 0.0
+    assert len(updates) == N_CLIENTS
+
+
+def test_a_measurable_round_reports_measured():
+    """The flag must not be pessimistic: an ordinary round is measured."""
+    env = _env()
+    ctx = env.begin_round()
+    assert env.clean_reference_measured is True
+    assert ctx.clean_measured is True
+
+
+def test_unmeasured_rounds_skip_the_policy_update():
+    """``grpo_step(skip_update=True)`` still scores the group (the environment needs a
+    rollout to advance) but applies no gradient, so a structurally-zero damage term
+    cannot move the policy."""
+    from rl.grpo import grpo_step
+
+    class _Policy:
+        def generate(self, adapter, system, user, n, temperature, max_new_tokens):
+            # Deliberately DIFFERENT lengths so the rewards below separate: the point
+            # of this test is that only the caller's veto stops the step, not degeneracy.
+            return ["plan" + "!" * i for i in range(n)]
+
+        def policy_token_logprobs(self, *a, **k):
+            raise AssertionError("skip_update must not run the log-prob pass")
+
+        def adapter_parameters(self, adapter):
+            raise AssertionError("skip_update must not touch the optimizer")
+
+    class _Turn:
+        def messages(self):
+            return "sys", "user"
+
+        def reward(self, text):
+            return 0.1 * len(text)
+
+    class _Optimizer:
+        def zero_grad(self):
+            raise AssertionError("skip_update must not touch the optimizer")
+
+        def step(self):
+            raise AssertionError("skip_update must not touch the optimizer")
+
+    stats = grpo_step(_Policy(), "attacker", _Optimizer(), _Turn(), G=4,
+                      skip_update=True, skip_reason="test")
+    assert stats["stepped"] is False
+    assert stats["skipped_by_caller"] is True
+    assert stats["reward_spread"] > 0.0        # the group WAS separated...
+    assert stats["zero_advantage_fraction"] == 0.0   # ...and not degenerate...
+    assert len(stats["completions"]) == 4      # ...and the rollouts are available
+    assert stats["loss"] == 0.0                # ...but nothing was optimized
 
 
 def test_league_is_a_bounded_ring_buffer():

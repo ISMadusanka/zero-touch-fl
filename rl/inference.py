@@ -15,6 +15,7 @@ import logging
 
 from core.types import RoundLog
 from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
+from rl.switch import success_drop_bar
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,14 @@ def run_inference(
                                 diversity=diversity)
         d_rew = defender_reward(verdicts, chosen_ids)
 
-        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
+        # Same damage-based success definition as training (see rl.switch); the clean
+        # accuracy is withheld when the defense produced no clean aggregate, so an
+        # unmeasurable round is never recorded as a measured zero drop.
+        metrics_tracker.update(
+            ctx.round_num, verdicts, new_acc, set(chosen_ids),
+            clean_accuracy=(ctx.clean_accuracy if ctx.clean_measured else None),
+            success_drop=success_drop_bar(ctx.goal),
+        )
         save_round_log(RoundLog(
             round_num=ctx.round_num,
             attack_goal=ctx.goal,

@@ -31,7 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch  # noqa: E402
 
-from benchmark.defenses.base import rank_normalized_scores  # noqa: E402
+from benchmark.defenses.base import (  # noqa: E402
+    boundary_calibrated_p, selection_boundary,
+)
 from core.types import DetectionVerdict  # noqa: E402
 from rl.grpo import grpo_step  # noqa: E402
 from rl.rewards import (  # noqa: E402
@@ -79,16 +81,44 @@ def test_stealth_increases_as_a_surviving_client_looks_more_honest():
     assert old_soft_p(nearly_caught[0]) < old_soft_p(comfortable[0])
 
 
-def test_unbounded_scores_are_rank_normalized_not_clipped():
+def test_unbounded_scores_are_boundary_calibrated_not_clipped_or_ranked():
     """Multi-Krum/DnC scores are unbounded sums of squares (and +inf for a
-    non-finite client). Clipping them to [0, 1] collapsed stealth to a binary;
-    ranking keeps it continuous inside the surviving set."""
-    p = rank_normalized_scores([0.1, 5.0, 5.0, 1e9, float("inf")])
-    assert p == [0.0, 0.25, 0.25, 0.75, 1.0]          # bounded, ties equal, inf worst
-    assert rank_normalized_scores([float("nan"), 1.0]) == [1.0, 0.0]   # NaN = worst
-    assert rank_normalized_scores([]) == [] and rank_normalized_scores([9.9]) == [0.0]
-    # The old path clipped every score > 1 to exactly 1.0 -> no spread at all.
-    assert len(set(p)) > 1
+    non-finite client). Clipping them to [0, 1] collapsed stealth to a binary, and
+    rank-normalizing them made p purely relative (a fixed 0..1 spread every round,
+    so p moved when OTHER clients moved). Calibrating against the actual keep/drop
+    boundary keeps it continuous AND meaningful."""
+    scores = [0.1, 5.0, 5.0, 1e9, float("inf")]
+    kept = {0, 1, 2}                                   # keep the 3 lowest
+    thr = selection_boundary(scores, kept)
+    assert 5.0 < thr < 1e9                             # midway between kept and dropped
+    p = boundary_calibrated_p(scores, thr, flags=[i not in kept for i in range(5)])
+
+    # THE invariant: p >= 0.5 exactly for the dropped clients.
+    assert [pi >= 0.5 for pi in p] == [False, False, False, True, True]
+    assert all(0.0 <= pi <= 1.0 for pi in p)
+    assert p[1] == p[2]                                # equal scores -> equal p
+    assert p[0] < p[1]                                 # monotone inside the kept set
+    assert p[4] == 1.0                                 # +inf saturates, stays serializable
+    assert len(set(p)) > 1                             # real spread, not a binary
+
+    # NaN is the worst score, so it must saturate on the dropped side while the
+    # accepted client keeps a real (non-zero, sub-0.5) probability.
+    p_nan = boundary_calibrated_p([float("nan"), 1.0], 1.5, flags=[True, False])
+    assert p_nan[0] == 1.0
+    assert 0.0 < p_nan[1] < 0.5
+    assert boundary_calibrated_p([], 0.0) == []
+
+
+def test_calibration_survives_a_tie_across_the_boundary():
+    """A keep-the-lowest-k rule breaks ties by index, so two clients with identical
+    scores can land on opposite sides of the cut and NO threshold separates them. The
+    defense's own flags must win — otherwise the invariant fails exactly on the
+    boundary, which is where the attacker's stealth gradient lives."""
+    scores = [1.0, 1.0, 1.0, 1.0]
+    kept = {0, 1}                                      # tie broken by index
+    p = boundary_calibrated_p(scores, selection_boundary(scores, kept),
+                              flags=[i not in kept for i in range(4)])
+    assert [pi >= 0.5 for pi in p] == [False, False, True, True]
 
 
 # --- 2. one defense per round, identical for every scored rollout ------------
@@ -371,21 +401,36 @@ def test_stub_generators_without_ids_fall_back_to_the_text_path():
 
 # --- 6. the defense is strong enough to produce a measurable outcome ---------
 
-def test_root_epochs_match_the_clients_iteration_count():
+def test_root_epochs_match_the_clients_iteration_count_but_are_capped():
     """FLTrust rescales EVERY accepted delta to ||g0|| and applies w <- w + eta*g, so
     the SERVER's reference update sets how far the global can move per round. At
     root_epochs=1 the root took ~2 SGD steps (100 examples / batch 64) against a
     client's ~144: ||g0|| was ~60x too small, the global froze, and the damage term
-    was ~0 for every candidate in the group — no gradient on FLTrust's ~1/4 of rounds,
-    and the configured target drops were unreachable in principle."""
-    from server.algo_defender import resolve_root_epochs
+    was ~0 for every candidate in the group — no gradient on FLTrust's ~1/4 of rounds.
 
-    # null -> match the honest client's ITERATION count (not its epoch count).
-    assert resolve_root_epochs(None, root_batches=2, client_iterations=144) == 72
+    Matching iterations UN-CAPPED overshoots the other way: 144/2 = 72 epochs over 100
+    root examples memorises them, so g0 stops being a descent direction the clients
+    share. Trust is ReLU(cos(delta_i, g0)), so honest clients then score cos <= 0 and
+    are DROPPED — the recorded run showed FLTrust at FPR 0.9-1.0 for whole blocks, and
+    rounds where the only accepted clients were the poisoned ones. Hence the cap."""
+    from server.algo_defender import DEFAULT_MAX_ROOT_EPOCHS, resolve_root_epochs
+
+    # null -> match the honest client's ITERATION count (not its epoch count)...
     assert resolve_root_epochs(None, root_batches=48, client_iterations=144) == 3
-    # An explicit value is always honoured, and is never allowed below 1.
+    # ...but never past the overfit ceiling.
+    assert resolve_root_epochs(None, root_batches=2, client_iterations=144) == \
+        DEFAULT_MAX_ROOT_EPOCHS
+    assert resolve_root_epochs(None, root_batches=2, client_iterations=144,
+                               max_epochs=4) == 4
+    # The cap only ever lowers the matched value, never raises it.
+    assert resolve_root_epochs(None, root_batches=48, client_iterations=144,
+                               max_epochs=999) == 3
+    # An explicit value is always honoured, is never allowed below 1, and is NOT capped
+    # (the operator asked for it).
     assert resolve_root_epochs(5, root_batches=2, client_iterations=144) == 5
     assert resolve_root_epochs(0, root_batches=2, client_iterations=144) == 1
+    assert resolve_root_epochs(70, root_batches=2, client_iterations=144,
+                               max_epochs=10) == 70
     # Unknown client cost (no loaders, e.g. a unit test) degrades to the old default.
     assert resolve_root_epochs(None, root_batches=2, client_iterations=None) == 1
     assert resolve_root_epochs(None, root_batches=0, client_iterations=144) == 1

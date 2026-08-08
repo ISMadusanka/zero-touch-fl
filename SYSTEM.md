@@ -117,11 +117,15 @@ for algorithm in defense.algorithms:            # fltrust, defl, dnc, multikrum
 - **Position is one integer**, saved in `checkpoints/rl_progress.json` next to
   `rounds_done` / `controller`, so a resume continues mid-block. Older progress
   files fall back to `rounds_done`, which counts exactly the same rounds.
-- **The attack target is pinned** (`attack.goal.target_accuracy_drop: 0.10`,
+- **The attack target is pinned** (`attack.goal.target_accuracy_drop: 0.02`,
   `sample_target_in_training: false`) so a block's rounds — and one block against
   the next — are comparable: the win gate is `win_fraction x the round's target`
   and the reward is normalized by it, so a moving target would change what
-  "success" means inside a block.
+  "success" means inside a block. The value is the **reward's scale**, not an
+  aspiration: at the old `0.10`, against 1–5 of 20 clients facing a robust
+  aggregator, the observed drops of ~0.01 mapped to ~0.1 of reward — less than the
+  collaboration bonus and only ~3x the stealth term, so the reward nominally led
+  with damage while ranking it third. Raise it back if you widen the threat model.
 - Each round log carries `attack_metadata.curriculum`
   (`algorithm`, `n_poisoners`, `cycle`, `block`, `position`, `block_round`).
 - `curriculum.enabled: false` (or no `curriculum:` block) restores the random draws.
@@ -192,13 +196,14 @@ for algorithm in defense.algorithms:            # fltrust, defl, dnc, multikrum
 Both continuous, so GRPO group advantages don't collapse.
 
 - **Attacker**: `α·drop_term(drop, target) + β·stealth − γ·malformed_frac
-  + ζ·diversity`, with `target` from the goal, `stealth` =
-  confidence-weighted evasion over the chosen clients (0 when nothing was
+  + ζ·diversity·stealth`, with `target` from the goal, `stealth` =
+  calibrated evasion over the chosen clients (`1 − p_malicious`, 0 when nothing was
   poisoned), `malformed_frac = n_malformed / n_selected` (the waste penalty,
   normalized over the clients the attacker *selected*), and
   `diversity = 1 − mean pairwise cosine` of
   the chosen clients' perturbations (the **collaboration** bonus, 0 for a single
-  client) — rewarding coordinated, distinct multi-client attacks over identical
+  client, and **gated on stealth** so a well-coordinated attack that got caught earns
+  nothing for its coordination) — rewarding coordinated, distinct multi-client attacks over identical
   Sybil-like clones. See `rl/rewards.py` (`attacker_reward`, `drop_term`,
   `perturbation_diversity`).
 
@@ -213,16 +218,38 @@ Both continuous, so GRPO group advantages don't collapse.
     and ≈0 forever after, which put the schedule's `success_streak` gate
     permanently out of reach. Against the clean counterfactual an attack that hits
     its target scores the same every time, in either retrain mode.
-  - **`drop_term(drop, target)`** is `x = drop/target` floored at `−0.5`, linear
-    up to `x = 1` (hitting the goal scores exactly 1.0), then
-    `1 + 0.5·(x−1)/(x−1+1)` — strictly increasing but asymptotic to 1.5. Same
-    range and same value at the goal as the old hard `clip(x, −0.5, 1.5)`; the
-    difference is that there is **no flat region**. The flat region was a training
-    failure: once the policy reliably overshot `1.5·target`, every rollout in a
-    GRPO group tied, the advantage spread collapsed to zero, and `grpo_step`
-    skipped the update — the attacker stopped learning exactly when it got good.
-    Saturation is fast (4× the target buys < 0.4 extra), so the objective stays
-    "hit the requested drop", not "destroy the model".
+
+    **When there is no counterfactual to measure** — the round's defense refused to
+    aggregate even the unpoisoned updates (FLTrust zeroing every trust score, DeFL
+    removing everyone in a CLP) — `clean_reference_accuracy` returns
+    `current_accuracy` as a placeholder and sets `clean_reference_measured = False`.
+    Callers must check it: `RoundContext.clean_measured` carries it to the schedule,
+    which passes `skip_update=True` to `grpo_step` so the round still advances the
+    environment but applies **no gradient**, and the round log records
+    `clean_measured: false`. Returning the fallback silently was a real training bug:
+    it is the previous round's post-attack accuracy, and when the poisoned round also
+    failed to aggregate the post accuracy was that same number, so `drop` was
+    identically `+0.0000` by construction. About a quarter of the rounds in a
+    recorded run looked like a measured "the attack achieved nothing".
+  - **`drop_term(drop, target)`** is `x = drop/target`: linear on `−0.5 ≤ x ≤ 1`
+    (hitting the goal scores exactly 1.0), then `1 + 0.5·(x−1)/(x−1+1)` above —
+    strictly increasing, asymptotic to 1.5 — and `−0.5 − 0.25·u/(u+1)` with
+    `u = −0.5 − x` below, strictly *decreasing*, asymptotic to −0.75. Same value at
+    the goal and the same linear region as the old hard `clip(x, −0.5, 1.5)`; the
+    difference is that there is **no flat region at either end**.
+
+    Flat regions are a specific training failure, because GRPO's advantage *is* the
+    within-group reward spread: once every rollout lands in the same flat region they
+    tie, the spread collapses, and `grpo_step` skips the update. The overshoot flat
+    came first — the attacker stopped learning exactly when it got good at overshooting
+    `1.5·target`. The **backfire** flat matters once `target` is small: at the
+    configured `0.02`, `x < −0.5` means "the attack made the model more than 1pp
+    *better* than the clean counterfactual", which several rounds in a recorded run
+    were well past, and every such rollout used to score exactly `−0.5`.
+
+    Both saturations are fast (4× the target buys < 0.4 extra), so the objective stays
+    "hit the requested drop", not "destroy the model", and a catastrophic backfire
+    stays bounded-bad instead of dominating.
 - **Defender** (train-time ground truth): confidence-weighted **soft-F1** vs the
   poisoned set (or `clip(TPR − λ·FPR)`). On a **clean round** (empty poisoned set
   — the attacker's plans were all no-ops) F1 is undefined and would score a

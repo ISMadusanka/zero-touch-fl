@@ -51,7 +51,7 @@ from rl.grpo import grpo_step
 from rl.policy import PolicyGenerator
 from rl.rewards import (
     DEFAULT_ADVANTAGE_STD_FLOOR, DEFAULT_MIN_REWARD_SPREAD,
-    attacker_reward, defender_reward, perturbation_diversity,
+    attacker_reward, defender_reward, goal_target, perturbation_diversity,
 )
 from rl.switch import PhaseController, SwitchConfig, committed_success
 from rl.turns import AttackerTurn, DefenderTurn
@@ -381,6 +381,15 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
             reward_cfg=k["reward_def"], opponent_temperature=k["scoring_opp_temp"],
         )
 
+    # The attacker's reward is dominated by the damage term, which is measured
+    # against the clean counterfactual. When the round's defense refused to
+    # aggregate the unpoisoned updates there is no counterfactual, so the damage
+    # term is structurally 0 for every rollout and the group would train the policy
+    # on the stealth/malformed terms alone while LOOKING like a measured round.
+    # Score the group (the environment still needs a rollout to advance) but apply
+    # no gradient. The defender's reward is detection-only, so it is unaffected.
+    unmeasured = learner == "attacker" and not getattr(ctx, "clean_measured", True)
+
     stats = grpo_step(
         state["policy"], learner, state["optimizers"][learner], turn,
         G=k["G"], kl_beta=k["kl_beta"], temperature=k["learner_temp"],
@@ -390,6 +399,9 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
         resample_temperature=k["resample_temp"],
         min_reward_spread=k["min_reward_spread"],
         advantage_std_floor=k["advantage_std_floor"],
+        skip_update=unmeasured,
+        skip_reason=(f"{env.round_defense or 'the aggregator'} produced no clean "
+                     "aggregate, so the damage term is unmeasurable" if unmeasured else ""),
     )
 
     # Advance the env with an ON-POLICY draw from the group (see _committed_index):
@@ -403,14 +415,21 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     # scored unpoisoned), so the win-gate measures the attack — not the change
     # since the previous round. See FLArmsRaceEnv.clean_reference_accuracy.
     drop = ctx.clean_accuracy - info["post_accuracy"]
-    success = committed_success(learner, drop, info["verdicts"], poisoned_ids,
-                                state["switch_cfg"], ctx.goal)
+    # An unmeasured counterfactual cannot certify a win either: the phase gate feeds
+    # ``success_streak``, and crediting a win on a round whose damage was never
+    # measured would switch phases on noise.
+    success = (not unmeasured) and committed_success(
+        learner, drop, info["verdicts"], poisoned_ids, state["switch_cfg"], ctx.goal)
+
+    # The relative damage bar this round had to clear, shared with the metrics
+    # tracker so the recorded attack_success means the same thing as the win gate.
+    success_drop = state["switch_cfg"].win_fraction * goal_target(ctx.goal)
 
     _log_round(env, ctx, info, learner, stats, state["metrics_tracker"],
                state["save_round_log"], reward_att=k["reward_att"], reward_def=k["reward_def"],
                phase_index=phase_index, phase_round=phase_round, success=success,
                best_index=best, committed_index=committed, poisoned_ids=poisoned_ids,
-               defense_algorithm=env.round_defense)
+               defense_algorithm=env.round_defense, success_drop=success_drop)
     return stats, drop, success
 
 
@@ -656,10 +675,50 @@ def _save_adapters(state):
             policy.save_adapter(name, path)
 
 
+def _warn_defense_malfunction(round_num, defense_algorithm, verdicts, poisoned_ids):
+    """Shout when the round's defense behaved in a way that invalidates the reward.
+
+    A robust aggregator that rejects the honest majority is not "a hard round for the
+    attacker" — it is a broken defense, and every quantity derived from that round is
+    meaningless: the clean counterfactual, the post-attack accuracy, the drop, the
+    reward. This went undiagnosed for a whole recorded run because the symptoms all
+    look like ordinary numbers (an accuracy, a small drop, a plausible reward).
+
+    The loudest case is a strict subset accept: FLTrust dropping all 19 honest clients
+    and keeping ONLY the poisoned one, so the "defended" aggregate is built purely
+    from the attack. See ``server.algo_defender.resolve_root_epochs`` for the cause
+    this detector was written to catch.
+    """
+    if not verdicts:
+        return
+    accepted = [v.client_id for v in verdicts if not v.is_suspicious]
+    poisoned = set(poisoned_ids or ())
+    tag = f"Round {round_num} [{defense_algorithm or 'llm'}]"
+    if not accepted:
+        logger.warning("%s: defense REJECTED ALL %d clients — no aggregate is possible "
+                       "and this round's reward carries no information",
+                       tag, len(verdicts))
+        return
+    if poisoned and set(accepted) <= poisoned:
+        logger.warning(
+            "%s: defense accepted ONLY POISONED clients (%s of %d) — the aggregate is "
+            "built entirely from the attack, so the measured drop reflects a defense "
+            "malfunction, not the attacker's skill", tag, sorted(accepted), len(verdicts))
+        return
+    honest_total = len(verdicts) - len(poisoned)
+    honest_rejected = honest_total - len([c for c in accepted if c not in poisoned])
+    if honest_total > 0 and honest_rejected > honest_total / 2:
+        logger.warning(
+            "%s: defense rejected %d of %d HONEST clients (FPR=%.2f) — a robust "
+            "aggregator dropping the honest majority indicates a misconfigured "
+            "defense, not a strong attack", tag, honest_rejected, honest_total,
+            honest_rejected / honest_total)
+
+
 def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                reward_att=None, reward_def=None, phase_index=0, phase_round=0,
                success=False, best_index=0, committed_index=0, poisoned_ids=None,
-               defense_algorithm=None):
+               defense_algorithm=None, success_drop=None):
     verdicts = info["verdicts"]
     post_acc = info["post_accuracy"]
     n_malformed = info["n_malformed"]
@@ -685,7 +744,15 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                             mode=reward_def.get("mode", "soft_f1"),
                             fpr_penalty=reward_def.get("fpr_penalty", 1.0))
 
-    metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(poisoned_ids))
+    clean_measured = bool(getattr(ctx, "clean_measured", True))
+    _warn_defense_malfunction(ctx.round_num, defense_algorithm, verdicts, poisoned_ids)
+
+    # ``clean_accuracy`` is passed only when it was really measured: the tracker
+    # derives the damage-based attack_success from it and must not treat the
+    # current-global fallback as a counterfactual.
+    metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(poisoned_ids),
+                           clean_accuracy=(ctx.clean_accuracy if clean_measured else None),
+                           success_drop=success_drop)
     save_round_log(RoundLog(
         round_num=ctx.round_num,
         attack_goal=goal,
@@ -718,6 +785,11 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             # and the visualizer report the same number the policy is trained on.
             "clean_accuracy": round(float(ctx.clean_accuracy), 6),
             "induced_drop": round(float(ctx.clean_accuracy - post_acc), 6),
+            # False = the defense produced no clean aggregate, so `clean_accuracy` is
+            # the current global's accuracy standing in for a counterfactual that does
+            # not exist and `induced_drop` is not a measurement. Slice these rounds OUT
+            # before reporting damage; the policy was not updated on them either.
+            "clean_measured": clean_measured,
             "phase_index": phase_index,
             "phase_round": phase_round,
             "learner_success": success,
@@ -738,7 +810,13 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                 "total_tokens": stats.get("total_tokens"),
                 "completion_tokens": stats.get("completion_tokens"),
                 "zero_advantage_fraction": stats["zero_advantage_fraction"],
+                # Degeneracy of the FIRST draw, before any re-roll. The field above is
+                # post-resample, so on its own it reports a healthy group for a round
+                # that only became healthy on the second attempt.
+                "zero_advantage_fraction_first_draw":
+                    stats.get("zero_advantage_fraction_first_draw"),
                 "stepped": stats.get("stepped", True),
+                "skipped_by_caller": stats.get("skipped_by_caller", False),
                 "resampled": stats.get("resampled", False),
             },
         },
@@ -750,14 +828,25 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     )
     dbg.flush()
     slot = getattr(env, "round_curriculum", None)
+    # ph / blk are "index/round" pairs, NOT decimals: `ph=0/14` is phase 0 round 14.
+    # They used to be joined with a '.', which read as a float and made `blk=1.9` ->
+    # `blk=2.0` look like a 0.1 step when it is block 1 round 9 -> block 2 round 0.
     logger.info(
-        f"Round {ctx.round_num} [learn={learner} ph={phase_index}.{phase_round} "
+        f"Round {ctx.round_num} [learn={learner} ph={phase_index}/{phase_round} "
         f"def={defense_algorithm or 'llm'} "
-        + (f"blk={slot.block}.{slot.block_round} n_pois={slot.n_poisoners} " if slot else "")
+        + (f"blk={slot.block}/{slot.block_round} n_pois={slot.n_poisoners} " if slot else "")
         + f"{'WIN' if success else '...'}]: acc {ctx.global_accuracy:.4f}->{post_acc:.4f} "
-        f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - post_acc:+.4f}) "
+        f"(clean_ref={ctx.clean_accuracy:.4f}{'' if clean_measured else '~UNMEASURED'} "
+        f"drop={ctx.clean_accuracy - post_acc:+.4f}) "
         f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} "
         f"| grpo_loss={stats['loss']:.4f} mean_r={stats['mean_reward']:.3f} "
-        f"zero_adv={stats['zero_advantage_fraction']:.2f} "
-        f"{'step' if stats.get('stepped', True) else 'SKIP'}"
+        f"spread={stats.get('reward_spread', 0.0):.3f} "
+        f"zero_adv={stats['zero_advantage_fraction']:.2f}"
+        # The first draw's degeneracy is the honest read on whether the reward still
+        # separates the policy's own samples; the field above hides a re-roll.
+        f"(first={stats.get('zero_advantage_fraction_first_draw', 0.0):.2f}) "
+        f"n_malformed={n_malformed}/{ctx.budget} "
+        + ("resampled " if stats.get("resampled") else "")
+        + ("step" if stats.get("stepped", True)
+           else ("SKIP-unmeasured" if stats.get("skipped_by_caller") else "SKIP-degenerate"))
     )

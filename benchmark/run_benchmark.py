@@ -317,10 +317,6 @@ def main():
         bias_q=float(data_cfg.get("noniid_bias", 0.5)), seed=seed,
     )
 
-    if fl.get("benign_retrain_each_round", False):
-        log.warning("benign_retrain_each_round=true: the benchmark assumes frozen benign "
-                    "replay (false). With retrain on, benign updates are retrained against a "
-                    "stale env global and the cross-defense comparison may be skewed.")
 
     # Phase-1 start state (reuse the saved honest-FedAvg checkpoint, or train fresh).
     # load_state() returns None on a partial/corrupt checkpoint, so guard the unpack.
@@ -340,6 +336,17 @@ def main():
     # Env: pure round generator (controllable pool + benign updates + build_updates).
     rng = random.Random(seed)
     env = FLArmsRaceEnv(base_cfg, client_loaders, test_loader, rng)
+    # Frozen benign replay is a BENCHMARK requirement, not a training preference, so it
+    # is pinned here rather than read from fl.benign_retrain_each_round (which training
+    # now sets to true — see configs/base.yaml). Every defense in the panel must see
+    # byte-identical benign updates in a round for "same attack to everyone" to hold,
+    # and each Defense owns its own global while the env's stays at the Phase-1 state,
+    # so retraining here would re-draw the honest updates against a stale reference for
+    # no benefit. This used to be a warning that the comparison "may be skewed".
+    if env.benign_retrain:
+        log.info("benchmark: pinning frozen benign replay (fl.benign_retrain_each_round "
+                 "is true for training, but the panel needs identical benign updates)")
+        env.benign_retrain = False
     env.reset(copy.deepcopy(global_weights), client_weights, baseline_accuracy)
 
     attack_cfg = base_cfg.get("attack", {})
@@ -406,13 +413,17 @@ def main():
         # sizes the root update to an honest client's iteration count. FLTrust rescales
         # every accepted delta to ||g0||, so R_l alone decides how far the global can
         # move per round — see server.algo_defender.resolve_root_epochs.
-        from server.algo_defender import resolve_root_epochs
+        from server.algo_defender import DEFAULT_MAX_ROOT_EPOCHS, resolve_root_epochs
+        ft_cfg = ((base_cfg.get("defense") or {}).get("fltrust") or {})
         configured = args.root_epochs
         if configured is None:
-            configured = ((base_cfg.get("defense") or {}).get("fltrust") or {}).get("root_epochs")
+            configured = ft_cfg.get("root_epochs")
         root_epochs = resolve_root_epochs(
             configured, root_batches=len(root_loader),
             client_iterations=int(fl["local_epochs"]) * len(client_loaders[0]),
+            # Same cap as training, or the FLTrust column faces a different (and
+            # in the un-capped case malfunctioning) defense than the policy trained on.
+            max_epochs=int(ft_cfg.get("max_root_epochs") or DEFAULT_MAX_ROOT_EPOCHS),
         )
         log.info(f"FLTrust root fine-tuning: root_epochs={root_epochs} over "
                  f"{len(root_loader)} batch(es) = ~{root_epochs * len(root_loader)} SGD "

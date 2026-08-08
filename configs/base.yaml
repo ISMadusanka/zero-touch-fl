@@ -10,7 +10,17 @@ fl:
                                   # its pool to poison (see attack.max_poison_clients). Kept only
                                   # as a legacy fallback for defenses that assume a #malicious.
   poison_seed: 0                  # RNG seed: non-IID partition + per-round budget sampling + repro
-  benign_retrain_each_round: false # false = benign clients replay frozen Phase-1 final-round local weights every round
+  benign_retrain_each_round: true  # true = every benign client retrains from the CURRENT global each
+                                  # round. false replays frozen Phase-1 local weights forever, which
+                                  # broke FLTrust: trust is ReLU(cos(delta_i, g0)) and a frozen
+                                  # delta points back at a stale weight vector, so as the global
+                                  # moved the honest deltas went anti-correlated with the fresh root
+                                  # direction and FLTrust DROPPED the honest majority (measured FPR
+                                  # 0.9-1.0 for whole curriculum blocks; on some rounds the only
+                                  # clients it accepted were the poisoned ones). Retraining keeps the
+                                  # honest deltas on the same descent direction the server sees. It
+                                  # costs one local-training pass per client per round, which on this
+                                  # 970-parameter model is negligible next to LLM generation.
   local_epochs: 3
   batch_size: 64
   lr: 0.002
@@ -27,8 +37,23 @@ data:
 attack:
   goal:
     type: "untargeted_degrade"    # untargeted_degrade | slow_degrade | targeted_label
-    target_accuracy_drop: 0.10    # THE training target (sample_target_in_training is off, so every
+    target_accuracy_drop: 0.02    # THE training target (sample_target_in_training is off, so every
                                   # round asks for this exact drop) and the fallback used at EVAL.
+                                  #
+                                  # This is the REWARD'S SCALE, not just an aspiration: the damage
+                                  # term is drop/target (see rl.rewards.drop_term), so the target
+                                  # decides how much reward a given drop earns. At 0.10, with
+                                  # 1-5 of 20 clients facing a robust aggregator, the observed drops
+                                  # of ~0.01 mapped to ~0.1 of reward — LESS than the collaboration
+                                  # bonus (zeta, fully controllable) and only ~3x the stealth term.
+                                  # The reward nominally led with damage (alpha 1.0) while in
+                                  # practice ranking it third, so the policy's cheapest way to score
+                                  # was to emit distinct per-client plans and ignore the model.
+                                  # At 0.02 a 1pp drop is worth 0.5 and damage leads again.
+                                  # RAISE THIS BACK if you change the threat model (more
+                                  # compromisable clients, a weaker defense) so larger drops become
+                                  # reachable — it is a scale knob, not a cap on what the attacker
+                                  # is allowed to achieve (drop_term stays monotone past 1.0).
     # per_round_drop: 0.02        # slow_degrade
     # label: 7                    # targeted_label (per-class eval is a TODO; falls back to overall)
   # --- Attack-goal target sampling (generalize instead of overfitting a single target) ---
@@ -40,9 +65,13 @@ attack:
                                   # inside the block (the win gate is win_fraction * the round's
                                   # target, and the reward is normalized by it), so block-to-block
                                   # differences were partly just which targets got drawn. Training
-                                  # now asks for goal.target_accuracy_drop (0.10) every round.
-  target_choices: [0.05, 0.10, 0.20, 0.30]  # per-round target pool — only read when
+                                  # now asks for goal.target_accuracy_drop every round.
+  target_choices: [0.01, 0.02, 0.03, 0.05]  # per-round target pool — only read when
                                   # sample_target_in_training is true (kept for that experiment).
+                                  # Scaled down with goal.target_accuracy_drop above: the old
+                                  # [0.05..0.30] pool put every draw far outside what this threat
+                                  # model can reach, so the damage term was compressed into the
+                                  # bottom tenth of its range no matter which target was drawn.
   # --- Exact client-selection quota (the attacker chooses WHICH clients) ---
   max_poison_clients: 5           # TRAINING quota cap; also the default upper end of the curriculum's
                                   # poisoner sweep (legacy key name; must be <= n_compromisable).
@@ -100,9 +129,27 @@ defense:
                                   # candidates, and ~1/4 of all rounds (FLTrust's share
                                   # of the rotation) produced no gradient at all. The
                                   # configured target drops were unreachable in
-                                  # principle. Set an integer to pin R_l explicitly.
+                                  # principle. Set an integer to pin R_l explicitly
+                                  # (an explicit value is never capped).
+    max_root_epochs: 10           # CEILING on the iteration-matched count above. Matching
+                                  # iterations un-capped asks for ~70 epochs over 100 root
+                                  # examples, which the model memorises: g0 stops being a
+                                  # descent direction the clients share and becomes a
+                                  # root-set-overfit direction of its own. Trust is
+                                  # ReLU(cos(delta_i, g0)), so honest clients then score
+                                  # cos <= 0 and get DROPPED — measured FPR 0.9-1.0 for
+                                  # whole blocks, and rounds where the ONLY clients FLTrust
+                                  # accepted were the poisoned ones (the aggregate was then
+                                  # built entirely from the attack, so the "drop" measured
+                                  # the defense malfunctioning, not the attacker). The cap
+                                  # keeps ||g0|| ~10x the root_epochs: 1 value without
+                                  # letting the reference overfit. If the aggregate still
+                                  # moves too slowly, raise `eta` — that is the paper's own
+                                  # knob for the step size — rather than this.
     root_lr: null                 # null = fl.lr
-    eta: 1.0                      # FLTrust global learning rate
+    eta: 1.0                      # FLTrust global learning rate (paper Eq. 5). This, not
+                                  # max_root_epochs, is the right knob for "the global model
+                                  # should move further per round".
   defl:
     delta: 0.05                   # CLP relative-rise threshold (paper Eq. 4)
     tau: 2.5                      # MOUD per-layer outlier z-threshold
@@ -237,9 +284,15 @@ rl:
                                   # is unknown; normally the relative win_fraction gate applies.
   win_fraction: 0.6               # "attack passed" = committed drop >= win_fraction * the round's
                                   # requested target_accuracy_drop — a RELATIVE bar, so the gate
-                                  # tracks whatever target the round asked for (0.10 by default =>
-                                  # a 0.06 drop wins) rather than one absolute floor. It also
+                                  # tracks whatever target the round asked for (0.02 by default =>
+                                  # a 0.012 drop wins) rather than one absolute floor. It also
                                   # stays correct if attack.sample_target_in_training is re-enabled.
+                                  # This same bar now defines the recorded attack_success metric
+                                  # (see rl.switch.success_drop_bar), so the headline number and
+                                  # the phase gate cannot disagree. At the old target of 0.10 the
+                                  # bar was a 0.06 drop against observed drops of ~0.01: no round
+                                  # in a 75-round recorded run cleared it, the phase never ended,
+                                  # and no honest-FL interlude ever ran.
   attacker_min_evaded: 1.0        # fraction of poisoned clients that must evade detection
   defender_min_tpr: 0.99          # defender "win": catches the poisoned client(s)...
   defender_max_fpr: 0.10          # ...without over-flagging honest clients
@@ -250,13 +303,45 @@ rl:
     attacker: "checkpoints/attacker_adapter"
     defender: "checkpoints/defender_adapter"
   reward:
+    # These weights must stay ORDERED BY THE CONTROLLABLE RANGE they buy, not just by
+    # size, or the reward's stated priority is not the one the policy optimizes. With
+    # attack.goal.target_accuracy_drop at 0.02 the damage term spans ~[-0.5, +1.5] and
+    # a 1pp drop is worth 0.5, so: damage (~1.0 controllable) > stealth (0.5) ~
+    # malformed (0.5) > collaboration (0.2). Under the old settings (target 0.10,
+    # gamma 1.0, an un-calibrated stealth term worth ~0.035 on FLTrust rounds) that
+    # order was exactly inverted — malformed 1.0 > collaboration 0.2 > damage ~0.1 >
+    # stealth ~0.035 — and the group's reward spread came almost entirely from whether
+    # a rollout emitted a parseable plan. Re-check this ordering whenever you change
+    # target_accuracy_drop.
     attacker:
       alpha: 1.0                  # weight on accuracy-drop term
-      beta: 0.5                   # weight on evasion term
-      gamma: 1.0                  # penalty for malformed weight output
-      zeta: 0.2                   # bonus for COLLABORATIVE multi-client attacks: diversity =
+      beta: 0.5                   # weight on evasion term. Now a real signal in [0, 1]:
+                                  # every defense reports a boundary-calibrated
+                                  # p_malicious (p >= 0.5 iff flagged), so 1 - p means
+                                  # "undetected" instead of "far from the cohort median".
+      gamma: 0.5                  # penalty for malformed weight output (a wasted quota
+                                  # slot now costs about what 1pp of accuracy earns). At
+                                  # 1.0 this single term was ~10x the damage spread, so
+                                  # `mean_r` landed on exact multiples of -0.25/-0.5/-0.75
+                                  # (k of G rollouts scoring the flat -1.0) and GRPO's
+                                  # advantage was dominated by JSON validity. The penalty
+                                  # is kept — unusable output must still cost — just not
+                                  # at a scale that hides the attack-quality gradient.
+      zeta: 0.2                   # bonus for COLLABORATIVE multi-client attacks:
+                                  # zeta * diversity * STEALTH, where diversity =
                                   # 1 - mean pairwise cosine of chosen clients' perturbations
                                   # (0 for a single client). Rewards distinct, coordinated roles.
+                                  # Keep this the SMALLEST term: diversity is almost free to
+                                  # maximize (emit distinct per-client plans and it goes to
+                                  # ~1.0 regardless of whether the attack works), so if it
+                                  # outranks damage it becomes the policy's shortcut. The
+                                  # stealth factor is what stops it being a flat payment for
+                                  # formatting — one recorded round collected 0.197 of it while
+                                  # every poisoned client was detected and the model got BETTER.
+                                  # It also matches why diversity is worth anything: identical
+                                  # clones are exactly what the defender's max_pairwise_cos
+                                  # feature looks for, so coordination only pays in an attack
+                                  # that survives detection.
     defender:
       mode: "soft_f1"             # soft_f1 | tpr_minus_fpr
       fpr_penalty: 1.0

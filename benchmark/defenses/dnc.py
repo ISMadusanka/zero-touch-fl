@@ -48,7 +48,9 @@ import random
 
 from core.types import DetectionVerdict
 
-from benchmark.defenses.base import Defense, StepResult, rank_normalized_scores
+from benchmark.defenses.base import (
+    Defense, StepResult, boundary_calibrated_p, selection_boundary,
+)
 
 
 def num_to_remove(c: float, m: int, n: int) -> int:
@@ -185,13 +187,20 @@ class DnC(Defense):
             # The raw spectral score is unbounded (a squared projection) and can be
             # +inf for a non-finite client, so it is NOT a probability — reporting it
             # as one saturated the attacker's stealth reward into a binary and ran
-            # backwards over the kept clients. Rank-normalize it instead; the flag is
-            # a bottom-`keep_count` slice of the same ordering, so hard and soft
-            # read-outs agree. See base.rank_normalized_scores.
-            p_mal = rank_normalized_scores(mean_scores)
+            # backwards over the kept clients.
+            #
+            # Rank-normalizing it (the previous fix) was bounded and monotone but
+            # purely RELATIVE: the ranks are a fixed 0..1 spread every round, so a
+            # client's p moved whenever OTHER clients moved and said nothing about
+            # whether it was detected. Calibrate against the real cut instead — the
+            # midpoint between the worst kept and the best removed score — so
+            # p >= 0.5 means exactly "DnC removed me". See base.boundary_calibrated_p.
+            flags = [i not in kept for i in range(n)]
+            p_mal = boundary_calibrated_p(
+                mean_scores, selection_boundary(mean_scores, kept), flags=flags)
             verdicts = [
                 DetectionVerdict(
-                    u.client_id, i not in kept,
+                    u.client_id, flags[i],
                     abs(2.0 * p_mal[i] - 1.0),
                     f"dnc {'removed' if i not in kept else 'kept'} score={mean_scores[i]:.3g}",
                     p_malicious=p_mal[i],

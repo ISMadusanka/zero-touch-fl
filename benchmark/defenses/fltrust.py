@@ -37,7 +37,7 @@ from core.types import DetectionVerdict
 from clients.benign_client import BenignClient
 from server.fed_server import FedServer
 
-from benchmark.defenses.base import Defense, StepResult
+from benchmark.defenses.base import Defense, StepResult, boundary_calibrated_p
 
 
 def _flatten(state_dict: dict, keys: list) -> "torch.Tensor":
@@ -59,32 +59,45 @@ def fltrust_combine(deltas: list, g0: "torch.Tensor"):
 
     ``deltas`` = list of per-client deltas (client weights minus current global,
     flattened); ``g0`` = the server root update (flattened). Returns
-    ``(agg, trust_scores)`` where:
+    ``(agg, trust_scores, cosines)`` where:
 
-      trust_i = ReLU( cos(delta_i, g0) )                             (Eq. 2)
+      cos_i   = cos(delta_i, g0)                                     in [-1, 1]
+      trust_i = ReLU( cos_i )                                        (Eq. 2)
       agg     = (1 / sum_j trust_j) * sum_i trust_i * (||g0||/||delta_i||) delta_i  (Eq. 3/4)
 
     ``agg`` is None when every trust score is 0 (guard against /0). Kept separate
     from ``FLTrust.step`` so the math is unit-testable in isolation.
+
+    The raw ``cosines`` are returned alongside ``trust`` because ReLU DESTROYS the
+    only information that distinguishes rejected clients from each other: every
+    client pointing away from the trusted direction — whether slightly or exactly
+    opposite — collapses to ``trust = 0``. The aggregation only needs the ReLU'd
+    value, but the calibrated ``p_malicious`` needs the signed margin, so the
+    verdicts are built from the cosine (see :meth:`FLTrust.step`).
     """
     g0_norm = g0.norm()
     trust: list[float] = []
+    cosines: list[float] = []
     agg = torch.zeros_like(g0)
     ts_sum = 0.0
     for di in deltas:
         di_norm = di.norm()
         if di_norm.item() <= 0.0 or g0_norm.item() <= 0.0:
+            # A zero-length delta (or a zero root update) has no direction at all;
+            # it is neither aligned nor opposed, so the boundary value is 0.
+            cos = 0.0
             ts = 0.0
         else:
-            cos = torch.dot(di, g0) / (di_norm * g0_norm)
-            ts = float(torch.relu(cos).item())
+            cos = float((torch.dot(di, g0) / (di_norm * g0_norm)).item())
+            ts = max(0.0, cos)
+        cosines.append(cos)
         trust.append(ts)
         if ts > 0.0 and di_norm.item() > 0.0:
             agg = agg + ts * (g0_norm / di_norm) * di      # normalize to ||g0|| then trust-weight
             ts_sum += ts
     if ts_sum > 0.0:
-        return agg / ts_sum, trust
-    return None, trust
+        return agg / ts_sum, trust, cosines
+    return None, trust, cosines
 
 
 class FLTrust(Defense):
@@ -157,24 +170,34 @@ class FLTrust(Defense):
         g0 = self._root_update(gw, gw_flat, keys)
 
         deltas = [_flatten(u.weights, keys) - gw_flat for u in updates]
-        agg, trust = fltrust_combine(deltas, g0)
+        agg, trust, cosines = fltrust_combine(deltas, g0)
 
-        # Trust is ReLU(cos) in [0, 1], so `1 - ts` is already a calibrated
-        # P(malicious): 1.0 for a client pointing away from the trusted direction
-        # (which is also exactly the drop condition), falling continuously to 0 for
-        # a client perfectly aligned with it. It goes in ``p_malicious``; the
-        # ``confidence`` slot means certainty in the VERDICT (see core.types), which
-        # for a threshold at trust<=0 is |2p - 1|. Putting the suspicion score in
-        # ``confidence`` inverted the attacker's stealth reward — see
-        # ``rl.rewards._soft_malicious_prob``.
-        verdicts = []
-        for u, ts in zip(updates, trust):
-            p_mal = max(0.0, min(1.0, 1.0 - ts))
-            verdicts.append(DetectionVerdict(
-                u.client_id, ts <= self.trust_flag_threshold,
-                abs(2.0 * p_mal - 1.0), f"trust={ts:.3f}",
-                p_malicious=p_mal,
-            ))
+        # The verdict boundary is ``trust <= trust_flag_threshold``. Because trust is
+        # ReLU(cos) and the threshold is >= 0, that is exactly ``cos <= threshold``,
+        # so the cosine is the score to calibrate against — and unlike trust it keeps
+        # a signed margin for the rejected side.
+        #
+        # ``1 - trust`` was NOT a calibrated P(malicious), which is the bug this
+        # replaces: in a small model the cosine between any single client's delta and
+        # the root update is ~0.05, so every client FLTrust happily accepted reported
+        # ``p ~ 0.95``. The attacker's stealth term (``1 - p``) was then ~0.03 whether
+        # it evaded detection or not — a dead signal worth 3% of its configured
+        # weight. ``boundary_calibrated_p`` puts 0.5 exactly on the drop condition, so
+        # accepted clients land below it and rejected ones above.
+        #
+        # ``confidence`` means certainty in the VERDICT (see core.types) = |2p - 1|.
+        flags = [ts <= self.trust_flag_threshold for ts in trust]
+        cos_threshold = max(0.0, self.trust_flag_threshold)
+        p_mals = boundary_calibrated_p(cosines, cos_threshold,
+                                       higher_is_suspicious=False, flags=flags)
+        verdicts = [
+            DetectionVerdict(
+                u.client_id, flags[i], abs(2.0 * p_mals[i] - 1.0),
+                f"trust={trust[i]:.3f} cos={cosines[i]:+.3f}",
+                p_malicious=p_mals[i],
+            )
+            for i, u in enumerate(updates)
+        ]
 
         if agg is not None:
             new_flat = gw_flat + self.eta * agg              # w <- w + eta*g (Eq. 4/5)
@@ -184,4 +207,6 @@ class FLTrust(Defense):
             new_global = None    # no trusted client this round -> keep the global (guard /0)
 
         return StepResult(new_global, verdicts,
-                          info={"g0_norm": float(g0.norm().item()), "trust_sum": sum(trust)})
+                          info={"g0_norm": float(g0.norm().item()),
+                                "trust_sum": sum(trust),
+                                "n_accepted": sum(1 for f in flags if not f)})

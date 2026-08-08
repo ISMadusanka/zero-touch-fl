@@ -83,11 +83,21 @@ def grpo_step(
     resample_temperature: float = 1.3,
     min_reward_spread: float = DEFAULT_MIN_REWARD_SPREAD,
     advantage_std_floor: float = DEFAULT_ADVANTAGE_STD_FLOOR,
+    skip_update: bool = False,
+    skip_reason: str = "",
 ) -> dict:
     """Run one GRPO update for ``adapter`` against ``turn``. Returns metrics.
 
     ``turn`` must expose ``messages() -> (system, user)`` and
     ``reward(completion_text) -> float`` (see ``rl/turns.py``).
+
+    ``skip_update`` samples and scores the group as usual but applies NO gradient.
+    The caller uses it when the round's reward is known in advance to be
+    uninformative — currently when the environment could not measure the clean
+    counterfactual, which makes the attacker's damage term structurally zero (see
+    ``rl.env.FLArmsRaceEnv.clean_reference_measured``). The rollouts are still
+    produced and scored because the caller needs one of them to advance the
+    environment, and the recorded rewards stay comparable with trainable rounds.
 
     Zero-advantage handling (the attacker-collapse guard): when every sampled
     rollout earns the same reward the within-group spread is ~0, so the
@@ -126,6 +136,12 @@ def grpo_step(
     # 3. Group-relative advantages.
     advantages, zero_frac = group_advantages(
         rewards, min_spread=min_reward_spread, std_floor=advantage_std_floor)
+    # Keep the FIRST group's verdict: ``zero_advantage_fraction`` below is
+    # overwritten by the re-roll, so on its own it reports a healthy group for a
+    # round that only became healthy on the second attempt. The rate of degenerate
+    # FIRST draws is the diagnostic that says whether the reward still separates the
+    # policy's own samples.
+    zero_frac_first = zero_frac
 
     # 3b. A degenerate (zero-spread) group gives no learning signal. Optionally
     #     re-roll once at a higher temperature to recover diversity.
@@ -150,7 +166,15 @@ def grpo_step(
     mean_r = sum(rewards) / len(rewards) if rewards else 0.0
 
     # 3c. Still degenerate → do NOT step (would only pull the adapter to base).
-    stepped = not (zero_frac >= 1.0 and skip_zero_advantage)
+    #     ``skip_update`` is the caller's own veto (an uninformative round).
+    stepped = not (zero_frac >= 1.0 and skip_zero_advantage) and not skip_update
+    if skip_update:
+        logger.warning(
+            f"GRPO[{adapter}]: update SKIPPED by the caller"
+            + (f" ({skip_reason})" if skip_reason else "")
+            + f"; {G} rollouts scored around {mean_r:.3f} for the environment only, "
+            "no gradient applied"
+        )
 
     # 4. Accumulate the GRPO loss; backward per-sample to bound memory.
     #
@@ -216,10 +240,13 @@ def grpo_step(
         "min_reward": min(rewards) if rewards else 0.0,
         "reward_spread": spread,
         "zero_advantage_fraction": zero_frac,
+        # The first draw's degeneracy, BEFORE any re-roll — see zero_frac_first.
+        "zero_advantage_fraction_first_draw": zero_frac_first,
         "rewards": rewards,
         "completions": completions,
         "advantages": advantages,
         "stepped": stepped,
+        "skipped_by_caller": bool(skip_update),
         "resampled": resampled,
         "temperature": eff_temperature,
         # Tokens the update was normalized over, and the per-rollout lengths behind
@@ -228,7 +255,7 @@ def grpo_step(
         "total_tokens": total_tokens,
         "completion_tokens": token_lengths,
     }
-    if zero_frac >= 1.0 and not stepped:
+    if zero_frac >= 1.0 and not stepped and not skip_update:
         logger.warning(
             f"GRPO[{adapter}]: degenerate group - {G} rewards span only "
             f"{spread:.4g} (< min_reward_spread={min_reward_spread:g}) around "

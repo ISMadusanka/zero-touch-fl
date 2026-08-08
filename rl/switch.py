@@ -64,6 +64,25 @@ class SwitchConfig:
         )
 
 
+def success_drop_bar(goal: dict | None, cfg: SwitchConfig | None = None) -> float:
+    """The accuracy drop this round's attack must achieve to count as a success.
+
+    ``win_fraction * goal_target(goal)`` — the same RELATIVE bar
+    :func:`attacker_succeeded` applies — falling back to the absolute
+    ``attacker_min_drop`` when the round's goal is unknown. Shared so the metrics
+    tracker's ``attack_success`` and the schedule's phase gate cannot drift apart:
+    they used to answer different questions entirely (the tracker recorded evasion,
+    ``fn > 0``, and reported a success on rounds where accuracy went UP).
+
+    ``cfg=None`` uses the dataclass defaults, which is what the evaluation and
+    baseline paths want — they have no schedule to read from.
+    """
+    cfg = cfg or SwitchConfig()
+    if goal is None:
+        return float(cfg.attacker_min_drop)
+    return float(cfg.win_fraction) * goal_target(goal)
+
+
 def _tpr_fpr(verdicts, poisoned_ids) -> tuple[float, float]:
     poisoned = set(poisoned_ids)
     tp = sum(1 for v in verdicts if v.client_id in poisoned and v.is_suspicious)
@@ -92,8 +111,7 @@ def attacker_succeeded(drop: float, verdicts, poisoned_ids, cfg: SwitchConfig,
     flagged = {v.client_id for v in verdicts if v.is_suspicious}
     evaded = sum(1 for cid in poisoned_ids if cid not in flagged)
     evaded_frac = evaded / len(poisoned_ids)
-    min_drop = (cfg.win_fraction * goal_target(goal) if goal is not None
-                else cfg.attacker_min_drop)
+    min_drop = success_drop_bar(goal, cfg)
     return evaded_frac >= cfg.attacker_min_evaded and drop >= min_drop
 
 

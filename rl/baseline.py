@@ -20,6 +20,7 @@ import torch
 
 from core.types import DetectionVerdict, RoundLog
 from rl.rewards import attacker_reward, defender_reward
+from rl.switch import success_drop_bar
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,12 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
                                 chosen_ids, verdicts, n_malformed)
         d_rew = defender_reward(verdicts, chosen_ids)
 
-        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
+        # Same damage-based success definition as training (see rl.switch).
+        metrics_tracker.update(
+            ctx.round_num, verdicts, new_acc, set(chosen_ids),
+            clean_accuracy=(ctx.clean_accuracy if ctx.clean_measured else None),
+            success_drop=success_drop_bar(ctx.goal),
+        )
         save_round_log(RoundLog(
             round_num=ctx.round_num,
             attack_goal=ctx.goal,

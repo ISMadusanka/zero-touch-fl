@@ -128,7 +128,7 @@ them, 10 at each attack strength**. Details:
   of the Phase-2 resume state in `checkpoints/rl_progress.json`, so a restart
   continues mid-block instead of rewinding to `fltrust` × 1 every time.
 - **The target drop is held fixed too** (`attack.sample_target_in_training:
-  false`, `goal.target_accuracy_drop: 0.10`). A block holds the defense and the
+  false`, `goal.target_accuracy_drop: 0.02`). A block holds the defense and the
   poisoner count fixed precisely so its 10 rounds are comparable; a target
   re-drawn each round changes what "success" means *inside* the block, since the
   win gate is `win_fraction × the round's target` and the reward is normalized by
@@ -351,11 +351,18 @@ a warning. Evaluation never samples: pick the target at the benchmark with
 Both the reward and this gate measure the committed drop against the round's
 **clean counterfactual** (the accuracy the aggregate reaches with no poison), not
 against the previous round's post-attack accuracy — see
-[`SYSTEM.md`](SYSTEM.md#verifiable-rewards-rlrewardspy). Without that, the
+[`SYSTEM.md`](SYSTEM.md#verifiable-rewards-rlrewardspy). Without that, a
 memoryless environment (`benign_retrain_each_round: false`) made a repeated,
 equally damaging attack score ≈0 from the second round on, so
 `rl.success_streak` consecutive wins were unreachable and the arms-race handoff
 never fired.
+
+A round whose defense produced no clean aggregate has **no** counterfactual to
+measure. Those rounds are marked `clean_measured: false` in the round log, are
+excluded from the damage statistics, and apply **no** gradient — the schedule passes
+`skip_update=True` to `grpo_step`. Previously the reference silently fell back to the
+current global's accuracy, which made `drop` identically `+0.0000` and indistinguishable
+from a measured "the attack achieved nothing".
 
 Benchmark a trained attacker against a specific goal (fixed for the whole run):
 

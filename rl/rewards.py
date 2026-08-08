@@ -26,34 +26,53 @@ _OVERSHOOT_BONUS = 0.5
 # "maximize damage"; strictly positive so the term never goes flat.
 _OVERSHOOT_HALF = 1.0
 
+# Where the linear region ends on the BACKFIRE side: an attack that improves the
+# model by ``0.5 * target`` scores -0.5, as it always has.
+_BACKFIRE_KNEE = -0.5
+# How much worse than the knee a catastrophic backfire can score, and how fast it
+# gets there. Mirrors the overshoot construction above (see :func:`drop_term`).
+_BACKFIRE_EXTRA = 0.25
+_BACKFIRE_HALF = 1.0
+
 
 def drop_term(drop: float, target: float) -> float:
     """Shape the achieved accuracy drop into the reward's damage term.
 
     ``x = drop / target``:
 
-    * ``x <= 1``  → ``x`` (linear up to the goal), floored at ``-0.5`` so a
-      round that *improves* the model is bounded-bad.
-    * ``x > 1``   → ``1 + 0.5·(x-1)/(x-1+1)``: strictly increasing, asymptotic to
-      ``1.5``.
+    * ``-0.5 <= x <= 1`` → ``x``: linear, and hitting the goal scores exactly 1.0.
+    * ``x > 1``          → ``1 + 0.5·(x-1)/(x-1+1)``: strictly increasing, asymptotic
+      to ``1.5``.
+    * ``x < -0.5``       → ``-0.5 - 0.25·u/(u+1)`` with ``u = -0.5 - x``: strictly
+      DEcreasing, asymptotic to ``-0.75``.
 
-    The range and the value at the target are exactly what the previous hard
-    ``clip(x, -0.5, 1.5)`` gave, so the objective ("cut accuracy by about
-    ``target``") is unchanged. What changes is that the term is now **strictly
-    monotonic above the goal instead of flat**. The flat region was a real
-    training failure: once the policy reliably overshot ``1.5·target``, every
-    rollout in a GRPO group scored an identical reward, the group's advantage
-    spread collapsed to zero, and ``grpo_step`` skipped the update — the
-    attacker stopped learning exactly when it got good. The saturation is
-    deliberately fast (half the bonus by ``x = 2``) so gross overshoot is worth
-    very little: enough to break ties, not enough to turn the goal into
-    "destroy the model".
+    The value at the target and the whole linear region are exactly what the original
+    hard ``clip(x, -0.5, 1.5)`` gave, so the objective ("cut accuracy by about
+    ``target``") is unchanged. What changes is that the term is **strictly monotonic
+    everywhere instead of flat at both ends**.
+
+    Flat regions are a specific, observed training failure, because GRPO's advantage
+    *is* the within-group reward spread: once every rollout lands in the same flat
+    region they all score identically, the spread collapses, and ``grpo_step`` skips
+    the update. The overshoot flat came first — the attacker stopped learning exactly
+    when it got good at overshooting ``1.5·target``. The backfire flat matters once
+    ``target`` is small: at ``target = 0.02`` (the configured value) ``x < -0.5`` means
+    "the attack made the model more than 1pp BETTER than the clean counterfactual",
+    which is not exotic — several rounds in a recorded run were well past it, and every
+    such rollout in a group used to score exactly ``-0.5``.
+
+    Both saturations are deliberately fast and small, so the extremes are worth just
+    enough to break ties: gross overshoot does not turn the goal into "destroy the
+    model", and a catastrophic backfire stays bounded-bad rather than dominating.
     """
     x = drop / target
-    if x <= 1.0:
-        return max(-0.5, x)
-    over = x - 1.0
-    return 1.0 + _OVERSHOOT_BONUS * over / (over + _OVERSHOOT_HALF)
+    if x > 1.0:
+        over = x - 1.0
+        return 1.0 + _OVERSHOOT_BONUS * over / (over + _OVERSHOOT_HALF)
+    if x >= _BACKFIRE_KNEE:
+        return x
+    under = _BACKFIRE_KNEE - x
+    return _BACKFIRE_KNEE - _BACKFIRE_EXTRA * under / (under + _BACKFIRE_HALF)
 
 
 def goal_target(goal: dict) -> float:
@@ -94,7 +113,7 @@ def attacker_reward(
     reward = alpha * drop_term(drop, target)
            + beta  * stealth
            - gamma * malformed_fraction
-           + zeta  * collab_bonus
+           + zeta  * diversity * stealth
 
     ``drop = reference_accuracy - post_accuracy``.
 
@@ -123,8 +142,19 @@ def attacker_reward(
     clients and wasting two is penalized twice as hard as wasting one.
 
     ``collab_bonus``
-    = ``diversity`` in [0, 1] (only when >1 client) rewards distinct, coordinated
-    per-client perturbations over identical clones — see ``perturbation_diversity``.
+    = ``diversity * stealth`` in [0, 1] (only when >1 client) rewards distinct,
+    coordinated per-client perturbations over identical clones — see
+    ``perturbation_diversity``.
+
+    The ``stealth`` factor is what keeps the bonus honest. Diversity is almost free
+    to maximize — emit a distinct plan per client and it goes to ~1.0 whether or not
+    the attack does anything — so as a standalone additive term it was a flat payment
+    for formatting. On one recorded round the attacker collected 0.197 of collaboration
+    bonus while every poisoned client was detected and the model got 0.0007 *better*;
+    that single term was most of the round's positive reward. Gating it on evasion also
+    matches the reason diversity is worth rewarding in the first place: identical clones
+    are what the defender's ``max_pairwise_cos`` feature is looking for, so coordination
+    only has value in an attack that survives detection.
     """
     target = goal_target(goal)   # shared with the schedule's relative win-gate
 
@@ -147,10 +177,12 @@ def attacker_reward(
     malformed_fraction = n_malformed / n_selected if n_selected else 0.0
 
     # Collaboration bonus: reward diverse (coordinated) multi-client attacks. Only
-    # meaningful with >1 client; `diversity` in [0, 1].
+    # meaningful with >1 client; `diversity` in [0, 1]. Scaled by stealth so a
+    # well-coordinated attack that got caught earns nothing for its coordination —
+    # see the docstring.
     collab_bonus = 0.0
     if zeta and n_used > 1 and diversity is not None:
-        collab_bonus = _clip(float(diversity), 0.0, 1.0)
+        collab_bonus = _clip(float(diversity), 0.0, 1.0) * stealth
 
     return (alpha * damage + beta * stealth - gamma * malformed_fraction
             + zeta * collab_bonus)
@@ -207,6 +239,17 @@ def _soft_malicious_prob(v: DetectionVerdict) -> float:
     intended gradient. Unbounded scores (Multi-Krum/DnC) additionally clipped to
     1.0 and collapsed ``stealth`` to a binary, destroying the within-group spread
     the continuous reward exists to provide.
+
+    Moving the score into ``p_malicious`` did not by itself fix that: a raw score in
+    the right FIELD is still a raw score. ``p_malicious`` therefore carries a
+    contract — ``p >= 0.5`` if and only if ``is_suspicious`` — enforced at the
+    producers by ``benchmark.defenses.base.boundary_calibrated_p`` and asserted for
+    every defense in ``tests/test_p_malicious_calibration.py``. Without it FLTrust
+    reported ``p ~ 0.95`` for clients it had ACCEPTED (a cosine of 0.05 is normal on a
+    small model) and DeFL reported ``p = 0.5`` for clients it had FLAGGED (its
+    adaptive threshold fires at one layer-vote out of two), so ``stealth`` was worth
+    ~0.03 of its 0.5 weight on FLTrust rounds and paid 0.25 for being caught on DeFL
+    rounds.
     """
     p = getattr(v, "p_malicious", None)
     if p is not None:
@@ -307,7 +350,7 @@ def group_advantages(
       information about how much better the winning rollout actually was. With the
       floor, advantages stay proportional to real reward differences until the
       spread is genuinely large (std > std_floor), where this reduces to standard
-      GRPO z-scoring. The attacker reward spans about [-1.8, 2.2], so a healthy
+      GRPO z-scoring. The attacker reward spans about [-1.3, 2.2], so a healthy
       group is unaffected.
 
     Pass ``min_spread=0.0, std_floor=0.0`` for textbook GRPO behaviour.

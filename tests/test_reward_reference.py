@@ -55,11 +55,12 @@ def test_reward_tracks_goal_attainment_not_round_over_round_change():
     assert abs(full - (1.0 + 0.5)) < 1e-9
 
 
-# --- 2. no flat region above the goal ---------------------------------------
+# --- 2. no flat region at EITHER end ----------------------------------------
 
-def test_drop_term_matches_old_shape_up_to_the_goal():
-    for x in (-3.0, -0.5, 0.0, 0.25, 0.5, 1.0):
-        assert abs(drop_term(x * 0.2, 0.2) - max(-0.5, x)) < 1e-9
+def test_drop_term_is_linear_through_the_whole_original_range():
+    """The linear region and the value at the goal are unchanged."""
+    for x in (-0.5, 0.0, 0.25, 0.5, 1.0):
+        assert abs(drop_term(x * 0.2, 0.2) - x) < 1e-9
 
 
 def test_drop_term_is_bounded_and_strictly_increasing_past_the_goal():
@@ -67,6 +68,75 @@ def test_drop_term_is_bounded_and_strictly_increasing_past_the_goal():
     vals = [drop_term(x * 0.2, 0.2) for x in xs]
     assert all(b > a for a, b in zip(vals, vals[1:])), vals
     assert vals[0] == 1.0 and max(vals) < 1.5
+
+
+def test_drop_term_is_bounded_and_strictly_decreasing_past_a_backfire():
+    """The mirror of the overshoot fix, and it matters at the configured target.
+
+    ``x < -0.5`` means "the attack made the model more than 0.5*target BETTER than the
+    clean counterfactual". With target 0.02 that is a 1pp improvement — several rounds
+    in a recorded run were well past it, and the old hard floor scored every one of
+    them at exactly -0.5, so a whole group of backfiring rollouts tied and GRPO skipped
+    the update.
+    """
+    xs = [-0.5, -0.75, -1.0, -2.0, -5.0, -20.0]
+    vals = [drop_term(x * 0.02, 0.02) for x in xs]
+    assert all(b < a for a, b in zip(vals, vals[1:])), vals
+    assert vals[0] == -0.5                     # the knee is exactly the old floor
+    assert min(vals) > -0.75                   # still bounded-bad, not unbounded
+
+
+def test_backfiring_group_keeps_a_learning_signal():
+    """The concrete failure the smooth floor prevents: four rollouts that all improve
+    the model must still be ORDERED, so the least-bad one is reinforced."""
+    small_goal = {"type": "untargeted_degrade", "target_accuracy_drop": 0.02}
+    posts = [0.81, 0.83, 0.86, 0.90]           # drops -0.01 / -0.03 / -0.06 / -0.10
+    rs = [attacker_reward(0.80, p, small_goal, [0], _evaded([0]), 0) for p in posts]
+    assert len(set(rs)) == len(rs), rs
+    assert all(b < a for a, b in zip(rs, rs[1:])), rs   # worse backfire -> less reward
+    _adv, zero_frac = group_advantages(rs)
+    assert zero_frac == 0.0
+
+
+# --- 2b. the collaboration bonus is not free money --------------------------
+
+def test_collaboration_bonus_requires_evading_detection():
+    """Diversity is almost free to maximize (emit distinct per-client plans and it goes
+    to ~1.0 regardless of whether the attack works), so paying for it unconditionally
+    was a reward-hacking channel: one recorded round collected 0.197 of collaboration
+    bonus while every poisoned client was detected and the model got *better*."""
+    caught = [DetectionVerdict(i, True, 1.0, "", p_malicious=1.0) for i in range(4)] + [
+        DetectionVerdict(i, False, 1.0, "", p_malicious=0.0) for i in range(4, 20)]
+    evaded = [DetectionVerdict(i, False, 1.0, "", p_malicious=0.0) for i in range(20)]
+    ids = [0, 1, 2, 3]
+
+    # Caught: the bonus is gated to zero, so diversity changes nothing.
+    r_caught_diverse = attacker_reward(0.80, 0.80, GOAL, ids, caught, 0,
+                                       zeta=0.2, diversity=1.0)
+    r_caught_clones = attacker_reward(0.80, 0.80, GOAL, ids, caught, 0,
+                                      zeta=0.2, diversity=0.0)
+    assert abs(r_caught_diverse - r_caught_clones) < 1e-9
+
+    # Evaded: coordination is worth its full weight.
+    r_evaded_diverse = attacker_reward(0.80, 0.80, GOAL, ids, evaded, 0,
+                                       zeta=0.2, diversity=1.0)
+    r_evaded_clones = attacker_reward(0.80, 0.80, GOAL, ids, evaded, 0,
+                                      zeta=0.2, diversity=0.0)
+    assert abs((r_evaded_diverse - r_evaded_clones) - 0.2) < 1e-9
+
+
+def test_collaboration_bonus_stays_the_smallest_term():
+    """It must never out-earn damage, or it becomes the policy's shortcut."""
+    goal = {"type": "untargeted_degrade", "target_accuracy_drop": 0.02}
+    evaded = [DetectionVerdict(i, False, 1.0, "", p_malicious=0.0) for i in range(20)]
+    ids = [0, 1]
+    # A realistically achievable 1pp drop...
+    damage_gain = (attacker_reward(0.80, 0.79, goal, ids, evaded, 0, zeta=0.2, diversity=0.0)
+                   - attacker_reward(0.80, 0.80, goal, ids, evaded, 0, zeta=0.2, diversity=0.0))
+    # ...versus perfect coordination on a round that did nothing.
+    collab_gain = (attacker_reward(0.80, 0.80, goal, ids, evaded, 0, zeta=0.2, diversity=1.0)
+                   - attacker_reward(0.80, 0.80, goal, ids, evaded, 0, zeta=0.2, diversity=0.0))
+    assert damage_gain > collab_gain, (damage_gain, collab_gain)
 
 
 def test_competent_group_keeps_a_learning_signal():

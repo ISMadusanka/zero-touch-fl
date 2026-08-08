@@ -42,7 +42,7 @@ class RoundContext:
     """
 
     def __init__(self, round_num, global_accuracy, pool_ids, pool_benign, budget,
-                 goal=None, clean_accuracy=None):
+                 goal=None, clean_accuracy=None, clean_measured=True):
         self.round_num = round_num
         self.global_accuracy = global_accuracy            # accuracy of the CURRENT global model
         self.pool_ids = pool_ids                          # list[int] controllable pool
@@ -54,6 +54,11 @@ class RoundContext:
         # poison. This — not ``global_accuracy`` — is what the attacker's damage
         # is measured against (see ``FLArmsRaceEnv.clean_reference_accuracy``).
         self.clean_accuracy = clean_accuracy
+        # False when the defense produced NO clean aggregate, so the counterfactual
+        # could not actually be measured and ``clean_accuracy`` is only a fallback.
+        # The attacker's damage term is meaningless on such a round — see
+        # ``FLArmsRaceEnv.clean_reference_measured``.
+        self.clean_measured = clean_measured
 
 
 class FLArmsRaceEnv:
@@ -138,6 +143,7 @@ class FLArmsRaceEnv:
         self.round_goal: dict = dict(self.goal)           # this round's (maybe sampled) goal
         self.poisoned_ids: list[int] = []                 # attacker's committed choice
         self._clean_ref_acc: float | None = None          # cached per-round clean counterfactual
+        self._clean_ref_measured: bool = False            # was that counterfactual real?
         self.round_defense: str | None = None             # this round's defense algorithm (if any)
         self.round_curriculum = None                      # this round's CurriculumSlot (if any)
 
@@ -185,6 +191,7 @@ class FLArmsRaceEnv:
         self.current_accuracy = float(state["current_accuracy"])
         self.round_index = int(state.get("round_index", self.round_index))
         self._clean_ref_acc = None        # stale: the shared model just changed
+        self._clean_ref_measured = False
         logger.info(
             f"Restored Phase-2 FL state — round_index={self.round_index}, "
             f"current_accuracy={self.current_accuracy:.4f} "
@@ -253,6 +260,7 @@ class FLArmsRaceEnv:
         self.round_goal = self._round_goal()
         self.poisoned_ids = []                            # attacker decides at commit
         self._clean_ref_acc = None                        # recomputed lazily for this round
+        self._clean_ref_measured = False
         # Fix this round's defense BEFORE anything is scored (the clean
         # counterfactual below already goes through it), so the counterfactual,
         # every rollout and the commit all face the SAME algorithm.
@@ -265,7 +273,8 @@ class FLArmsRaceEnv:
             f"defense={self.round_defense or 'llm'} "
             + (f"curriculum=block{slot.block}[{slot.block_round + 1}/"
                f"{self.curriculum.rounds_per_block}] cycle={slot.cycle} " if slot else "")
-            + f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_acc:.4f})"
+            + f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_acc:.4f}"
+            + ("" if self._clean_ref_measured else " UNMEASURED") + ")"
         )
         return RoundContext(
             round_num=round_num,
@@ -275,6 +284,7 @@ class FLArmsRaceEnv:
             budget=self.round_budget,
             goal=self.round_goal,
             clean_accuracy=clean_acc,
+            clean_measured=self._clean_ref_measured,
         )
 
     # ------------------------------------------------------------------
@@ -303,6 +313,18 @@ class FLArmsRaceEnv:
         round's algorithm too (without committing its state), so the reference is
         "what the defended aggregate scores with no poison" — the drop then
         isolates the attack rather than the defense's own cost in honest rounds.
+
+        **When the defense produces no clean aggregate at all** (FLTrust zeroing
+        every trust score, DeFL removing everyone during a CLP) there IS no
+        counterfactual to measure. This returns ``current_accuracy`` as a placeholder
+        and sets :attr:`clean_reference_measured` to False; callers must check it.
+        Silently returning ``current_accuracy`` was a real training bug: it is the
+        PREVIOUS round's post-attack accuracy — exactly the quantity this method
+        exists not to be — and when the poisoned round also produced no aggregate the
+        post accuracy was that same number, so ``drop`` was identically 0.0000 by
+        construction. About a quarter of rounds in a recorded run looked like a
+        perfectly measured "the attack achieved nothing" when in truth nothing had
+        been measured, and GRPO trained on the resulting zero damage term.
         """
         if self._clean_ref_acc is None:
             updates = self.build_updates({})
@@ -312,8 +334,29 @@ class FLArmsRaceEnv:
                 clean = [DetectionVerdict(u.client_id, False, 0.0, "clean_ref")
                          for u in updates]
                 state = self.aggregator.aggregate(updates, clean)
+            self._clean_ref_measured = state is not None
+            if state is None:
+                logger.warning(
+                    "Clean counterfactual UNMEASURABLE: %s produced no aggregate from "
+                    "the unpoisoned updates — falling back to the current global's "
+                    "accuracy (%.4f). The attacker's damage term is meaningless this "
+                    "round and no policy update will be applied.",
+                    self.round_defense or "the aggregator", self.current_accuracy,
+                )
             self._clean_ref_acc = self._eval_state(state)
         return self._clean_ref_acc
+
+    @property
+    def clean_reference_measured(self) -> bool:
+        """Did :meth:`clean_reference_accuracy` actually MEASURE the counterfactual?
+
+        False means the round's defense declined to aggregate the unpoisoned updates,
+        so the cached reference is the current global's accuracy standing in for a
+        value that does not exist. A round in that state cannot score an attack: see
+        ``rl.schedule._run_learner_round``, which skips the GRPO update rather than
+        training on a structurally-zero damage term.
+        """
+        return self._clean_ref_measured
 
     def set_committed_poison(self, chosen_ids) -> None:
         """Record which clients the attacker actually poisoned (for logs/metrics)."""
@@ -440,6 +483,7 @@ class FLArmsRaceEnv:
         # Refresh the per-client benign references the rest of Phase 2 consumes.
         self.client_weights = [copy.deepcopy(u.weights) for u in updates]
         self._clean_ref_acc = None        # stale: global + benign references just changed
+        self._clean_ref_measured = False
 
         logger.info(
             f"[FL round {round_num}] benign FedAvg over {len(updates)} clients "

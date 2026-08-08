@@ -49,6 +49,11 @@ class MetricsTracker:
         self._total_rounds = 0
         self._tp = self._fn = self._fp = self._tn = 0
         self._n_attack_successes = 0
+        self._n_evaded = 0
+        # Damage is only summed over rounds whose clean counterfactual was measurable,
+        # so an unmeasurable round does not enter the mean as a 0 drop.
+        self._measured_rounds = 0
+        self._drop_sum = 0.0
         self._final_accuracy = 0.0
 
         os.makedirs(self.output_dir, exist_ok=True)
@@ -65,10 +70,15 @@ class MetricsTracker:
         verdicts: list[DetectionVerdict],
         current_accuracy: float,
         malicious_ids: set[int],
+        clean_accuracy: float | None = None,
+        success_drop: float | None = None,
     ) -> RoundMetrics:
         """Compute and store metrics for a single round. Returns them.
 
         ``malicious_ids`` is this round's ground-truth poisoned set.
+        ``clean_accuracy`` / ``success_drop`` carry the damage measurement (see
+        :func:`metrics.compute.compute_round_metrics`); pass ``clean_accuracy=None``
+        when the round's counterfactual could not be measured.
         """
         metrics = compute_round_metrics(
             round_num=round_num,
@@ -76,6 +86,8 @@ class MetricsTracker:
             malicious_ids=set(malicious_ids),
             current_accuracy=current_accuracy,
             baseline_accuracy=self.baseline_accuracy,
+            clean_accuracy=clean_accuracy,
+            success_drop=success_drop,
         )
         self.rounds.append(metrics)
         self._total_rounds += 1
@@ -84,6 +96,10 @@ class MetricsTracker:
         self._fp += metrics.fp
         self._tn += metrics.tn
         self._n_attack_successes += int(metrics.attack_success)
+        self._n_evaded += int(metrics.evaded)
+        if metrics.induced_drop is not None:
+            self._measured_rounds += 1
+            self._drop_sum += float(metrics.induced_drop)
         self._final_accuracy = metrics.current_accuracy
         self._log_round(metrics)
         self._save_round(metrics)
@@ -104,6 +120,7 @@ class MetricsTracker:
                 attack_success_rate=0.0, tpr=0.0, fpr=0.0, recall=0.0,
                 accuracy_preservation_rate=0.0,
                 baseline_accuracy=self.baseline_accuracy, final_accuracy=0.0,
+                evasion_rate=0.0, mean_induced_drop=0.0, measured_rounds=0,
             )
 
         tp, fn, fp, tn = self._tp, self._fn, self._fp, self._tn
@@ -120,6 +137,9 @@ class MetricsTracker:
             accuracy_preservation_rate=_safe_div(final_accuracy, self.baseline_accuracy),
             baseline_accuracy=self.baseline_accuracy,
             final_accuracy=final_accuracy,
+            evasion_rate=_safe_div(self._n_evaded, total_rounds),
+            mean_induced_drop=_safe_div(self._drop_sum, self._measured_rounds),
+            measured_rounds=self._measured_rounds,
         )
 
     # ------------------------------------------------------------------
@@ -144,19 +164,29 @@ class MetricsTracker:
 
     # ------------------------------------------------------------------
     def _log_round(self, m: RoundMetrics) -> None:
+        # `success` is damage-based and `evaded` is detection-based; they are printed
+        # side by side because they answer different questions and routinely disagree.
+        drop = "n/a" if m.induced_drop is None else f"{m.induced_drop:+.4f}"
+        bar = "n/a" if m.success_drop is None else f"{m.success_drop:.4f}"
         logger.info(
             "Metrics [round=%d] tp=%d fn=%d fp=%d tn=%d | "
-            "attack_success=%s tpr=%.3f fpr=%.3f apr=%.3f (acc=%.4f / baseline=%.4f)",
+            "success=%s (drop=%s vs bar=%s) evaded=%s tpr=%.3f fpr=%.3f "
+            "apr=%.3f (acc=%.4f / baseline=%.4f)",
             m.round_num, m.tp, m.fn, m.fp, m.tn,
-            m.attack_success, m.tpr, m.fpr, m.accuracy_preservation_rate,
-            m.current_accuracy, m.baseline_accuracy,
+            m.attack_success, drop, bar, m.evaded, m.tpr, m.fpr,
+            m.accuracy_preservation_rate, m.current_accuracy, m.baseline_accuracy,
         )
 
     def _log_summary(self, agg: AggregateMetrics, out_path: str) -> None:
         logger.info("=" * 60)
         logger.info("AGGREGATE METRICS (over %d round(s))", agg.total_rounds)
         logger.info("  Confusion: TP=%d FN=%d FP=%d TN=%d", agg.tp, agg.fn, agg.fp, agg.tn)
-        logger.info("  Attack Success Rate (ASR):     %.4f", agg.attack_success_rate)
+        logger.info("  Attack Success Rate (ASR):     %.4f  (hit the damage bar)",
+                    agg.attack_success_rate)
+        logger.info("  Evasion Rate:                  %.4f  (slipped past detection)",
+                    agg.evasion_rate)
+        logger.info("  Mean Induced Drop:             %+.4f (over %d measured round(s))",
+                    agg.mean_induced_drop, agg.measured_rounds)
         logger.info("  True Positive Rate (TPR):      %.4f", agg.tpr)
         logger.info("  False Positive Rate (FPR):     %.4f", agg.fpr)
         logger.info("  Accuracy Preservation Rate:    %.4f (final=%.4f / baseline=%.4f)",

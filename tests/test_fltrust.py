@@ -29,24 +29,29 @@ def test_trust_excludes_anti_aligned_and_orthogonal():
         torch.tensor([-1.0, 0.0]),   # opposite -> cos=-1  -> ReLU 0, dropped
         torch.tensor([0.0, 3.0]),    # orthogonal -> cos=0 -> ReLU 0, dropped
     ]
-    agg, trust = fltrust_combine(deltas, g0)
+    agg, trust, cosines = fltrust_combine(deltas, g0)
     assert abs(trust[0] - 1.0) < 1e-6
     assert trust[1] == 0.0 and trust[2] == 0.0
     # only client 0 survives; normalized to ||g0||=1 -> direction [1,0]
     assert torch.allclose(agg, torch.tensor([1.0, 0.0]), atol=1e-5)
+    # The RAW cosines survive the ReLU: both dropped clients have trust 0, but they
+    # are not equally suspicious, and p_malicious needs to tell them apart.
+    assert abs(cosines[0] - 1.0) < 1e-6
+    assert abs(cosines[1] + 1.0) < 1e-6      # anti-aligned, not merely un-aligned
+    assert abs(cosines[2]) < 1e-6            # orthogonal
 
 
 def test_magnitude_attack_is_normalized_away():
     g0 = torch.tensor([1.0, 0.0])
     # huge but aligned update: trust=1 but rescaled to ||g0|| so it can't dominate
-    agg, trust = fltrust_combine([torch.tensor([1000.0, 0.0])], g0)
+    agg, trust, cosines = fltrust_combine([torch.tensor([1000.0, 0.0])], g0)
     assert abs(trust[0] - 1.0) < 1e-6
     assert torch.allclose(agg, torch.tensor([1.0, 0.0]), atol=1e-5)
 
 
 def test_all_zero_trust_returns_none():
     g0 = torch.tensor([1.0, 0.0])
-    agg, trust = fltrust_combine([torch.tensor([-1.0, 0.0]), torch.tensor([-2.0, 0.0])], g0)
+    agg, trust, cosines = fltrust_combine([torch.tensor([-1.0, 0.0]), torch.tensor([-2.0, 0.0])], g0)
     assert agg is None and trust == [0.0, 0.0]
 
 
@@ -55,7 +60,7 @@ def test_trust_weighted_average_direction():
     g0 = torch.tensor([1.0, 0.0])
     a = torch.tensor([1.0, 0.0])           # cos 1
     b = torch.tensor([1.0, 1.0])           # cos ~0.707
-    agg, trust = fltrust_combine([a, b], g0)
+    agg, trust, cosines = fltrust_combine([a, b], g0)
     assert abs(trust[0] - 1.0) < 1e-6 and abs(trust[1] - (2 ** -0.5)) < 1e-4
     # result points into the positive quadrant, dominated by client a
     assert agg[0] > agg[1] > 0

@@ -203,10 +203,14 @@ also give a softer view than the binary flag.
   that: a round the *attacker* could not produce a usable action for is dropped for
   **every** defense at once, so the panel is always compared over the same rounds
   (see [Unusable attacker rounds](#unusable-attacker-rounds---attack-retries)).
-- **Assumes `benign_retrain_each_round: false`** (the project default — frozen
-  benign replay), so the benign client updates are identical across all defenses
-  each round (the source of the "same attack to everyone" fairness). The runner
-  warns if it is `true`.
+- **Pins frozen benign replay** (`env.benign_retrain = False`) regardless of
+  `fl.benign_retrain_each_round`, so the benign client updates are identical across
+  all defenses each round — the source of the "same attack to everyone" fairness.
+  Training sets that flag to `true` (each defense there evolves one shared global, so
+  honest deltas must track it), but here every `Defense` owns its own global while the
+  env's stays at the Phase-1 state, so retraining would only re-draw the honest updates
+  against a stale reference. The runner logs when it overrides the config; it used to
+  merely warn that the comparison "may be skewed".
 - Runs in the project's native regime (5-of-5 controllable clients poisoned by default per
   `configs/base.yaml`), which keeps the LLM defender in-distribution. FLTrust
   still works here: benign client deltas point toward good weights and so align

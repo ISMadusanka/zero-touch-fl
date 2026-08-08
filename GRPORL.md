@@ -372,9 +372,31 @@ client the defense had *nearly dropped* scored as maximally stealthy: the attack
 was being trained to sit on the detection boundary. Multi-Krum/DnC scores are
 additionally unbounded (and `+inf` for a non-finite client), so clipping them
 collapsed `stealth` to a binary and destroyed the group spread the continuous
-reward exists to create. Each defense now reports a calibrated `p_malicious`
-(FLTrust `1 − trust`; DeFL `votes/L`; Multi-Krum/DnC the normalized rank from
-`benchmark.defenses.base.rank_normalized_scores`).
+reward exists to create.
+
+Moving the score into `p_malicious` did not fix that on its own — a raw score in the
+right *field* is still a raw score, and the first attempt at this shipped exactly
+that: FLTrust reported `1 − ReLU(cos)`, DeFL `votes/L`, Multi-Krum/DnC the cohort
+rank. All three fail in ways that are invisible in the logs:
+
+| defense | reported | what went wrong |
+|---|---|---|
+| FLTrust | `1 − ReLU(cos)` | Cosines are ~0.05 on a 970-parameter model, so every **accepted** client reported `p ≈ 0.95`. Stealth was ~0.03 whether the attack evaded detection or not — 3% of its configured 0.5 weight. |
+| DeFL | `votes/L` | The flag test is `votes >= threshold` with an **adaptive** threshold; on a two-layer model it settles at `votes >= 1`, so a **flagged** client reported `p = 1/2 = 0.5`. One recorded round paid `att_reward = 0.440` — the highest in the sample — for an attack that was fully detected and did no damage. |
+| Multi-Krum / DnC | cohort rank | Bounded and monotone, but the ranks are a fixed 0..1 spread every round: the mean is always ~0.5, and a client's `p` moved when *other* clients moved. It carried no information about whether this client was detected. |
+
+`p_malicious` therefore carries a **contract**, stated in `core.types.DetectionVerdict`:
+
+> `p_malicious >= 0.5` if and only if `is_suspicious`
+
+enforced at the producers by `benchmark.defenses.base.boundary_calibrated_p`, which
+maps a defense's own score to `0.5 * (1 + tanh(m / s))` where `m` is the signed
+distance past *that defense's own boundary* and `s` is the median `|m|` in the round.
+The **sign** is absolute, so the hard flag and the soft score can never disagree; the
+**magnitude** is round-relative, so the map neither saturates on scores that live at
+1e-3 nor collapses on scores that live at 1e9. `tests/test_p_malicious_calibration.py`
+asserts the contract, the reward-level consequence (evading must out-score being
+caught), and that the accepted side keeps a usable gradient, for all four defenses.
 
 **`group_advantages`** ([rl/rewards.py](rl/rewards.py)): the z-scoring from §4,
 plus the degeneracy gate and the `zero_advantage_fraction` signal.
