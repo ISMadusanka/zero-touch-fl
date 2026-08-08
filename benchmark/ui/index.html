@@ -1,0 +1,1189 @@
+<!doctype html>
+<html lang="en" data-theme="">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Targeted poisoning benchmark</title>
+<style>
+/* Palette: validated categorical slots (see dataviz/references/palette.md).
+   Light mode puts aqua/yellow/magenta below 3:1 on the surface, so every chart
+   ships direct endpoint labels AND a table twin as the required relief. */
+:root {
+  color-scheme: light;
+  --surface: #fcfcfb;
+  --page: #f9f9f7;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11,11,11,.10);
+  --wash: rgba(11,11,11,.04);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+  --good: #0ca30c; --warn: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --good-ink: #006300;
+  --radius: 10px;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --surface: #1a1a19; --page: #0d0d0d; --ink: #fff; --ink-2: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+    --border: rgba(255,255,255,.10); --wash: rgba(255,255,255,.05);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    --good-ink: #0ca30c;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface: #1a1a19; --page: #0d0d0d; --ink: #fff; --ink-2: #c3c2b7;
+  --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+  --border: rgba(255,255,255,.10); --wash: rgba(255,255,255,.05);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --good-ink: #0ca30c;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font-family: var(--font); font-size: 14px; line-height: 1.5;
+}
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -.01em; }
+h1 { font-size: 16px; }
+h2 { font-size: 14px; }
+h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+a { color: var(--s1); }
+
+/* ---------- shell ---------- */
+header {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 10px 18px; background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+header .grow { flex: 1; }
+.layout { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 18px; padding: 18px; align-items: start; }
+@media (max-width: 940px) { .layout { grid-template-columns: minmax(0,1fr); } }
+.side { position: sticky; top: 61px; display: flex; flex-direction: column; gap: 14px; }
+@media (max-width: 940px) { .side { position: static; } }
+main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px;
+}
+.card > header { position: static; padding: 0 0 10px; background: none; border: 0; }
+
+/* ---------- controls ---------- */
+label.field { display: block; margin-bottom: 14px; }
+label.field > span.lbl {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 12px; color: var(--ink-2); margin-bottom: 6px; font-weight: 500;
+}
+label.field .hint { color: var(--muted); font-weight: 400; font-size: 11px; }
+input[type=number], input[type=text], select {
+  width: 100%; padding: 7px 9px; font: inherit; color: var(--ink);
+  background: var(--page); border: 1px solid var(--border); border-radius: 8px;
+}
+input[type=range] { width: 100%; accent-color: var(--s1); }
+.chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.chip {
+  min-width: 30px; min-height: 30px; padding: 3px 8px; cursor: pointer;
+  font: inherit; font-size: 12px; font-variant-numeric: tabular-nums;
+  color: var(--ink-2); background: var(--page);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.chip:hover { background: var(--wash); }
+.chip[aria-pressed="true"] { background: var(--s1); border-color: var(--s1); color: #fff; }
+.chip.outside { border-style: dashed; }
+.chip[aria-pressed="true"].outside { background: var(--serious); border-color: var(--serious); color: #0b0b0b; }
+.chip.def { min-width: 0; }
+.chip.def[aria-pressed="true"] { color: #fff; }
+.btn {
+  padding: 9px 14px; font: inherit; font-weight: 600; cursor: pointer;
+  border-radius: 9px; border: 1px solid var(--border);
+  background: var(--page); color: var(--ink);
+}
+.btn:hover:not(:disabled) { background: var(--wash); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.primary { background: var(--s1); border-color: var(--s1); color: #fff; }
+.btn.danger { background: var(--critical); border-color: var(--critical); color: #fff; }
+.btn.ghost { padding: 5px 10px; font-weight: 500; font-size: 12px; }
+.row { display: flex; gap: 8px; align-items: center; }
+.check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink-2); margin-bottom: 7px; }
+details > summary { cursor: pointer; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+
+/* ---------- status ---------- */
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+  border-radius: 999px; font-size: 12px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--page); color: var(--ink-2);
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.pill[data-state="running"] .dot, .pill[data-state="starting"] .dot { background: var(--s1); animation: pulse 1.2s infinite; }
+.pill[data-state="done"] .dot { background: var(--good); }
+.pill[data-state="error"] .dot { background: var(--critical); }
+.pill[data-state="cancelled"] .dot { background: var(--warn); }
+@keyframes pulse { 50% { opacity: .3; } }
+.badge {
+  padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  background: var(--warn); color: #0b0b0b;
+}
+.note {
+  padding: 9px 11px; border-radius: 8px; font-size: 12px; line-height: 1.45;
+  background: var(--wash); border: 1px solid var(--border); color: var(--ink-2);
+}
+.note.bad { border-color: var(--critical); color: var(--ink); }
+.note.warn { border-color: var(--serious); }
+.cmd {
+  font-family: var(--mono); font-size: 11.5px; color: var(--ink-2);
+  background: var(--page); border: 1px solid var(--border); border-radius: 8px;
+  padding: 9px 11px; overflow-x: auto; white-space: pre; margin: 0;
+}
+
+/* ---------- progress ---------- */
+.bar { height: 5px; border-radius: 999px; background: var(--wash); overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--s1); transition: width .25s ease; }
+
+/* ---------- stat tiles ---------- */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 10px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
+.tile .k { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.tile .v { font-size: 26px; font-weight: 600; line-height: 1.15; margin-top: 4px; }
+.tile .sub { font-size: 11.5px; color: var(--ink-2); }
+.tile .v.good { color: var(--good-ink); }
+.tile .v.bad { color: var(--critical); }
+
+/* ---------- charts ---------- */
+.filterbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 14px; }
+@media (max-width: 700px) { .charts { grid-template-columns: minmax(0,1fr); } }
+.plotwrap { position: relative; }
+svg.plot { display: block; width: 100%; height: auto; overflow: visible; }
+svg.plot .gridline { stroke: var(--grid); stroke-width: 1; }
+svg.plot .axis { stroke: var(--axis); stroke-width: 1; }
+svg.plot text { fill: var(--muted); font-size: 10px; font-family: var(--font); font-variant-numeric: tabular-nums; }
+svg.plot text.endlabel { font-size: 10px; font-weight: 600; }
+svg.plot .refline { stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 5 4; fill: none; }
+svg.plot .series { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+svg.plot .crosshair { stroke: var(--ink-2); stroke-width: 1; }
+.tip {
+  /* top/left are set on hover; they must also be set HERE, or the box resolves
+     to its static position below the plot and gives the card a phantom scroll. */
+  position: absolute; top: 0; left: 0;
+  pointer-events: none; z-index: 5; min-width: 150px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; font-size: 11.5px; box-shadow: 0 6px 20px rgba(0,0,0,.14);
+  opacity: 0; transition: opacity .1s;
+}
+.tip.on { opacity: 1; }
+.tip .r { display: flex; justify-content: space-between; gap: 12px; font-variant-numeric: tabular-nums; }
+.tip .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 8px; font-size: 11.5px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 11px; height: 3px; border-radius: 2px; display: inline-block; }
+.legend i.dash { background: repeating-linear-gradient(90deg, var(--muted) 0 4px, transparent 4px 7px); }
+
+/* ---------- tables ---------- */
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+th, td { padding: 5px 9px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--border); }
+th:first-child, td:first-child { text-align: left; font-variant-numeric: normal; }
+thead th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+tbody tr:hover { background: var(--wash); }
+tr.ref td { color: var(--ink-2); font-style: italic; }
+td.tgt, th.tgt { background: var(--wash); font-weight: 600; }
+.swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; vertical-align: baseline; }
+
+/* ---------- defense cards ---------- */
+.defs { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 10px; }
+.dcard {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 11px 13px; border-left: 3px solid var(--muted); cursor: pointer; text-align: left;
+  font: inherit; color: inherit; width: 100%;
+}
+.dcard:hover { background: var(--wash); }
+.dcard[aria-pressed="true"] { outline: 2px solid var(--s1); outline-offset: -1px; }
+.dcard .top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.dcard .nm { font-weight: 600; font-size: 13px; }
+.dcard .desc { font-size: 11px; color: var(--muted); margin: 3px 0 8px; line-height: 1.35; }
+.dcard .kv { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px 8px; }
+.dcard .kv div { font-size: 11px; color: var(--muted); }
+.dcard .kv b { display: block; font-size: 14px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+.verdicts { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 9px; }
+.vc {
+  font-size: 10px; font-variant-numeric: tabular-nums; padding: 1px 5px;
+  border-radius: 4px; border: 1px solid var(--border); color: var(--ink-2);
+}
+.vc.tp { background: var(--good); color: #fff; border-color: var(--good); }
+.vc.fn { background: var(--critical); color: #fff; border-color: var(--critical); }
+.vc.fp { background: var(--warn); color: #0b0b0b; border-color: var(--warn); }
+
+/* ---------- feed & log ---------- */
+.feed, .log {
+  max-height: 320px; overflow-y: auto; font-family: var(--mono);
+  font-size: 11.5px; line-height: 1.55; background: var(--page);
+  border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
+}
+.log div { white-space: pre-wrap; word-break: break-word; color: var(--ink-2); }
+.log div.ui { color: var(--s1); }
+.log div.err { color: var(--critical); }
+.feed .ev { padding: 5px 0; border-bottom: 1px solid var(--border); }
+.feed .ev:last-child { border-bottom: 0; }
+.feed .hd { color: var(--ink); font-weight: 600; }
+.feed .ops { color: var(--muted); }
+.feed .win { color: var(--good-ink); font-weight: 600; }
+.feed .miss { color: var(--muted); }
+pre.report {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.5; overflow-x: auto;
+  background: var(--page); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px; margin: 0; color: var(--ink-2);
+}
+.hidden { display: none !important; }
+.empty { color: var(--muted); font-size: 12.5px; padding: 20px 0; text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Targeted poisoning benchmark</h1>
+  <span class="badge hidden" id="demoBadge">demo mode — synthetic numbers</span>
+  <span class="grow"></span>
+  <span class="pill" id="statusPill" data-state="idle"><span class="dot"></span><span id="statusText">idle</span></span>
+  <button class="btn ghost" id="themeBtn" title="Toggle light / dark">◐ theme</button>
+</header>
+
+<div class="layout">
+
+  <!-- ============ configuration ============ -->
+  <aside class="side">
+    <section class="card">
+      <header><h2>Run configuration</h2></header>
+
+      <label class="field">
+        <span class="lbl">Attack rounds <span class="hint" id="roundsEcho">100</span></span>
+        <input type="number" id="rounds" min="1" max="100000" value="100">
+        <input type="range" id="roundsRange" min="1" max="500" value="100" style="margin-top:6px">
+      </label>
+
+      <label class="field">
+        <span class="lbl">Compromised clients <span class="hint" id="poolHint"></span></span>
+        <div class="chips" id="clientChips"></div>
+      </label>
+
+      <label class="field">
+        <span class="lbl">Target label <span class="hint">the class to destroy</span></span>
+        <div class="chips" id="labelChips"></div>
+      </label>
+
+      <label class="field">
+        <span class="lbl">Defenses <span class="hint">fedavg is always included</span></span>
+        <div class="chips" id="defChips"></div>
+      </label>
+
+      <details>
+        <summary>Advanced</summary>
+        <label class="field">
+          <span class="lbl">Attack temperature <span class="hint">0 = deterministic</span></span>
+          <input type="number" id="temp" step="0.1" min="0" max="5" value="0.7">
+        </label>
+        <label class="field">
+          <span class="lbl">Poison budget / round <span class="hint">blank = all selected</span></span>
+          <input type="number" id="budget" min="1" placeholder="all selected">
+        </label>
+        <label class="field">
+          <span class="lbl">Output directory <span class="hint">blank = write nothing</span></span>
+          <input type="text" id="out" value="logs/targeted/benchmark" placeholder="logs/targeted/benchmark">
+        </label>
+        <label class="check"><input type="checkbox" id="noPlot"> skip the matplotlib figures</label>
+        <label class="check"><input type="checkbox" id="fresh"> force fresh Phase-1 (ignore checkpoint)</label>
+      </details>
+
+      <div class="row" style="margin-top:4px">
+        <button class="btn primary" id="runBtn">Run benchmark</button>
+        <button class="btn danger hidden" id="stopBtn">Stop</button>
+      </div>
+      <div class="note hidden" id="formNote" style="margin-top:10px"></div>
+    </section>
+
+    <section class="card">
+      <header><h3>Command</h3></header>
+      <pre class="cmd" id="cmdEcho">—</pre>
+      <p style="font-size:11px;color:var(--muted);margin:8px 0 0">
+        The UI runs exactly this. Copy it to reproduce the run in a terminal.
+      </p>
+    </section>
+  </aside>
+
+  <!-- ============ live ============ -->
+  <main>
+    <section class="card" id="progressCard">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <h2 id="progressTitle">Waiting to start</h2>
+        <span style="font-size:12px;color:var(--muted)" id="progressMeta"></span>
+      </div>
+      <div class="bar"><i id="progressBar" style="width:0%"></i></div>
+    </section>
+
+    <div class="tiles" id="tiles"></div>
+
+    <section class="card">
+      <div class="filterbar" style="margin-bottom:12px">
+        <h2>Per-round recall</h2>
+        <span class="grow" style="flex:1"></span>
+        <button class="btn ghost" id="viewChart" aria-pressed="true">Charts</button>
+        <button class="btn ghost" id="viewTable" aria-pressed="false">Table</button>
+      </div>
+
+      <div id="chartView">
+        <div class="charts">
+          <div>
+            <h3 id="tgtTitle">Target class recall — lower means the attack worked</h3>
+            <div class="plotwrap"><div id="chartTgt"></div><div class="tip" id="tipTgt"></div></div>
+            <div class="legend" id="legendTgt"></div>
+          </div>
+          <div>
+            <h3>Other classes — mean recall (should not move)</h3>
+            <div class="plotwrap"><div id="chartOth"></div><div class="tip" id="tipOth"></div></div>
+            <div class="legend" id="legendOth"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="tableView" class="hidden tablewrap"></div>
+      <p class="empty" id="chartEmpty">No rounds yet.</p>
+    </section>
+
+    <section class="card">
+      <div class="filterbar" style="margin-bottom:12px">
+        <h2>Per-class recall — <span id="focusName">—</span></h2>
+        <span style="font-size:11.5px;color:var(--muted)">click a defense below to change</span>
+      </div>
+      <div class="plotwrap"><div id="chartClasses"></div><div class="tip" id="tipClasses"></div></div>
+      <div class="legend" id="legendClasses"></div>
+      <h3 style="margin-top:16px">Who was poisoned vs who got flagged — <span id="stripName">—</span></h3>
+      <div class="plotwrap"><div id="chartStrip"></div><div class="tip" id="tipStrip"></div></div>
+      <div class="legend" id="legendStrip"></div>
+    </section>
+
+    <section class="card">
+      <header><h2>Defenses</h2></header>
+      <div class="defs" id="defCards"></div>
+    </section>
+
+    <section class="card">
+      <div class="filterbar" style="margin-bottom:10px">
+        <h2>What happened</h2>
+        <span class="grow" style="flex:1"></span>
+        <button class="btn ghost" id="tabFeed" aria-pressed="true">Round feed</button>
+        <button class="btn ghost" id="tabLog" aria-pressed="false">Process log</button>
+      </div>
+      <div class="feed" id="feed"><div class="empty">Nothing yet.</div></div>
+      <div class="log hidden" id="log"></div>
+    </section>
+
+    <section class="card hidden" id="summaryCard">
+      <header><h2>Summary</h2></header>
+      <div class="note" id="verdict" style="margin-bottom:12px"></div>
+      <div class="tablewrap" id="summaryTable"></div>
+      <h3 style="margin:18px 0 8px">Per-class recall — final model</h3>
+      <div class="tablewrap" id="finalTable"></div>
+      <details style="margin-top:16px">
+        <summary>Full text report (as the CLI prints it)</summary>
+        <pre class="report" id="reportText"></pre>
+      </details>
+    </section>
+  </main>
+</div>
+
+<script>
+"use strict";
+
+/* ============================================================================
+   Color is assigned per DEFENSE NAME, never by position in the current
+   selection: deselecting a defense must not repaint the survivors. Slots follow
+   the validated categorical order.
+   ========================================================================== */
+const SLOT = { fedavg:'--s1', oracle:'--s2', llm_defender:'--s3', fltrust:'--s4',
+               defl:'--s5', dnc:'--s6', multikrum:'--s7', ensemble:'--s8' };
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const color = name => css(SLOT[name] || '--muted');
+
+const DESC = {
+  fedavg: 'No defense — plain FedAvg. Isolates what the attack itself does.',
+  oracle: 'Perfect detection. The upper bound; should track the clean row exactly.',
+  llm_defender: 'The trained defender LLM, scoring per-layer update features.',
+  fltrust: 'Cosine trust against a clean server-side root set.',
+  defl: 'CLP relative-rise gate + MOUD per-layer outlier z-score.',
+  dnc: 'Divide-and-Conquer spectral filtering of the update matrix.',
+  multikrum: 'Krum distance scores; averages the m closest updates.',
+  ensemble: 'Majority vote across fltrust / multikrum / dnc / defl.'
+};
+
+const $ = id => document.getElementById(id);
+const fmt = (v, d=3) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : Number(v).toFixed(d);
+const pct = v => (v === null || v === undefined) ? '—' : (v*100).toFixed(v*100 >= 99.95 ? 0 : 1) + '%';
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ---------------------------------------------------------------- state --- */
+const S = {
+  meta: null, runId: 0, state: 'idle', lastSeq: 0,
+  rounds: [], clean: null, label: 0, defenses: [], start: null,
+  summary: null, focus: null, logs: [], feed: [], phase: '', error: null,
+  view: 'chart', tab: 'feed', nClients: 20
+};
+
+/* ============================================================================
+   Config form
+   ========================================================================== */
+let selClients = new Set([0]), selLabel = 0, selDefs = new Set();
+
+function chip(text, on, cls='') {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'chip ' + cls; b.textContent = text;
+  b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  return b;
+}
+
+function buildForm(meta) {
+  S.nClients = meta.n_clients;
+  const pool = new Set(meta.default_pool);
+  $('poolHint').textContent = `config pool: ${meta.default_pool.join(', ')}`;
+
+  const cc = $('clientChips'); cc.innerHTML = '';
+  for (let i = 0; i < meta.n_clients; i++) {
+    const b = chip(i, selClients.has(i), pool.has(i) ? '' : 'outside');
+    b.title = pool.has(i) ? `client ${i} — inside the config's compromisable pool`
+                          : `client ${i} — OUTSIDE fl.n_compromisable; measures generalization`;
+    b.onclick = () => {
+      if (selClients.has(i)) selClients.delete(i); else selClients.add(i);
+      if (!selClients.size) selClients.add(i);          // never allow an empty pool
+      b.setAttribute('aria-pressed', selClients.has(i) ? 'true' : 'false');
+      [...cc.children].forEach((el, k) => el.setAttribute('aria-pressed', selClients.has(k) ? 'true':'false'));
+      syncForm();
+    };
+    cc.appendChild(b);
+  }
+
+  const lc = $('labelChips'); lc.innerHTML = '';
+  for (let i = 0; i < meta.n_classes; i++) {
+    const b = chip(i, i === selLabel);
+    b.onclick = () => {
+      selLabel = i;
+      [...lc.children].forEach((el, k) => el.setAttribute('aria-pressed', k === i ? 'true':'false'));
+      syncForm();
+    };
+    lc.appendChild(b);
+  }
+
+  const dc = $('defChips'); dc.innerHTML = '';
+  selDefs = new Set(meta.default_defenses);
+  meta.defenses.forEach(name => {
+    const b = chip(name, selDefs.has(name), 'def');
+    b.title = DESC[name] || name;
+    if (selDefs.has(name)) b.style.background = b.style.borderColor = color(name);
+    b.onclick = () => {
+      if (name === 'fedavg') return;                    // always included by the CLI
+      if (selDefs.has(name)) selDefs.delete(name); else selDefs.add(name);
+      b.setAttribute('aria-pressed', selDefs.has(name) ? 'true' : 'false');
+      b.style.background = b.style.borderColor = selDefs.has(name) ? color(name) : '';
+      syncForm();
+    };
+    dc.appendChild(b);
+  });
+  syncForm();
+}
+
+function params() {
+  const out = $('out').value.trim();
+  return {
+    rounds: Number($('rounds').value) || 1,
+    label: selLabel,
+    client_ids: [...selClients].sort((a,b) => a-b),
+    defenses: ['fedavg', ...[...selDefs].filter(d => d !== 'fedavg')],
+    attack_temperature: $('temp').value,
+    poison_clients: $('budget').value.trim(),
+    out, no_plot: $('noPlot').checked, fresh: $('fresh').checked
+  };
+}
+
+function syncForm() {
+  const p = params();
+  $('roundsEcho').textContent = p.rounds + (p.rounds === 1 ? ' round' : ' rounds');
+  const q = s => /[^A-Za-z0-9_,.\/=:-]/.test(s) ? `'${s}'` : s;
+  let cmd = ['python -m benchmark.run_targeted_benchmark',
+             `--rounds ${p.rounds}`, `--label ${p.label}`,
+             `--poison-client-ids ${p.client_ids.join(',')}`,
+             `--defenses ${p.defenses.join(',')}`].join(' ');
+  if (p.poison_clients) cmd += ` --poison-clients ${p.poison_clients}`;
+  if (Number(p.attack_temperature) !== 0.7) cmd += ` --attack-temperature ${p.attack_temperature}`;
+  cmd += ` --out ${p.out ? q(p.out) : "''"}`;
+  if (p.no_plot) cmd += ' --no-plot';
+  if (p.fresh) cmd += ' --fresh';
+  $('cmdEcho').textContent = cmd;
+
+  // Warn about the two settings that make a run measure something other than
+  // what the policy was trained for.
+  const pool = new Set(S.meta ? S.meta.default_pool : [0]);
+  const outside = p.client_ids.filter(c => !pool.has(c));
+  const msgs = [];
+  if (outside.length)
+    msgs.push(`Client ${outside.join(', ')} sits outside the config's compromisable pool (${[...pool].join(', ')}). The attacker was trained as the insider on client ${[...pool][0]}, so this measures generalization, not the trained attack.`);
+  if (S.meta && S.meta.target_label_from_client !== null && S.meta.target_label_from_client !== undefined && p.label !== 0)
+    msgs.push(`Training derived its target from client ${S.meta.target_label_from_client}'s own shard (label 0 with the shipped seed). Label ${p.label} is a generalization probe.`);
+  const note = $('formNote');
+  note.className = 'note' + (msgs.length ? ' warn' : '');
+  note.classList.toggle('hidden', !msgs.length);
+  note.innerHTML = msgs.map(esc).join('<br><br>');
+}
+
+['rounds','temp','budget','out'].forEach(id => $(id).oninput = syncForm);
+$('noPlot').onchange = $('fresh').onchange = syncForm;
+$('rounds').oninput = () => { $('roundsRange').value = Math.min(500, Number($('rounds').value)||1); syncForm(); };
+$('roundsRange').oninput = () => { $('rounds').value = $('roundsRange').value; syncForm(); };
+
+/* ============================================================================
+   Charts — hand-rolled SVG, no external libraries.
+   ========================================================================== */
+const NS = 'http://www.w3.org/2000/svg';
+function el(tag, attrs = {}, text) {
+  const n = document.createElementNS(NS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+
+/**
+ * Line chart. One y-axis, always — two measures never share a plot.
+ * `series`: [{name, color, values:[y|null]}]; `x`: [round numbers].
+ * `ref`: optional {label, value} drawn as a dashed reference rule.
+ */
+function lineChart(mount, tipEl, {x, series, ref, yMin = 0, yMax = 1, yFmt = v => v.toFixed(1)}) {
+  mount.innerHTML = '';
+  if (!x.length) return;
+  const W = 560, H = 250, P = {t: 12, r: 74, b: 26, l: 38};
+  const iw = W - P.l - P.r, ih = H - P.t - P.b;
+  const svg = el('svg', {class: 'plot', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'xMidYMid meet'});
+  const sx = i => P.l + (x.length === 1 ? iw / 2 : (i / (x.length - 1)) * iw);
+  const sy = v => P.t + ih - ((v - yMin) / (yMax - yMin)) * ih;
+
+  for (let t = 0; t <= 5; t++) {
+    const v = yMin + (yMax - yMin) * t / 5, y = sy(v);
+    svg.appendChild(el('line', {class: 'gridline', x1: P.l, x2: P.l + iw, y1: y, y2: y}));
+    svg.appendChild(el('text', {x: P.l - 7, y: y + 3.5, 'text-anchor': 'end'}, yFmt(v)));
+  }
+  svg.appendChild(el('line', {class: 'axis', x1: P.l, x2: P.l + iw, y1: P.t + ih, y2: P.t + ih}));
+
+  const step = Math.max(1, Math.ceil(x.length / 8));
+  for (let i = 0; i < x.length; i += step) {
+    svg.appendChild(el('text', {x: sx(i), y: H - 8, 'text-anchor': 'middle'}, x[i]));
+  }
+  if (x.length > 1) svg.appendChild(el('text', {x: sx(x.length-1), y: H - 8, 'text-anchor': 'end'}, x[x.length-1]));
+
+  // Endpoint labels are the relief for light-mode's sub-3:1 series colors:
+  // identity is never carried by hue alone. The reference joins the same stagger
+  // pass as the series, or it lands on top of whichever series it sits nearest.
+  const ends = [];
+  if (ref !== undefined && ref !== null) {
+    svg.appendChild(el('line', {class: 'refline', x1: P.l, x2: P.l + iw, y1: sy(ref.value), y2: sy(ref.value)}));
+    ends.push({name: ref.label, color: css('--muted'), y: sy(ref.value), x: P.l + iw});
+  }
+  series.forEach(s => {
+    let d = '', pen = false;
+    s.values.forEach((v, i) => {
+      if (v === null || v === undefined) { pen = false; return; }
+      d += (pen ? 'L' : 'M') + sx(i).toFixed(1) + ',' + sy(v).toFixed(1) + ' ';
+      pen = true;
+    });
+    if (!d) return;
+    const p = el('path', {class: 'series', d}); p.setAttribute('stroke', s.color);
+    svg.appendChild(p);
+    for (let i = s.values.length - 1; i >= 0; i--) {
+      if (s.values[i] !== null && s.values[i] !== undefined) {
+        ends.push({name: s.name, color: s.color, y: sy(s.values[i]), x: sx(i)});
+        break;
+      }
+    }
+  });
+  ends.sort((a, b) => a.y - b.y);
+  let prev = -1e9;
+  ends.forEach(e => { e.ly = Math.max(e.y, prev + 11); prev = e.ly; });
+  // If the stack ran past the plot floor, slide it all up rather than letting the
+  // tail escape the chart.
+  const spill = prev - (P.t + ih);
+  if (spill > 0) ends.forEach(e => e.ly -= spill);
+  ends.forEach(e => {
+    const t = el('text', {x: P.l + iw + 6, y: e.ly + 3.5, class: 'endlabel'}, e.name);
+    t.setAttribute('fill', e.color);
+    svg.appendChild(t);
+    if (Math.abs(e.ly - e.y) > 1.5)          // leader line back to the real endpoint
+      svg.appendChild(el('line', {x1: e.x, x2: P.l + iw + 3, y1: e.y, y2: e.ly,
+                                  stroke: e.color, 'stroke-width': .7, opacity: .45}));
+  });
+
+  const cross = el('line', {class: 'crosshair', y1: P.t, y2: P.t + ih, opacity: 0});
+  svg.appendChild(cross);
+  const hit = el('rect', {x: P.l, y: P.t, width: iw, height: ih, fill: 'transparent'});
+  svg.appendChild(hit);
+  mount.appendChild(svg);
+
+  // Tooltips enhance; every value is also in the table view.
+  const move = ev => {
+    const r = svg.getBoundingClientRect();
+    const px = (ev.clientX - r.left) / r.width * W;
+    let i = x.length === 1 ? 0 : Math.round((px - P.l) / iw * (x.length - 1));
+    i = Math.max(0, Math.min(x.length - 1, i));
+    cross.setAttribute('x1', sx(i)); cross.setAttribute('x2', sx(i)); cross.setAttribute('opacity', .45);
+    tipEl.innerHTML = `<div class="r"><b>round ${x[i]}</b></div>` +
+      series.filter(s => s.values[i] !== null && s.values[i] !== undefined)
+            .sort((a, b) => b.values[i] - a.values[i])
+            .map(s => `<div class="r"><span><i class="sw" style="background:${s.color}"></i>${esc(s.name)}</span><span>${fmt(s.values[i])}</span></div>`)
+            .join('') +
+      (ref ? `<div class="r" style="color:var(--muted)"><span>${esc(ref.label)}</span><span>${fmt(ref.value)}</span></div>` : '');
+    tipEl.classList.add('on');
+    const wrap = mount.parentElement.getBoundingClientRect();
+    const left = (sx(i) / W) * wrap.width;
+    tipEl.style.left = Math.min(Math.max(0, left + 12), wrap.width - tipEl.offsetWidth - 4) + 'px';
+    tipEl.style.top = '6px';
+  };
+  hit.addEventListener('mousemove', move);
+  hit.addEventListener('mouseleave', () => { tipEl.classList.remove('on'); cross.setAttribute('opacity', 0); });
+}
+
+/** Grouped bars: clean reference vs the focused defense, one group per class. */
+function classChart(mount, tipEl, {clean, current, label, name}) {
+  mount.innerHTML = '';
+  if (!clean) return;
+  const n = clean.length, W = 700, H = 210, P = {t: 10, r: 10, b: 34, l: 38};
+  const iw = W - P.l - P.r, ih = H - P.t - P.b;
+  const svg = el('svg', {class: 'plot', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'xMidYMid meet'});
+  const gw = iw / n, bw = Math.min(20, (gw - 8) / 2);
+  const sy = v => P.t + ih - v * ih;
+
+  for (let t = 0; t <= 4; t++) {
+    const y = sy(t / 4);
+    svg.appendChild(el('line', {class: 'gridline', x1: P.l, x2: P.l + iw, y1: y, y2: y}));
+    svg.appendChild(el('text', {x: P.l - 7, y: y + 3.5, 'text-anchor': 'end'}, (t/4).toFixed(2)));
+  }
+  svg.appendChild(el('line', {class: 'axis', x1: P.l, x2: P.l + iw, y1: sy(0), y2: sy(0)}));
+
+  const cur = color(name);
+  for (let c = 0; c < n; c++) {
+    const gx = P.l + c * gw + (gw - (bw * 2 + 2)) / 2;   // 2px surface gap between fills
+    const isT = c === label;
+    if (isT) svg.appendChild(el('rect', {x: P.l + c*gw + 1, y: P.t, width: gw - 2, height: ih,
+                                         fill: css('--wash')}));
+    const bars = [{v: clean[c], x: gx, fill: css('--axis')},
+                  {v: current ? current[c] : null, x: gx + bw + 2, fill: cur}];
+    bars.forEach(b => {
+      if (b.v === null || b.v === undefined) return;
+      const h = Math.max(1, b.v * ih);
+      const r = el('rect', {x: b.x, y: sy(b.v), width: bw, height: h, rx: 4, fill: b.fill});
+      svg.appendChild(r);
+    });
+    const t = el('text', {x: P.l + c*gw + gw/2, y: H - 20, 'text-anchor': 'middle'},
+                 isT ? `★ ${c}` : String(c));
+    if (isT) t.setAttribute('fill', css('--ink'));
+    svg.appendChild(t);
+    // Only the target class is direct-labeled — a number on every bar is noise.
+    if (isT && current) {
+      const lab = el('text', {x: gx + bw + 2 + bw/2, y: Math.max(P.t + 9, sy(current[c]) - 5),
+                              'text-anchor': 'middle', class: 'endlabel'}, fmt(current[c]));
+      lab.setAttribute('fill', css('--ink'));
+      svg.appendChild(lab);
+    }
+  }
+  svg.appendChild(el('text', {x: P.l + iw/2, y: H - 4, 'text-anchor': 'middle'}, 'class'));
+  mount.appendChild(svg);
+
+  svg.addEventListener('mousemove', ev => {
+    const r = svg.getBoundingClientRect();
+    const c = Math.floor(((ev.clientX - r.left) / r.width * W - P.l) / gw);
+    if (c < 0 || c >= n) { tipEl.classList.remove('on'); return; }
+    tipEl.innerHTML = `<div class="r"><b>class ${c}${c === label ? ' — target' : ''}</b></div>` +
+      `<div class="r"><span><i class="sw" style="background:${css('--axis')}"></i>clean</span><span>${fmt(clean[c])}</span></div>` +
+      (current ? `<div class="r"><span><i class="sw" style="background:${cur}"></i>${esc(name)}</span><span>${fmt(current[c])}</span></div>` : '');
+    tipEl.classList.add('on');
+    const wrap = mount.parentElement.getBoundingClientRect();
+    const left = ((P.l + c*gw + gw/2) / W) * wrap.width;
+    tipEl.style.left = Math.min(Math.max(0, left + 10), wrap.width - tipEl.offsetWidth - 4) + 'px';
+    tipEl.style.top = '4px';
+  });
+  svg.addEventListener('mouseleave', () => tipEl.classList.remove('on'));
+}
+
+/** Per-client × per-round detection map for one defense. Status colors — the
+ *  legend spells each state out, so color never carries it alone. */
+function stripChart(mount, tipEl, {rounds, name}) {
+  mount.innerHTML = '';
+  if (!rounds.length) return;
+  const rows = new Set();
+  rounds.forEach(r => {
+    (r.poisoned || []).forEach(c => rows.add(c));
+    ((r.defenses[name] || {}).flagged || []).forEach(c => rows.add(c));
+  });
+  if (!rows.size) { mount.innerHTML = '<p class="empty">No client was poisoned or flagged yet.</p>'; return; }
+  const ids = [...rows].sort((a, b) => a - b);
+  const W = 700, P = {t: 6, r: 8, b: 24, l: 62};
+  const rh = 17, H = P.t + ids.length * rh + P.b;
+  const iw = W - P.l - P.r, cw = iw / rounds.length;
+  const svg = el('svg', {class: 'plot', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'xMidYMid meet'});
+  const C = {tp: css('--good'), fn: css('--critical'), fp: css('--warn'), tn: css('--wash')};
+
+  ids.forEach((cid, r) => {
+    const y = P.t + r * rh;
+    const t = el('text', {x: P.l - 7, y: y + rh/2 + 3.5, 'text-anchor': 'end'}, 'client ' + cid);
+    svg.appendChild(t);
+    rounds.forEach((rd, i) => {
+      const d = rd.defenses[name]; if (!d) return;
+      const isP = (rd.poisoned || []).includes(cid);
+      const isF = (d.flagged || []).includes(cid);
+      const st = isP && isF ? 'tp' : isP ? 'fn' : isF ? 'fp' : 'tn';
+      svg.appendChild(el('rect', {x: P.l + i*cw, y: y + 1.5, width: Math.max(1, cw - 1),
+                                  height: rh - 3, rx: 2, fill: C[st]}));
+    });
+  });
+  const step = Math.max(1, Math.ceil(rounds.length / 10));
+  for (let i = 0; i < rounds.length; i += step)
+    svg.appendChild(el('text', {x: P.l + i*cw + cw/2, y: H - 8, 'text-anchor': 'middle'}, rounds[i].index));
+  mount.appendChild(svg);
+
+  svg.addEventListener('mousemove', ev => {
+    const r = svg.getBoundingClientRect();
+    const i = Math.floor(((ev.clientX - r.left) / r.width * W - P.l) / cw);
+    if (i < 0 || i >= rounds.length) { tipEl.classList.remove('on'); return; }
+    const rd = rounds[i], d = rd.defenses[name] || {};
+    const missed = (rd.poisoned || []).filter(c => !(d.flagged || []).includes(c));
+    const caught = (rd.poisoned || []).filter(c => (d.flagged || []).includes(c));
+    const falses = (d.flagged || []).filter(c => !(rd.poisoned || []).includes(c));
+    tipEl.innerHTML = `<div class="r"><b>round ${rd.round}</b></div>` +
+      `<div class="r"><span>poisoned</span><span>${(rd.poisoned||[]).join(', ') || 'none'}</span></div>` +
+      `<div class="r"><span>caught</span><span>${caught.join(', ') || '—'}</span></div>` +
+      `<div class="r"><span>missed</span><span>${missed.join(', ') || '—'}</span></div>` +
+      `<div class="r"><span>false alarms</span><span>${falses.join(', ') || '—'}</span></div>`;
+    tipEl.classList.add('on');
+    const wrap = mount.parentElement.getBoundingClientRect();
+    const left = ((P.l + i*cw) / W) * wrap.width;
+    tipEl.style.left = Math.min(Math.max(0, left + 10), wrap.width - tipEl.offsetWidth - 4) + 'px';
+    tipEl.style.top = '4px';
+  });
+  svg.addEventListener('mouseleave', () => tipEl.classList.remove('on'));
+}
+
+/* ============================================================================
+   Renderers
+   ========================================================================== */
+function legend(mount, names, refLabel) {
+  mount.innerHTML = names.map(n =>
+    `<span><i style="background:${color(n)}"></i>${esc(n)}</span>`).join('') +
+    (refLabel ? `<span><i class="dash"></i>${esc(refLabel)}</span>` : '');
+}
+
+function renderCharts() {
+  const R = S.rounds;
+  $('chartEmpty').classList.toggle('hidden', R.length > 0);
+  if (!R.length) { ['chartTgt','chartOth','chartClasses','chartStrip'].forEach(i => $(i).innerHTML = ''); return; }
+  const x = R.map(r => r.index);
+  const names = S.defenses;
+  const mk = pick => names.map(n => ({
+    name: n, color: color(n),
+    values: R.map(r => { const d = r.defenses[n]; return d ? pick(d) : null; })
+  }));
+
+  const cleanTgt = S.clean ? S.clean[S.label] : null;
+  lineChart($('chartTgt'), $('tipTgt'), {
+    x, series: mk(d => d.targeted ? d.targeted.target_recall : (d.per_class ? d.per_class[S.label] : null)),
+    ref: cleanTgt === null ? null : {label: 'clean', value: cleanTgt}
+  });
+  legend($('legendTgt'), names, 'clean (unpoisoned)');
+
+  const others = S.clean
+    ? S.clean.reduce((a, v, i) => i === S.label ? a : a + v, 0) / (S.clean.length - 1) : null;
+  lineChart($('chartOth'), $('tipOth'), {
+    x, series: mk(d => d.targeted ? d.targeted.others_recall : null),
+    ref: others === null ? null : {label: 'clean', value: others},
+    yMin: 0.5, yMax: 1, yFmt: v => v.toFixed(2)
+  });
+  legend($('legendOth'), names, 'clean (unpoisoned)');
+
+  const focus = S.focus && names.includes(S.focus) ? S.focus : names[0];
+  S.focus = focus;
+  $('focusName').textContent = focus;
+  $('stripName').textContent = focus;
+  const last = R[R.length - 1].defenses[focus];
+  classChart($('chartClasses'), $('tipClasses'),
+             {clean: S.clean, current: last ? last.per_class : null, label: S.label, name: focus});
+  $('legendClasses').innerHTML =
+    `<span><i style="background:${css('--axis')}"></i>clean (unpoisoned)</span>` +
+    `<span><i style="background:${color(focus)}"></i>${esc(focus)} — round ${R[R.length-1].index}</span>` +
+    `<span style="color:var(--muted)">★ = attacked class ${S.label}</span>`;
+
+  stripChart($('chartStrip'), $('tipStrip'), {rounds: R, name: focus});
+  $('legendStrip').innerHTML =
+    `<span><i style="background:${css('--good')}"></i>poisoned → caught</span>` +
+    `<span><i style="background:${css('--critical')}"></i>poisoned → MISSED</span>` +
+    `<span><i style="background:${css('--warn')}"></i>clean → false alarm</span>` +
+    `<span><i style="background:${css('--wash')};border:1px solid var(--border)"></i>clean → ok</span>`;
+}
+
+function renderTableView() {
+  const R = S.rounds;
+  if (!R.length) { $('tableView').innerHTML = ''; return; }
+  const names = S.defenses;
+  const head = `<tr><th>round</th>${names.map(n =>
+    `<th><span class="swatch" style="background:${color(n)}"></span>${esc(n)}</th>`).join('')}</tr>`;
+  const rows = R.slice().reverse().map(r =>
+    `<tr><td>${r.index}</td>${names.map(n => {
+      const d = r.defenses[n];
+      return `<td>${d ? fmt(d.targeted ? d.targeted.target_recall : d.per_class[S.label]) : '—'}</td>`;
+    }).join('')}</tr>`).join('');
+  const ref = S.clean
+    ? `<tr class="ref"><td>clean</td>${names.map(() => `<td>${fmt(S.clean[S.label])}</td>`).join('')}</tr>` : '';
+  $('tableView').innerHTML =
+    `<p style="font-size:11.5px;color:var(--muted);margin:0 0 8px">Recall on the attacked class (${S.label}), newest first.</p>` +
+    `<table><thead>${head}</thead><tbody>${ref}${rows}</tbody></table>`;
+}
+
+function renderTiles() {
+  const R = S.rounds, last = R[R.length - 1];
+  const base = last && last.defenses.fedavg ? last.defenses.fedavg : null;
+  const t = base && base.targeted ? base.targeted : null;
+  const cleanTgt = S.clean ? S.clean[S.label] : null;
+  const tiles = [];
+
+  tiles.push({k: 'rounds done', v: R.length ? `${R.length}` : '—',
+              sub: S.start ? `of ${S.start.n_rounds}` : 'not started'});
+  tiles.push({k: `class ${S.label} recall`, v: t ? fmt(t.target_recall) : '—',
+              sub: cleanTgt !== null ? `clean ${fmt(cleanTgt)} · undefended` : 'undefended (fedavg)',
+              cls: t ? (t.target_recall < 0.5 * (cleanTgt ?? 1) ? 'bad' : '') : ''});
+  tiles.push({k: 'other classes', v: t ? fmt(t.others_recall) : '—',
+              sub: t ? `collateral ${fmt(t.collateral)} / ${fmt((S.start && S.start.goal && S.start.goal.max_collateral) || 0.05, 2)}` : 'mean recall'});
+  tiles.push({k: 'targeted success', v: base ? pct(base.targeted_success_rate) : '—',
+              sub: 'rounds the goal was met (undefended)'});
+
+  // Best defense = the one holding the target class closest to clean.
+  let best = null;
+  if (last) for (const n of S.defenses) {
+    if (n === 'fedavg' || n === 'oracle') continue;
+    const d = last.defenses[n]; if (!d || !d.targeted) continue;
+    if (!best || d.targeted.target_recall > best.v) best = {n, v: d.targeted.target_recall};
+  }
+  tiles.push({k: 'best real defense', v: best ? best.n : '—',
+              sub: best ? `class ${S.label} held at ${fmt(best.v)}` : 'needs a non-oracle defense',
+              small: true});
+
+  $('tiles').innerHTML = tiles.map(x =>
+    `<div class="tile"><div class="k">${esc(x.k)}</div>` +
+    `<div class="v ${x.cls||''}" ${x.small ? 'style="font-size:18px"' : ''}>${esc(x.v)}</div>` +
+    `<div class="sub">${esc(x.sub)}</div></div>`).join('');
+}
+
+function renderDefCards() {
+  const last = S.rounds[S.rounds.length - 1];
+  $('defCards').innerHTML = S.defenses.map(n => {
+    const d = last ? last.defenses[n] : null;
+    const t = d && d.targeted;
+    const chips = d ? (() => {
+      const pois = last.poisoned || [], fl = d.flagged || [];
+      const all = [...new Set([...pois, ...fl])].sort((a,b) => a-b);
+      if (!all.length) return '<span class="vc">no client poisoned or flagged</span>';
+      return all.map(c => {
+        const st = pois.includes(c) ? (fl.includes(c) ? 'tp' : 'fn') : 'fp';
+        const word = st === 'tp' ? 'caught' : st === 'fn' ? 'missed' : 'false alarm';
+        return `<span class="vc ${st}" title="client ${c} — ${word}">c${c} ${word}</span>`;
+      }).join('');
+    })() : '';
+    return `<button type="button" class="dcard" aria-pressed="${n === S.focus}" data-def="${esc(n)}"
+              style="border-left-color:${color(n)}">
+      <div class="top"><span class="nm">${esc(n)}</span>
+        <span style="font-size:11px;color:var(--muted)">${d ? 'acc ' + fmt(d.accuracy) : ''}</span></div>
+      <div class="desc">${esc(DESC[n] || '')}</div>
+      <div class="kv">
+        <div>detect<b>${d ? pct(d.detection_rate) : '—'}</b></div>
+        <div>FPR<b>${d ? pct(d.fpr) : '—'}</b></div>
+        <div>F1<b>${d ? fmt(d.f1, 2) : '—'}</b></div>
+        <div>class ${S.label}<b>${t ? fmt(t.target_recall) : '—'}</b></div>
+        <div>others<b>${t ? fmt(t.others_recall) : '—'}</b></div>
+        <div>tgt succ<b>${d ? pct(d.targeted_success_rate) : '—'}</b></div>
+      </div>
+      <div class="verdicts">${chips}</div>
+    </button>`;
+  }).join('');
+  $('defCards').querySelectorAll('.dcard').forEach(b => b.onclick = () => {
+    S.focus = b.dataset.def; renderDefCards(); renderCharts();
+  });
+}
+
+function renderFeed() {
+  const f = $('feed');
+  if (!S.feed.length) { f.innerHTML = '<div class="empty">Nothing yet.</div>'; return; }
+  const stick = f.scrollTop + f.clientHeight >= f.scrollHeight - 30;
+  f.innerHTML = S.feed.slice(-300).join('');
+  if (stick) f.scrollTop = f.scrollHeight;
+}
+
+function feedRound(r) {
+  const names = S.defenses;
+  const base = r.defenses.fedavg;
+  const t = base && base.targeted;
+  const pois = (r.poisoned || []);
+  const ops = (r.plan || []).flatMap(p => (p.ops || []).map(o =>
+    `${o.op}${o.rows ? ` row ${o.rows.join('/')}` : ''}${o.target ? ` on ${o.target}` : ''}` +
+    `${o.factor !== undefined ? ` ×${o.factor}` : ''}`)).slice(0, 3).join('; ');
+  const caught = names.filter(n => n !== 'fedavg' && n !== 'oracle' &&
+    pois.some(c => (r.defenses[n].flagged || []).includes(c)));
+  const missed = names.filter(n => n !== 'fedavg' && n !== 'oracle' && !caught.includes(n));
+  const hit = t && t.hit;
+  S.feed.push(
+    `<div class="ev"><span class="hd">round ${r.index}</span> ` +
+    (pois.length ? `poisoned client ${pois.join(', ')}` : `<span class="miss">no client effectively poisoned</span>`) +
+    (r.n_malformed ? ` <span class="miss">(${r.n_malformed} wasted)</span>` : '') +
+    (ops ? `<div class="ops">plan: ${esc(ops)}</div>` : '') +
+    (t ? `<div>undefended class ${S.label}: <b>${fmt(t.target_recall)}</b> ` +
+         `(others ${fmt(t.others_recall)}, collateral ${fmt(t.collateral)}) ` +
+         (hit ? `<span class="win">GOAL MET</span>` : `<span class="miss">goal not met</span>`) + `</div>` : '') +
+    `<div class="ops">caught by: ${caught.length ? esc(caught.join(', ')) : '—'} · ` +
+    `evaded: ${missed.length ? esc(missed.join(', ')) : '—'}</div></div>`);
+}
+
+function renderLog() {
+  const l = $('log');
+  const stick = l.scrollTop + l.clientHeight >= l.scrollHeight - 30;
+  l.innerHTML = S.logs.slice(-800).map(e =>
+    `<div class="${e.cls}">${esc(e.line)}</div>`).join('');
+  if (stick) l.scrollTop = l.scrollHeight;
+}
+
+const SUM_COLS = [
+  ['detection_rate', 'detect%', pct], ['fpr', 'FPR', pct], ['f1', 'F1', v => fmt(v, 2)],
+  ['target_recall_final', 'TGT final', fmt], ['target_recall_mean', 'TGT mean', fmt],
+  ['others_recall_mean', 'others mean', fmt], ['mean_collateral', 'collat', fmt],
+  ['final_accuracy', 'overall', fmt], ['attack_success_rate', 'atk thru', pct],
+  ['targeted_success_rate', 'tgt succ', pct]
+];
+
+function renderSummary(s) {
+  $('summaryCard').classList.remove('hidden');
+  $('reportText').textContent = s.report || '';
+  const L = s.target_label;
+  const base = (s.results || []).find(r => r.defense === 'fedavg');
+  if (base && base.target_recall_final !== undefined && base.target_recall_final !== null) {
+    const drop = base.target_recall_clean - base.target_recall_final;
+    const collat = base.others_recall_clean - base.others_recall_final;
+    const ok = drop >= 0.5 * Math.max(base.target_recall_clean, 1e-9) && collat <= 0.05;
+    const v = $('verdict');
+    v.className = 'note ' + (ok ? '' : 'warn');
+    v.innerHTML = `<b>${ok ? 'Targeted attack worked' : 'Targeted attack did NOT fully land'}</b>
+      (undefended / fedavg): class ${L} recall ${fmt(base.target_recall_clean)} →
+      <b>${fmt(base.target_recall_final)}</b> (lost ${fmt(drop)}); other classes
+      ${fmt(base.others_recall_clean)} → ${fmt(base.others_recall_final)} (lost ${fmt(collat)}).`;
+  }
+  $('summaryTable').innerHTML =
+    `<table><thead><tr><th>defense</th>${SUM_COLS.map(c => `<th>${esc(c[1])}</th>`).join('')}</tr></thead><tbody>` +
+    (s.results || []).map(r =>
+      `<tr><td><span class="swatch" style="background:${color(r.defense)}"></span>${esc(r.defense)}</td>` +
+      SUM_COLS.map(c => `<td>${r[c[0]] === null || r[c[0]] === undefined ? 'n/a' : c[2](r[c[0]])}</td>`).join('') +
+      `</tr>`).join('') + `</tbody></table>`;
+
+  const withClasses = (s.results || []).filter(r => r.per_class_final);
+  if (withClasses.length) {
+    const n = withClasses[0].per_class_final.length;
+    const head = `<tr><th>defense</th>${Array.from({length: n}, (_, c) =>
+      `<th class="${c === L ? 'tgt' : ''}">${c === L ? '★' + c : c}</th>`).join('')}<th>TARGET</th><th>others</th></tr>`;
+    const rowOf = (name, vals, cls='') => {
+      const oth = vals.filter((_, i) => i !== L);
+      return `<tr class="${cls}"><td>${name}</td>` +
+        vals.map((v, c) => `<td class="${c === L ? 'tgt' : ''}">${fmt(v)}</td>`).join('') +
+        `<td>${fmt(vals[L])}</td><td>${fmt(oth.reduce((a,b)=>a+b,0)/oth.length)}</td></tr>`;
+    };
+    const clean = withClasses[0].per_class_clean;
+    $('finalTable').innerHTML = `<table><thead>${head}</thead><tbody>` +
+      (clean ? rowOf('clean', clean, 'ref') : '') +
+      withClasses.map(r => rowOf(
+        `<span class="swatch" style="background:${color(r.defense)}"></span>${esc(r.defense)}`,
+        r.per_class_final)).join('') + `</tbody></table>`;
+  }
+}
+
+// Timer-throttled, deliberately NOT requestAnimationFrame: a run takes minutes
+// and the tab is often left in the background, where rAF is suspended and the
+// dashboard would silently stop updating until it is looked at again.
+let pending = false;
+function repaint() {
+  if (pending) return;
+  pending = true;
+  setTimeout(() => {
+    pending = false;
+    renderTiles();
+    if (S.view === 'chart') renderCharts(); else renderTableView();
+    renderDefCards();
+    renderFeed();
+    renderLog();
+  }, 120);
+}
+
+function setState(state, detail) {
+  S.state = state;
+  $('statusPill').dataset.state = state;
+  $('statusText').textContent = detail || state;
+  const busy = state === 'running' || state === 'starting';
+  $('runBtn').disabled = busy;
+  $('runBtn').textContent = busy ? 'Running…' : 'Run benchmark';
+  $('stopBtn').classList.toggle('hidden', !busy);
+}
+
+function setProgress() {
+  const n = S.start ? S.start.n_rounds : 0, done = S.rounds.length;
+  $('progressBar').style.width = (n ? (done / n) * 100 : 0) + '%';
+  if (S.state === 'idle') { $('progressTitle').textContent = 'Waiting to start'; $('progressMeta').textContent = ''; return; }
+  if (!S.start) {
+    $('progressTitle').textContent = S.phase || 'Starting…';
+    $('progressMeta').textContent = 'loading the model takes a while on the first run';
+    return;
+  }
+  $('progressTitle').textContent = `Round ${done} of ${n}`;
+  $('progressMeta').textContent =
+    `label ${S.start.target_label} · clients ${S.start.pool.join(', ')} · budget ${S.start.poison_budget} · ${S.start.device}`;
+}
+
+/* ============================================================================
+   Event stream
+   ========================================================================== */
+function resetRun() {
+  S.rounds = []; S.clean = null; S.summary = null; S.start = null;
+  S.feed = []; S.logs = []; S.phase = ''; S.error = null; S.focus = null;
+  $('summaryCard').classList.add('hidden');
+  repaint(); setProgress();
+}
+
+function handle(ev) {
+  S.lastSeq = Math.max(S.lastSeq, ev.seq || 0);
+  switch (ev.event) {
+    case 'run_started':
+      resetRun(); S.runId = ev.run_id;
+      $('cmdEcho').textContent = ev.command;
+      $('demoBadge').classList.toggle('hidden', !ev.demo);
+      setState('starting', 'starting');
+      S.logs.push({line: '$ ' + ev.command, cls: 'ui'});
+      break;
+    case 'phase':
+      S.phase = ev.message || ev.phase;
+      setState('running', ev.phase);
+      break;
+    case 'start':
+      S.start = ev; S.label = ev.target_label; S.defenses = ev.defenses;
+      S.focus = ev.defenses.find(d => d !== 'fedavg' && d !== 'oracle') || ev.defenses[0];
+      $('tgtTitle').textContent = `Class ${ev.target_label} recall — lower means the attack worked`;
+      setState('running', 'running');
+      break;
+    case 'clean':
+      S.clean = ev.per_class;
+      break;
+    case 'round':
+      S.rounds.push(ev); feedRound(ev);
+      break;
+    case 'summary':
+      S.summary = ev; renderSummary(ev);
+      break;
+    case 'log':
+      S.logs.push({line: ev.line, cls: ev.stream === 'ui' ? 'ui' : (/ERROR|Traceback/.test(ev.line) ? 'err' : '')});
+      break;
+    case 'error':
+      S.error = ev.message;
+      S.logs.push({line: ev.message, cls: 'err'});
+      if (ev.traceback) S.logs.push({line: ev.traceback, cls: 'err'});
+      break;
+    case 'warning':
+      S.logs.push({line: ev.message, cls: 'err'});
+      break;
+    case 'run_finished':
+      setState(ev.state, ev.state === 'done' ? 'finished' : ev.state);
+      if (ev.state === 'error' && S.error) {
+        const v = $('verdict'); v.className = 'note bad'; v.textContent = S.error;
+        $('summaryCard').classList.remove('hidden');
+      }
+      break;
+  }
+  repaint(); setProgress();
+}
+
+let es = null;
+function connect() {
+  if (es) es.close();
+  es = new EventSource('/api/stream?from=' + S.lastSeq);
+  es.onmessage = m => { try { handle(JSON.parse(m.data)); } catch (e) { console.error(e); } };
+  es.onerror = () => { es.close(); es = null; setTimeout(connect, 1500); };
+}
+
+/* ============================================================================
+   Wiring
+   ========================================================================== */
+$('runBtn').onclick = async () => {
+  setState('starting', 'starting');
+  try {
+    const res = await fetch('/api/run', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                         body: JSON.stringify(params())});
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({error: 'request failed'}));
+      const n = $('formNote'); n.className = 'note bad'; n.classList.remove('hidden');
+      n.textContent = j.error || 'could not start';
+      setState('error', 'could not start');
+    }
+  } catch (e) { setState('error', String(e)); }
+};
+$('stopBtn').onclick = () => fetch('/api/stop', {method: 'POST'});
+
+$('viewChart').onclick = () => setView('chart');
+$('viewTable').onclick = () => setView('table');
+function setView(v) {
+  S.view = v;
+  $('viewChart').setAttribute('aria-pressed', v === 'chart');
+  $('viewTable').setAttribute('aria-pressed', v === 'table');
+  $('chartView').classList.toggle('hidden', v !== 'chart');
+  $('tableView').classList.toggle('hidden', v !== 'table');
+  repaint();
+}
+$('tabFeed').onclick = () => setTab('feed');
+$('tabLog').onclick = () => setTab('log');
+function setTab(t) {
+  S.tab = t;
+  $('tabFeed').setAttribute('aria-pressed', t === 'feed');
+  $('tabLog').setAttribute('aria-pressed', t === 'log');
+  $('feed').classList.toggle('hidden', t !== 'feed');
+  $('log').classList.toggle('hidden', t !== 'log');
+}
+$('themeBtn').onclick = () => {
+  const cur = document.documentElement.dataset.theme;
+  const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+  document.documentElement.dataset.theme = cur ? (cur === 'dark' ? 'light' : 'dark') : (dark ? 'light' : 'dark');
+  repaint();
+};
+addEventListener('resize', repaint);
+
+(async function init() {
+  try {
+    const meta = await (await fetch('/api/meta')).json();
+    S.meta = meta;
+    if (meta.config_error) {
+      const n = $('formNote'); n.className = 'note bad'; n.classList.remove('hidden');
+      n.textContent = 'could not read ' + meta.config_error;
+    }
+    $('demoBadge').classList.toggle('hidden', !meta.demo);
+    selClients = new Set(meta.default_pool.length ? meta.default_pool : [0]);
+    buildForm(meta);
+    setState(meta.state === 'idle' ? 'idle' : meta.state);
+  } catch (e) {
+    document.body.insertAdjacentHTML('afterbegin',
+      `<div class="note bad" style="margin:18px">Could not reach the UI server: ${esc(e)}</div>`);
+  }
+  connect();
+  setProgress();
+})();
+</script>
+</body>
+</html>

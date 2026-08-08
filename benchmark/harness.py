@@ -22,13 +22,23 @@ from benchmark.metrics import DefenseMetrics
 logger = logging.getLogger("benchmark")
 
 
+def _notify(callback, payload) -> None:
+    """Call an optional observer without letting it break the run."""
+    if callback is None:
+        return
+    try:
+        callback(payload)
+    except Exception:                    # noqa: BLE001 - a watcher must never be fatal
+        logger.exception("benchmark observer raised; continuing the run")
+
+
 def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
                   init_global, baseline_accuracy, n_rounds, *,
                   attack_temperature: float = 0.7, max_new_tokens: int = 512,
                   device: str = "cpu", attacker_adapter: str = "attacker",
                   log_every: int = 10, target_drop: float | None = None,
                   goal: dict | None = None, win_fraction: float = 0.6,
-                  n_classes: int = 10):
+                  n_classes: int = 10, on_start=None, on_round=None):
     """Run ``n_rounds`` of attacker-vs-defenses. Returns (summaries, metrics) where
     summaries = {name: summary-dict} and metrics = {name: DefenseMetrics}.
 
@@ -40,7 +50,16 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
     (one pass, same cost as plain accuracy — see ``FedServer.evaluate_per_class``),
     so a ``targeted_label`` run can report the target class's recall against the
     other classes' for each defense. The clean per-class reference is taken from
-    round 1's clean counterfactual (``ctx.clean_eval``)."""
+    round 1's clean counterfactual (``ctx.clean_eval``).
+
+    ``on_start(clean_eval)`` and ``on_round(round_state)`` are optional observers
+    for a live watcher (``benchmark.ui``). ``on_round`` receives the round number,
+    the attacker's raw output + committed client set, and each defense's fresh
+    history entry, AFTER every defense has stepped — i.e. exactly the state the
+    end-of-run report is built from, one round at a time. They are pure
+    observers: neither return value is read, and a callback that raises is not
+    allowed to take the run down (it is logged and the run continues), because a
+    watcher is never worth losing a 100-round GPU run over."""
     if "fedavg" not in defenses:
         logger.warning("no 'fedavg' defense in the panel — the attacker's reference accuracy "
                        "will stay frozen at the clean baseline for the whole run.")
@@ -63,6 +82,7 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
                 m.set_clean_eval(clean_eval)
             logger.info("clean per-class recall: "
                         + " ".join(f"{i}={v:.3f}" for i, v in enumerate(clean_eval.per_class)))
+            _notify(on_start, clean_eval)
 
         # The trained attacker SELECTS which of its controllable pool to poison
         # (<= the eval budget) and plans ONE attack against the reference state;
@@ -97,6 +117,25 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
         # The attacker observes the undefended (no-defense) accuracy next round.
         if "fedavg" in metrics:
             reference_acc = metrics["fedavg"].last_acc
+
+        _notify(on_round, {
+            "round": ctx.round_num,
+            "index": r,
+            "n_rounds": n_rounds,
+            # Ground truth: the clients whose weights the plan actually changed.
+            # Clients the attacker selected but wasted are counted in n_malformed,
+            # not here (``AttackerAgent.select_and_apply``).
+            "poisoned": sorted(poisoned_ids),
+            "pool": list(ctx.pool_ids),
+            "budget": ctx.budget,
+            "n_malformed": _n_malformed,
+            "attack_text": text,
+            "reference_accuracy": reference_acc,
+            # Each defense's freshly appended history entry (verdicts, accuracy,
+            # per-class recall, targeted terms) plus its running summary.
+            "defenses": {n: {"last": metrics[n].history[-1], "summary": metrics[n].summary()}
+                         for n in defenses},
+        })
 
         if r == 1 or r % log_every == 0 or r == n_rounds:
             def _one(n):

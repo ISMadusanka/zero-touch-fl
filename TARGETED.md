@@ -21,6 +21,7 @@ pins the run to it, and prints it (see [§3](#which-label-derived-from-client-0s
 ```bash
 python train_targeted.py                                  # train
 python -m benchmark.run_targeted_benchmark --rounds 100    # evaluate the same label
+python -m benchmark.ui                                     # ...or evaluate from a live dashboard
 ```
 
 ---
@@ -337,6 +338,52 @@ Both are fixed for the whole run — no per-round sampling at evaluation. Other 
 flags: `--defenses`, `--rounds`, `--attack-temperature`, `--target-class-drop`,
 `--max-collateral`, `--out`, `--attacker-adapter`.
 
+`--poison-client-ids` names **which** clients the attacker controls instead of taking
+the config's insider prefix `[0 .. fl.n_compromisable)`:
+
+```bash
+python -m benchmark.run_targeted_benchmark --poison-client-ids 0,3,7 --rounds 100
+```
+
+Naming ids also sets the round budget to how many were named, unless `--poison-clients`
+narrows it. This is `fl.n_compromisable`'s *identity* knob, not its size knob: the
+trained policy is the insider on the config's client, so compromising a different one
+measures generalization the same way `--label` does. It is logged as a warning when the
+named set differs from the config's.
+
+### Watch a run in a browser
+
+```bash
+python -m benchmark.ui                    # opens http://127.0.0.1:8420
+```
+
+A local dashboard for the same command. Pick the rounds, the compromised clients (from
+the client list — client 0 by default, the config's insider) and the target label
+(0 by default, the class training derived from client 0's shard), choose the defense
+panel, and press Run. While it runs you get, per round: the target class's recall for
+every defense against the clean reference, the other classes' mean recall, the current
+per-class bar chart, a per-client caught/missed/false-alarm map, and a feed of what the
+attacker did and which defenses saw it. When it finishes, the same summary and
+per-class tables the CLI prints. Every chart has a table view, and the exact argv is
+shown so a run can be reproduced in a terminal.
+
+The UI **runs the real command** — it spawns
+`python -m benchmark.run_targeted_benchmark … --events -` and reads its structured
+event stream (`benchmark/events.py`), so it cannot drift from what the CLI does, and
+`--events` off by default leaves plain CLI output unchanged.
+
+| flag | |
+|---|---|
+| `--port` / `--host` | default `8420` on loopback |
+| `--config` | the config runs use, and where the form's defaults come from |
+| `--python` | interpreter to run the benchmark with (default: the one serving the UI) |
+| `--demo` | replay a synthetic run instead of spawning the benchmark — for checking the dashboard on a machine with no GPU, adapter or torch. The numbers are invented and the page says so |
+| `--no-browser` | don't open a browser tab |
+
+Only one run at a time (it owns the GPU); **Stop** terminates it. On a remote GPU box,
+forward the port — `ssh -L 8420:127.0.0.1:8420 <box>` — rather than binding `--host
+0.0.0.0`: the page can start processes.
+
 Check whether the single-insider policy transfers to other classes:
 
 ```bash
@@ -539,6 +586,8 @@ New:
 | `benchmark/run_targeted_benchmark.py` | evaluation entry point |
 | `benchmark/targeted_report.py` | per-class report + verdict line |
 | `benchmark/targeted_plot.py` | 4-panel targeted figure |
+| `benchmark/events.py` | opt-in per-round JSONL event stream (`--events`) |
+| `benchmark/ui/` | the live dashboard: `server.py` (stdlib HTTP + SSE), `index.html`, `demo.py` |
 | `tests/test_targeted.py` | 24 tests, CPU-only, no LLM |
 
 Modified — all additive; passing none of the new arguments reproduces the old behaviour
@@ -548,7 +597,7 @@ exactly (`tests/test_targeted.py::test_untargeted_reward_is_unchanged_by_the_new
 |---|---|
 | `core/types.py` | `ClassEval` (overall + per-class recall + support) |
 | `server/fed_server.py` | `evaluate_per_class`; `evaluate` unchanged, now sharing one pass |
-| `rl/env.py` | per-class clean counterfactual, `evaluate_updates_full`, `commit_full`, per-round label sampling |
+| `rl/env.py` | per-class clean counterfactual, `evaluate_updates_full`, `commit_full`, per-round label sampling, `pool_override` (name the compromised clients instead of taking the prefix) |
 | `rl/rewards.py` | `targeted_terms`, `goal_drop`, `goal_label`; `eta`/`clean_eval`/`post_eval` on `attacker_reward` |
 | `rl/switch.py` | collateral condition in the win-gate |
 | `rl/turns.py`, `rl/schedule.py`, `rl/inference.py`, `rl/baseline.py` | thread the per-class evals through; targeted logging |
@@ -556,7 +605,7 @@ exactly (`tests/test_targeted.py::test_untargeted_reward_is_unchanged_by_the_new
 | `agents/attacker_agent.py` | `TARGETED_SYSTEM_PROMPT`; `output_layer` + `federation` observation |
 | `storage/checkpoint.py` | `set_rl_dir` so RL artifacts stay per-experiment |
 | `main.py` | `--run-name` for log/checkpoint isolation |
-| `benchmark/metrics.py`, `benchmark/harness.py` | per-class accumulation (inert when the goal is untargeted) |
+| `benchmark/metrics.py`, `benchmark/harness.py` | per-class accumulation (inert when the goal is untargeted); optional `on_start`/`on_round` observers for a live watcher |
 
 One visible side effect on the untargeted benchmark: the per-defense per-round
 `"Global model test accuracy: …"` line is now logged at DEBUG instead of INFO, because

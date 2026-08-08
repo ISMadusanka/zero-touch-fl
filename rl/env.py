@@ -73,6 +73,12 @@ class FLArmsRaceEnv:
         # Attacker is a partial insider: it may only touch clients [0 .. n_compromisable).
         self.n_compromisable = max(1, min(
             int(fl.get("n_compromisable", self.n_clients)), self.n_clients))
+        # WHICH clients that is. ``None`` = the default prefix [0 .. n_compromisable),
+        # which is what training uses. An evaluation that wants to compromise a
+        # *named* set instead (e.g. "give the attacker clients 3 and 7") sets this to
+        # an explicit list; ``begin_round`` then exposes exactly those. Nothing else
+        # reads it, so leaving it None reproduces the previous behaviour exactly.
+        self.pool_override: list[int] | None = None
         # Per-round poison budget (max clients the attacker may poison). Training
         # randomizes it in [1, budget_cap]; eval fixes it (set sample_budget=False,
         # budget_cap=<desired>). These attributes are overridable by the benchmark.
@@ -231,7 +237,8 @@ class FLArmsRaceEnv:
         round_num = self.training_rounds + self.round_index
 
         self.honest_updates = [self._honest_update(cid) for cid in range(self.n_clients)]
-        self.pool_ids = list(range(self.n_compromisable))
+        self.pool_ids = (list(self.pool_override) if self.pool_override
+                         else list(range(self.n_compromisable)))
         self.pool_benign = {cid: self.honest_updates[cid].weights for cid in self.pool_ids}
         self.round_budget = self._round_budget()
         self.round_goal = self._round_goal()
