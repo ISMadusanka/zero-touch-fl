@@ -218,6 +218,114 @@ def plot_flagged_vs_poisoned(rounds, out_dir):
     plt.close(fig)
 
 
+def _round_confusion(r):
+    """(tp, fn, fp, tn) computed directly from a round's own
+    ``predicted_labels`` + ``poisoned_client_ids`` fields — no dependency on
+    ``metrics/summary.json``, so this always works even when that file is
+    missing or stale relative to the latest round_data. Mirrors
+    ``metrics.compute.confusion_counts`` exactly.
+    """
+    poisoned = set(r.get("poisoned_client_ids", []))
+    tp = fn = fp = tn = 0
+    for v in r.get("predicted_labels", []):
+        is_mal = v["client_id"] in poisoned
+        if is_mal and v["is_suspicious"]:
+            tp += 1
+        elif is_mal and not v["is_suspicious"]:
+            fn += 1
+        elif not is_mal and v["is_suspicious"]:
+            fp += 1
+        else:
+            tn += 1
+    return tp, fn, fp, tn
+
+
+def plot_attack_success_rate(rounds, out_dir):
+    """Cumulative attack success rate (>=1 poisoned client evaded that round),
+    computed self-contained from round_data alone."""
+    rns = [r["round_num"] for r in rounds]
+    flags = []
+    for r in rounds:
+        _, fn, _, _ = _round_confusion(r)
+        flags.append(1 if fn > 0 else 0)
+    flags = np.array(flags)
+    cum = np.cumsum(flags) / np.arange(1, len(flags) + 1)
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    apply_dark_style(ax, "Attack Success Rate (cumulative)", "Round", "ASR")
+    ax.plot(rns, cum, color=COLORS["accent2"], linewidth=2.2, label="Cumulative ASR")
+    ax.fill_between(rns, 0, cum, color=COLORS["accent2"], alpha=0.12)
+    ax.set_ylim(0, 1.05)
+    ax.text(0.99, 0.95, f"Final ASR: {cum[-1]:.3f}", transform=ax.transAxes, ha="right", va="top",
+            fontsize=12, fontweight="bold", color=COLORS["accent2"])
+    ax.legend(facecolor=COLORS["card"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "07_attack_success_rate.png"), dpi=150)
+    plt.close(fig)
+
+
+def plot_defense_success_rate(rounds, out_dir, defender_min_tpr=0.99, defender_max_fpr=0.10):
+    """Cumulative DEFENSE success rate: fraction of rounds meeting BOTH a
+    high-TPR and low-FPR bar (``rl.switch.defender_succeeded``'s own
+    criterion, same thresholds). This is a STRICTER, non-complementary notion
+    of "the defense did its job" than simply 1 - attack success rate: a round
+    with zero attack success can still fail this bar if honest clients were
+    over-flagged that round. Self-contained from round_data alone.
+    """
+    rns = [r["round_num"] for r in rounds]
+    asr_flags, def_flags = [], []
+    for r in rounds:
+        tp, fn, fp, tn = _round_confusion(r)
+        tpr = tp / (tp + fn) if (tp + fn) else 1.0
+        fpr = fp / (fp + tn) if (fp + tn) else 0.0
+        asr_flags.append(1 if fn > 0 else 0)
+        def_flags.append(1 if (tpr >= defender_min_tpr and fpr <= defender_max_fpr) else 0)
+    n = np.arange(1, len(rns) + 1)
+    asr_cum = np.cumsum(asr_flags) / n
+    def_cum = np.cumsum(def_flags) / n
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    apply_dark_style(ax, f"Defense Success Rate (TPR≥{defender_min_tpr:.2f} & FPR≤{defender_max_fpr:.2f}, cumulative)",
+                     "Round", "Rate")
+    ax.plot(rns, def_cum, color=COLORS["accent3"], linewidth=2.2, label="Cumulative Defense Success")
+    ax.plot(rns, asr_cum, color=COLORS["accent2"], linewidth=1.4, alpha=0.6, linestyle="--",
+            label="Cumulative Attack Success (for reference)")
+    ax.fill_between(rns, 0, def_cum, color=COLORS["accent3"], alpha=0.12)
+    ax.set_ylim(0, 1.05)
+    ax.text(0.99, 0.95, f"Final defense success: {def_cum[-1]:.3f}", transform=ax.transAxes,
+            ha="right", va="top", fontsize=12, fontweight="bold", color=COLORS["accent3"])
+    ax.legend(facecolor=COLORS["card"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "09_defense_success_rate.png"), dpi=150)
+    plt.close(fig)
+
+
+def plot_flagged_breakdown(rounds, out_dir):
+    """Splits 'flagged' into what actually matters: poisoned clients that GOT
+    flagged (attack caught) vs. total clients flagged including false alarms
+    (how trigger-happy the defender is) vs. ground-truth poisoned count.
+    Complements 04_flagged_vs_poisoned.png with the TP/FP breakdown that plot
+    doesn't distinguish. Self-contained from round_data alone.
+    """
+    rns = [r["round_num"] for r in rounds]
+    poisoned_ct, attack_flagged, total_flagged = [], [], []
+    for r in rounds:
+        tp, fn, fp, tn = _round_confusion(r)
+        poisoned_ct.append(tp + fn)
+        attack_flagged.append(tp)
+        total_flagged.append(tp + fp)
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    apply_dark_style(ax, "Attack Flagged vs. Defense Flagged Per Round", "Round", "Client count")
+    ax.plot(rns, poisoned_ct, color=COLORS["text_dim"], linewidth=1.2, linestyle=":",
+            label="Poisoned this round (truth)")
+    ax.plot(rns, attack_flagged, color=COLORS["accent3"], linewidth=1.8,
+            label="Attack flagged (poisoned clients caught, TP)")
+    ax.plot(rns, total_flagged, color=COLORS["accent2"], linewidth=1.4, alpha=0.85,
+            label="Defense flagged (all clients flagged, TP+FP)")
+    ax.legend(facecolor=COLORS["card"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "10_flagged_breakdown.png"), dpi=150)
+    plt.close(fig)
+
+
 # ─── Metric charts (from summary.json per_round) ──────────────────────────────
 def _metric_series(rounds, key):
     rns, vals = [], []
@@ -270,25 +378,6 @@ def plot_detection_rates(rounds, out_dir):
     ax.legend(facecolor=COLORS["card"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=10)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "06_detection_rates.png"), dpi=150)
-    plt.close(fig)
-
-
-def plot_attack_success_rate(rounds, out_dir):
-    rns, flags = _metric_series(rounds, "attack_success")
-    if not rns:
-        return
-    flags = np.array([1 if x else 0 for x in flags])
-    cum = np.cumsum(flags) / np.arange(1, len(flags) + 1)
-    fig, ax = plt.subplots(figsize=(12, 4.5))
-    apply_dark_style(ax, "Attack Success Rate (cumulative)", "Round", "ASR")
-    ax.plot(rns, cum, color=COLORS["accent2"], linewidth=2.2, label="Cumulative ASR")
-    ax.fill_between(rns, 0, cum, color=COLORS["accent2"], alpha=0.12)
-    ax.set_ylim(0, 1.05)
-    ax.text(0.99, 0.95, f"Final ASR: {cum[-1]:.3f}", transform=ax.transAxes, ha="right", va="top",
-            fontsize=12, fontweight="bold", color=COLORS["accent2"])
-    ax.legend(facecolor=COLORS["card"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=9)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "07_attack_success_rate.png"), dpi=150)
     plt.close(fig)
 
 
@@ -402,13 +491,19 @@ def main():
     plot_verdicts_heatmap(rounds, args.out_dir); print("  ✓ 03_verdicts_heatmap.png")
     plot_flagged_vs_poisoned(rounds, args.out_dir); print("  ✓ 04_flagged_vs_poisoned.png")
 
+    # Self-contained (derived directly from round_data alone, no metrics/summary.json
+    # dependency), so these always generate even when that file is missing or stale.
+    plot_attack_success_rate(rounds, args.out_dir); print("  ✓ 07_attack_success_rate.png")
+    plot_defense_success_rate(rounds, args.out_dir); print("  ✓ 09_defense_success_rate.png")
+    plot_flagged_breakdown(rounds, args.out_dir); print("  ✓ 10_flagged_breakdown.png")
+
     if have_metrics:
         plot_confusion_matrix(rounds, args.out_dir); print("  ✓ 05_confusion_matrix.png")
         plot_detection_rates(rounds, args.out_dir); print("  ✓ 06_detection_rates.png")
-        plot_attack_success_rate(rounds, args.out_dir); print("  ✓ 07_attack_success_rate.png")
         plot_accuracy_preservation(rounds, args.out_dir); print("  ✓ 08_accuracy_preservation.png")
     else:
-        print("[INFO] No metrics/summary.json per_round data — skipping metric charts.")
+        print("[INFO] No metrics/summary.json per_round data — skipping 05/06/08 (still generated "
+              "07/09/10 self-contained from round_data).")
 
     report_path = generate_html_report(rounds, args.out_dir, summary)
     print(f"\n[DONE] HTML report → {report_path}")
