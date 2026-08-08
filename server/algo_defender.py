@@ -127,6 +127,75 @@ class AlgorithmicDefender:
         self._current = key
         return key
 
+    # ------------------------------------------------------------------ resume
+    def state_dict(self) -> dict:
+        """Serializable state required to resume the exact defense opponent.
+
+        The environment checkpoints the shared global model separately. This
+        payload therefore contains the pool's selector state plus each member's
+        cross-round memory: DeFL's Beta/CLP history, DnC's coordinate-subsampling
+        RNG, and FLTrust's cached root update + root-loader shuffle stream.
+        """
+        return {
+            "version": 1,
+            "names": list(self._names),
+            "selection": self._selection,
+            "current": self._current,
+            "round_robin_index": int(self._rr),
+            "rng_state": self._rng.getstate(),
+            "defenses": {
+                name: defense.state_dict() for name, defense in self._defenses.items()
+            },
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore :meth:`state_dict`, rejecting incompatible defense pools.
+
+        Loading state into a differently ordered/configured pool would silently
+        change the curriculum/random-selection opponent after a restart, so a
+        mismatch fails loudly instead of partially applying stale memories.
+        """
+        if not isinstance(state, dict):
+            raise TypeError(
+                f"AlgorithmicDefender state must be a dict, got {type(state).__name__}"
+            )
+        version = int(state.get("version", 1))
+        if version != 1:
+            raise ValueError(f"unsupported AlgorithmicDefender state version {version}")
+
+        saved_names = list(state.get("names", []))
+        if saved_names != self._names:
+            raise ValueError(
+                "algorithmic-defense checkpoint pool does not match the current "
+                f"configuration (saved={saved_names}, current={self._names})"
+            )
+
+        selection = str(state.get("selection", self._selection)).lower()
+        if selection not in ("random", "round_robin"):
+            raise ValueError(f"invalid saved defense selection mode {selection!r}")
+        current = str(state.get("current", self._names[0])).lower()
+        if current not in self._defenses:
+            raise ValueError(f"invalid saved current defense {current!r}")
+
+        defense_states = state.get("defenses")
+        if not isinstance(defense_states, dict) or set(defense_states) != set(self._names):
+            have = sorted(defense_states) if isinstance(defense_states, dict) else []
+            raise ValueError(
+                "algorithmic-defense checkpoint member states do not match the "
+                f"current pool (saved={have}, current={sorted(self._names)})"
+            )
+
+        rng_state = state.get("rng_state")
+        if rng_state is None:
+            raise ValueError("algorithmic-defense checkpoint is missing rng_state")
+
+        self._rng.setstate(rng_state)
+        for name in self._names:
+            self._defenses[name].load_state_dict(defense_states[name])
+        self._selection = selection
+        self._current = current
+        self._rr = int(state.get("round_robin_index", -1))
+
     # ------------------------------------------------------------------
     def run(self, updates, global_weights: dict, *, commit: bool = False,
             algorithm: str | None = None) -> DefenseOutcome:

@@ -111,6 +111,48 @@ class FLTrust(Defense):
         self.server.set_global_weights(self._global)
         self._g0_cache = None
 
+    def state_dict(self) -> dict:
+        """Durable FLTrust state used by an arms-race resume.
+
+        ``state_snapshot`` intentionally stays empty: an uncommitted rollout must
+        leave the newly-computed ``g0`` cached so every candidate and the commit in
+        that GRPO group face the identical trusted direction. Across a process
+        restart, however, both that cache and the root DataLoader's shuffle stream
+        must survive or the resumed defense is a different stochastic opponent.
+        """
+        cache = None
+        if self._g0_cache is not None:
+            digest, g0 = self._g0_cache
+            cache = {"digest": bytes(digest), "g0": g0.detach().cpu().clone()}
+
+        generator = getattr(self.root_client.data_loader, "generator", None)
+        generator_state = None if generator is None else generator.get_state().clone()
+        return {"g0_cache": cache, "root_loader_generator_state": generator_state}
+
+    def load_state_dict(self, state: dict) -> None:
+        if not isinstance(state, dict):
+            raise TypeError(f"FLTrust state must be a dict, got {type(state).__name__}")
+
+        cache = state.get("g0_cache")
+        if cache is None:
+            self._g0_cache = None
+        else:
+            digest = cache.get("digest") if isinstance(cache, dict) else None
+            g0 = cache.get("g0") if isinstance(cache, dict) else None
+            if not isinstance(digest, (bytes, bytearray)) or not isinstance(g0, torch.Tensor):
+                raise ValueError("invalid FLTrust g0_cache in checkpoint")
+            self._g0_cache = (bytes(digest), g0.detach().cpu().clone())
+
+        generator_state = state.get("root_loader_generator_state")
+        if generator_state is not None:
+            generator = getattr(self.root_client.data_loader, "generator", None)
+            if generator is None:
+                raise ValueError(
+                    "FLTrust checkpoint contains a root-loader RNG state, but the "
+                    "configured root DataLoader has no generator"
+                )
+            generator.set_state(generator_state.detach().cpu())
+
     def _root_update(self, gw: dict, gw_flat: "torch.Tensor", keys: list) -> "torch.Tensor":
         """The trusted reference direction ``g0 = w_root - w_global``, computed ONCE
         per distinct global model and cached.

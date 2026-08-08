@@ -7,6 +7,7 @@ like MNIST — no download, no GPU, no LLM:
     python tests/test_algo_defender.py
 """
 
+import copy
 import os
 import random
 import sys
@@ -126,6 +127,94 @@ def test_round_robin_cycles_in_order():
     names = defender.names
     got = [defender.choose() for _ in range(len(names) * 2)]
     assert got == names * 2
+
+
+def test_algorithmic_defender_state_round_trips_random_selector_and_members():
+    """A restart must preserve both the next algorithm draw and member memory."""
+    cfg = _cfg(dnc={"sub_dim": 7, "niters": 1})
+    original = _defender(cfg)
+
+    # Advance the pool selector, DeFL's Beta/CLP state and DnC's subsampling RNG.
+    env = _env(cfg, defense=original)
+    env.begin_round()
+    updates = env.build_updates({cid: _wreck(env.pool_benign[cid]) for cid in POISONED})
+    original.run(updates, env.global_weights, commit=True, algorithm="defl")
+    original.run(updates, env.global_weights, commit=True, algorithm="dnc")
+    for _ in range(9):
+        original.choose()
+
+    saved = copy.deepcopy(original.state_dict())
+    expected_draws = [original.choose() for _ in range(20)]
+
+    restored = _defender(cfg)
+    restored.load_state_dict(saved)
+    assert [restored.choose() for _ in range(20)] == expected_draws
+    assert restored._defenses["defl"].state_snapshot() == \
+           saved["defenses"]["defl"]
+    assert restored._defenses["dnc"].state_snapshot() == \
+           saved["defenses"]["dnc"]
+
+
+def test_restored_dnc_rng_produces_the_same_next_defense_result():
+    """DnC must continue with the same next coordinate subsample after resume."""
+    cfg = _cfg(algorithms=["dnc"], dnc={"sub_dim": 7, "niters": 2})
+    env = _env(cfg)
+    env.begin_round()
+    updates = env.build_updates({cid: _wreck(env.pool_benign[cid]) for cid in POISONED})
+
+    # Consume one committed DnC step, then fork the durable state.
+    env.defense.run(updates, env.global_weights, commit=True, algorithm="dnc")
+    saved = copy.deepcopy(env.defense.state_dict())
+    restored = _defender(cfg)
+    restored.load_state_dict(saved)
+
+    a = env.defense.run(updates, env.global_weights, commit=True, algorithm="dnc")
+    b = restored.run(updates, env.global_weights, commit=True, algorithm="dnc")
+    assert [(v.client_id, v.is_suspicious, v.p_malicious) for v in a.verdicts] == \
+           [(v.client_id, v.is_suspicious, v.p_malicious) for v in b.verdicts]
+    for key in a.new_global:
+        assert torch.equal(a.new_global[key], b.new_global[key])
+
+
+def test_algorithmic_defender_rejects_a_checkpoint_for_another_pool():
+    saved = _defender(_cfg(algorithms=["defl", "dnc"])).state_dict()
+    restored = _defender(_cfg(algorithms=["dnc", "defl"]))
+    try:
+        restored.load_state_dict(saved)
+    except ValueError as e:
+        assert "pool does not match" in str(e)
+    else:
+        raise AssertionError("a differently ordered defense pool must not load silently")
+
+
+def test_fltrust_durable_state_preserves_cache_and_root_shuffle_rng():
+    """The within-round g0 cache and future root permutations both survive restart."""
+    from benchmark.defenses.fltrust import FLTrust
+
+    def root_loader(data_seed, shuffle_seed):
+        data_rng = torch.Generator().manual_seed(data_seed)
+        shuffle_rng = torch.Generator().manual_seed(shuffle_seed)
+        return DataLoader(
+            TensorDataset(torch.randn(64, 1, 28, 28, generator=data_rng),
+                          torch.randint(0, 10, (64,), generator=data_rng)),
+            batch_size=32, shuffle=True, generator=shuffle_rng,
+        )
+
+    root_a = root_loader(123, 456)
+    root_b = root_loader(123, 999)  # deliberately different shuffle state
+    a = FLTrust(root_a, lr=0.05, local_epochs=1, device="cpu")
+    b = FLTrust(root_b, lr=0.05, local_epochs=1, device="cpu")
+    a._g0_cache = (b"cache-key", torch.arange(7, dtype=torch.float32))
+    # Move A's root shuffle stream before taking the checkpoint.
+    torch.randperm(11, generator=root_a.generator)
+
+    b.load_state_dict(copy.deepcopy(a.state_dict()))
+    assert b._g0_cache[0] == b"cache-key"
+    assert torch.equal(b._g0_cache[1], torch.arange(7, dtype=torch.float32))
+    assert torch.equal(
+        torch.randperm(23, generator=root_a.generator),
+        torch.randperm(23, generator=root_b.generator),
+    )
 
 
 def test_the_algorithm_is_fixed_for_the_whole_round():

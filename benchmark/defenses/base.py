@@ -111,6 +111,29 @@ class Defense(ABC):
         """Undo every mutation made since :meth:`state_snapshot`. No-op by default."""
         return None
 
+    def state_dict(self) -> dict:
+        """Serializable cross-round state for a durable training checkpoint.
+
+        This is deliberately separate from the defense's global model: benchmark
+        defenses own their globals, but the Phase-2 ``AlgorithmicDefender`` is
+        re-based on the environment's externally checkpointed global before every
+        call. For most defenses the mutable state used by a scoring transaction is
+        also exactly the state that must survive a process restart, so the default
+        delegates to :meth:`state_snapshot`.
+
+        A defense whose durable state differs from its transactional rollback state
+        can override this pair. FLTrust does so for its cached root update: that
+        cache must persist across a resume, but must *not* be rolled back between the
+        clean counterfactual, scored rollouts and commit in one GRPO round.
+        """
+        return self.state_snapshot()
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore state returned by :meth:`state_dict`."""
+        if not isinstance(state, dict):
+            raise TypeError(f"defense state must be a dict, got {type(state).__name__}")
+        self.state_restore(state)
+
     def probe(self, updates: list[ModelUpdate], poisoned_ids: set[int]) -> "StepResult":
         """Run one :meth:`step` and undo everything it changed.
 

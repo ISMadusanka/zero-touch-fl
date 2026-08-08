@@ -10,6 +10,9 @@ from core.types import DetectionVerdict
 from metrics.types import RoundMetrics
 
 
+DEFAULT_TARGET_ACCURACY_DROP = 0.10
+
+
 def _safe_div(num: float, denom: float) -> float:
     """Division that returns 0.0 when the denominator is 0 (no samples)."""
     return num / denom if denom > 0 else 0.0
@@ -44,17 +47,38 @@ def compute_round_metrics(
     malicious_ids: set[int],
     current_accuracy: float,
     baseline_accuracy: float,
+    *,
+    reference_accuracy: float | None = None,
+    target_accuracy_drop: float = DEFAULT_TARGET_ACCURACY_DROP,
 ) -> RoundMetrics:
-    """Compute all per-round metrics from raw verdicts and accuracies."""
+    """Compute all per-round metrics from raw verdicts and accuracies.
+
+    ``attack_success`` has one canonical meaning: the attack-induced accuracy
+    drop reached ``target_accuracy_drop``. The drop is attributed against this
+    round's clean counterfactual when ``reference_accuracy`` is supplied; the
+    Phase-1 baseline is a backwards-compatible fallback for older callers.
+
+    Detection evasion is reported independently as ``evasion_success``. This
+    prevents an ineffective update that merely passes the detector from being
+    counted as a successful attack.
+    """
     tp, fn, fp, tn = confusion_counts(verdicts, malicious_ids)
 
     tpr = _safe_div(tp, tp + fn)
     fpr = _safe_div(fp, fp + tn)
     apr = _safe_div(current_accuracy, baseline_accuracy)
 
-    # An attack "succeeds" in a round when at least one malicious client is
-    # not flagged. With a single attacker this collapses to `fn > 0`.
-    attack_success = fn > 0
+    reference = (float(baseline_accuracy) if reference_accuracy is None
+                 else float(reference_accuracy))
+    target = float(target_accuracy_drop)
+    if target <= 0.0:
+        raise ValueError("target_accuracy_drop must be > 0")
+    induced_drop = reference - float(current_accuracy)
+
+    # A no-op/malformed round has no attack to credit, even if model noise alone
+    # happens to move accuracy by the requested amount.
+    attack_success = bool(malicious_ids) and induced_drop >= target - 1e-12
+    evasion_success = fn > 0
 
     return RoundMetrics(
         round_num=round_num,
@@ -63,6 +87,10 @@ def compute_round_metrics(
         fp=fp,
         tn=tn,
         attack_success=attack_success,
+        evasion_success=evasion_success,
+        reference_accuracy=reference,
+        induced_drop=induced_drop,
+        target_accuracy_drop=target,
         tpr=tpr,
         fpr=fpr,
         recall=tpr,

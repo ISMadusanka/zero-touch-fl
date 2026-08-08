@@ -24,8 +24,17 @@ class RoundMetrics:
     fp: int
     tn: int
 
-    # Per-round derived rates
-    attack_success: bool            # at least one malicious client passed detection
+    # Per-round attack outcome. ``attack_success`` is the canonical goal result:
+    # the attack itself induced at least the requested accuracy drop. Detection
+    # evasion is intentionally separate; passing a filter without damaging the
+    # model is not an attack success.
+    attack_success: bool
+    evasion_success: bool           # at least one malicious client passed detection
+    reference_accuracy: float       # clean counterfactual used for attribution
+    induced_drop: float             # reference_accuracy - current_accuracy
+    target_accuracy_drop: float
+
+    # Per-round detection / preservation rates
     tpr: float                      # recall on malicious clients (TP / (TP + FN))
     fpr: float                      # FP / (FP + TN)
     recall: float                   # alias of TPR — kept explicit for clarity
@@ -52,7 +61,8 @@ class AggregateMetrics:
     tn: int
 
     # Cumulative rates
-    attack_success_rate: float      # rounds_with_attack_success / total_rounds
+    attack_success_rate: float      # rounds whose induced drop reached the target
+    evasion_success_rate: float     # rounds where at least one poisoner evaded
     tpr: float                      # sum(TP) / (sum(TP) + sum(FN))
     fpr: float                      # sum(FP) / (sum(FP) + sum(TN))
     recall: float                   # alias of TPR

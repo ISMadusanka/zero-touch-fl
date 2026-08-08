@@ -30,26 +30,52 @@ def test_more_clients_do_not_lower_reward():
     assert abs(r2 - r1) < 1e-9
 
 
-def test_perturbation_diversity_orthogonal_vs_identical():
+def test_perturbation_diversity_orthogonal_vs_identical_or_antiparallel():
     refs = {0: {"w": torch.zeros(4)}, 1: {"w": torch.zeros(4)}}
     orthogonal = {0: {"w": torch.tensor([1.0, 0, 0, 0])},
                   1: {"w": torch.tensor([0.0, 1, 0, 0])}}
     identical = {0: {"w": torch.tensor([1.0, 0, 0, 0])},
                  1: {"w": torch.tensor([1.0, 0, 0, 0])}}
+    antiparallel = {0: {"w": torch.tensor([1.0, 0, 0, 0])},
+                    1: {"w": torch.tensor([-1.0, 0, 0, 0])}}
     assert abs(perturbation_diversity(orthogonal, refs) - 1.0) < 1e-6
     assert abs(perturbation_diversity(identical, refs) - 0.0) < 1e-6
+    # Opposite edits cancel; signed-cosine diversity used to reward them fully.
+    assert abs(perturbation_diversity(antiparallel, refs) - 0.0) < 1e-6
     assert perturbation_diversity({0: {"w": torch.ones(4)}}, {0: {"w": torch.zeros(4)}}) == 0.0
+
+
+def test_zero_edits_are_not_counted_as_orthogonal_roles():
+    refs = {0: {"w": torch.zeros(2)}, 1: {"w": torch.zeros(2)}}
+    one_real_one_zero = {
+        0: {"w": torch.tensor([1.0, 0.0])},
+        1: {"w": torch.zeros(2)},
+    }
+    assert perturbation_diversity(one_real_one_zero, refs) == 0.0
 
 
 def test_collab_bonus_rewards_diverse_multiclient():
     v = _benign_verdicts([0, 1])
     diverse = attacker_reward(0.9, 0.8, GOAL, [0, 1], v, 0,
-                              alpha=1.0, beta=0.0, gamma=0.0, zeta=1.0,
+                              alpha=1.0, beta=0.0, gamma=0.0, zeta=0.2,
                               diversity=1.0)
     redundant = attacker_reward(0.9, 0.8, GOAL, [0, 1], v, 0,
-                                alpha=1.0, beta=0.0, gamma=0.0, zeta=1.0,
+                                alpha=1.0, beta=0.0, gamma=0.0, zeta=0.2,
                                 diversity=0.0)
-    assert abs((diverse - redundant) - 1.0) < 1e-6  # zeta=1.0 * (1.0 - 0.0)
+    # Halfway to the target: progress .5 * zeta .2 * diversity 1.0.
+    assert abs((diverse - redundant) - 0.1) < 1e-6
+
+
+def test_collab_bonus_requires_two_hard_survivors():
+    verdicts = [
+        DetectionVerdict(0, False, 1.0, "survived"),
+        DetectionVerdict(1, True, 0.0, "rejected", p_malicious=0.01),
+    ]
+    shaped = attacker_reward(0.9, 0.8, GOAL, [0, 1], verdicts, 0,
+                             beta=0.0, gamma=0.0, zeta=1.0, diversity=1.0)
+    base = attacker_reward(0.9, 0.8, GOAL, [0, 1], verdicts, 0,
+                           beta=0.0, gamma=0.0, zeta=0.0, diversity=1.0)
+    assert shaped == base
 
 
 def test_collab_bonus_ignored_for_single_client():

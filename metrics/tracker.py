@@ -14,7 +14,11 @@ import os
 from collections import deque
 
 from core.types import DetectionVerdict
-from metrics.compute import compute_round_metrics, _safe_div
+from metrics.compute import (
+    DEFAULT_TARGET_ACCURACY_DROP,
+    compute_round_metrics,
+    _safe_div,
+)
 from metrics.types import AggregateMetrics, RoundMetrics
 
 logger = logging.getLogger(__name__)
@@ -49,6 +53,7 @@ class MetricsTracker:
         self._total_rounds = 0
         self._tp = self._fn = self._fp = self._tn = 0
         self._n_attack_successes = 0
+        self._n_evasion_successes = 0
         self._final_accuracy = 0.0
 
         os.makedirs(self.output_dir, exist_ok=True)
@@ -65,6 +70,9 @@ class MetricsTracker:
         verdicts: list[DetectionVerdict],
         current_accuracy: float,
         malicious_ids: set[int],
+        *,
+        reference_accuracy: float | None = None,
+        target_accuracy_drop: float = DEFAULT_TARGET_ACCURACY_DROP,
     ) -> RoundMetrics:
         """Compute and store metrics for a single round. Returns them.
 
@@ -76,6 +84,8 @@ class MetricsTracker:
             malicious_ids=set(malicious_ids),
             current_accuracy=current_accuracy,
             baseline_accuracy=self.baseline_accuracy,
+            reference_accuracy=reference_accuracy,
+            target_accuracy_drop=target_accuracy_drop,
         )
         self.rounds.append(metrics)
         self._total_rounds += 1
@@ -84,6 +94,7 @@ class MetricsTracker:
         self._fp += metrics.fp
         self._tn += metrics.tn
         self._n_attack_successes += int(metrics.attack_success)
+        self._n_evasion_successes += int(metrics.evasion_success)
         self._final_accuracy = metrics.current_accuracy
         self._log_round(metrics)
         self._save_round(metrics)
@@ -101,19 +112,22 @@ class MetricsTracker:
             logger.warning("MetricsTracker.aggregate() called with no rounds recorded")
             return AggregateMetrics(
                 total_rounds=0, tp=0, fn=0, fp=0, tn=0,
-                attack_success_rate=0.0, tpr=0.0, fpr=0.0, recall=0.0,
+                attack_success_rate=0.0, evasion_success_rate=0.0,
+                tpr=0.0, fpr=0.0, recall=0.0,
                 accuracy_preservation_rate=0.0,
                 baseline_accuracy=self.baseline_accuracy, final_accuracy=0.0,
             )
 
         tp, fn, fp, tn = self._tp, self._fn, self._fp, self._tn
         n_attack_successes = self._n_attack_successes
+        n_evasion_successes = self._n_evasion_successes
         final_accuracy = self._final_accuracy
 
         return AggregateMetrics(
             total_rounds=total_rounds,
             tp=tp, fn=fn, fp=fp, tn=tn,
             attack_success_rate=_safe_div(n_attack_successes, total_rounds),
+            evasion_success_rate=_safe_div(n_evasion_successes, total_rounds),
             tpr=_safe_div(tp, tp + fn),
             fpr=_safe_div(fp, fp + tn),
             recall=_safe_div(tp, tp + fn),
@@ -146,17 +160,21 @@ class MetricsTracker:
     def _log_round(self, m: RoundMetrics) -> None:
         logger.info(
             "Metrics [round=%d] tp=%d fn=%d fp=%d tn=%d | "
-            "attack_success=%s tpr=%.3f fpr=%.3f apr=%.3f (acc=%.4f / baseline=%.4f)",
+            "attack_success=%s evasion_success=%s induced_drop=%+.4f target=%.4f "
+            "tpr=%.3f fpr=%.3f apr=%.3f "
+            "(acc=%.4f / reference=%.4f / baseline=%.4f)",
             m.round_num, m.tp, m.fn, m.fp, m.tn,
-            m.attack_success, m.tpr, m.fpr, m.accuracy_preservation_rate,
-            m.current_accuracy, m.baseline_accuracy,
+            m.attack_success, m.evasion_success, m.induced_drop,
+            m.target_accuracy_drop, m.tpr, m.fpr, m.accuracy_preservation_rate,
+            m.current_accuracy, m.reference_accuracy, m.baseline_accuracy,
         )
 
     def _log_summary(self, agg: AggregateMetrics, out_path: str) -> None:
         logger.info("=" * 60)
         logger.info("AGGREGATE METRICS (over %d round(s))", agg.total_rounds)
         logger.info("  Confusion: TP=%d FN=%d FP=%d TN=%d", agg.tp, agg.fn, agg.fp, agg.tn)
-        logger.info("  Attack Success Rate (ASR):     %.4f", agg.attack_success_rate)
+        logger.info("  Attack Goal Success Rate:      %.4f", agg.attack_success_rate)
+        logger.info("  Detection Evasion Rate:        %.4f", agg.evasion_success_rate)
         logger.info("  True Positive Rate (TPR):      %.4f", agg.tpr)
         logger.info("  False Positive Rate (FPR):     %.4f", agg.fpr)
         logger.info("  Accuracy Preservation Rate:    %.4f (final=%.4f / baseline=%.4f)",

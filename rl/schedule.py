@@ -43,7 +43,8 @@ from rl.grpo import grpo_step
 from rl.policy import PolicyGenerator
 from rl.rewards import (
     DEFAULT_ADVANTAGE_STD_FLOOR, DEFAULT_MIN_REWARD_SPREAD,
-    attacker_reward, defender_reward, perturbation_diversity,
+    attacker_reward_breakdown, defender_reward, goal_target,
+    perturbation_diversity, soft_malicious_probability,
 )
 from rl.switch import PhaseController, SwitchConfig, committed_success
 from rl.turns import AttackerTurn, DefenderTurn
@@ -635,6 +636,7 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     reward_def = reward_def or {}
     # This round's actual goal (per-round target sampling); falls back to the env default.
     goal = ctx.goal if getattr(ctx, "goal", None) is not None else env.goal
+    target_drop = goal_target(goal)
 
     # Diversity of the committed (possibly multi-client) attack; 0 for one client.
     committed_refs = {cid: env.pool_benign[cid] for cid in poisoned_ids
@@ -647,27 +649,57 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     # from ``info`` because the turn measured them BEFORE committing — by the time we
     # are here ``env.global_weights`` is the NEXT round's reference. A DefenderTurn's
     # info has no ratios, which leaves the gate off, as it was for the defender.
-    a_rew = attacker_reward(ctx.clean_accuracy, post_acc, goal,
-                            poisoned_ids, verdicts, n_malformed,
-                            alpha=reward_att.get("alpha", 1.0),
-                            beta=reward_att.get("beta", 0.5),
-                            gamma=reward_att.get("gamma", 1.0),
-                            zeta=reward_att.get("zeta", 0.0),
-                            diversity=diversity,
-                            perturbation_ratios=info.get("perturbation_ratios"),
-                            stealth_floor=reward_att.get("stealth_floor", 1.0))
+    reward_parts = attacker_reward_breakdown(
+        ctx.clean_accuracy,
+        post_acc,
+        goal,
+        poisoned_ids,
+        verdicts,
+        n_malformed,
+        alpha=reward_att.get("alpha", 1.0),
+        beta=reward_att.get("beta", 0.5),
+        gamma=reward_att.get("gamma", 1.0),
+        zeta=reward_att.get("zeta", 0.0),
+        diversity=diversity,
+        perturbation_ratios=info.get("perturbation_ratios"),
+        stealth_floor=reward_att.get("stealth_floor", 1.0),
+    )
+    a_rew = reward_parts["total"]
     d_rew = defender_reward(verdicts, poisoned_ids,
                             mode=reward_def.get("mode", "soft_f1"),
                             fpr_penalty=reward_def.get("fpr_penalty", 1.0))
 
-    metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(poisoned_ids))
+    # Persist the exact soft probability consumed by reward shaping. Algorithmic
+    # defenses provide a calibrated value directly; the LLM path is reconstructed
+    # from its hard label and label confidence by ``soft_malicious_probability``.
+    verdict_probabilities = {
+        v.client_id: soft_malicious_probability(v) for v in verdicts
+    }
+    # Missing verdicts were not rejected and are treated as p(malicious)=0 by
+    # the reward, so retain that fact instead of silently omitting the poisoner.
+    poisoned_probabilities = {
+        cid: verdict_probabilities.get(cid, 0.0) for cid in poisoned_ids
+    }
+
+    round_metrics = metrics_tracker.update(
+        ctx.round_num,
+        verdicts,
+        post_acc,
+        set(poisoned_ids),
+        reference_accuracy=ctx.clean_accuracy,
+        target_accuracy_drop=target_drop,
+    )
     save_round_log(RoundLog(
         round_num=ctx.round_num,
         attack_goal=goal,
         poisoned_client_ids=poisoned_ids,
         predicted_labels=[
             {"client_id": v.client_id, "is_suspicious": v.is_suspicious,
-             "confidence": v.confidence, "reason": v.reason}
+             "confidence": v.confidence,
+             "p_malicious": verdict_probabilities[v.client_id],
+             "p_malicious_source": ("calibrated" if v.p_malicious is not None
+                                      else "derived"),
+             "reason": v.reason}
             for v in verdicts
         ],
         test_accuracy=post_acc,
@@ -694,6 +726,19 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             # and the visualizer report the same number the policy is trained on.
             "clean_accuracy": round(float(ctx.clean_accuracy), 6),
             "induced_drop": round(float(ctx.clean_accuracy - post_acc), 6),
+            # Canonical target attainment and detector evasion are deliberately
+            # separate. ``learner_success`` below remains the phase-switch gate.
+            "goal_hit": round_metrics.attack_success,
+            "evasion_success": round_metrics.evasion_success,
+            "target_accuracy_drop": target_drop,
+            "attacker_reward_components": {
+                key: round(float(value), 6)
+                for key, value in reward_parts.items()
+            },
+            "poisoned_p_malicious": {
+                cid: round(float(probability), 6)
+                for cid, probability in poisoned_probabilities.items()
+            },
             "phase_index": phase_index,
             "phase_round": phase_round,
             "learner_success": success,
@@ -727,12 +772,23 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     dbg.flush()
     block = (f"cur={curriculum_slot.label}#{curriculum_slot.round_in_block} "
              if curriculum_slot is not None else "")
+    poisoned_probability_text = ", ".join(
+        f"{cid}:{probability:.3f}"
+        for cid, probability in poisoned_probabilities.items()
+    )
     logger.info(
         f"Round {ctx.round_num} [learn={learner} ph={phase_index}.{phase_round} "
         f"def={defense_algorithm or 'llm'} {block}"
         f"{'WIN' if success else '...'}]: acc {ctx.global_accuracy:.4f}->{post_acc:.4f} "
         f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - post_acc:+.4f}) "
+        f"goal_hit={round_metrics.attack_success} "
+        f"evasion={round_metrics.evasion_success} "
         f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} "
+        f"parts(dmg={reward_parts['damage_component']:.3f} "
+        f"stealth={reward_parts['stealth_component']:.3f} "
+        f"malformed={reward_parts['malformed_component']:.3f} "
+        f"collab={reward_parts['collaboration_component']:.3f}) "
+        f"p_mal={{{poisoned_probability_text}}} "
         f"| grpo_loss={stats['loss']:.4f} mean_r={stats['mean_reward']:.3f} "
         f"zero_adv={stats['zero_advantage_fraction']:.2f} "
         f"{'step' if stats.get('stepped', True) else 'SKIP'}"

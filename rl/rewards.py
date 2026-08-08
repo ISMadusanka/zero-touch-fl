@@ -18,13 +18,10 @@ def _clip(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-# Upper bound of the drop term. Reaching the goal exactly scores 1.0; overshoot
-# is worth at most another 0.5 (see :func:`drop_term`).
-_OVERSHOOT_BONUS = 0.5
-# Ratio (drop/target beyond 1.0) at which HALF the overshoot bonus is earned.
-# Small = the bonus saturates fast, so the reward stays "hit the target", not
-# "maximize damage"; strictly positive so the term never goes flat.
-_OVERSHOOT_HALF = 1.0
+# Positive auxiliary shaping (stealth and collaboration) is capped to this
+# fraction of the achieved damage component. Damage therefore remains the
+# largest positive category even with aggressive auxiliary weights.
+_MAX_AUXILIARY_TO_DAMAGE = 0.75
 
 
 def drop_term(drop: float, target: float) -> float:
@@ -32,28 +29,13 @@ def drop_term(drop: float, target: float) -> float:
 
     ``x = drop / target``:
 
-    * ``x <= 1``  → ``x`` (linear up to the goal), floored at ``-0.5`` so a
-      round that *improves* the model is bounded-bad.
-    * ``x > 1``   → ``1 + 0.5·(x-1)/(x-1+1)``: strictly increasing, asymptotic to
-      ``1.5``.
-
-    The range and the value at the target are exactly what the previous hard
-    ``clip(x, -0.5, 1.5)`` gave, so the objective ("cut accuracy by about
-    ``target``") is unchanged. What changes is that the term is now **strictly
-    monotonic above the goal instead of flat**. The flat region was a real
-    training failure: once the policy reliably overshot ``1.5·target``, every
-    rollout in a GRPO group scored an identical reward, the group's advantage
-    spread collapsed to zero, and ``grpo_step`` skipped the update — the
-    attacker stopped learning exactly when it got good. The saturation is
-    deliberately fast (half the bonus by ``x = 2``) so gross overshoot is worth
-    very little: enough to break ties, not enough to turn the goal into
-    "destroy the model".
+    The term is linear until the requested drop is reached and then saturates:
+    ``clip(drop / target, -0.5, 1.0)``. This implements an *at least* target:
+    there remains a considerable gradient throughout the sub-target region,
+    while damage beyond the requested threshold is neither discouraged nor
+    rewarded as an invitation to destroy the model further.
     """
-    x = drop / target
-    if x <= 1.0:
-        return max(-0.5, x)
-    over = x - 1.0
-    return 1.0 + _OVERSHOOT_BONUS * over / (over + _OVERSHOOT_HALF)
+    return _clip(drop / target, -0.5, 1.0)
 
 
 def goal_target(goal: dict) -> float:
@@ -74,7 +56,7 @@ def goal_target(goal: dict) -> float:
     return max(target, 1e-6)
 
 
-def attacker_reward(
+def attacker_reward_breakdown(
     reference_accuracy: float,
     post_accuracy: float,
     goal: dict,
@@ -89,14 +71,16 @@ def attacker_reward(
     diversity: float | None = None,
     perturbation_ratios: dict | None = None,
     stealth_floor: float = 1.0,
-) -> float:
-    """Reward the attacker for degrading accuracy while staying stealthy and,
-    when the exact quota contains several clients, coordinating their plans.
+) -> dict[str, float]:
+    """Return the attacker's reward and its verifiable scalar components.
+
+    The ``total`` entry is the reward used for training. The remaining entries
+    make the damage, gates, cap, and final weighted contributions observable to
+    logs and tests without duplicating this shaping logic.
 
     reward = alpha * drop_term(drop, target)
-           + beta  * stealth
+           + capped(progress * (beta * stealth + zeta * collab_bonus))
            - gamma * malformed_fraction
-           + zeta  * collab_bonus
 
     ``drop = reference_accuracy - post_accuracy``.
 
@@ -112,13 +96,12 @@ def attacker_reward(
     became unreachable. Against the clean counterfactual, an attack that hits its
     target scores the same every time it hits it, in either retrain mode.
 
-    ``stealth`` is a CONTINUOUS evasion signal in [0, 1]: the mean over poisoned
-    clients of ``1 - soft P(malicious)`` derived from the defender's *confidence*
-    (not just the binary flag). Confidently caught -> ~0; confidently passed as
-    benign -> ~1; unsure -> ~0.5. Because it moves smoothly with the defender's
-    confidence, it gives GRPO a gradient even when every sampled plan ends up
-    with the SAME hard flag. It is 0 when the attacker poisoned nobody — there
-    was nothing to sneak past the defender.
+    ``stealth`` is a CONTINUOUS evasion signal in [0, 1], but only for updates
+    that actually pass the defender's hard decision. A suspicious verdict gives
+    that client exactly zero stealth even if its soft probability is inconsistent
+    with the hard flag. Among hard survivors, ``1 - soft P(malicious)`` preserves
+    a useful confidence gradient. Missing verdicts still mean the update was not
+    rejected and are treated as hard survivors.
 
     **Stealth has to be earned.** Passing as benign is only an achievement if
     there was something to hide. Left ungated, ``beta * stealth`` is a guaranteed
@@ -146,24 +129,43 @@ def attacker_reward(
     (``n_used + n_malformed``), not over the ones that landed, so selecting three
     clients and wasting two is penalized twice as hard as wasting one.
 
-    ``collab_bonus``
-    = ``diversity`` in [0, 1] (only when >1 client) rewards distinct, coordinated
-    per-client perturbations over identical clones — see ``perturbation_diversity``.
+    ``collab_bonus`` is ``diversity`` in [0, 1] only when at least two poisoned
+    clients hard-survive, scaled by the surviving fraction. See
+    ``perturbation_diversity``.
+
+    Both positive auxiliary terms are multiplied by damage progress
+    ``clip(drop / target, 0, 1)``. Thus zero or negative induced damage earns no
+    positive payout for merely being benign-looking or diverse. Their combined
+    positive contribution is additionally capped below the positive damage
+    component, keeping the optimization damage-dominant even when ``beta`` or
+    ``zeta`` is configured aggressively. Negative auxiliary weights, if supplied,
+    remain penalties rather than being clipped away.
     """
     target = goal_target(goal)   # shared with the schedule's relative win-gate
 
     drop = reference_accuracy - post_accuracy
     damage = drop_term(drop, target)
+    damage_progress = _clip(drop / target, 0.0, 1.0)
+    damage_component = alpha * damage
 
     verdict_by_id = {v.client_id: v for v in verdicts}
     n_used = len(poisoned_ids)
     stealth = 0.0
+    n_hard_survivors = 0
     for cid in poisoned_ids:
         v = verdict_by_id.get(cid)
-        # No verdict for a poisoned client => treat as undetected (passed).
-        evaded = 1.0 if v is None else (1.0 - _soft_malicious_prob(v))
-        stealth += evaded * _stealth_credit(cid, perturbation_ratios, stealth_floor)
+        # No verdict means the update was not rejected. A hard rejection is an
+        # absolute gate: a contradictory low p_malicious cannot earn stealth.
+        hard_survived = v is None or not v.is_suspicious
+        if not hard_survived:
+            continue
+        n_hard_survivors += 1
+        soft_evasion = (1.0 if v is None else
+                        1.0 - soft_malicious_probability(v))
+        stealth += soft_evasion * _stealth_credit(
+            cid, perturbation_ratios, stealth_floor)
     stealth = stealth / n_used if n_used else 0.0
+    hard_survival_fraction = n_hard_survivors / n_used if n_used else 0.0
 
     # Normalize the waste penalty by how many clients were SELECTED — a client
     # whose plan did nothing still consumed budget, so it belongs in the
@@ -171,14 +173,88 @@ def attacker_reward(
     n_selected = n_used + max(0, int(n_malformed))
     malformed_fraction = n_malformed / n_selected if n_selected else 0.0
 
-    # Collaboration bonus: reward diverse (coordinated) multi-client attacks. Only
-    # meaningful with >1 client; `diversity` in [0, 1].
+    # Collaboration only counts when at least two edited updates really survive.
+    # The supplied diversity covers all poisoners, so scale it by their hard
+    # survival rate instead of paying in full for a mostly rejected coalition.
     collab_bonus = 0.0
-    if zeta and n_used > 1 and diversity is not None:
-        collab_bonus = _clip(float(diversity), 0.0, 1.0)
+    if zeta and n_hard_survivors > 1 and diversity is not None:
+        collab_bonus = (_clip(float(diversity), 0.0, 1.0)
+                        * hard_survival_fraction)
 
-    return (alpha * damage + beta * stealth - gamma * malformed_fraction
-            + zeta * collab_bonus)
+    raw_stealth_component = damage_progress * beta * stealth
+    raw_collaboration_component = damage_progress * zeta * collab_bonus
+    positive_auxiliary = (max(0.0, raw_stealth_component)
+                          + max(0.0, raw_collaboration_component))
+    auxiliary_cap = _MAX_AUXILIARY_TO_DAMAGE * max(0.0, damage_component)
+    auxiliary_scale = (min(1.0, auxiliary_cap / positive_auxiliary)
+                       if positive_auxiliary > 0.0 else 1.0)
+
+    # Only positive shaping is capped. A caller-supplied negative beta/zeta is a
+    # deliberate penalty and must not be weakened by the positive-reward cap.
+    stealth_component = (raw_stealth_component * auxiliary_scale
+                         if raw_stealth_component > 0.0
+                         else raw_stealth_component)
+    collaboration_component = (raw_collaboration_component * auxiliary_scale
+                                if raw_collaboration_component > 0.0
+                                else raw_collaboration_component)
+    malformed_component = -gamma * malformed_fraction
+    auxiliary_component = stealth_component + collaboration_component
+    total = damage_component + auxiliary_component + malformed_component
+
+    return {
+        "induced_drop": float(drop),
+        "target_drop": float(target),
+        "damage": float(damage),
+        "damage_progress": float(damage_progress),
+        "hard_survival_fraction": float(hard_survival_fraction),
+        "stealth": float(stealth),
+        "malformed_fraction": float(malformed_fraction),
+        "collaboration": float(collab_bonus),
+        "damage_component": float(damage_component),
+        "stealth_component_uncapped": float(raw_stealth_component),
+        "collaboration_component_uncapped": float(raw_collaboration_component),
+        "positive_auxiliary_cap": float(auxiliary_cap),
+        "positive_auxiliary_scale": float(auxiliary_scale),
+        "stealth_component": float(stealth_component),
+        "malformed_component": float(malformed_component),
+        "collaboration_component": float(collaboration_component),
+        "auxiliary_component": float(auxiliary_component),
+        "total": float(total),
+    }
+
+
+def attacker_reward(
+    reference_accuracy: float,
+    post_accuracy: float,
+    goal: dict,
+    poisoned_ids: list[int],
+    verdicts: list[DetectionVerdict],
+    n_malformed: int,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.5,
+    gamma: float = 1.0,
+    zeta: float = 0.0,
+    diversity: float | None = None,
+    perturbation_ratios: dict | None = None,
+    stealth_floor: float = 1.0,
+) -> float:
+    """Return the scalar attacker reward (see :func:`attacker_reward_breakdown`)."""
+    return attacker_reward_breakdown(
+        reference_accuracy,
+        post_accuracy,
+        goal,
+        poisoned_ids,
+        verdicts,
+        n_malformed,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        zeta=zeta,
+        diversity=diversity,
+        perturbation_ratios=perturbation_ratios,
+        stealth_floor=stealth_floor,
+    )["total"]
 
 
 def _stealth_credit(client_id, perturbation_ratios: dict | None,
@@ -206,37 +282,43 @@ def _stealth_credit(client_id, perturbation_ratios: dict | None,
 
 
 def perturbation_diversity(poisoned_by_client: dict, references: dict) -> float:
-    """1 − mean pairwise cosine of the chosen clients' perturbation vectors.
+    """Mean pairwise ``1 - abs(cosine)`` of non-zero perturbations.
 
     Each client's perturbation is ``(poisoned - benign)`` flattened over all
-    layers. Returns 0.0 for fewer than 2 clients (no collaboration to reward).
-    Higher = the clients push the model in MORE different directions (distinct,
-    coordinated roles rather than identical clones — which also look like
-    colluding Sybils to the defender's ``max_pairwise_cos`` feature).
+    layers. Zero edits are excluded and fewer than two real perturbations return
+    0.0 (there is no collaboration to reward). Orthogonal roles score 1.0;
+    identical vectors score 0.0. Crucially, anti-parallel vectors also score
+    0.0: equal-and-opposite updates cancel in aggregation and must not receive
+    the maximum diversity reward merely because their signed cosine is -1.
     """
     import torch
 
-    cids = [cid for cid in poisoned_by_client if cid in references]
-    if len(cids) < 2:
-        return 0.0
     eps = 1e-8
     normed = []
-    for cid in cids:
+    for cid in poisoned_by_client:
+        if cid not in references:
+            continue
         pw, bw = poisoned_by_client[cid], references[cid]
         delta = torch.cat([
             (pw[k].flatten().float() - bw[k].flatten().float()) for k in bw
         ])
-        normed.append(delta / (delta.norm() + eps))
+        norm = delta.norm()
+        if not bool(torch.isfinite(norm)) or float(norm) <= eps:
+            continue
+        normed.append(delta / norm)
+    if len(normed) < 2:
+        return 0.0
+
     total, pairs = 0.0, 0
     for i in range(len(normed)):
         for j in range(i + 1, len(normed)):
-            total += float(torch.dot(normed[i], normed[j]))
+            cosine = float(torch.dot(normed[i], normed[j]))
+            total += _clip(1.0 - abs(cosine), 0.0, 1.0)
             pairs += 1
-    mean_cos = total / pairs if pairs else 0.0
-    return _clip(1.0 - mean_cos, 0.0, 1.0)
+    return total / pairs if pairs else 0.0
 
 
-def _soft_malicious_prob(v: DetectionVerdict) -> float:
+def soft_malicious_probability(v: DetectionVerdict) -> float:
     """Map a verdict to a soft P(malicious) in [0, 1].
 
     Prefers the verdict's explicitly calibrated ``p_malicious`` when the producer
@@ -262,6 +344,11 @@ def _soft_malicious_prob(v: DetectionVerdict) -> float:
         return _clip(float(p), 0.0, 1.0)
     c = _clip(float(v.confidence), 0.0, 1.0)
     return 0.5 + 0.5 * c if v.is_suspicious else 0.5 - 0.5 * c
+
+
+def _soft_malicious_prob(v: DetectionVerdict) -> float:
+    """Backward-compatible private alias for :func:`soft_malicious_probability`."""
+    return soft_malicious_probability(v)
 
 
 def defender_reward(
@@ -290,7 +377,7 @@ def defender_reward(
     if not poisoned:
         if not verdicts:
             return 1.0
-        mean_p = sum(_soft_malicious_prob(v) for v in verdicts) / len(verdicts)
+        mean_p = sum(soft_malicious_probability(v) for v in verdicts) / len(verdicts)
         return _clip(1.0 - mean_p, 0.0, 1.0)
 
     if mode == "tpr_minus_fpr":
@@ -306,7 +393,7 @@ def defender_reward(
     eps = 1e-8
     tp = fp = fn = 0.0
     for v in verdicts:
-        p = _soft_malicious_prob(v)
+        p = soft_malicious_probability(v)
         if v.client_id in poisoned:
             tp += p
             fn += 1.0 - p
