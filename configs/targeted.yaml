@@ -6,16 +6,23 @@
 # `python -m benchmark.run_targeted_benchmark`. See TARGETED.md.
 #
 # Attack goal: "misclassify label L" — drive the global model's recall on ONE class
-# to ~0 while every other class keeps working. During training L is redrawn each
-# round from `attack.target_labels` so the policy learns to attack whichever class
-# the goal names; evaluation fixes a single L.
+# to ~0 while every other class keeps working.
+#
+# Setup: ONE insider (client 0) and ONE fixed label. L is not written down here — the
+# data split is non-IID, so it is derived at runtime from client 0's own shard (its
+# most-represented class) by `data/target_label.py` and printed to the log at startup.
+# See `attack.target_label_from_client` and `fl.n_compromisable` below.
 
 fl:
   training_rounds: 45             # Phase 1: honest training rounds (SHARED with the
                                   # untargeted run — same checkpoints/, same baseline)
   simulation_rounds: 2000000      # Phase 2: adversarial RL rounds
   n_clients: 20                   # total federated clients (honest majority)
-  n_compromisable: 5              # attacker can ONLY access clients [0 .. n_compromisable-1]
+  n_compromisable: 1              # SINGLE INSIDER: the attacker can ONLY access clients
+                                  # [0 .. n_compromisable-1] = client 0. So client 0 is the
+                                  # one and only poisoner (1/20 of the FedAvg average — see
+                                  # `row_zero_factor` in the attacker's prompt: it must scale
+                                  # the target row by ~-19 to zero the aggregated logit).
   poison_fraction: 0.2            # legacy fallback only; the attacker CHOOSES its clients
   poison_seed: 0                  # RNG seed: non-IID partition + per-round budget/label sampling
   benign_retrain_each_round: false # false = benign clients replay frozen Phase-1 local weights
@@ -34,8 +41,9 @@ data:
 attack:
   goal:
     type: "targeted_label"        # THE difference from base.yaml
-    label: 2                      # EVAL default / fallback. Training overrides it every
-                                  # round from `target_labels` below.
+    label: 2                      # FALLBACK ONLY — used when `target_label_from_client`
+                                  # below is null. Otherwise it is REPLACED at runtime by
+                                  # the class client 0 actually holds most of.
     target_class_drop: 0.50       # how much of the target class's RECALL to destroy.
                                   # 0.50 = "lose half the class": a class the clean model gets
                                   # 0.86 right must fall to ~0.36. Set 0.80 to demand near-total
@@ -46,19 +54,37 @@ attack:
                                   # they may lose before the attack stops counting as targeted.
                                   # The reward charges collateral in units of this.
 
-  # --- Label sampling: what makes the policy generalize across classes ---
-  sample_target_in_training: true # true = redraw `goal.label` each round from `target_labels`.
-                                  # This is the whole reason the trained attacker works on any
-                                  # requested class: the label is never constant, so the only
-                                  # way to score is to READ it off the goal and hit that class's
-                                  # output-layer row. false = always attack `goal.label`.
-  target_labels: [0, 1, 2, 3, 4, 5]  # the classes trained on. Evaluation may ask for any of
-                                  # them (and 6-9 measure out-of-distribution generalization).
+  # --- WHICH label: derived at runtime from the poisoner's own data -------------
+  # The data split is non-IID (FLTrust bias-q), so WHICH classes client 0 owns is
+  # decided by the partition RNG (`data.noniid_bias`, `fl.poison_seed`, `fl.n_clients`)
+  # and is NOT knowable from this file. Setting this to a client id makes
+  # `data/target_label.py` measure that client's label histogram right after
+  # partitioning and pin the run to its MOST-REPRESENTED class, so the insider attacks
+  # a class it is genuinely trained on. It overrides three fields below/above:
+  #     attack.goal.label               -> the derived class
+  #     attack.target_labels            -> [that class]
+  #     attack.sample_target_in_training-> false
+  # The derivation (full histogram + chosen label + its share) is printed to
+  # logs/targeted/system.log at startup, and every round's log line carries it as
+  # `TGT[<label>]`. Set to null to go back to the configured label / label sampling.
+  target_label_from_client: 0     # = client 0, the only compromisable client
+
+  # --- Label sampling: only used when `target_label_from_client` is null ---------
+  sample_target_in_training: false # true = redraw `goal.label` each round from `target_labels`,
+                                  # which trains a LABEL-AGNOSTIC policy (it must read the label
+                                  # off the goal). false = always attack `goal.label` — required
+                                  # here, because the target must stay the one class client 0
+                                  # holds; a per-round redraw would ask it to attack classes its
+                                  # own data has almost nothing of.
+  target_labels: [0, 1, 2, 3, 4, 5]  # the classes trained on when sampling is on. Replaced by
+                                  # [derived label] whenever `target_label_from_client` is set.
 
   # --- Client-selection budget (the attacker chooses WHICH & HOW MANY to poison) ---
-  max_poison_clients: 5           # TRAINING budget cap (must be <= n_compromisable)
-  sample_budget_in_training: true # randomize the per-round cap in [1..max_poison_clients] so
-                                  # the policy is BUDGET-AWARE and generalizes to any eval budget
+  max_poison_clients: 1           # TRAINING budget cap (must be <= n_compromisable). 1 =
+                                  # exactly one poisoned client per round, and with
+                                  # n_compromisable=1 that client is always client 0.
+  sample_budget_in_training: false # nothing to randomize at a cap of 1 (a sampled budget in
+                                  # [1..1] is the constant 1); keep it off so the logs say so.
   eval_poison_clients: 1          # EVALUATION default budget (benchmark --poison-clients override)
 
 # Non-LLM defense for `python train_targeted.py --freeze defender` (and the
@@ -140,7 +166,9 @@ rl:
       beta: 0.5                   # weight on evasion (stealth)
       gamma: 1.0                  # penalty for malformed / wasted clients
       delta: 0.3                  # penalty for using MORE poison clients than needed
-      zeta: 0.2                   # bonus for COLLABORATIVE multi-client attacks
+                                  # (INERT at n_compromisable=1 / max_poison_clients=1 —
+                                  # both terms need >1 poisoned client to fire)
+      zeta: 0.2                   # bonus for COLLABORATIVE multi-client attacks (ditto)
       eta: 1.0                    # PENALTY for collateral damage to the other classes,
                                   # in units of attack.goal.max_collateral (capped at 3.0).
                                   # This term is what makes the attack targeted instead of

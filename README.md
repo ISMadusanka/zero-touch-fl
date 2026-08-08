@@ -221,9 +221,15 @@ adapters and logs — see [`TARGETED.md`](TARGETED.md).** It never shares state 
 the untargeted run (only the Phase-1 honest baseline, so both start identically):
 
 ```bash
-python train_targeted.py                                                  # train
-python -m benchmark.run_targeted_benchmark --label 2 --poison-clients 3   # evaluate
+python train_targeted.py                              # train
+python -m benchmark.run_targeted_benchmark --rounds 100   # evaluate
 ```
+
+As shipped it is a **single-insider** attack: `fl.n_compromisable: 1` and
+`attack.max_poison_clients: 1` mean client 0 is the only poisoner, and
+`attack.target_label_from_client: 0` makes `data/target_label.py` derive the attacked
+class at runtime from client 0's own non-IID shard (its most-represented class) and print
+it at startup, since a non-IID split decides that class by RNG rather than by config.
 
 **Target generalization (untargeted_degrade).** Rather than overfitting a single
 target, training randomizes `target_accuracy_drop` each round from

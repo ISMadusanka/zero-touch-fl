@@ -4,16 +4,23 @@ A second, **separate** experiment alongside the untargeted one. Same arms race, 
 GRPO machinery, different objective:
 
 > **Untargeted** (`configs/base.yaml`): *"cut global accuracy by 20%."*
-> **Targeted** (`configs/targeted.yaml`): *"make the model misclassify label 2 —
+> **Targeted** (`configs/targeted.yaml`): *"make the model misclassify label L —
 > and leave every other class working."*
 
 The two never share a config, a LoRA adapter, a log directory or a report. They do
 share one thing on purpose: the Phase-1 honest-training checkpoint, so both are
 measured from the identical clean baseline.
 
+**One insider, one label.** As shipped, the attacker controls exactly **one** client
+(client 0, `fl.n_compromisable: 1`) and attacks exactly **one** class — the class
+client 0's own non-IID shard is dominated by. That label is not written in the config:
+the split is non-IID, so which classes client 0 owns depends on the partition RNG and is
+only knowable at runtime. `data/target_label.py` measures it right after partitioning,
+pins the run to it, and prints it (see [§3](#which-label-derived-from-client-0s-own-data)).
+
 ```bash
-python train_targeted.py                                          # train
-python -m benchmark.run_targeted_benchmark --label 2 --poison-clients 3   # evaluate
+python train_targeted.py                                  # train
+python -m benchmark.run_targeted_benchmark --rounds 100    # evaluate the same label
 ```
 
 ---
@@ -171,26 +178,76 @@ Identical GRPO loop to the untargeted run — `G` rollouts per state, group-norm
 advantage, freeze-and-alternate schedule, opponent league. **Nothing about GRPO
 changed**; only the scalar it optimizes.
 
-### Training across labels 0–5
+### Which label: derived from client 0's own data
+
+The poisoner is client 0 and the target class is *its* class. With a non-IID split that
+class is decided at runtime, not in the config:
 
 ```yaml
+fl:
+  n_compromisable: 1              # the attacker controls client 0 and nothing else
 attack:
-  sample_target_in_training: true
-  target_labels: [0, 1, 2, 3, 4, 5]
+  target_label_from_client: 0     # read the label off THAT client's shard
+  max_poison_clients: 1           # one poisoned client per round
+  sample_budget_in_training: false
 ```
 
-Each round `rl/env.py::_round_goal` redraws `goal.label` from `target_labels` and leaves
-the rest of the goal alone. The label the attacker must hit therefore **changes every
-round**, and it travels in the prompt (`attack_goal.label`, plus
-`output_layer.row_for_target_label`).
+Before Phase 2 starts, `data/target_label.py::resolve_client_target_label` reads client
+0's label histogram (`data/mnist_loader.py::client_label_counts` — indexes the dataset's
+`targets` through the shard's index list, so it costs no data loading), takes its
+most-represented class, and pins three fields:
 
-That is the entire mechanism behind generalization: because the label is never constant,
-memorizing "row 2" scores badly. The only strategy that works across rounds is *read the
-label off the goal and attack that class's row*. At evaluation you pin one label and the
-policy applies the learned procedure to it.
+| field | set to | why |
+|---|---|---|
+| `attack.goal.label` | the derived class | what the reward, win-gate and prompt read |
+| `attack.target_labels` | `[that class]` | nothing else is trained |
+| `attack.sample_target_in_training` | `false` | no per-round redraw |
 
-Labels **6–9 are deliberately excluded from training** — evaluating on them measures
-whether the policy learned the procedure or just memorized six special cases.
+All three matter. Leaving `sample_target_in_training: true` would make
+`rl/env.py::_round_goal` redraw a *different* label every round — correct when training a
+label-agnostic policy, wrong here, where the attack must stay on the one class the
+insider actually holds data for.
+
+With the shipped settings (`n_clients: 20`, `noniid_bias: 0.5`, `poison_seed: 0`) the
+FLTrust round-robin puts client 0 in group 0, so the derived label is **0**, at ~49% of
+its 3045 samples. Change the seed, the bias or the client count and it can change — which
+is the whole reason it is measured instead of hardcoded.
+
+The derivation is logged at startup, before the first round:
+
+```
+============================================================
+TARGET LABEL DERIVED AT RUNTIME from client 0's non-IID shard
+  client 0 holds 3045 samples across 10 class(es)
+  label histogram (label:count)  0:1479  1:204  2:174  3:204  4:155  5:144  6:167  7:187  8:162  9:169
+  runner-up: label 1 (204 samples)
+  >>> TARGET LABEL = 0   (1479 samples = 48.6% of client 0's data) <<<
+  pinned: attack.goal.label=0, target_labels=[0], sample_target_in_training=False (same label every round)
+============================================================
+```
+
+and every round's log line then carries it as `TGT[0]`, so a run is never ambiguous about
+what it attacked. `--debug` also records the full derivation under
+`config_summary.target_label_derivation` in `logs/targeted/debug.json`.
+
+To go back to the label-agnostic policy (train over several classes so evaluation can ask
+for any of them), set `target_label_from_client: null` and restore
+`sample_target_in_training: true` with the `target_labels` list. Labels **6–9 are then
+deliberately excluded from training** so evaluating on them measures whether the policy
+learned the procedure or memorized special cases.
+
+### One poisoned client
+
+`n_compromisable: 1` makes `rl/env.py::begin_round` expose a controllable pool of exactly
+`[0]`, and `max_poison_clients: 1` caps the round budget at one client. The attacker's
+prompt therefore offers `controllable_client_ids: [0]`, `max_poison_clients: 1`, and a
+dilution table with a single entry — `row_zero_factor["1"] = -19`. A selection naming any
+other client is dropped by `AttackerAgent.select_and_apply` (it filters to the pool), so
+client 0 is the only client that can ever be poisoned.
+
+Two reward terms go inert at one client and are left in place for the multi-client
+configuration: `delta` (penalty for using more clients than needed) and `zeta` (bonus for
+coordinated multi-client roles) both require `n_used > 1`.
 
 ### Round flow
 
@@ -261,36 +318,43 @@ Nothing here collides with the untargeted run's `checkpoints/attacker_adapter/` 
 ### Evaluate
 
 ```bash
-python -m benchmark.run_targeted_benchmark --label 2 --poison-clients 3 --rounds 100
+python -m benchmark.run_targeted_benchmark --rounds 100
 ```
+
+With no flags this evaluates **exactly what training attacked**: it re-derives the label
+from `attack.target_label_from_client`'s shard (same seed → same partition → same class)
+and uses `attack.eval_poison_clients` (1) as the budget. The derivation block is printed
+here too, so a report can always be traced back to its label.
 
 The two knobs the experiment is parameterised on:
 
 | flag | meaning |
 |---|---|
-| `--label L` | which class the attack must make the model misclassify (0–9) |
-| `--poison-clients k` | how many clients the attacker may poison per round (it chooses *which*) |
+| `--label L` | which class the attack must make the model misclassify (0–9). **Overrides** the runtime derivation — use it to probe generalization to a class the policy was not trained on |
+| `--poison-clients k` | how many clients the attacker may poison per round (it chooses *which*, from the `n_compromisable` pool — so `k > 1` needs a wider pool in the config) |
 
 Both are fixed for the whole run — no per-round sampling at evaluation. Other useful
 flags: `--defenses`, `--rounds`, `--attack-temperature`, `--target-class-drop`,
 `--max-collateral`, `--out`, `--attacker-adapter`.
 
-Sweep a few settings:
+Check whether the single-insider policy transfers to other classes:
 
 ```bash
 for L in 0 1 2 3 4 5 6 7 8 9; do
-  python -m benchmark.run_targeted_benchmark --label $L --poison-clients 3 \
+  python -m benchmark.run_targeted_benchmark --label $L \
       --rounds 50 --out logs/targeted/benchmark_l$L
 done
 ```
 
-Labels 6–9 are the held-out generalization check.
+Every label except client 0's own is held out by construction here: a run trained with
+`target_label_from_client` sees one class only, so all nine others measure generalization.
 
 ---
 
 ## 5. Reading the benchmark output
 
-The report leads with the target class against the others, per defense:
+The report leads with the target class against the others, per defense (example below
+from a wider-pool run: `--label 2 --poison-clients 3`):
 
 ```
 ====================================================================
@@ -356,19 +420,26 @@ python -m benchmark.targeted_plot --history logs/targeted/benchmark/history.json
 `configs/targeted.yaml`, the fields that differ from `base.yaml`:
 
 ```yaml
+fl:
+  n_compromisable: 1          # SINGLE INSIDER: the pool is clients [0 .. n-1] = [0]
+
 attack:
   goal:
     type: "targeted_label"
-    label: 2                  # EVAL default; training overrides per round
-    target_class_drop: 0.80   # how much of the class's recall to destroy
+    label: 2                  # FALLBACK ONLY — replaced at runtime by the derived label
+    target_class_drop: 0.50   # how much of the class's recall to destroy
                               #   (clamped per round to that class's clean recall)
     max_collateral: 0.05      # mean recall the OTHER classes may lose
-  sample_target_in_training: true      # redraw `label` every round
-  target_labels: [0,1,2,3,4,5]         # the classes trained on
+  target_label_from_client: 0 # derive the label from client 0's own shard (null = off)
+  sample_target_in_training: false     # no per-round redraw (forced false when derived)
+  target_labels: [0,1,2,3,4,5]         # only used when the derivation is off
+  max_poison_clients: 1                # training budget: one poisoned client per round
+  sample_budget_in_training: false     # nothing to randomize at a cap of 1
   eval_poison_clients: 1               # benchmark default (--poison-clients)
 
 data:
-  n_classes: 10               # width of the per-class breakdown
+  n_classes: 10               # width of the per-class breakdown; also the partition's
+                              #   group count, so it decides which class client 0 owns
 
 rl:
   adapter_paths:              # SEPARATE from the untargeted run
@@ -384,8 +455,14 @@ rl:
 
 - **Attack too destructive?** Raise `eta` or lower `max_collateral`.
 - **Attack never lands?** The likely cause is under-shooting the dilution. Check the
-  `TGT[...]` line: if `post_recall ≈ clean_recall` the factors are too timid. Raising
-  `eval_poison_clients` / `max_poison_clients` gives the attacker more aggregate share.
+  `TGT[...]` line: if `post_recall ≈ clean_recall` the factors are too timid. At one
+  poisoned client of 20 the factor that zeroes the aggregated row is **−19**, and the
+  policy has to reach past it; a timid −3 moves the average by 20% and does nothing.
+  Raising `n_compromisable` / `max_poison_clients` / `eval_poison_clients` (back above 1)
+  gives the attacker more aggregate share and smaller per-client factors.
+- **Attacking the wrong class?** The label comes from client 0's data, not the config —
+  read the `TARGET LABEL DERIVED AT RUNTIME` block at the top of the log. It moves with
+  `fl.poison_seed`, `data.noniid_bias` and `fl.n_clients`, since those decide the split.
 - **`zero_adv=1.00` on many rounds?** The group has no reward spread. `resample_temperature`
   and `scoring_opponent_temperature` are the existing levers.
 - **Want source→target (`2 → 7`) instead of `2 → anything`?** Not implemented. It needs a

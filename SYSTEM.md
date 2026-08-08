@@ -9,7 +9,8 @@ checkpoint layout. It supersedes the old feedback/episodic-memory design.
 | Layer | Module | Role |
 |-------|--------|------|
 | Model | `model/mnist_net.py` | `MnistNet`, ~970 params. State_dict keys: `net.2.weight [16,49]`, `net.2.bias [16]`, `net.4.weight [10,16]`, `net.4.bias [10]`. The schema both LLMs operate over. |
-| Data | `data/mnist_loader.py` | MNIST load + per-client partition: IID, or the FLTrust non-IID bias-`q` scheme (`partition_noniid_fltrust`). |
+| Data | `data/mnist_loader.py` | MNIST load + per-client partition: IID, or the FLTrust non-IID bias-`q` scheme (`partition_noniid_fltrust`); `client_label_counts` reads one client's shard histogram. |
+| Data | `data/target_label.py` | Targeted runs only: derives the attacked class at runtime from a chosen client's own non-IID shard and pins the goal to it (`attack.target_label_from_client`). See `TARGETED.md`. |
 | Clients | `clients/benign_client.py` | Honest local SGD → `ModelUpdate`. |
 | Server | `server/fed_server.py`, `server/aggregation.py` | Global model + eval; FedAvg over non-flagged clients. |
 | Features | `detector/features.py` | Per-client, per-layer statistical feature vectors (no decisions). |

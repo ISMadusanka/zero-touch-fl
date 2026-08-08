@@ -161,6 +161,7 @@ def main():
         n_clients=fl["n_clients"], batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), iid=data_cfg.get("iid", True),
         bias_q=float(data_cfg.get("noniid_bias", 0.5)), seed=seed,
+        n_classes=int(data_cfg.get("n_classes", 10)),
     )
 
     if fl.get("benign_retrain_each_round", False):

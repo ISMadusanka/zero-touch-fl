@@ -37,7 +37,9 @@ def _parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--label", type=int, default=None,
                     help="the class the attack must make the model misclassify (0-9). "
-                         "Default: attack.goal.label from --config.")
+                         "Default: the label derived at runtime from client "
+                         "attack.target_label_from_client's own non-IID shard (the same "
+                         "class training attacked), or attack.goal.label when that is null.")
     ap.add_argument("--poison-clients", type=int, default=None,
                     help="how many clients the attacker may poison each round (it chooses "
                          "WHICH of its controllable pool). Default: attack.eval_poison_clients")
@@ -130,7 +132,9 @@ def main():
     attacker_cfg["attack_goal"] = goal
     attacker_cfg["n_clients"] = int(base_cfg["fl"]["n_clients"])
     attacker_cfg["n_classes"] = n_classes
-    log.info(f"Targeted goal (fixed for the run): {goal}")
+    # NOTE: `label` may still be replaced below, once the data is partitioned, when the
+    # config derives it from a client's own shard (attack.target_label_from_client).
+    log.info(f"Targeted goal from config/flags: {goal}")
 
     fl = base_cfg["fl"]
     rl_cfg = base_cfg.get("rl", {})
@@ -153,7 +157,24 @@ def main():
         n_clients=fl["n_clients"], batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), iid=data_cfg.get("iid", True),
         bias_q=float(data_cfg.get("noniid_bias", 0.5)), seed=seed,
+        n_classes=n_classes,
     )
+
+    # Match training's label choice: when the config derives the target label from a
+    # client's own non-IID shard, evaluation must attack that SAME class or it is
+    # measuring a policy on a goal it was never trained for. An explicit --label wins
+    # (that is what it is for: probing generalization to another class).
+    from data.target_label import CLIENT_KEY, resolve_client_target_label
+    if args.label is None:
+        info = resolve_client_target_label(base_cfg, client_loaders)
+        if info is not None:
+            label = int(goal["label"])          # goal was mutated in place
+            log.info(f"Targeted goal (fixed for the run, label read off client "
+                     f"{info['client_id']}'s data): {goal}")
+    elif (base_cfg.get("attack") or {}).get(CLIENT_KEY) is not None:
+        log.info(f"--label {label} given explicitly — ignoring attack.{CLIENT_KEY}="
+                 f"{base_cfg['attack'][CLIENT_KEY]} (the label training derived from "
+                 f"that client's data may differ)")
 
     if fl.get("benign_retrain_each_round", False):
         log.warning("benign_retrain_each_round=true: the benchmark assumes frozen benign "

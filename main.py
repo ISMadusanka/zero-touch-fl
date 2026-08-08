@@ -37,6 +37,7 @@ from dataclasses import asdict
 import yaml
 
 from data.mnist_loader import get_data_loaders
+from data.target_label import resolve_client_target_label
 from clients.benign_client import BenignClient
 from server.fed_server import FedServer
 from server.aggregation import FedAvgAggregator
@@ -245,6 +246,11 @@ def run_phase2(
     logger.info(f"  simulation_rounds={n_rounds}, n_compromisable={fl.get('n_compromisable')}, "
                 f"max_poison_clients={attack_cfg.get('max_poison_clients')}, "
                 f"sample_budget={attack_cfg.get('sample_budget_in_training')}")
+    # Spell out WHO can be poisoned and WHAT is being attacked: with a single
+    # compromisable client and a runtime-derived target label, neither is guessable
+    # from the config file alone.
+    logger.info(f"  controllable clients={list(range(int(fl.get('n_compromisable', fl['n_clients']))))}"
+                f", attack_goal={attack_cfg.get('goal')}")
     logger.info(f"  baseline_accuracy={baseline_accuracy:.4f}")
     logger.info("=" * 60)
 
@@ -433,11 +439,25 @@ def main():
 
     fl = base_config["fl"]
     data_cfg = base_config["data"]
+    n_classes = int(data_cfg.get("n_classes", 10))
     client_loaders, test_loader = get_data_loaders(
         n_clients=fl["n_clients"], batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), iid=data_cfg.get("iid", True),
         bias_q=float(data_cfg.get("noniid_bias", 0.5)), seed=seed,
+        n_classes=n_classes,
     )
+
+    # TARGETED single-insider mode: the class under attack is NOT a config constant.
+    # With a non-IID split, which classes the compromised client owns is decided by
+    # the partition RNG, so the label is read off that client's shard here — after
+    # partitioning, before the goal is frozen — and logged. No-op (returns None) when
+    # `attack.target_label_from_client` is null or the goal is not targeted_label.
+    target_label_info = resolve_client_target_label(base_config, client_loaders)
+    if target_label_info is not None:
+        # `goal` is the same dict the resolver mutated; re-publish it to the agent
+        # config explicitly so the derived label cannot be missed by a future reader.
+        goal = base_config["attack"]["goal"]
+        attacker_config["attack_goal"] = goal
 
     state = load_state() if (state_exists() and not args.fresh) else None
     if state is not None and len(state[1]) != fl["n_clients"]:
@@ -477,6 +497,9 @@ def main():
                 "n_clients": fl.get("n_clients"),
                 "n_compromisable": fl.get("n_compromisable"),
                 "attack_goal": goal,
+                "target_label_from_client": base_config.get("attack", {}).get(
+                    "target_label_from_client"),
+                "target_label_derivation": target_label_info,
                 "target_labels": base_config.get("attack", {}).get("target_labels"),
                 "max_poison_clients": base_config.get("attack", {}).get("max_poison_clients"),
                 "sample_budget": base_config.get("attack", {}).get("sample_budget_in_training"),

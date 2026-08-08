@@ -98,6 +98,39 @@ def partition_noniid_fltrust(dataset, n_clients: int, n_classes: int = 10,
     return shards
 
 
+def client_label_counts(source, n_classes: int = 10) -> list[int]:
+    """Label histogram of ONE client's shard: ``counts[c]`` = samples of class ``c``.
+
+    Accepts the client's ``DataLoader`` (what :func:`get_data_loaders` returns), its
+    ``Subset``, or a bare dataset. Labels are read straight off the underlying
+    dataset's ``targets`` and indexed with the shard's index list, so this costs no
+    batching and no image decoding — it is O(shard size) integer lookups.
+
+    Why it exists: under the non-IID partition (:func:`partition_noniid_fltrust`)
+    *which* classes a client holds is decided at runtime by the partition RNG, not
+    by the config. A targeted attack that must aim at a class its compromised client
+    actually owns therefore has to MEASURE the shard after partitioning — see
+    ``data.target_label``.
+    """
+    ds = source.dataset if isinstance(source, DataLoader) else source
+    # Peel nested Subsets, composing their index maps down to the base dataset:
+    # sample j of the outer Subset is base[inner[outer[j]]].
+    indices = None
+    while isinstance(ds, Subset):
+        inner = list(ds.indices)
+        indices = inner if indices is None else [inner[i] for i in indices]
+        ds = ds.dataset
+    targets = _dataset_targets(ds)
+    if indices is None:                      # a bare dataset = the whole thing
+        indices = range(len(targets))
+    counts = [0] * max(1, int(n_classes))
+    for i in indices:
+        c = int(targets[i])
+        if 0 <= c < len(counts):
+            counts[c] += 1
+    return counts
+
+
 def get_root_loader(root_size: int, batch_size: int, data_dir: str = "./data/mnist_raw",
                     seed: int = 0):
     """A small CLEAN "root" dataset held by the server.
