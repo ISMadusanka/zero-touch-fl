@@ -16,6 +16,15 @@ class BenignClient:
         self.local_epochs = local_epochs
         self.device = device
 
+    def set_data_loader(self, data_loader) -> None:
+        """Swap in this round's local data.
+
+        Phase 2's simulated rounds hand every client a fresh slice of its own
+        shard each round (see ``data.round_sampler.RoundDataSampler``), which is
+        what makes consecutive rounds differ when the global model is frozen.
+        """
+        self.data_loader = data_loader
+
     def train(self, global_model: nn.Module) -> ModelUpdate:
         """Train on local data starting from global model weights."""
         model = copy.deepcopy(global_model).to(self.device)

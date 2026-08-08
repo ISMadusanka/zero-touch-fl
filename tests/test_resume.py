@@ -40,9 +40,13 @@ def _loader(seed, n=64):
 
 def _cfg():
     return {
+        # freeze_global_in_phase2: False — the FL-state roundtrip and the interlude
+        # gating tested here are about the CONTINUING federation, whose shared model
+        # a resume has to carry. Frozen rounds re-anchor instead (covered in
+        # tests/test_frozen_rounds.py::test_restore_reanchors_a_drifted_checkpoint).
         "fl": {"n_clients": 4, "device": "cpu", "benign_retrain_each_round": False,
                "training_rounds": 20, "n_compromisable": 2, "lr": 0.05, "local_epochs": 1,
-               "simulation_rounds": 1},
+               "freeze_global_in_phase2": False, "simulation_rounds": 1},
         "attack": {"goal": {"type": "untargeted_degrade", "target_accuracy_drop": 0.2},
                    "max_poison_clients": 2, "sample_budget_in_training": True},
         "rl": {"G": 2, "save_every": 1, "league_snapshot_every": 0, "league_prob": 0.0,

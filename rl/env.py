@@ -18,7 +18,24 @@ Round protocol (driven by the schedule / inference loop):
     acc = env.evaluate_updates(updates, verdicts)   # no commit (used to score rollouts)
     ...
     env.set_committed_poison(chosen_ids)            # record the committed poison set
-    new_acc = env.commit(updates, verdicts)         # advance the global model one round
+    new_acc = env.commit(updates, verdicts)         # measure (and, if not frozen, install)
+
+SIMULATED (frozen-anchor) ROUNDS — ``fl.freeze_global_in_phase2: true``, the
+default. Phase 2 does not run a continuing federation; it runs independent
+attacker-learning episodes that all branch off the SAME Phase-1 final model:
+
+    for each round:
+        the frozen Phase-1 global is sent to every client
+        every client trains on NEW local data  (data.round_sampler)
+        the attacker picks `budget` of its pool and poisons them
+        server aggregates poisoned + honest -> candidate global
+        that candidate is evaluated on the test set  -> reward -> GRPO
+        the candidate is DISCARDED; the next round starts from the anchor again
+
+so ``commit`` measures the round without advancing the model, and the global the
+clients see never drifts. Set ``freeze_global_in_phase2: false`` to restore the
+original continuing federation, where each committed aggregate becomes the next
+round's starting point.
 """
 
 import copy
@@ -92,7 +109,7 @@ class RoundContext:
 
 class FLArmsRaceEnv:
     def __init__(self, config: dict, client_loaders, test_loader, rng, defense=None,
-                 curriculum=None):
+                 curriculum=None, round_data=None):
         """``defense`` is an optional :class:`server.algo_defender.AlgorithmicDefender`.
 
         When present the defender LLM is disabled and the server side of every
@@ -110,6 +127,11 @@ class FLArmsRaceEnv:
         holds one (algorithm, #poisoners) pair for a whole block of consecutive
         rounds, so every pair gets an equal, contiguous share of training. The
         goal/target draw is unaffected (see :meth:`_round_goal`).
+
+        ``round_data`` is an optional :class:`data.round_sampler.RoundDataSampler`.
+        When present, every client is handed a fresh slice of its own shard at the
+        start of each round — the "clients train with new data" step of a simulated
+        round. Without it the clients replay their whole fixed shard every round.
         """
         fl = config["fl"]
         attack = config.get("attack", {})
@@ -117,6 +139,31 @@ class FLArmsRaceEnv:
         self.device = fl.get("device", "cpu")
         self.benign_retrain = bool(fl.get("benign_retrain_each_round", True))
         self.training_rounds = int(fl.get("training_rounds", 0))
+        # SIMULATED ROUNDS. Phase 2 does not continue the federation: every round is
+        # an independent episode branching off the frozen Phase-1 model. The round's
+        # aggregate is measured (that measurement IS the attacker's reward) and then
+        # discarded, so round n+1 sends the clients the same anchor as round n.
+        #
+        # Why: in a continuing federation the attacker's own damage becomes the next
+        # round's starting point, so what a plan is worth depends on the wreckage
+        # left by every plan before it — the same attack scores differently
+        # depending on run history, and the reward drifts with the environment
+        # rather than measuring the action. Freezing the anchor makes each round a
+        # controlled experiment against a fixed reference, which is what GRPO's
+        # damage term (clean_reference_accuracy - post_accuracy) assumes.
+        self.freeze_global = bool(fl.get("freeze_global_in_phase2", True))
+        # A frozen anchor plus frozen client weights would make every round
+        # byte-identical, so the retrain step is not optional here — it is the
+        # "clients train with new data" half of the round.
+        if self.freeze_global and not self.benign_retrain:
+            logger.warning(
+                "fl.benign_retrain_each_round is false but Phase 2 runs frozen "
+                "simulated rounds — replaying frozen Phase-1 client weights against a "
+                "frozen global makes every round identical. Forcing benign retraining on."
+            )
+            self.benign_retrain = True
+        # Per-round local data for the clients (None = replay the whole fixed shard).
+        self.round_data = round_data
         self.goal = attack.get(
             "goal", {"type": "untargeted_degrade", "target_accuracy_drop": 0.20}
         )
@@ -163,6 +210,12 @@ class FLArmsRaceEnv:
         self.baseline_accuracy: float = 0.0
         self.current_accuracy: float = 0.0
         self.round_index: int = 0
+        # The Phase-1 final model. In frozen mode this is what every simulated round
+        # sends to the clients, and what :meth:`commit_state` rewinds to.
+        self._anchor_weights: dict | None = None
+        # The most recent COMMITTED round's post-aggregation accuracy. In frozen mode
+        # this is the only place it survives, since it never becomes the global's.
+        self.last_round_accuracy: float = 0.0
 
         # Set by begin_round().
         self.honest_updates: list[ModelUpdate] = []
@@ -180,9 +233,13 @@ class FLArmsRaceEnv:
     # ------------------------------------------------------------------
     def reset(self, global_weights, client_weights, baseline_accuracy):
         self.server.set_global_weights(copy.deepcopy(global_weights))
+        # Keep an untouchable copy: in frozen mode this is the model every simulated
+        # round hands the clients, so it must survive whatever a round aggregates.
+        self._anchor_weights = copy.deepcopy(global_weights)
         self.client_weights = [copy.deepcopy(w) for w in client_weights]
         self.baseline_accuracy = float(baseline_accuracy)
         self.current_accuracy = float(baseline_accuracy)
+        self.last_round_accuracy = float(baseline_accuracy)
         self.round_index = 0
         budget_src = ("curriculum" if self.curriculum is not None
                       else ("sampled" if self.sample_budget else "fixed"))
@@ -191,6 +248,17 @@ class FLArmsRaceEnv:
             f"budget_cap={self.budget_cap}, budget={budget_src}, "
             f"benign_retrain={self.benign_retrain}, baseline_acc={baseline_accuracy:.4f}"
         )
+        if self.freeze_global:
+            logger.info(
+                "Phase 2 = SIMULATED rounds on the frozen Phase-1 global: every round "
+                "restarts the clients from this anchor (acc=%.4f), scores the round's "
+                "aggregate, then discards it. The between-phase benign FL round is "
+                "disabled — there is no shared FL state to advance.",
+                self.baseline_accuracy,
+            )
+        else:
+            logger.info("Phase 2 = CONTINUING federation: each committed aggregate "
+                        "becomes the next round's global (freeze_global_in_phase2: false)")
 
     # ------------------------------------------------------------------
     def snapshot_fl_state(self) -> dict:
@@ -220,6 +288,12 @@ class FLArmsRaceEnv:
         self.client_weights = [copy.deepcopy(w) for w in state["client_weights"]]
         self.current_accuracy = float(state["current_accuracy"])
         self.round_index = int(state.get("round_index", self.round_index))
+        if self.freeze_global and self._anchor_weights is not None:
+            # Frozen mode has no drifting global to restore, and a checkpoint written
+            # BEFORE the flag was turned on holds one that did drift — re-assert the
+            # Phase-1 anchor so the resumed rounds start where fresh ones do.
+            self.server.set_global_weights(copy.deepcopy(self._anchor_weights))
+            self.current_accuracy = self.baseline_accuracy
         self._clean_ref_acc = None        # stale: the shared model just changed
         self._clean_ref_measured = False
         self._clean_defense_sane = True
@@ -273,12 +347,30 @@ class FLArmsRaceEnv:
         # Replay frozen Phase-1 weights.
         return ModelUpdate(client_id=cid, weights=copy.deepcopy(self.client_weights[cid]))
 
+    def _refresh_client_data(self, round_index: int) -> None:
+        """Hand every client its data for this round — a fresh slice of its OWN shard.
+
+        This is the step that makes consecutive simulated rounds differ: the global
+        they start from is frozen, so without new local data every round would
+        reproduce the same honest updates. No-op when no sampler is configured
+        (``fl.client_data_refresh: none``), where the clients keep their full shard.
+        """
+        if self.round_data is None or self._clients is None:
+            return
+        for client, loader in zip(self._clients,
+                                  self.round_data.loaders_for_round(round_index)):
+            client.set_data_loader(loader)
+
     def begin_round(self) -> RoundContext:
         """Produce this round's honest updates and expose the attacker's controllable
         pool + exact poison quota. The poisoned SET is chosen by the attacker, not here."""
         self.round_index += 1
         round_num = self.training_rounds + self.round_index
 
+        # New local data first, THEN train: the honest updates (and so the clean
+        # counterfactual, every scored rollout and the commit) all come from this
+        # round's data, off the frozen global.
+        self._refresh_client_data(self.round_index)
         self.honest_updates = [self._honest_update(cid) for cid in range(self.n_clients)]
         self.pool_ids = list(range(self.n_compromisable))
         self.pool_benign = {cid: self.honest_updates[cid].weights for cid in self.pool_ids}
@@ -500,12 +592,34 @@ class FLArmsRaceEnv:
         return self._eval_state(state)
 
     def commit_state(self, state: dict | None) -> float:
-        """Install an already-aggregated state as the new global and re-evaluate."""
+        """Close the round: measure the aggregate and return its test accuracy.
+
+        In FROZEN mode (``fl.freeze_global_in_phase2``, the default) that is ALL this
+        does — the aggregate is scored and thrown away, and the global stays the
+        Phase-1 anchor so the next round sends the clients exactly the same model.
+        The returned accuracy is still this round's post-attack accuracy, which is
+        what the reward is computed from (``clean_reference_accuracy() - post``); it
+        simply no longer becomes round n+1's starting point.
+
+        Otherwise the aggregate is installed as the new global (a continuing
+        federation) and the returned accuracy is the new global's.
+        """
+        if self.freeze_global:
+            # ``_eval_state`` evaluates without installing and always restores the
+            # global, so the anchor is intact when this returns. ``state is None``
+            # (the defense declined to aggregate) scores the unchanged anchor.
+            self.last_round_accuracy = self._eval_state(state)
+            if state is None:
+                logger.warning("Round commit: no aggregate produced — "
+                               "scoring the unchanged frozen global")
+            return self.last_round_accuracy
+
         if state is not None:
             self.server.set_global_weights(state)
             self.current_accuracy = self.server.evaluate(self.test_loader)
         else:
             logger.warning("Round commit: no aggregate produced — global model unchanged")
+        self.last_round_accuracy = self.current_accuracy
         return self.current_accuracy
 
     # ------------------------------------------------------------------
@@ -525,9 +639,18 @@ class FLArmsRaceEnv:
         following round.
 
         Advances ``round_index`` so the interlude gets its own sequential round
-        number, and returns a summary dict for logging. Returns ``None`` when the
-        env has no client loaders (e.g. some unit tests) so callers can no-op.
+        number, and returns a summary dict for logging. Returns ``None`` — and
+        changes nothing — when the env has no client loaders (e.g. some unit tests),
+        or when Phase 2 runs frozen simulated rounds, where advancing the shared
+        model is precisely what must not happen.
         """
+        if self.freeze_global:
+            logger.info(
+                "run_benign_fl_round: SKIPPED — Phase 2 runs simulated rounds on the "
+                "frozen Phase-1 global, so there is no shared FL state to advance "
+                "(fl.freeze_global_in_phase2)."
+            )
+            return None
         if self._clients is None:
             logger.warning("run_benign_fl_round: no client loaders — FL round skipped")
             return None
@@ -536,6 +659,7 @@ class FLArmsRaceEnv:
         round_num = self.training_rounds + self.round_index
         prev_accuracy = self.current_accuracy
 
+        self._refresh_client_data(self.round_index)
         updates = [c.train(self.server.model) for c in self._clients]
         # All clients are honest here — every verdict is benign, so FedAvg averages
         # the full set (mirrors Phase 1's clean aggregation).

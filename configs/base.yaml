@@ -10,6 +10,59 @@ fl:
                                   # its pool to poison (see attack.max_poison_clients). Kept only
                                   # as a legacy fallback for defenses that assume a #malicious.
   poison_seed: 0                  # RNG seed: non-IID partition + per-round budget sampling + repro
+  # --- Phase 2 = SIMULATED rounds on the frozen Phase-1 model ---
+  freeze_global_in_phase2: true   # true = Phase 2 does NOT continue the federation. Every
+                                  # attacker-learning round is an independent episode off the
+                                  # SAME Phase-1 final model: the anchor is sent to the clients,
+                                  # they train on new local data, the attacker poisons its chosen
+                                  # clients, the server aggregates, the aggregate is SCORED on the
+                                  # test set (that score is the reward GRPO trains on) and then
+                                  # DISCARDED — the next round starts from the anchor again.
+                                  #
+                                  # Why not let it accumulate: in a continuing federation the
+                                  # attacker's own damage becomes the next round's starting point,
+                                  # so what a plan is worth depends on the wreckage left by every
+                                  # plan before it. The same attack scores differently depending on
+                                  # run history, and a run that has already collapsed the model
+                                  # scores every subsequent plan against rubble. The reward then
+                                  # tracks environment drift rather than the action — and the
+                                  # damage term (clean_reference_accuracy - post_accuracy) is only
+                                  # a controlled comparison when both branches start from the same
+                                  # model, which is exactly what the frozen anchor guarantees.
+                                  #
+                                  # false = the original continuing federation (each committed
+                                  # aggregate becomes the next round's global). Note that
+                                  # rl.fl_interlude_between_phases only does anything when this is
+                                  # false — with a frozen anchor there is no shared FL state to
+                                  # advance, so the interlude is skipped.
+  client_data_refresh: "rotate"   # step 2 of a simulated round: what data the clients train on.
+                                  # rotate   = the client's shard is shuffled and cut into disjoint
+                                  #            per-round slices; round r trains on slice r, and the
+                                  #            shard is re-shuffled (re-cut differently) once it is
+                                  #            exhausted. Every example is used before any is reused.
+                                  # resample = an independent random draw from the shard each round.
+                                  # none     = every round replays the whole fixed shard, so rounds
+                                  #            differ only by SGD shuffle order. Combined with the
+                                  #            frozen anchor that makes consecutive rounds nearly
+                                  #            identical, which is why it is not the default.
+                                  # A slice always comes from the client's OWN shard, so the non-IID
+                                  # skew the FLTrust partition built is preserved.
+  client_round_fraction: 0.25     # fraction of its shard a client trains on per round.
+                                  # 20 clients over MNIST = ~3000-example shards, so 0.25 is ~750
+                                  # examples (12 batches, 36 SGD iterations at local_epochs: 3) and
+                                  # `rotate` covers the whole shard every 4 rounds.
+                                  # It is a REAL knob on the FL dynamics, not just bookkeeping:
+                                  # fewer examples per round = fewer SGD iterations = smaller honest
+                                  # updates, so a poisoned update of a given size stands out more.
+                                  # Raising it toward 1.0 restores full-shard local training at the
+                                  # cost of `rotate` degenerating to a per-round re-shuffle of the
+                                  # same examples (i.e. no new data).
+                                  # It also sets FLTrust's root fine-tuning budget: root_epochs is
+                                  # iteration-matched to local_epochs x batches-per-round (see
+                                  # defense.fltrust.root_epochs), and main.py counts those batches
+                                  # over the ROUND's data, not the full shard. Lowering this
+                                  # therefore shrinks ||g0|| in step with the honest clients — do
+                                  # not "fix" one without the other.
   benign_retrain_each_round: true  # true = every benign client retrains from the CURRENT global each
                                   # round. false replays frozen Phase-1 local weights forever, which
                                   # broke FLTrust: trust is ReLU(cos(delta_i, g0)) and a frozen
@@ -21,6 +74,9 @@ fl:
                                   # honest deltas on the same descent direction the server sees. It
                                   # costs one local-training pass per client per round, which on this
                                   # 970-parameter model is negligible next to LLM generation.
+                                  # FORCED ON when freeze_global_in_phase2 is true: a frozen global
+                                  # plus frozen client weights makes every round byte-identical, so
+                                  # the retrain IS the "clients train with new data" step there.
   local_epochs: 3
   batch_size: 64
   lr: 0.002
@@ -303,6 +359,9 @@ rl:
                                   # global, FedAvg into a new global, and the refreshed per-client
                                   # weights become what the next learner / frozen opponent /
                                   # aggregator consume. false = keep the frozen Phase-1 weights.
+                                  # NO EFFECT while fl.freeze_global_in_phase2 is true — advancing
+                                  # the shared global is exactly what a simulated round must not do,
+                                  # so env.run_benign_fl_round() skips and logs instead.
   curriculum_on_cap: true         # after a phase caps without a win, next learner faces an
                                   # earlier opponent snapshot so it can find a foothold
   attacker_min_drop: 0.10         # FALLBACK absolute drop bar, used only when the round's goal

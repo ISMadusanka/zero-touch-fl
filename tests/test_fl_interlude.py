@@ -39,6 +39,10 @@ def _cfg():
         "fl": {
             "n_clients": N_CLIENTS,
             "device": "cpu",
+            # The interlude only exists in the CONTINUING federation: with Phase 2's
+            # default frozen simulated rounds there is no shared FL state to advance,
+            # so run_benign_fl_round() skips (asserted in test_frozen_rounds.py).
+            "freeze_global_in_phase2": False,
             "benign_retrain_each_round": False,  # honest updates replay client_weights
             "training_rounds": TRAINING_ROUNDS,
             "n_compromisable": N_COMPROMISABLE,

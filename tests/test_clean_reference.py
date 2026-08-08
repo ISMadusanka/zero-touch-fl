@@ -32,8 +32,13 @@ def _loader(seed: int, n: int = 64):
 
 def _env(benign_retrain=False):
     cfg = {
+        # freeze_global_in_phase2: False — the counterfactual's interaction with a
+        # MOVING global (it must be invalidated when the shared model advances) is
+        # what several of these tests are about. Its behaviour on frozen simulated
+        # rounds is covered by tests/test_frozen_rounds.py.
         "fl": {"n_clients": N_CLIENTS, "device": "cpu",
                "benign_retrain_each_round": benign_retrain,
+               "freeze_global_in_phase2": False,
                "training_rounds": TRAINING_ROUNDS, "n_compromisable": 2,
                "lr": 0.05, "local_epochs": 1},
         "attack": {"goal": {"type": "untargeted_degrade", "target_accuracy_drop": 0.20},

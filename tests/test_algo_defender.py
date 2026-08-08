@@ -38,8 +38,13 @@ def _loader(seed: int, n: int = 64):
 
 def _cfg(**defense):
     base = {
+        # freeze_global_in_phase2: False — these tests cover the CONTINUING-federation
+        # path (commit installs the defense's aggregate, the benign interlude advances
+        # the shared model). The frozen simulated rounds that Phase 2 now runs by
+        # default are covered by tests/test_frozen_rounds.py.
         "fl": {"n_clients": N_CLIENTS, "device": "cpu", "lr": 0.05, "local_epochs": 1,
                "benign_retrain_each_round": False, "training_rounds": 5,
+               "freeze_global_in_phase2": False,
                "n_compromisable": 2, "poison_seed": 0, "batch_size": 32},
         "data": {"data_dir": "./data/mnist_raw"},
         "attack": {"goal": {"type": "untargeted_degrade", "target_accuracy_drop": 0.2},

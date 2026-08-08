@@ -2,11 +2,23 @@
 
 Two phases:
   Phase 1 (training_rounds): honest FedAvg training, then checkpoint.
-  Phase 2 (simulation_rounds): LLM-direct adversarial arms race with RL.
+  Phase 2 (simulation_rounds): attacker-learning rounds SIMULATED on the frozen
+    Phase-1 global.
 
-In Phase 2 an exact-budget subset of clients is poisoned each round. An attacker LLM
-emits an attack plan (primitive weight operators) applied to the benign weights,
-and the server defends.
+Phase 2 does not run a continuing federation. Each round is an independent episode
+branching off the SAME Phase-1 final model:
+
+  1. that frozen global is sent to every client;
+  2. every client trains on NEW local data (a fresh slice of its own shard);
+  3. the attacker LLM picks an exact-budget subset of its controllable pool and
+     poisons those clients (primitive weight operators over the benign weights);
+  4. poisoned + honest updates go to the server, which defends and aggregates;
+  5. the aggregate is evaluated on the test set — that accuracy is the attacker's
+     reward — and then DISCARDED. The attacker improves on it with GRPO;
+  6. the next round starts again from the Phase-1 global.
+
+Set ``fl.freeze_global_in_phase2: false`` to restore the original continuing
+federation, where each committed aggregate becomes the next round's global.
 
 The DEFENDER LLM IS CURRENTLY DISABLED (``defense.mode: algorithmic`` in
 configs/base.yaml). The server instead defends with the published algorithms —
@@ -39,6 +51,7 @@ from dataclasses import asdict
 import yaml
 
 from data.mnist_loader import get_data_loaders, build_root_loader
+from data.round_sampler import build_round_data_sampler
 from clients.benign_client import BenignClient
 from server.fed_server import FedServer
 from server.aggregation import FedAvgAggregator
@@ -189,7 +202,11 @@ def run_phase2(
     fl = config["fl"]
     logger.info("=" * 60)
     attack_cfg = config.get("attack", {})
-    logger.info(f"PHASE 2: LLM-direct arms race  (mode={mode})")
+    frozen = bool(fl.get("freeze_global_in_phase2", True))
+    logger.info(f"PHASE 2: attacker-learning rounds  (mode={mode}, "
+                f"{'SIMULATED on the frozen Phase-1 global' if frozen else 'continuing federation'})")
+    logger.info(f"  client_data_refresh={fl.get('client_data_refresh', 'rotate')} "
+                f"fraction={fl.get('client_round_fraction', 0.25)}")
     logger.info(f"  simulation_rounds={n_rounds}, n_compromisable={fl.get('n_compromisable')}, "
                 f"max_poison_clients={attack_cfg.get('max_poison_clients')}, "
                 f"sample_budget={attack_cfg.get('sample_budget_in_training')}")
@@ -202,6 +219,12 @@ def run_phase2(
 
     seed = int(fl.get("poison_seed", 0))
     rng = random.Random(seed)
+    # Step 2 of a simulated round: every client gets NEW local data each round (a
+    # fresh slice of its own shard). Without this the frozen global would hand the
+    # clients an identical starting point AND identical data, so every round would
+    # reproduce the same honest updates and there would be nothing for the attacker
+    # to generalize over. ``fl.client_data_refresh: none`` turns it off.
+    round_data = build_round_data_sampler(config, client_loaders, seed=seed)
     # Server-side defense. With ``defense.mode: algorithmic`` (the default) the
     # defender LLM is disabled and one published algorithm — FLTrust / DeFL / DnC /
     # Multi-Krum — defends each round, drawn at random; only the attacker trains.
@@ -210,9 +233,17 @@ def run_phase2(
     # sized to match it (defense.fltrust.root_epochs: null), because FLTrust rescales
     # every accepted update to ||g0|| — so the server's reference update, not the
     # clients', sets how far the global model can move per round. See
-    # server.algo_defender.resolve_root_epochs.
+    # server.algo_defender.resolve_root_epochs. It must be counted over the data a
+    # client actually trains on THIS round, which with the per-round refresh on is a
+    # slice of the shard, not the whole thing — sizing g0 off the full shard would
+    # make it several times too large and FLTrust would rescale every honest update
+    # to match.
+    batches_per_client = (
+        round_data.batches_per_round if round_data is not None
+        else (len(client_loaders[0]) if client_loaders else 0)
+    )
     client_iterations = (
-        int(fl["local_epochs"]) * len(client_loaders[0]) if client_loaders else None
+        int(fl["local_epochs"]) * batches_per_client if client_loaders else None
     )
     defense = build_algorithmic_defender(
         config, seed=seed, client_iterations=client_iterations,
@@ -233,7 +264,7 @@ def run_phase2(
     curriculum = build_training_curriculum(
         config, algorithms=(defense.names if defense is not None else None))
     env = FLArmsRaceEnv(config, client_loaders, test_loader, rng,
-                        defense=defense, curriculum=curriculum)
+                        defense=defense, curriculum=curriculum, round_data=round_data)
     env.reset(global_weights, client_weights, baseline_accuracy)
 
     metrics_tracker = MetricsTracker(baseline_accuracy=baseline_accuracy, output_dir="logs/metrics")
@@ -323,7 +354,15 @@ def run_phase2(
 
     logger.info("\n" + "=" * 60)
     logger.info("PHASE 2 COMPLETE")
-    logger.info(f"Final accuracy: {env.current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
+    if frozen:
+        # The global never moved (that is the point), so the informative number is
+        # the LAST round's post-attack accuracy — what the anchor degrades to under
+        # the attacker's committed plan — not the anchor's own unchanged accuracy.
+        logger.info(f"Frozen anchor accuracy: {env.current_accuracy:.4f} "
+                    f"(baseline: {baseline_accuracy:.4f}) — last simulated round scored "
+                    f"{env.last_round_accuracy:.4f}")
+    else:
+        logger.info(f"Final accuracy: {env.current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
     logger.info("=" * 60)
     metrics_tracker.save_summary()
 
@@ -430,6 +469,9 @@ def main():
                 "defense_algorithms": (base_config.get("defense", {}) or {}).get("algorithms"),
                 "defense_selection": (base_config.get("defense", {}) or {}).get("selection", "random"),
                 "curriculum": (base_config.get("curriculum") or None),
+                "freeze_global_in_phase2": fl.get("freeze_global_in_phase2", True),
+                "client_data_refresh": fl.get("client_data_refresh", "rotate"),
+                "client_round_fraction": fl.get("client_round_fraction", 0.25),
                 "n_clients": fl.get("n_clients"),
                 "n_compromisable": fl.get("n_compromisable"),
                 "max_poison_clients": base_config.get("attack", {}).get("max_poison_clients"),
