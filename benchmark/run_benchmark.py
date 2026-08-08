@@ -238,6 +238,7 @@ def main():
         n_rounds=args.rounds, attack_temperature=args.attack_temperature,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)), device=device,
         log_every=args.log_every, recovery_interval=args.recovery_interval,
+        baseline_class_accuracy=env.baseline_class_accuracies,
     )
 
     out_dir = args.out or None
@@ -249,7 +250,11 @@ def main():
         import json as _json
         history = {name: m.history for name, m in _metrics.items()}
         with open(os.path.join(out_dir, "history.json"), "w") as f:
-            _json.dump({"baseline_accuracy": baseline_accuracy, "history": history}, f, indent=2)
+            _json.dump({
+                "baseline_accuracy": baseline_accuracy,
+                "baseline_class_accuracy": env.baseline_class_accuracies,
+                "history": history,
+            }, f, indent=2)
         log.info(f"[saved] {os.path.join(out_dir, 'history.json')}")
         if not args.no_plot:
             from benchmark.plot import plot_history, plot_summary
@@ -257,10 +262,12 @@ def main():
                 history, baseline_accuracy, os.path.join(out_dir, "benchmark.png"),
                 defender_min_tpr=float(rl_cfg.get("defender_min_tpr", 0.99)),
                 defender_max_fpr=float(rl_cfg.get("defender_max_fpr", 0.10)),
+                baseline_class_accuracy=env.baseline_class_accuracies,
             )
             if png:
                 log.info(f"[saved] {png}")
-            spng = plot_summary(history, baseline_accuracy, os.path.join(out_dir, "benchmark_summary.png"))
+            spng = plot_summary(history, baseline_accuracy, os.path.join(out_dir, "benchmark_summary.png"),
+                                baseline_class_accuracy=env.baseline_class_accuracies)
             if spng:
                 log.info(f"[saved] {spng}")
 

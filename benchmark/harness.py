@@ -38,16 +38,27 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
                   init_global, baseline_accuracy, n_rounds, *,
                   attack_temperature: float = 0.7, max_new_tokens: int = 512,
                   device: str = "cpu", attacker_adapter: str = "attacker",
-                  log_every: int = 10, recovery_interval: int = 0):
+                  log_every: int = 10, recovery_interval: int = 0,
+                  baseline_class_accuracy: dict | None = None):
     """Run ``n_rounds`` of attacker-vs-defenses. Returns (summaries, metrics) where
-    summaries = {name: summary-dict} and metrics = {name: DefenseMetrics}."""
+    summaries = {name: summary-dict} and metrics = {name: DefenseMetrics}.
+
+    ``baseline_class_accuracy`` (optional): pass ``env.baseline_class_accuracies``
+    when the configured attack goal is ``targeted_label`` to additionally track,
+    per defense per round, per-class test accuracy -- otherwise global accuracy
+    alone can hide a defense that let one class be quietly destroyed while
+    everything else looked fine. Left ``None`` (default) skips the extra
+    per-class evaluation entirely for the untargeted goal, at no added cost.
+    """
     if "fedavg" not in defenses:
         logger.warning("no 'fedavg' defense in the panel — the attacker's reference accuracy "
                        "will stay frozen at the clean baseline for the whole run.")
     for d in defenses.values():
         d.reset(init_global)
     eval_server = FedServer(device=device)
-    metrics = {name: DefenseMetrics(name, baseline_accuracy) for name in defenses}
+    is_targeted = baseline_class_accuracy is not None
+    metrics = {name: DefenseMetrics(name, baseline_accuracy, baseline_class_accuracy)
+              for name in defenses}
     reference_acc = float(baseline_accuracy)   # what the attacker observes (no-defense world)
 
     for r in range(1, n_rounds + 1):
@@ -81,15 +92,20 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
         for name, d in defenses.items():
             res = d.step(updates, poisoned_ids)
             gw = d.global_weights()
+            class_acc = None
             if gw is not None:
                 # On a skip the defense kept its previous global, so this still
                 # reflects that defense's actual current model accuracy.
                 eval_server.set_global_weights(gw)
-                acc = eval_server.evaluate(test_loader)
+                if is_targeted:
+                    acc, class_acc = eval_server.evaluate(test_loader, return_per_class=True)
+                else:
+                    acc = eval_server.evaluate(test_loader)
             else:
                 acc = metrics[name].last_acc      # no model yet (shouldn't happen post-reset)
+                class_acc = metrics[name].last_class_accuracy
             metrics[name].record(ctx.round_num, res.verdicts, poisoned_ids, acc,
-                                 skipped=(res.new_global is None))
+                                 skipped=(res.new_global is None), class_accuracy=class_acc)
 
         # The attacker observes the undefended (no-defense) accuracy next round.
         if "fedavg" in metrics:

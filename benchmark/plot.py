@@ -20,12 +20,29 @@ Two figures are drawn from the per-round history each defense recorded:
      trigger-happy is this defense" (makes a near-indiscriminate defense like
      FLTrust's FPR=71.7% immediately visible as a near-vertical-max line).
 
+  TARGETED-GOAL EXTRAS (panels 9-10, added automatically when the history carries
+  per-round ``class_accuracy`` AND ``baseline_class_accuracy`` is supplied -- i.e.
+  the attack goal was ``targeted_label``; silently omitted for the untargeted
+  goal, at no cost):
+  9. worst-hit class's accuracy per round (per defense) — directly comparable to
+     panel 1's GLOBAL accuracy: a stealthy targeted attack looks like panel 1
+     staying flat near baseline while panel 9 falls;
+  10. worst-hit class's accuracy DROP per round vs its own baseline (per defense)
+      — the damage magnitude view, on the same 0-1 scale every round regardless
+      of which class happens to be worst-hit that round (relevant under
+      ``label: "menu"``, where the attacker may pick a different class each
+      round).
+
 ``benchmark_summary.png`` (per-defense summary, one bar/point per defense):
-  9. final accuracy per defense, with the clean baseline as a reference line;
-  10. detection rate (TPR) vs. mean accuracy drop — makes it visible when a
+  11. final accuracy per defense, with the clean baseline as a reference line;
+  12. detection rate (TPR) vs. mean accuracy drop — makes it visible when a
       defense's own detection numbers do NOT predict its realised protection
       (the central finding of this benchmark: DeFL has the best non-oracle
       detection rate yet the worst non-collapsed accuracy drop).
+  13. TARGETED-GOAL EXTRA: mean global accuracy drop vs. mean worst-class
+      accuracy drop — the stealth-vs-damage summary; a defense in the
+      bottom-right quadrant (low global drop, high class drop) was fooled by a
+      stealthy targeted attack even though its aggregate accuracy looked fine.
 
 Auto-invoked by run_benchmark. Also runnable standalone to RE-PLOT a saved history
 without re-running the (slow, GPU) benchmark:
@@ -78,9 +95,50 @@ def _round_tpr_fpr(r: dict) -> tuple:
     return tpr, fpr
 
 
+def _normalize_class_dict(d) -> dict | None:
+    """Coerce class-accuracy dict keys to strings.
+
+    ``env.baseline_class_accuracies`` (in-process, same run) has int keys;
+    anything round-tripped through ``history.json`` has string keys (JSON has
+    no int keys). ``class_accuracy`` rows are already stored string-keyed by
+    ``benchmark.metrics.DefenseMetrics.record``, so the baseline must match or
+    every lookup below silently misses and returns a bogus 0.0 baseline.
+    """
+    if not d:
+        return None
+    return {str(k): float(v) for k, v in d.items()}
+
+
+def _has_targeted_data(history: dict, baseline_class_accuracy) -> bool:
+    if not baseline_class_accuracy:
+        return False
+    return any(
+        any(r.get("class_accuracy") for r in h)
+        for h in history.values()
+    )
+
+
+def _worst_class_series(h: list, baseline_class_accuracy: dict) -> tuple:
+    """Per round: (worst-hit class's current accuracy, its drop vs baseline).
+    ``nan`` for rounds with no ``class_accuracy`` recorded."""
+    acc_series, drop_series = [], []
+    for r in h:
+        ca = r.get("class_accuracy")
+        if not ca:
+            acc_series.append(float("nan")); drop_series.append(float("nan"))
+            continue
+        drops = {c: baseline_class_accuracy.get(c, 0.0) - ca.get(c, 0.0) for c in ca}
+        worst = max(drops, key=drops.get)
+        acc_series.append(ca.get(worst, float("nan")))
+        drop_series.append(drops[worst])
+    return acc_series, drop_series
+
+
 def plot_history(history: dict, baseline_accuracy: float, out_path: str, window: int = 20,
-                 defender_min_tpr: float = 0.99, defender_max_fpr: float = 0.10):
-    """Render the 8-panel per-round diagnostics figure.
+                 defender_min_tpr: float = 0.99, defender_max_fpr: float = 0.10,
+                 baseline_class_accuracy: dict | None = None):
+    """Render the per-round diagnostics figure (8 panels, or 10 when targeted
+    per-class data is available — see module docstring).
 
     ``defender_min_tpr``/``defender_max_fpr`` set the joint bar for panel 6
     (DEFENSE SUCCESS RATE), matching ``rl.switch.SwitchConfig``'s own defaults so
@@ -97,8 +155,11 @@ def plot_history(history: dict, baseline_accuracy: float, out_path: str, window:
         return None
     import os
 
+    baseline_class_accuracy = _normalize_class_dict(baseline_class_accuracy)
     names = _ordered_names(history)
-    fig, ax = plt.subplots(4, 2, figsize=(15, 17))
+    targeted = _has_targeted_data(history, baseline_class_accuracy)
+    n_rows = 5 if targeted else 4
+    fig, ax = plt.subplots(n_rows, 2, figsize=(15, 4.25 * n_rows))
 
     # 1: test accuracy per round
     for n in names:
@@ -178,6 +239,28 @@ def plot_history(history: dict, baseline_accuracy: float, out_path: str, window:
     ax[3, 1].set_title("Total clients flagged per round (raw count) — how trigger-happy")
     ax[3, 1].set_xlabel("round"); ax[3, 1].set_ylabel("# clients"); ax[3, 1].legend(fontsize=7)
 
+    if targeted:
+        # 9: worst-hit class's accuracy per round — compare directly against panel 1
+        for n in names:
+            h = history[n]
+            acc_series, _ = _worst_class_series(h, baseline_class_accuracy)
+            ax[4, 0].plot([r["round"] for r in h], acc_series, label=n, color=_color(n), lw=1.2)
+        mean_class_baseline = sum(baseline_class_accuracy.values()) / len(baseline_class_accuracy)
+        ax[4, 0].axhline(mean_class_baseline, color="#999999", ls="--", lw=0.8,
+                         label="mean per-class baseline")
+        ax[4, 0].set_title("Worst-hit class accuracy per round — compare to panel 1 (global)")
+        ax[4, 0].set_xlabel("round"); ax[4, 0].set_ylabel("accuracy")
+        ax[4, 0].set_ylim(-0.03, 1.03); ax[4, 0].legend(fontsize=8)
+
+        # 10: worst-hit class's accuracy DROP per round — damage magnitude, goal-agnostic
+        for n in names:
+            h = history[n]
+            _, drop_series = _worst_class_series(h, baseline_class_accuracy)
+            ax[4, 1].plot([r["round"] for r in h], drop_series, label=n, color=_color(n), lw=1.2)
+        ax[4, 1].set_title("Worst-hit class accuracy DROP per round — lower = more damage done")
+        ax[4, 1].set_xlabel("round"); ax[4, 1].set_ylabel("accuracy drop")
+        ax[4, 1].legend(fontsize=8)
+
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.savefig(out_path, dpi=140)
@@ -185,10 +268,11 @@ def plot_history(history: dict, baseline_accuracy: float, out_path: str, window:
     return out_path
 
 
-def plot_summary(history: dict, baseline_accuracy: float, out_path: str):
-    """Render the 2-panel per-defense summary figure (final accuracy bar chart +
-    detection-rate-vs-accuracy-drop scatter). Returns ``out_path``, or ``None`` if
-    matplotlib is absent."""
+def plot_summary(history: dict, baseline_accuracy: float, out_path: str,
+                 baseline_class_accuracy: dict | None = None):
+    """Render the per-defense summary figure (2 panels, or 3 when targeted
+    per-class data is available — see module docstring). Returns ``out_path``,
+    or ``None`` if matplotlib is absent."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -198,7 +282,9 @@ def plot_summary(history: dict, baseline_accuracy: float, out_path: str):
         return None
     import os
 
+    baseline_class_accuracy = _normalize_class_dict(baseline_class_accuracy)
     names = _ordered_names(history)
+    targeted = _has_targeted_data(history, baseline_class_accuracy)
 
     def _summary(n):
         h = history[n]
@@ -209,9 +295,16 @@ def plot_summary(history: dict, baseline_accuracy: float, out_path: str):
         final_acc = h[-1]["accuracy"] if h else 0.0
         return tpr, mean_acc, final_acc
 
-    fig, ax = plt.subplots(1, 2, figsize=(13, 5.5))
+    def _mean_worst_class_drop(n):
+        h = history[n]
+        _, drop_series = _worst_class_series(h, baseline_class_accuracy)
+        vals = [d for d in drop_series if d == d]   # drop nan
+        return sum(vals) / len(vals) if vals else 0.0
 
-    # 9: final accuracy per defense (bar), baseline as a reference line
+    n_cols = 3 if targeted else 2
+    fig, ax = plt.subplots(1, n_cols, figsize=(6.3 * n_cols, 5.5))
+
+    # 11: final accuracy per defense (bar), baseline as a reference line
     finals = [_summary(n)[2] for n in names]
     bars = ax[0].bar(names, finals, color=[_color(n) for n in names])
     ax[0].axhline(baseline_accuracy, color="#333333", ls="--", lw=1.0, label="clean baseline")
@@ -222,7 +315,7 @@ def plot_summary(history: dict, baseline_accuracy: float, out_path: str):
         ax[0].text(b.get_x() + b.get_width() / 2, v + 0.01, f"{v:.3f}",
                    ha="center", va="bottom", fontsize=7)
 
-    # 10: detection rate (TPR) vs mean accuracy drop — detection quality != realized protection
+    # 12: detection rate (TPR) vs mean accuracy drop — detection quality != realized protection
     for n in names:
         tpr, mean_acc, _ = _summary(n)
         drop = baseline_accuracy - mean_acc
@@ -233,6 +326,20 @@ def plot_summary(history: dict, baseline_accuracy: float, out_path: str):
     ax[1].set_xlim(-0.05, 1.05)
     ax[1].axhline(0.0, color="#cccccc", lw=0.8)
     ax[1].grid(alpha=0.25)
+
+    if targeted:
+        # 13: mean global accuracy drop vs mean worst-class accuracy drop — stealth vs damage
+        for n in names:
+            _, mean_acc, _ = _summary(n)
+            global_drop = baseline_accuracy - mean_acc
+            class_drop = _mean_worst_class_drop(n)
+            ax[2].scatter(global_drop, class_drop, color=_color(n), s=60, zorder=3)
+            ax[2].annotate(n, (global_drop, class_drop), textcoords="offset points",
+                           xytext=(6, 4), fontsize=8)
+        ax[2].set_title("Stealth vs. damage — bottom-right = fooled by a stealthy targeted attack")
+        ax[2].set_xlabel("mean GLOBAL accuracy drop"); ax[2].set_ylabel("mean WORST-CLASS accuracy drop")
+        ax[2].axhline(0.0, color="#cccccc", lw=0.8); ax[2].axvline(0.0, color="#cccccc", lw=0.8)
+        ax[2].grid(alpha=0.25)
 
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -254,15 +361,18 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
     with open(args.history) as f:
         blob = json.load(f)
+    baseline_class_accuracy = blob.get("baseline_class_accuracy")
 
     png = plot_history(blob["history"], blob["baseline_accuracy"], args.out, window=args.window,
-                       defender_min_tpr=args.defender_min_tpr, defender_max_fpr=args.defender_max_fpr)
+                       defender_min_tpr=args.defender_min_tpr, defender_max_fpr=args.defender_max_fpr,
+                       baseline_class_accuracy=baseline_class_accuracy)
     print(f"[saved] {png}" if png else "no plot produced (matplotlib missing)")
 
     import os
     summary_out = args.summary_out or os.path.join(
         os.path.dirname(args.out) or ".", "benchmark_summary.png")
-    spng = plot_summary(blob["history"], blob["baseline_accuracy"], summary_out)
+    spng = plot_summary(blob["history"], blob["baseline_accuracy"], summary_out,
+                        baseline_class_accuracy=baseline_class_accuracy)
     print(f"[saved] {spng}" if spng else "no summary plot produced (matplotlib missing)")
 
 
