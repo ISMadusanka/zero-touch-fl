@@ -174,10 +174,21 @@ class DefenderTurn:
     def reward(self, defender_text) -> float:
         dbg.scoring_rollout(defender_text)
         verdicts = self.defender_agent.parse(defender_text, self.client_ids)
+
+        # Opt-in, OFF by default (see rl/rewards.py::defender_reward docstring):
+        # only pay the extra FedAvg+eval pass when damage_weight > 0.
+        damage_weight = float(self.reward_cfg.get("damage_weight", 0.0))
+        accuracy_drop = None
+        if damage_weight > 0.0:
+            post_acc, _ = self.env.evaluate_updates(self.updates, verdicts)
+            accuracy_drop = self.env.current_accuracy - post_acc
+
         r = defender_reward(
             verdicts, self.poisoned_ids,
             mode=self.reward_cfg.get("mode", "soft_f1"),
             fpr_penalty=self.reward_cfg.get("fpr_penalty", 1.0),
+            damage_weight=damage_weight,
+            accuracy_drop=accuracy_drop,
         )
         dbg.rollout_outcome(reward=r, verdicts=verdicts, poisoned_ids=self.poisoned_ids)
         return r

@@ -85,9 +85,13 @@ class DefenderAgent:
     def parse(self, text, client_ids: list[int]) -> list[DetectionVerdict]:
         """Parse LLM output into one DetectionVerdict per requested client.
 
-        Robust to missing/garbled entries: any client the model failed to label
-        defaults to benign with ``default_confidence`` and reason "unparsed".
-        Ordering follows ``client_ids``.
+        Fails CLOSED on missing/garbled entries: any client the model did not
+        label is treated as SUSPICIOUS (excluded from aggregation), with
+        ``default_confidence`` and reason "unparsed-fail-closed". A parsing
+        failure means the policy never actually classified that client, so it
+        should not be silently admitted into FedAvg -- the opposite default
+        (fail-open) let a truncated or malformed response quietly include
+        whichever clients it happened to omit. Ordering follows ``client_ids``.
         """
         raw = extract_json(text)
         by_id: dict[int, dict] = {}
@@ -118,7 +122,7 @@ class DefenderAgent:
         for cid in client_ids:
             e = by_id.get(cid)
             if e is None:
-                verdicts.append(DetectionVerdict(cid, False, self.default_confidence, "unparsed"))
+                verdicts.append(DetectionVerdict(cid, True, self.default_confidence, "unparsed-fail-closed"))
                 continue
             verdicts.append(DetectionVerdict(
                 client_id=cid,

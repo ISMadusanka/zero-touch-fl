@@ -113,3 +113,10 @@ rl:
     defender:
       mode: "soft_f1"             # soft_f1 | tpr_minus_fpr
       fpr_penalty: 1.0
+      damage_weight: 0.0          # OFF by default (0.0 = original behaviour, no retraining
+                                  # needed). > 0 subtracts damage_weight * accuracy_drop from
+                                  # the reward on top of the base score, so a miss that actually
+                                  # damages the model is scored worse than a harmless one. Costs
+                                  # an extra FedAvg+eval pass per scored candidate (removes the
+                                  # "defender rounds are faster" property, see HOWATTACKDEFEND.md)
+                                  # and requires retraining the defender adapter if enabled.

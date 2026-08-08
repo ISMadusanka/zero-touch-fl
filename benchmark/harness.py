@@ -12,6 +12,18 @@ Each round:
 
 Holding the attack fixed across defenses and varying only the defense is what
 makes the comparison fair.
+
+``recovery_interval`` (opt-in, default 0 = off) mirrors the RL training loop's
+benign FL interlude (``rl.fl_interlude_between_phases``): every that many
+rounds, the attacker sits out and every defense instead processes an all-honest
+round through its OWN normal ``.step()`` pipeline. Training gives both agents
+periodic clean-slate rounds between phases; the original, uninterrupted
+benchmark protocol gave defenses none at all, which is a real train/eval
+mismatch for any defense whose current global model is path-dependent (notably
+the LLM defender -- see ``benchmark/defenses/llm_defender.py``). Left at 0 to
+keep the original protocol reproducible; set e.g. ``--recovery-interval 10`` to
+test whether a struggling defense recovers when given the same kind of
+opportunity training did.
 """
 import logging
 
@@ -26,7 +38,7 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
                   init_global, baseline_accuracy, n_rounds, *,
                   attack_temperature: float = 0.7, max_new_tokens: int = 512,
                   device: str = "cpu", attacker_adapter: str = "attacker",
-                  log_every: int = 10):
+                  log_every: int = 10, recovery_interval: int = 0):
     """Run ``n_rounds`` of attacker-vs-defenses. Returns (summaries, metrics) where
     summaries = {name: summary-dict} and metrics = {name: DefenseMetrics}."""
     if "fedavg" not in defenses:
@@ -40,21 +52,31 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
 
     for r in range(1, n_rounds + 1):
         ctx = env.begin_round()
+        is_recovery = recovery_interval > 0 and r % recovery_interval == 0
 
-        # The trained attacker SELECTS which of its controllable pool to poison
-        # (<= the eval budget) and plans ONE attack against the reference state;
-        # the SAME poisoned updates go to every defense (vary defense, hold attack).
-        system = attacker_agent.system_prompt()
-        user = attacker_agent.build_user_prompt(ctx.round_num, reference_acc,
-                                                ctx.pool_benign, env.global_weights,
-                                                ctx.budget, ctx.target_neuron_indices)
-        text = policy.generate(attacker_adapter, system, user, n=1,
-                               temperature=attack_temperature, max_new_tokens=max_new_tokens)[0]
-        poisoned, chosen_ids, _n_malformed = attacker_agent.select_and_apply(
-            text, ctx.pool_benign, ctx.budget)
-        poisoned_ids = set(chosen_ids)
-        env.set_committed_poison(chosen_ids)
-        updates = env.build_updates(poisoned)
+        if is_recovery:
+            # All-honest round: no attack this round, every defense processes
+            # its normal pipeline over clean updates only (a clean-slate chance
+            # to shed any accumulated corruption in its own self._global).
+            poisoned_ids = set()
+            env.set_committed_poison([])
+            updates = env.build_updates({})
+        else:
+            # The trained attacker SELECTS which of its controllable pool to
+            # poison (<= the eval budget) and plans ONE attack against the
+            # reference state; the SAME poisoned updates go to every defense
+            # (vary defense, hold attack).
+            system = attacker_agent.system_prompt()
+            user = attacker_agent.build_user_prompt(ctx.round_num, reference_acc,
+                                                    ctx.pool_benign, env.global_weights,
+                                                    ctx.budget, ctx.target_neuron_indices)
+            text = policy.generate(attacker_adapter, system, user, n=1,
+                                   temperature=attack_temperature, max_new_tokens=max_new_tokens)[0]
+            poisoned, chosen_ids, _n_malformed = attacker_agent.select_and_apply(
+                text, ctx.pool_benign, ctx.budget)
+            poisoned_ids = set(chosen_ids)
+            env.set_committed_poison(chosen_ids)
+            updates = env.build_updates(poisoned)
 
         for name, d in defenses.items():
             res = d.step(updates, poisoned_ids)
@@ -78,6 +100,7 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
                 f"{n}: det={metrics[n].summary()['detection_rate']:.0%} acc={metrics[n].last_acc:.3f}"
                 for n in defenses
             )
-            logger.info(f"[round {r}/{n_rounds}] poisoned={sorted(poisoned_ids)} | {status}")
+            tag = "RECOVERY" if is_recovery else f"poisoned={sorted(poisoned_ids)}"
+            logger.info(f"[round {r}/{n_rounds}] {tag} | {status}")
 
     return {name: m.summary() for name, m in metrics.items()}, metrics

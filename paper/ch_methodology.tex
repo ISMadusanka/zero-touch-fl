@@ -1,0 +1,220 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Methodology chapter for the report-class project document.
+%% Save as Chapters/ch_3.tex (adjust the number if your Methodology chapter is
+%% not the third \input in main.tex) and \input it in place of a placeholder.
+%%
+%% This chapter uses only packages already loaded by the project's main.tex,
+%% EXCEPT for pseudocode boxes, which need two extra packages. Add these two
+%% lines to your preamble (next to \usepackage{listings}):
+%%   \usepackage{algorithm}
+%%   \usepackage{algpseudocode}
+%% Everything else (tables, equations) uses only graphicx/xcolor/amsmath/array,
+%% which your preamble already loads.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\chapter{Methodology}
+\label{ch:methodology}
+
+\section{Overview}
+\label{sec:method-overview}
+
+This chapter describes how the zero-touch attacker was designed, trained, and evaluated. The guiding principle behind the methodology is that neither the attack strategy nor the evasion behaviour is specified by hand: both are left for a large language model (LLM) policy to discover through reinforcement learning against an exactly verifiable reward. The chapter is organised as follows. Section~\ref{sec:method-environment} describes the federated learning (FL) simulation environment and the two-phase training protocol. Section~\ref{sec:method-threat} states the threat model. Section~\ref{sec:method-attacker} details the attacker agent's observation and action contract, including the primitive weight-operator domain-specific language (DSL) it composes its attacks from. Section~\ref{sec:method-defender} describes the co-trained defender agent it learns against. Section~\ref{sec:method-rl} details the reinforcement learning methodology: why Group-Relative Policy Optimization (GRPO) was chosen, the reward formulation, and the training schedule used to keep the attacker and defender improving against each other rather than collapsing or cycling. Section~\ref{sec:method-eval} describes the evaluation methodology: the panel of independent defenses the trained attacker is benchmarked against and the protocol used to make that comparison fair. Section~\ref{sec:method-impl} summarises the implementation and hyperparameters used to produce the results in the following chapter.
+
+\section{Federated Learning Environment}
+\label{sec:method-environment}
+
+\subsection{Dataset and Non-IID Partitioning}
+The environment simulates FL on the MNIST handwritten-digit dataset with $N = 20$ clients. Data is partitioned across clients using a non-IID bias scheme in which each client's local data is skewed toward a subset of classes with a configurable bias strength $q$, following the scheme used to evaluate FLTrust~\citep{fltrust}. This is a deliberate methodological choice: a non-IID partition is what makes robust aggregation hard in practice, because an honest client's update can legitimately resemble a statistical outlier when its local class distribution departs from the majority, and a defense that is only evaluated under an IID partition risks over-stating its real-world robustness.
+
+\subsection{Global Model}
+The global model is a lightweight multilayer perceptron (MLP) with 970 trainable parameters: an average-pooling layer that reduces each $28\times28$ image to a $7\times7$ feature map (no learnable parameters), followed by a $49 \rightarrow 16$ linear layer, a ReLU activation, and a $16 \rightarrow 10$ linear output layer. This scale was chosen deliberately: it keeps the per-layer statistics that both agents observe small enough to serialise as structured JSON and reason over directly, while still containing distinct weight and bias tensors that an attack can target selectively.
+
+\subsection{Two-Phase Training Protocol}
+Training proceeds in two phases.
+
+\begin{itemize}
+    \item \textbf{Phase 1 (honest training).} All $N$ clients train honestly and their updates are combined by Federated Averaging (FedAvg) for a configured number of rounds. The resulting global model, every client's locally trained weights, and the baseline test accuracy are checkpointed and form the starting state for Phase 2.
+    \item \textbf{Phase 2 (adversarial training).} An adversarial round loop begins, structured as a Stackelberg game: the attacker moves first each round by choosing which clients to poison and how, and the defender best-responds by classifying the resulting mixture of poisoned and honest updates before aggregation. Algorithm~\ref{alg:round} summarises one round.
+\end{itemize}
+
+\begin{algorithm}[h]
+\caption{One Phase-2 training round}
+\label{alg:round}
+\begin{algorithmic}[1]
+\Require global model $G_t$, benign client references, controllable client pool $P$, poison budget $b$
+\ForAll{clients $i = 1, \dots, N$}
+    \State compute the honest update $\Delta_i \gets \text{LocalTrain}(G_t) - G_t$
+\EndFor
+\State attacker selects $S \subseteq P$, $|S| \le b$, and a per-client attack plan (Section~\ref{sec:method-attacker})
+\ForAll{$i \in S$}
+    \State $w_i^{\text{poison}} \gets \text{ApplyPlan}(w_i^{\text{benign}}, \text{plan}_i)$
+\EndFor
+\State $U \gets \{w_i^{\text{poison}} : i \in S\} \cup \{w_i^{\text{benign}} : i \notin S\}$
+\State defender computes per-client statistical features from $U$ and returns verdicts $V$
+\State $G_{t+1} \gets \text{FedAvg}(\{w_i \in U : V_i = \text{benign}\})$
+\State evaluate $\text{acc}_t \gets \text{Evaluate}(G_{t+1})$
+\State compute rewards $R_{\text{att}}, R_{\text{def}}$ from ground truth $S$ and the round outcome (Section~\ref{sec:method-rewards})
+\State update whichever agent is currently learning; the other stays frozen
+\end{algorithmic}
+\end{algorithm}
+
+\section{Threat Model}
+\label{sec:method-threat}
+
+The attacker is modelled as a \emph{partial insider}: it controls a fixed, strict-minority pool of $n_{\text{compromisable}}$ clients (5 of the 20 in this study) for the entire run, and in any given round may poison at most $b = \min(\text{budget}, n_{\text{compromisable}})$ of that pool. For each pool client, the attacker observes only statistics of that client's \emph{own} honest update relative to the current global model -- it never receives a cross-client reference such as the coordinate-wise median, another client's update, or any statistic computed over the full pool, and it never observes any defense's internal state (features, thresholds, or verdicts). This choice keeps the attacker's knowledge realistic: a real compromised participant sees only what it and its own data produce, not the server's internal bookkeeping.
+
+Two distinct relationships with a defense are used in this methodology, corresponding to Sections~\ref{sec:method-defender} and \ref{sec:method-eval}: during \emph{training} the attacker adapts against a co-evolving defender LLM, using only the resulting accuracy and the defender's confidence as feedback; during \emph{evaluation} the trained, frozen attacker's committed actions are replayed unmodified against defenses it never trained against, so that any resistance those defenses show (or fail to show) is a transfer property of the learned strategy rather than the result of the attacker adapting to them directly.
+
+\section{Attacker Agent Design}
+\label{sec:method-attacker}
+
+\subsection{Observation Contract}
+Each round, the attacker agent is given: the round number; the current global test accuracy; the configured attack goal (this study evaluates \texttt{untargeted\_degrade} -- lower the global test accuracy by a target amount); the set of controllable client ids; the round's poison budget; and, for every client in the controllable pool, a set of dimensionless statistics describing that client's honest update $\Delta = w_{\text{local}} - w_{\text{global}}$ relative to the current global model. These statistics -- relative update norm, per-coordinate step size, the fraction of the update's energy concentrated in each layer, the fraction of coordinates that flipped sign relative to the global model, spread and magnitude ratios, and whole-model cosine similarity to the global model -- are all normalised only against the global model, consistent with the partial-insider threat model in Section~\ref{sec:method-threat}.
+
+\subsection{Primitive Operator DSL}
+Rather than asking the LLM to emit raw poisoned weights directly, the attacker composes an ordered plan from a small set of primitive weight operators, listed in Table~\ref{tab:method-ops}. A deterministic interpreter -- not the LLM -- applies the plan to a client's benign weights, in order, to the target the plan specifies (the whole model, a named layer group, or a specific parameter tensor), then clamps the result and removes any invalid (NaN/Inf) values before the update is sent to the server. This design keeps the LLM's output small and easy to parse and score, while still allowing it to compose non-obvious multi-step attacks by chaining primitives.
+
+\begin{table}[h]
+\centering
+\caption{Primitive weight-operator DSL used by the attacker.}
+\label{tab:method-ops}
+\begin{tabular}{|l|p{7.5cm}|}
+\hline
+\textbf{Operator} & \textbf{Effect} \\
+\hline
+\texttt{scale} & multiply targeted weights by a factor \\
+\hline
+\texttt{sign\_flip} & negate the top fraction of weights by magnitude \\
+\hline
+\texttt{add\_gaussian\_noise} & add zero-mean Gaussian noise per coordinate \\
+\hline
+\texttt{mask} & zero out a fraction of weights (largest / smallest / random) \\
+\hline
+\texttt{clip} & clamp values into a fixed range \\
+\hline
+\texttt{add\_constant} & add a constant to every targeted weight \\
+\hline
+\texttt{permute} & randomly shuffle coordinates within the target \\
+\hline
+\texttt{scale\_neurons} & scale a fraction of the highest-norm output rows \\
+\hline
+\texttt{blend\_random} & interpolate the weights toward scaled random noise \\
+\hline
+\texttt{quantize} & round weights to a coarse, fixed step size \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Action Contract}
+The attacker's output is a single structured object naming at most $b$ pool clients and an ordered operator plan for each. Using fewer clients than the budget allows, and giving distinct rather than near-identical plans to the clients it does use, are both incentivised through the reward rather than enforced by the interpreter (Section~\ref{sec:method-rewards}) -- this was a deliberate methodological choice, so that any preference for economy or coordination the attacker exhibits is something it learns, not something hardcoded into its action space.
+
+\section{The Co-Trained Defender Agent}
+\label{sec:method-defender}
+
+During Phase 2 training, the attacker's opponent is a defender LLM that observes per-client, per-layer statistical features computed from every client's update relative to the current global model: each client's update norm relative to the group median, its cosine similarity to the coordinate-wise median, the fraction of coordinates whose sign agrees with the median, and whole-model features including cosine similarity to the mean update, the maximum pairwise cosine similarity to any other client (a FoolsGold-style collusion signal), and a spectral outlier score computed the same way as DnC's projection step. The defender returns a per-client suspicious/benign verdict with a confidence score; the server then aggregates only the clients it did not flag. Ground truth (which clients are actually poisoned) is used only to compute the defender's training reward -- it is never included in the defender's own input.
+
+\section{Reinforcement Learning Methodology}
+\label{sec:method-rl}
+
+\subsection{Choice of Algorithm}
+Both agents are trained with GRPO~\citep{grpo}, a critic-free policy-gradient method. This choice was made for three reasons specific to this setting. First, each round yields exactly one terminal, verifiable scalar reward per agent (Section~\ref{sec:method-rewards}), rather than a sequence of intermediate rewards along a long trajectory, so the per-token credit assignment a learned critic provides in Proximal Policy Optimization (PPO)~\citep{ppo,ouyang2022} buys little here. Second, Direct Preference Optimization (DPO)~\citep{dpo} is an offline, preference-pair method that discards reward magnitude, which does not fit an online interaction against a continuously evolving opponent. Third, GRPO's group-relative normalisation -- sampling several completions for the same situation and scoring each against the group average -- removes the need for a separate value network altogether, which keeps training simpler at the scale of a small LoRA adapter (Section~\ref{sec:method-impl}).
+
+\subsection{GRPO Update}
+For a group of $G$ completions $\{o_1, \ldots, o_G\}$ sampled for the same round, with rewards $\{r_1, \ldots, r_G\}$, the group-normalised advantage is
+\begin{equation}
+A_i = \frac{r_i - \text{mean}(r)}{\text{std}(r) + \epsilon}.
+\label{eq:method-advantage}
+\end{equation}
+When the group's reward spread is (near) zero, every advantage is set to zero and no gradient is applied that round -- this \emph{zero-advantage} case is discussed further in Section~\ref{sec:method-stochastic}, since it is a known failure mode of group-relative methods on small action spaces. The policy parameters are updated to increase the log-probability of completions with positive advantage and decrease it for those with negative advantage, regularised by a Kullback-Leibler (KL) penalty toward the frozen base model so the policy does not drift arbitrarily far from a coherent language model.
+
+\subsection{Reward Formulation}
+\label{sec:method-rewards}
+Both rewards are computed from ground truth available only during training (the true poisoned set and the resulting accuracy), making them exactly verifiable rather than learned or estimated. Both are also deliberately \emph{continuous} rather than binary, because a binary reward collapses the group spread in Equation~\ref{eq:method-advantage} to zero whenever every sampled completion in a group receives the same 0/1 score -- a likely outcome on the small, near-binary action space of choosing which clients to flag or poison.
+
+The attacker's reward combines five terms: credit proportional to the accuracy drop it caused, relative to a configured target; a stealth term rewarding low defender confidence on the clients it poisoned; a penalty for plans that failed to parse; a penalty for using more of its controllable pool than necessary; and a bonus, active only when more than one client is used, for giving those clients distinct rather than near-identical perturbations. The last two terms encode a specific methodological intent: an attacker that always uses the maximum budget, or that clones the same plan across several clients, is both easier to detect (a larger, more Sybil-like footprint) and a less interesting object of study, so the reward is shaped to push the learned policy toward economical, coordinated attacks rather than brute-force ones.
+
+The defender's reward is a confidence-weighted soft F1 score: poisoned clients contribute to a soft true-positive count in proportion to how confidently they were flagged, honest clients contribute to a soft false-positive count in proportion to how confidently they were (wrongly) flagged, and the reward is the harmonic mean of the resulting soft precision and recall. This rewards not just a correct binary verdict but a well-calibrated confidence, which matters because the attacker's own stealth term (above) is computed from that same confidence value.
+
+\subsection{Stochastic Opponent Scoring}
+\label{sec:method-stochastic}
+A specific failure mode was observed and addressed during development: if the frozen opponent responds deterministically (greedy decoding), every sampled completion in a group can receive an identical opponent response once the opponent is clearly winning or losing, which collapses the reward spread and eliminates the learning signal entirely (Equation~\ref{eq:method-advantage}). The methodology adopted to address this is to sample the frozen opponent at a moderate temperature ($\tau = 0.7$) only while \emph{scoring} the group of candidate completions, so different candidates see different opponent reactions and a usable reward spread is restored. The single action that actually advances the environment each round -- the \emph{committed} action -- still uses the opponent's deterministic, greedy response, so the environment transition itself remains reproducible and a recorded "win" is never an artefact of the randomised scoring pass.
+
+\subsection{Training Schedule}
+Because the interaction is a Stackelberg game (the attacker moves first, the defender best-responds) rather than simultaneous play, the two agents are not trained jointly. Instead, one agent trains while the other is frozen at greedy decoding, in a \emph{freeze-and-alternate} schedule: the currently-training agent keeps training until it beats its frozen opponent on several consecutive committed rounds (a "win streak"), at which point it is frozen and the opponent begins training against this stronger, fixed target. A hard round cap forces a handoff even without a sustained win, to prevent one side stalling training indefinitely. Between phases, one additional honest FedAvg round refreshes every client's local weights from the current global model, so successive phases train against an updated client population rather than a stale Phase-1 snapshot. Finally, an opponent league periodically snapshots each agent's adapter and, with a configured probability, has the current learner face a past snapshot instead of the immediately preceding opponent -- a standard technique for damping the cyclic, "rock-paper-scissors" forgetting that can otherwise emerge between two co-adapting policies.
+
+\section{Evaluation Methodology}
+\label{sec:method-eval}
+
+\subsection{Rationale}
+Training the attacker only against a single co-evolving defender answers whether the attacker can learn \emph{something}, but not whether what it learns generalises. To test that, the trained (frozen) attacker is additionally evaluated against a panel of independent defenses it never trained against, using a protocol designed so that the defense is the only variable that changes between comparisons.
+
+\subsection{Defense Panel}
+The panel used in this study is summarised in Table~\ref{tab:method-defenses}. It spans three categories: a no-defense reference and an upper-bound oracle; classical, non-learned Byzantine-robust aggregation rules that encode a fixed, hand-designed statistical prior; and the adaptive, co-trained LLM defender from Section~\ref{sec:method-defender}, included so that the co-trained defense can be compared on equal footing against classical baselines it was never explicitly designed to beat.
+
+\begin{table}[h]
+\centering
+\caption{Defense panel used for evaluation.}
+\label{tab:method-defenses}
+\begin{tabular}{|l|p{7.5cm}|}
+\hline
+\textbf{Defense} & \textbf{Mechanism} \\
+\hline
+FedAvg & No defense: plain average over every client. \\
+\hline
+Oracle & Flags exactly the true poisoned clients; an upper bound, not a real defense. \\
+\hline
+FLTrust~\citep{fltrust} & Scores each client by cosine similarity to a trusted reference update computed from a small clean root dataset, then rescales and trust-weights the average. \\
+\hline
+Multi-Krum~\citep{krum} & Keeps only the clients whose updates are closest, by Euclidean distance, to the bulk of the pool. \\
+\hline
+DnC~\citep{dnc} & Projects updates onto their dominant spectral direction and removes the largest outliers along it. \\
+\hline
+DeFL~\citep{defl} & Tracks each layer's gradient-norm profile across rounds and flags clients whose per-layer contribution deviates from the group during a detected critical learning period. \\
+\hline
+LLM Defender & The co-trained adaptive defender from Section~\ref{sec:method-defender}, evaluated frozen. \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Benchmark Protocol}
+Each evaluation round proceeds as follows: the environment produces the controllable pool's honest updates; the trained, frozen attacker produces \emph{one} client selection and attack plan; that single set of poisoned updates is then given, unmodified, to every defense in the panel in turn, each of which maintains and evolves its own independent global model across the run and returns its own accept/reject verdicts. Holding the attack fixed while only the defense varies is the key methodological control: it ensures any difference in outcome between two defenses in the results reported in the next chapter is attributable to the defense itself, rather than to round-to-round variation in what the attacker happened to try.
+
+\subsection{Evaluation Metrics}
+For each defense, two families of metrics are recorded. \emph{Detection metrics} compare each round's verdicts against the ground-truth poisoned set: true-positive rate (recall), false-positive rate, precision, and F1. \emph{Robustness metrics} describe the resulting model under attack: final and mean test accuracy, the mean accuracy drop relative to the clean Phase-1 baseline, and the attack success rate -- the fraction of rounds in which the attack achieved a meaningful, realised effect rather than merely being technically undetected. Reporting both families together is a deliberate methodological choice: as the results in the next chapter show, a defense's detection metrics and its realised protection of the model do not always agree, and reporting only one family would have obscured that.
+
+\section{Implementation}
+\label{sec:method-impl}
+
+The environment, agents, and training loop are implemented in PyTorch. LLM loading, low-rank adapter (LoRA) injection~\citep{lora2022}, and the GRPO update are implemented directly against the environment's verifiable reward using the Unsloth library on top of Hugging Face PEFT and Transformers, without an external RL-trainer dependency. The attacker and defender are represented as two separate LoRA adapters over one shared, frozen \texttt{Llama-3.2-3B-Instruct} base model, trained in bf16 precision by default (4-bit QLoRA~\citep{qlora2023} is supported as a lower-memory alternative). Table~\ref{tab:method-hparams} summarises the main training hyperparameters used to produce the results reported in the following chapter.
+
+\begin{table}[h]
+\centering
+\caption{Main training hyperparameters.}
+\label{tab:method-hparams}
+\begin{tabular}{|l|c|}
+\hline
+\textbf{Hyperparameter} & \textbf{Value} \\
+\hline
+GRPO group size $G$ & 4 \\
+\hline
+KL penalty & 0.02 \\
+\hline
+Learning rate & $1.0 \times 10^{-5}$ \\
+\hline
+Opponent scoring temperature & 0.7 \\
+\hline
+Committed-action temperature & 0.0 (greedy) \\
+\hline
+Win streak required for handoff & 3 consecutive rounds \\
+\hline
+Controllable clients / total clients & 5 / 20 \\
+\hline
+Non-IID bias $q$ & 0.5 \\
+\hline
+\end{tabular}
+\end{table}
+
+\section{Summary}
+\label{sec:method-summary}
+
+This chapter described a methodology in which neither the attack nor the defense strategy is fixed in advance: both are LLM policies trained online against an exactly verifiable reward, using GRPO with a freeze-and-alternate schedule, stochastic opponent scoring, and an opponent league to keep training stable. The trained attacker is evaluated in two ways -- implicitly, through its ability to keep improving against a co-trained defender during Phase 2, and explicitly, through a fixed-attack, varied-defense benchmark against a panel of classical and adaptive defenses it never trained against. The results of applying this methodology are reported in the next chapter.

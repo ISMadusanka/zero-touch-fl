@@ -1,0 +1,58 @@
+\chapter{Introduction}
+\label{ch:introduction}
+
+\section{Background and Motivation}
+\label{sec:intro-background}
+
+Federated learning (FL) lets a set of clients -- edge devices, organisations, or other data holders -- collaboratively train a shared machine learning model without any client exposing its raw data to the others or to a central server \citep{fedavg}. Each round, a central server broadcasts the current global model, every participating client trains it further on its own local data, and the server combines the returned updates -- typically by Federated Averaging (FedAvg) -- into a new global model. This is what makes FL attractive for privacy-sensitive applications: the server only ever sees model updates, never the data that produced them.
+
+That same property is also FL's central weakness. Because the server cannot inspect a client's local data, it has no independent way to check that a returned update reflects honest training. A client under an attacker's control can submit a manipulated update instead, and if enough poisoned updates are averaged into the global model, the model itself is compromised -- either its overall accuracy degrades, or a narrower vulnerability is introduced while overall accuracy stays high enough to go unnoticed \citep{bagdasaryan2020,bhagoji2019}. This is known as \emph{model poisoning}, and defending against it while preserving FL's core privacy property -- never inspecting a client's raw data or gradients in detail -- is an open, actively studied problem.
+
+The dominant defense strategy in the literature treats every client's update as a point in a high-dimensional vector space and looks for statistical outliers. Coordinate-wise median and trimmed-mean aggregation bound the influence any single coordinate can have \citep{byzantine}. Krum and Multi-Krum keep only the updates that sit closest to their neighbours under a Euclidean-distance criterion \citep{krum}. DnC projects updates onto their dominant spectral direction and removes the ones that stick out furthest along it \citep{dnc}. FLTrust bootstraps a small, trusted reference update from a clean root dataset held by the server and rescales client updates toward it by cosine similarity \citep{fltrust}. FoolsGold instead looks for clients whose update histories resemble each other -- the signature of colluding Sybils \citep{foolsgold}. DeFL departs from these single-round, whole-update statistics and instead tracks how a model's per-layer gradient-norm profile evolves across rounds \citep{defl}. What every one of these approaches has in common is that the notion of "what a poisoned update looks like" is fixed once, at design time, by a human researcher.
+
+An attacker does not have to respect that fixed notion. Prior work has shown that an attacker aware of a specific deployed defense can construct updates that satisfy its statistical assumptions while still corrupting the aggregate \citep{fang2020,bhagoji2019}. In principle, this sets up an arms race between attack and defense. In practice, that arms race has historically been fought by hand: a researcher designs an attack against a defense, another researcher designs a defense against that attack, and the cycle repeats on the timescale of publications, not training rounds. Between human interventions, both sides are frozen.
+
+Large language models (LLMs), meanwhile, have become capable enough -- and cheap enough to fine-tune with parameter-efficient methods such as LoRA \citep{lora2022} and reinforcement learning algorithms such as GRPO \citep{grpo} -- that it is now practical to ask whether an attack strategy can be \emph{learned} directly by a policy interacting with an FL environment, rather than designed by a person. This report investigates that question specifically for the attacker side of the FL security arms race.
+
+\section{Problem Statement}
+\label{sec:intro-problem}
+
+Existing FL poisoning attacks in the literature are, almost without exception, hand-designed: a researcher specifies the perturbation (scale a layer, flip signs, add noise) and the targeting logic (which clients, how much) as a fixed procedure, sometimes tuned against one specific defense. This has two consequences relevant to this project. First, evaluating a new defense against such attacks only tells us how that defense performs against the attacks a researcher happened to think of, not against the space of attacks an adaptive adversary could discover. Second, comparing defenses against each other typically means comparing them against different, non-uniform attacks reported in different papers, rather than the identical attack under identical conditions.
+
+This report addresses both consequences by building an attacker whose strategy -- which clients to poison, how many, and what to do to their weights -- is not specified in advance but is instead learned through reinforcement learning against a verifiable reward, and by evaluating that trained attacker against several defenses under an identical, replayed attack so that the defense is the only variable in the comparison.
+
+\section{Research Aim and Objectives}
+\label{sec:intro-objectives}
+
+\textbf{Aim.} To design, implement, and evaluate a zero-touch, LLM-directed attacker for federated learning -- one that learns its poisoning strategy through reinforcement learning rather than a hand-authored attack template -- and to determine whether the resulting strategy generalises to classical, non-learned Byzantine-robust defenses it never trained against.
+
+\textbf{Objectives.}
+\begin{enumerate}
+    \item Design an attacker agent contract in which an LLM policy selects, each round, which of a fixed pool of controllable clients to poison and composes a plan from a small set of primitive weight operators, using only statistics of its own controllable clients' honest updates.
+    \item Formulate an exactly verifiable, continuous reward for the attacker, computed from the ground-truth poisoned set and the resulting model accuracy, that credits accuracy degradation and evasion while discouraging wasteful or easily-detected multi-client use.
+    \item Train the attacker online with Group-Relative Policy Optimization (GRPO) against a co-trained defender LLM, using a training schedule -- freeze-and-alternate scheduling, stochastic opponent scoring, and an opponent league -- designed to keep both agents improving rather than stalling or cycling.
+    \item Build a fixed-attack, varied-defense benchmark harness that replays the trained attacker's committed actions, unmodified, against a panel of independent defenses (FedAvg, an Oracle upper bound, FLTrust, Multi-Krum, DnC, DeFL, and the co-trained LLM defender).
+    \item Empirically evaluate the trained attacker against this panel and analyse the results, in particular whether a defense's per-round detection accuracy (TPR/FPR/F1) predicts its realised protection of the model under attack.
+\end{enumerate}
+
+\section{Scope and Assumptions}
+\label{sec:intro-scope}
+
+This report evaluates the \emph{untargeted} attack goal -- degrading the global model's overall test accuracy -- on the MNIST dataset with a compact, 970-parameter multilayer perceptron (MLP) as the global model, under a non-IID client data partition. The attacker is modelled as a partial insider controlling a fixed minority of clients (5 of 20), consistent with a realistic compromise scenario in which the majority of participants remain honest. The reported empirical results are from a single 50-round benchmark run at one poison budget and one target accuracy-drop setting; they are explicitly presented as preliminary, pending replication across seeds, budgets, and settings (Chapter~\ref{ch:results}). Targeted (class-specific/backdoor) attacks, Sybil client creation, and collusion with a compromised aggregation server are out of scope for this report and are discussed as future work.
+
+\section{Contribution}
+\label{sec:intro-contribution}
+
+This report makes the following contributions:
+\begin{itemize}
+    \item A zero-touch FL attacker whose client selection and weight-operator composition are generated directly by an LLM policy, using a general-purpose primitive-operator DSL, without prescribing any attack strategy in advance.
+    \item A verifiable, continuous reward that jointly credits accuracy degradation and evasion while penalising malformed output, unnecessary client use, and non-diverse multi-client collusion.
+    \item A GRPO training protocol -- freeze-and-alternate scheduling, stochastic opponent scoring, and an opponent league -- that keeps the attacker's learning signal alive against a co-evolving defender and formalises the interaction as a Stackelberg game.
+    \item A fixed-attack, varied-defense benchmark harness that isolates the defense as the only variable when comparing FedAvg, an Oracle upper bound, FLTrust, Multi-Krum, DnC, DeFL, and a co-trained LLM defender against the same trained attacker.
+    \item An empirical result showing that a defense's per-round detection metrics do not reliably predict its realised protection of the model, evidenced most sharply by DeFL recording the highest detection rate of any non-oracle defense in the panel while also suffering the largest accuracy collapse among the classical defenses.
+\end{itemize}
+
+\section{Report Structure}
+\label{sec:intro-structure}
+
+The remainder of this report is organised as follows. Chapter~\ref{ch:literature} reviews the relevant literature: the FL poisoning attack surface, Byzantine-robust and statistical defenses, adaptive and learning-based attacks, and the reinforcement-learning methods used to fine-tune LLM policies. Chapter~\ref{ch:methodology} describes the methodology: the FL simulation environment, the threat model, the attacker and defender agent designs, the GRPO training methodology and reward formulation, and the benchmark evaluation methodology. Chapter~\ref{ch:results} reports the results of a preliminary benchmark run, discusses what they reveal about the relationship between detection accuracy and realised protection, states the limitations of the current results, and concludes with a summary of findings and directions for future work. Appendix~\ref{app:prompts} reproduces the attacker and defender prompt contracts and the full operator DSL reference, and Appendix~\ref{app:config} reproduces the configuration and hyperparameters used to produce the reported results.

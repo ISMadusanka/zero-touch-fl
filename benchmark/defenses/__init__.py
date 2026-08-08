@@ -28,6 +28,7 @@ def build_defenses(
     dnc_seed: int = 0,
     multikrum_num_byzantine: int = 1,
     multikrum_m=None,
+    llm_defender_clip: float | None = 3.0,
 ):
     """Instantiate the requested defenses, preserving order. Returns an ordered
     dict {name: Defense}. Raises on an unknown name or missing dependency."""
@@ -49,7 +50,8 @@ def build_defenses(
             if policy is None or defender_agent is None:
                 raise ValueError("llm_defender requires a loaded policy + defender_agent")
             out[name] = LLMDefender(policy, defender_agent, device=device,
-                                    temperature=defender_temperature, max_new_tokens=max_new_tokens)
+                                    temperature=defender_temperature, max_new_tokens=max_new_tokens,
+                                    clip_multiplier=llm_defender_clip)
         elif name == "fltrust":
             if root_loader is None:
                 raise ValueError("fltrust requires a root_loader (clean root dataset)")

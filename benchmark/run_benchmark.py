@@ -59,6 +59,15 @@ def _parse_args():
                     help="Multi-Krum assumed #Byzantine f (default: configured poison count)")
     ap.add_argument("--multikrum-m", type=int, default=None,
                     help="Multi-Krum #selected/averaged (default: n - f)")
+    ap.add_argument("--llm-defender-clip", type=float, default=3.0,
+                    help="LLM defender: median-anchored norm-clip multiplier applied to accepted "
+                         "clients underneath its own verdicts (safety net vs. a single wrong "
+                         "verdict on a large-magnitude update). 0 or negative disables it.")
+    ap.add_argument("--recovery-interval", type=int, default=0,
+                    help="if > 0, every this many rounds run one all-honest round (no attack) "
+                         "through every defense's normal pipeline, mirroring the RL training "
+                         "loop's benign FL interlude. 0 (default) reproduces the original, "
+                         "uninterrupted-adversarial-rounds protocol.")
     ap.add_argument("--device", default=None, help="override fl.device")
     ap.add_argument("--seed", type=int, default=None, help="override fl.poison_seed")
     ap.add_argument("--out", default="logs/benchmark", help="output dir for json/csv/png (or '' to skip)")
@@ -217,16 +226,18 @@ def main():
         dnc_num_byzantine=dnc_m, dnc_c=args.dnc_c, dnc_niters=args.dnc_niters,
         dnc_sub_dim=args.dnc_sub_dim, dnc_seed=seed,
         multikrum_num_byzantine=mk_f, multikrum_m=args.multikrum_m,
+        llm_defender_clip=(args.llm_defender_clip if args.llm_defender_clip > 0 else None),
     )
 
     log.info(f"Benchmark: {args.rounds} rounds | defenses={list(defenses)} | "
-             f"baseline_acc={baseline_accuracy:.4f} | attack_temp={args.attack_temperature}")
+             f"baseline_acc={baseline_accuracy:.4f} | attack_temp={args.attack_temperature} | "
+             f"recovery_interval={args.recovery_interval}")
     summaries, _metrics = run_benchmark(
         env, policy, attacker_agent, defenses, test_loader,
         init_global=copy.deepcopy(global_weights), baseline_accuracy=baseline_accuracy,
         n_rounds=args.rounds, attack_temperature=args.attack_temperature,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)), device=device,
-        log_every=args.log_every,
+        log_every=args.log_every, recovery_interval=args.recovery_interval,
     )
 
     out_dir = args.out or None
@@ -241,10 +252,17 @@ def main():
             _json.dump({"baseline_accuracy": baseline_accuracy, "history": history}, f, indent=2)
         log.info(f"[saved] {os.path.join(out_dir, 'history.json')}")
         if not args.no_plot:
-            from benchmark.plot import plot_history
-            png = plot_history(history, baseline_accuracy, os.path.join(out_dir, "benchmark.png"))
+            from benchmark.plot import plot_history, plot_summary
+            png = plot_history(
+                history, baseline_accuracy, os.path.join(out_dir, "benchmark.png"),
+                defender_min_tpr=float(rl_cfg.get("defender_min_tpr", 0.99)),
+                defender_max_fpr=float(rl_cfg.get("defender_max_fpr", 0.10)),
+            )
             if png:
                 log.info(f"[saved] {png}")
+            spng = plot_summary(history, baseline_accuracy, os.path.join(out_dir, "benchmark_summary.png"))
+            if spng:
+                log.info(f"[saved] {spng}")
 
 
 if __name__ == "__main__":

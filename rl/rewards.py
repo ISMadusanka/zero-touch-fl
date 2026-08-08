@@ -195,11 +195,26 @@ def defender_reward(
     *,
     mode: str = "soft_f1",
     fpr_penalty: float = 1.0,
+    damage_weight: float = 0.0,
+    accuracy_drop: float | None = None,
 ) -> float:
     """Reward the defender for correctly identifying the poisoned clients.
 
     ``soft_f1`` (default): confidence-weighted soft F1 in [0, 1].
     ``tpr_minus_fpr``:     clip(TPR - fpr_penalty * FPR, 0, 1) using hard flags.
+
+    ``damage_weight`` / ``accuracy_drop`` (both optional, OFF by default): the
+    base score above treats every miss identically regardless of how much
+    damage it actually did. When ``damage_weight > 0`` and ``accuracy_drop``
+    (prev_accuracy - post_accuracy for THIS verdict set's own hypothetical
+    aggregate) is supplied, an extra ``damage_weight * max(0, accuracy_drop)``
+    is subtracted, making a miss that causes real damage strictly worse than
+    one that happens to be harmless. Computing ``accuracy_drop`` per scored
+    candidate requires an extra FedAvg + eval pass (see ``rl/turns.py``),
+    which removes the "no per-attempt model evaluation" speed advantage
+    defender-learning rounds otherwise have — left off by default for that
+    reason, and enabling it means retraining the defender adapter from
+    scratch (it changes the reward the policy was fit to).
     """
     poisoned = set(poisoned_ids)
     if mode == "tpr_minus_fpr":
@@ -209,7 +224,10 @@ def defender_reward(
         tn = sum(1 for v in verdicts if v.client_id not in poisoned and not v.is_suspicious)
         tpr = tp / (tp + fn) if (tp + fn) else 0.0
         fpr = fp / (fp + tn) if (fp + tn) else 0.0
-        return _clip(tpr - fpr_penalty * fpr, 0.0, 1.0)
+        reward = _clip(tpr - fpr_penalty * fpr, 0.0, 1.0)
+        if damage_weight > 0.0 and accuracy_drop is not None:
+            reward -= damage_weight * max(0.0, float(accuracy_drop))
+        return reward
 
     # soft_f1
     eps = 1e-8
@@ -223,7 +241,10 @@ def defender_reward(
             fp += p
     precision = tp / (tp + fp + eps)
     recall = tp / (tp + fn + eps)
-    return 2 * precision * recall / (precision + recall + eps)
+    reward = 2 * precision * recall / (precision + recall + eps)
+    if damage_weight > 0.0 and accuracy_drop is not None:
+        reward -= damage_weight * max(0.0, float(accuracy_drop))
+    return reward
 
 
 def group_advantages(rewards: list[float]) -> tuple[list[float], float]:
