@@ -33,6 +33,29 @@ from server.fed_server import FedServer
 logger = logging.getLogger(__name__)
 
 
+def _accepts_honest_majority(verdicts) -> bool:
+    """Did the defense keep more than half of an entirely HONEST cohort?
+
+    Applied to the clean counterfactual's verdicts, where every update is honest by
+    construction, so anything it flags is a false positive. A robust aggregator that
+    rejects the honest majority of an unpoisoned cohort is misconfigured, and every
+    number the round produces afterwards — the counterfactual accuracy, the post-attack
+    accuracy, the drop, the reward — describes that malfunction rather than the
+    attacker (see ``server.algo_defender.resolve_root_epochs`` for the mechanism, and
+    ``rl.schedule._warn_defense_malfunction`` for the post-hoc detector this
+    complements).
+
+    Testing it on the CLEAN updates rather than the poisoned ones matters: it makes
+    the check independent of what the attacker did, so a genuinely strong attack that
+    provokes lots of flags can never be mistaken for a broken defense, and the verdict
+    is available before the rollouts are scored.
+    """
+    if not verdicts:
+        return True
+    accepted = sum(1 for v in verdicts if not v.is_suspicious)
+    return accepted * 2 > len(verdicts)
+
+
 class RoundContext:
     """Per-round observation handed to the agents.
 
@@ -42,7 +65,8 @@ class RoundContext:
     """
 
     def __init__(self, round_num, global_accuracy, pool_ids, pool_benign, budget,
-                 goal=None, clean_accuracy=None, clean_measured=True):
+                 goal=None, clean_accuracy=None, clean_measured=True,
+                 defense_sane=True):
         self.round_num = round_num
         self.global_accuracy = global_accuracy            # accuracy of the CURRENT global model
         self.pool_ids = pool_ids                          # list[int] controllable pool
@@ -59,6 +83,11 @@ class RoundContext:
         # The attacker's damage term is meaningless on such a round — see
         # ``FLArmsRaceEnv.clean_reference_measured``.
         self.clean_measured = clean_measured
+        # False when the round's defense rejected the honest MAJORITY of an
+        # entirely unpoisoned cohort. It aggregated something, so the numbers look
+        # ordinary, but they measure the defense malfunctioning — see
+        # ``FLArmsRaceEnv.clean_defense_sane``.
+        self.defense_sane = defense_sane
 
 
 class FLArmsRaceEnv:
@@ -144,6 +173,7 @@ class FLArmsRaceEnv:
         self.poisoned_ids: list[int] = []                 # attacker's committed choice
         self._clean_ref_acc: float | None = None          # cached per-round clean counterfactual
         self._clean_ref_measured: bool = False            # was that counterfactual real?
+        self._clean_defense_sane: bool = True             # did it keep the honest majority?
         self.round_defense: str | None = None             # this round's defense algorithm (if any)
         self.round_curriculum = None                      # this round's CurriculumSlot (if any)
 
@@ -192,6 +222,7 @@ class FLArmsRaceEnv:
         self.round_index = int(state.get("round_index", self.round_index))
         self._clean_ref_acc = None        # stale: the shared model just changed
         self._clean_ref_measured = False
+        self._clean_defense_sane = True
         logger.info(
             f"Restored Phase-2 FL state — round_index={self.round_index}, "
             f"current_accuracy={self.current_accuracy:.4f} "
@@ -261,6 +292,7 @@ class FLArmsRaceEnv:
         self.poisoned_ids = []                            # attacker decides at commit
         self._clean_ref_acc = None                        # recomputed lazily for this round
         self._clean_ref_measured = False
+        self._clean_defense_sane = True
         # Fix this round's defense BEFORE anything is scored (the clean
         # counterfactual below already goes through it), so the counterfactual,
         # every rollout and the commit all face the SAME algorithm.
@@ -274,7 +306,8 @@ class FLArmsRaceEnv:
             + (f"curriculum=block{slot.block}[{slot.block_round + 1}/"
                f"{self.curriculum.rounds_per_block}] cycle={slot.cycle} " if slot else "")
             + f"(global_acc={self.current_accuracy:.4f} clean_ref={clean_acc:.4f}"
-            + ("" if self._clean_ref_measured else " UNMEASURED") + ")"
+            + ("" if self._clean_ref_measured else " UNMEASURED")
+            + ("" if self._clean_defense_sane else " DEFENSE-MALFUNCTION") + ")"
         )
         return RoundContext(
             round_num=round_num,
@@ -285,6 +318,7 @@ class FLArmsRaceEnv:
             goal=self.round_goal,
             clean_accuracy=clean_acc,
             clean_measured=self._clean_ref_measured,
+            defense_sane=self._clean_defense_sane,
         )
 
     # ------------------------------------------------------------------
@@ -331,10 +365,24 @@ class FLArmsRaceEnv:
             if self.defense is not None:
                 _verdicts, state = self.defend(updates, commit=False)
             else:
-                clean = [DetectionVerdict(u.client_id, False, 0.0, "clean_ref")
-                         for u in updates]
-                state = self.aggregator.aggregate(updates, clean)
+                _verdicts = [DetectionVerdict(u.client_id, False, 0.0, "clean_ref")
+                             for u in updates]
+                state = self.aggregator.aggregate(updates, _verdicts)
             self._clean_ref_measured = state is not None
+            # Every update here is honest, so anything flagged is a false positive.
+            # Losing the majority of them means the DEFENSE is broken this round, and
+            # the accuracies below describe that, not the attack.
+            self._clean_defense_sane = _accepts_honest_majority(_verdicts)
+            if not self._clean_defense_sane:
+                n_flagged = sum(1 for v in _verdicts if v.is_suspicious)
+                logger.warning(
+                    "Defense MALFUNCTION: %s flagged %d of %d entirely HONEST clients "
+                    "on the clean counterfactual (FPR=%.2f). Every accuracy this round "
+                    "is a measurement of the defense, not of the attack — the round "
+                    "still advances the environment but applies no policy gradient.",
+                    self.round_defense or "the aggregator", n_flagged, len(_verdicts),
+                    n_flagged / max(1, len(_verdicts)),
+                )
             if state is None:
                 logger.warning(
                     "Clean counterfactual UNMEASURABLE: %s produced no aggregate from "
@@ -357,6 +405,23 @@ class FLArmsRaceEnv:
         training on a structurally-zero damage term.
         """
         return self._clean_ref_measured
+
+    @property
+    def clean_defense_sane(self) -> bool:
+        """Did this round's defense keep the honest majority of an UNPOISONED cohort?
+
+        False means it rejected most of a cohort in which every update was honest, so
+        the aggregate it built — and therefore the clean counterfactual, the
+        post-attack accuracy and the drop between them — is a reading of the defense's
+        own false-positive rate. The round is not a valid observation of the attacker:
+        ``rl.schedule._run_learner_round`` skips the GRPO update on it, exactly as it
+        does for an unmeasurable counterfactual.
+
+        This was silent for a whole recorded run: 45 of 262 rounds (17%) rejected the
+        honest majority under FLTrust (mean FPR 0.43, peak 0.81), a warning was logged
+        after the fact, and the policy was trained on every one of them anyway.
+        """
+        return self._clean_defense_sane
 
     def set_committed_poison(self, chosen_ids) -> None:
         """Record which clients the attacker actually poisoned (for logs/metrics)."""
@@ -484,6 +549,7 @@ class FLArmsRaceEnv:
         self.client_weights = [copy.deepcopy(u.weights) for u in updates]
         self._clean_ref_acc = None        # stale: global + benign references just changed
         self._clean_ref_measured = False
+        self._clean_defense_sane = True
 
         logger.info(
             f"[FL round {round_num}] benign FedAvg over {len(updates)} clients "

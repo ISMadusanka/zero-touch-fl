@@ -242,7 +242,11 @@ def run_phase2(
 
     if mode == "baseline":
         from rl.baseline import run_baseline
-        run_baseline(env, n_rounds, metrics_tracker, _save_round_log)
+        # Same attacker reward weights training uses — the baseline COMMITS the
+        # highest-scoring action, so different weights would report a different
+        # attack (see rl.rewards.check_reward_balance).
+        run_baseline(env, n_rounds, metrics_tracker, _save_round_log,
+                     reward_cfg=config.get("rl", {}).get("reward", {}).get("attacker", {}))
 
     elif mode == "dry-run":
         from rl.inference import InferenceGenerator, run_inference
@@ -256,7 +260,8 @@ def run_phase2(
         gen = InferenceGenerator(backend, max_new_tokens=int(config.get("rl", {}).get("max_new_tokens", 2048)))
         run_inference(env, attacker_agent, defender_agent, gen, n_rounds,
                       metrics_tracker, _save_round_log,
-                      temperature=float(llm_cfg.get("temperature", 0.7)))
+                      temperature=float(llm_cfg.get("temperature", 0.7)),
+                      reward_cfg=config.get("rl", {}).get("reward", {}).get("attacker", {}))
 
     else:  # full GRPO training
         from rl.policy import LLMPolicy

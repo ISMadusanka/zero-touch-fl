@@ -275,7 +275,9 @@ whether the learner won:
 
 - **Attacker wins** (`attacker_succeeded`) when: its poison **evaded** the defender
   (the poisoned client was *not* flagged) **and** the model **lost accuracy** by at
-  least `attacker_min_drop` (default 0.02). → *"my attack got through AND did damage."*
+  least `win_fraction × the round's target` (0.6 × 0.10 = **0.06** with the shipped
+  config; `attacker_min_drop` is only the fallback when no target is known). →
+  *"my attack got through AND did damage."*
 - **Defender wins** (`defender_succeeded`) when: it **caught** the poison
   (TPR ≥ `defender_min_tpr`, default 0.99) **and** didn't **over-flag** honest
   clients (FPR ≤ `defender_max_fpr`, default 0.10). → *"flagged the bad one, spared
@@ -330,9 +332,9 @@ Phase 5 [defender] ended (cap) after 1000 rounds — froze defender
 | Setting | Default | Controls |
 |---|---|---|
 | `success_streak` | 3 | wins-in-a-row needed to hand off |
-| `min_phase_rounds` | 8 | earliest a phase may switch (anti-fluke floor) |
+| `min_phase_rounds` | 3 | earliest a phase may switch (anti-fluke floor) |
 | `max_phase_rounds` | 200 | force-switch ceiling (anti-stall) |
-| `attacker_min_drop` | 0.02 | accuracy drop that counts as an attacker win |
+| `attacker_min_drop` | 0.10 | fallback drop bar; the live gate is `win_fraction × target` = 0.06 |
 | `attacker_min_evaded` | 1.0 | fraction of poisoned clients that must evade |
 | `defender_min_tpr` / `defender_max_fpr` | 0.99 / 0.10 | what counts as a defender win |
 

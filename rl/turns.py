@@ -27,7 +27,9 @@ from FedAvg over the un-flagged clients.
 import logging
 
 from core.debug import dbg
-from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
+from rl.rewards import (
+    attack_potency, attacker_reward, defender_reward, perturbation_diversity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +129,12 @@ class AttackerTurn:
             attacker_text, self.scoring_opp_temp, commit=False)
         post_acc = (self.env.evaluate_state(state) if self.algorithmic
                     else self.env.evaluate_updates(updates, verdicts))
-        diversity = perturbation_diversity(
-            poisoned, {cid: self.pool_references[cid] for cid in chosen_ids})
+        refs = {cid: self.pool_references[cid] for cid in chosen_ids}
+        diversity = perturbation_diversity(poisoned, refs)
+        # How much poison this rollout actually shipped, relative to the honest
+        # update it hides in — gates the stealth term so "don't attack" stops
+        # being the highest-scoring way to evade detection (see attack_potency).
+        potency = attack_potency(poisoned, refs, self.env.global_weights)
         r = attacker_reward(
             self.reference_accuracy, post_acc, self.goal, chosen_ids,
             verdicts, n_malformed,
@@ -137,6 +143,7 @@ class AttackerTurn:
             gamma=self.reward_cfg.get("gamma", 1.0),
             zeta=self.reward_cfg.get("zeta", 0.0),
             diversity=diversity,
+            potency=potency,
         )
         dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed,
                             verdicts=verdicts, poisoned_ids=chosen_ids)

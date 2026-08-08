@@ -51,7 +51,8 @@ from rl.grpo import grpo_step
 from rl.policy import PolicyGenerator
 from rl.rewards import (
     DEFAULT_ADVANTAGE_STD_FLOOR, DEFAULT_MIN_REWARD_SPREAD,
-    attacker_reward, defender_reward, goal_target, perturbation_diversity,
+    attack_potency, attacker_reward_terms, check_reward_balance, defender_reward,
+    goal_target, perturbation_diversity,
 )
 from rl.switch import PhaseController, SwitchConfig, committed_success
 from rl.turns import AttackerTurn, DefenderTurn
@@ -263,6 +264,11 @@ def train(
     reward_att = reward_cfg.get("attacker", {})
     reward_def = reward_cfg.get("defender", {})
     switch_cfg = SwitchConfig.from_cfg(rl)
+    # Verify up front that damage still outbids the shaping terms. The invariant
+    # couples four values across two config blocks and has been broken twice by
+    # changing one of them alone; both times the symptom was a policy that trained
+    # for hundreds of rounds and learned to look harmless.
+    check_reward_balance(reward_att, env.goal, context="train")
 
     total_rounds = resolve_round_budget(
         int(cfg["fl"]["simulation_rounds"]), total_rounds, max_new_rounds, start_round)
@@ -382,13 +388,31 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
         )
 
     # The attacker's reward is dominated by the damage term, which is measured
-    # against the clean counterfactual. When the round's defense refused to
-    # aggregate the unpoisoned updates there is no counterfactual, so the damage
-    # term is structurally 0 for every rollout and the group would train the policy
-    # on the stealth/malformed terms alone while LOOKING like a measured round.
-    # Score the group (the environment still needs a rollout to advance) but apply
-    # no gradient. The defender's reward is detection-only, so it is unaffected.
+    # against the clean counterfactual. Two round states make that measurement
+    # meaningless, and on both we score the group (the environment still needs a
+    # rollout to advance) but apply NO gradient. The defender's reward is
+    # detection-only, so it is unaffected by either.
+    #
+    # 1. NO COUNTERFACTUAL — the defense refused to aggregate even the unpoisoned
+    #    updates, so the damage term is structurally 0 for every rollout while
+    #    LOOKING like a measured round.
+    # 2. BROKEN DEFENSE — the defense DID aggregate, but only after rejecting the
+    #    honest majority of the unpoisoned cohort. The accuracies are then a reading
+    #    of the defense's false-positive rate, and the drop between two such
+    #    readings is noise wearing the costume of an attack result. 45 of 262 rounds
+    #    in a recorded run were in this state (FLTrust, mean FPR 0.43) and every one
+    #    of them contributed a gradient.
     unmeasured = learner == "attacker" and not getattr(ctx, "clean_measured", True)
+    malfunctioned = learner == "attacker" and not getattr(ctx, "defense_sane", True)
+    void = unmeasured or malfunctioned
+    skip_reason = ""
+    if unmeasured:
+        skip_reason = (f"{env.round_defense or 'the aggregator'} produced no clean "
+                       "aggregate, so the damage term is unmeasurable")
+    elif malfunctioned:
+        skip_reason = (f"{env.round_defense or 'the aggregator'} rejected the honest "
+                       "majority of the UNPOISONED cohort, so this round measures the "
+                       "defense, not the attack")
 
     stats = grpo_step(
         state["policy"], learner, state["optimizers"][learner], turn,
@@ -399,9 +423,8 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
         resample_temperature=k["resample_temp"],
         min_reward_spread=k["min_reward_spread"],
         advantage_std_floor=k["advantage_std_floor"],
-        skip_update=unmeasured,
-        skip_reason=(f"{env.round_defense or 'the aggregator'} produced no clean "
-                     "aggregate, so the damage term is unmeasurable" if unmeasured else ""),
+        skip_update=void,
+        skip_reason=skip_reason,
     )
 
     # Advance the env with an ON-POLICY draw from the group (see _committed_index):
@@ -415,10 +438,11 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     # scored unpoisoned), so the win-gate measures the attack — not the change
     # since the previous round. See FLArmsRaceEnv.clean_reference_accuracy.
     drop = ctx.clean_accuracy - info["post_accuracy"]
-    # An unmeasured counterfactual cannot certify a win either: the phase gate feeds
+    # A void round cannot certify a win either: the phase gate feeds
     # ``success_streak``, and crediting a win on a round whose damage was never
-    # measured would switch phases on noise.
-    success = (not unmeasured) and committed_success(
+    # measured — or was measured through a defense that had already dropped the
+    # honest majority — would switch phases on noise.
+    success = (not void) and committed_success(
         learner, drop, info["verdicts"], poisoned_ids, state["switch_cfg"], ctx.goal)
 
     # The relative damage bar this round had to clear, shared with the metrics
@@ -729,29 +753,39 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     goal = ctx.goal if getattr(ctx, "goal", None) is not None else env.goal
 
     # Diversity of the committed (possibly multi-client) attack; 0 for one client.
-    diversity = perturbation_diversity(
-        info.get("poisoned_by_client", {}),
-        {cid: env.pool_benign[cid] for cid in poisoned_ids if cid in env.pool_benign},
-    )
-    a_rew = attacker_reward(ctx.clean_accuracy, post_acc, goal,
-                            poisoned_ids, verdicts, n_malformed,
-                            alpha=reward_att.get("alpha", 1.0),
-                            beta=reward_att.get("beta", 0.5),
-                            gamma=reward_att.get("gamma", 1.0),
-                            zeta=reward_att.get("zeta", 0.0),
-                            diversity=diversity)
+    poisoned_by_client = info.get("poisoned_by_client", {})
+    refs = {cid: env.pool_benign[cid] for cid in poisoned_ids if cid in env.pool_benign}
+    diversity = perturbation_diversity(poisoned_by_client, refs)
+    # Size of the committed poison relative to the honest update it hides in; gates
+    # the stealth term exactly as it does when the rollouts were scored, so the
+    # logged reward is the one the policy was actually trained on.
+    potency = attack_potency(poisoned_by_client, refs, env.global_weights)
+    terms = attacker_reward_terms(ctx.clean_accuracy, post_acc, goal,
+                                  poisoned_ids, verdicts, n_malformed,
+                                  alpha=reward_att.get("alpha", 1.0),
+                                  beta=reward_att.get("beta", 0.5),
+                                  gamma=reward_att.get("gamma", 1.0),
+                                  zeta=reward_att.get("zeta", 0.0),
+                                  diversity=diversity,
+                                  potency=potency)
+    a_rew = terms["total"]
     d_rew = defender_reward(verdicts, poisoned_ids,
                             mode=reward_def.get("mode", "soft_f1"),
                             fpr_penalty=reward_def.get("fpr_penalty", 1.0))
 
     clean_measured = bool(getattr(ctx, "clean_measured", True))
+    defense_sane = bool(getattr(ctx, "defense_sane", True))
     _warn_defense_malfunction(ctx.round_num, defense_algorithm, verdicts, poisoned_ids)
 
-    # ``clean_accuracy`` is passed only when it was really measured: the tracker
-    # derives the damage-based attack_success from it and must not treat the
-    # current-global fallback as a counterfactual.
+    # ``clean_accuracy`` is passed only when it was really measured AND measured
+    # through a defense that was working: the tracker derives the damage-based
+    # attack_success from it, and must treat neither the current-global fallback
+    # (clean_measured=False) nor a counterfactual built after the honest majority
+    # was rejected (defense_sane=False) as a counterfactual. Both would credit the
+    # attacker with the defense's own noise.
+    countable = clean_measured and defense_sane
     metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(poisoned_ids),
-                           clean_accuracy=(ctx.clean_accuracy if clean_measured else None),
+                           clean_accuracy=(ctx.clean_accuracy if countable else None),
                            success_drop=success_drop)
     save_round_log(RoundLog(
         round_num=ctx.round_num,
@@ -780,6 +814,16 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             # the run draws the defense/quota at random instead of sweeping them.
             "curriculum": _curriculum_slot(env),
             "attack_diversity": round(float(diversity), 4),
+            # ‖poison‖/‖honest update‖ squashed into [0,1) — how hard the committed
+            # attack actually pushed. Near 0 with a high reward means the policy is
+            # farming the stealth term instead of attacking (see attack_potency).
+            "attack_potency": round(float(potency), 4),
+            # The attacker reward broken into its WEIGHTED terms. `damage` must be
+            # the dominant one on any round the attack actually worked; a run where
+            # `stealth` carries the reward is a run learning to hide, not to attack
+            # — which is exactly what a recorded 262-round run did while looking
+            # healthy in every other field. Summing to `attacker_reward`.
+            "reward_terms": {k: round(float(v), 6) for k, v in terms.items()},
             # The clean counterfactual and the damage measured against it — the
             # quantities the reward and the win-gate actually use, so monitor.py
             # and the visualizer report the same number the policy is trained on.
@@ -790,6 +834,11 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             # not exist and `induced_drop` is not a measurement. Slice these rounds OUT
             # before reporting damage; the policy was not updated on them either.
             "clean_measured": clean_measured,
+            # False = the round's defense had already rejected the honest majority of
+            # the UNPOISONED cohort, so `clean_accuracy` / `induced_drop` measure its
+            # false-positive rate rather than the attack. Slice these out too; no
+            # policy gradient was applied on them either.
+            "defense_sane": defense_sane,
             "phase_index": phase_index,
             "phase_round": phase_round,
             "learner_success": success,
@@ -838,7 +887,12 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
         + f"{'WIN' if success else '...'}]: acc {ctx.global_accuracy:.4f}->{post_acc:.4f} "
         f"(clean_ref={ctx.clean_accuracy:.4f}{'' if clean_measured else '~UNMEASURED'} "
         f"drop={ctx.clean_accuracy - post_acc:+.4f}) "
-        f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} "
+        # Break the attacker reward out by term. Reading `att_reward` alone hid the
+        # central failure of a whole recorded run: a healthy-looking 0.47 that was
+        # 93% stealth and ~0% damage.
+        f"| att_reward={a_rew:.3f}(dmg={terms['damage']:+.3f} stl={terms['stealth']:+.3f} "
+        f"mal={terms['malformed']:+.3f} col={terms['collab']:+.3f} pot={potency:.2f}) "
+        f"def_reward={d_rew:.3f} "
         f"| grpo_loss={stats['loss']:.4f} mean_r={stats['mean_reward']:.3f} "
         f"spread={stats.get('reward_spread', 0.0):.3f} "
         f"zero_adv={stats['zero_advantage_fraction']:.2f}"
@@ -848,5 +902,6 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
         f"n_malformed={n_malformed}/{ctx.budget} "
         + ("resampled " if stats.get("resampled") else "")
         + ("step" if stats.get("stepped", True)
-           else ("SKIP-unmeasured" if stats.get("skipped_by_caller") else "SKIP-degenerate"))
+           else ("SKIP-degenerate" if not stats.get("skipped_by_caller")
+                 else ("SKIP-unmeasured" if not clean_measured else "SKIP-defense-broken")))
     )

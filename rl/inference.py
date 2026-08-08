@@ -14,7 +14,10 @@ attacker calls the LLM here.
 import logging
 
 from core.types import RoundLog
-from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
+from rl.rewards import (
+    attack_potency, attacker_reward, check_reward_balance, defender_reward,
+    perturbation_diversity,
+)
 from rl.switch import success_drop_bar
 
 logger = logging.getLogger(__name__)
@@ -43,9 +46,27 @@ def run_inference(
     metrics_tracker,
     save_round_log,
     temperature: float = 0.7,
+    reward_cfg=None,
 ):
-    """Run ``n_rounds`` of the arms race with frozen LLMs (no learning)."""
+    """Run ``n_rounds`` of the arms race with frozen LLMs (no learning).
+
+    ``reward_cfg`` is ``rl.reward.attacker`` from the config. Without it this loop
+    scored rounds with the ``attacker_reward`` function defaults (alpha 1.0 /
+    beta 0.5) while training used the configured weights, so a --dry-run reward was
+    not on the same scale as a training reward even though both are written to
+    ``logs/round_data/rounds.jsonl`` under the same field name. Against the shipped
+    target of 0.10 the defaults also invert the shaping-budget invariant — see
+    :func:`rl.rewards.check_reward_balance`.
+    """
+    reward_cfg = reward_cfg or {}
+    weights = {
+        "alpha": float(reward_cfg.get("alpha", 1.0)),
+        "beta": float(reward_cfg.get("beta", 0.5)),
+        "gamma": float(reward_cfg.get("gamma", 1.0)),
+        "zeta": float(reward_cfg.get("zeta", 0.0)),
+    }
     logger.info(f"[dry-run] running {n_rounds} inference round(s) — no weight updates")
+    check_reward_balance(reward_cfg, env.goal, context="dry-run")
     for _ in range(n_rounds):
         ctx = env.begin_round()
 
@@ -77,13 +98,18 @@ def run_inference(
             verdicts = defender_agent.parse(d_text, client_ids)
             new_acc = env.commit(updates, verdicts)
 
-        diversity = perturbation_diversity(
-            poisoned, {cid: ctx.pool_benign[cid] for cid in chosen_ids})
-        # Damage is scored against the round's clean counterfactual, exactly as in
-        # training (see FLArmsRaceEnv.clean_reference_accuracy).
+        refs = {cid: ctx.pool_benign[cid] for cid in chosen_ids}
+        diversity = perturbation_diversity(poisoned, refs)
+        # Damage is scored against the round's clean counterfactual, and stealth is
+        # gated on how much poison actually went out — exactly as in training (see
+        # FLArmsRaceEnv.clean_reference_accuracy and rl.rewards.attack_potency), so
+        # a --dry-run reward is comparable to a training one.
         a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal, chosen_ids,
                                 verdicts, n_malformed,
-                                diversity=diversity)
+                                diversity=diversity,
+                                potency=attack_potency(poisoned, refs,
+                                                       env.global_weights),
+                                **weights)
         d_rew = defender_reward(verdicts, chosen_ids)
 
         # Same damage-based success definition as training (see rl.switch); the clean

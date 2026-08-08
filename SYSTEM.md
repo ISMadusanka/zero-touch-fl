@@ -117,15 +117,20 @@ for algorithm in defense.algorithms:            # fltrust, defl, dnc, multikrum
 - **Position is one integer**, saved in `checkpoints/rl_progress.json` next to
   `rounds_done` / `controller`, so a resume continues mid-block. Older progress
   files fall back to `rounds_done`, which counts exactly the same rounds.
-- **The attack target is pinned** (`attack.goal.target_accuracy_drop: 0.02`,
+- **The attack target is pinned** (`attack.goal.target_accuracy_drop: 0.10`,
   `sample_target_in_training: false`) so a block's rounds — and one block against
   the next — are comparable: the win gate is `win_fraction x the round's target`
-  and the reward is normalized by it, so a moving target would change what
-  "success" means inside a block. The value is the **reward's scale**, not an
-  aspiration: at the old `0.10`, against 1–5 of 20 clients facing a robust
-  aggregator, the observed drops of ~0.01 mapped to ~0.1 of reward — less than the
-  collaboration bonus and only ~3x the stealth term, so the reward nominally led
-  with damage while ranking it third. Raise it back if you widen the threat model.
+  (0.06 here) and the reward is normalized by it, so a moving target would change
+  what "success" means inside a block. The target is **two things at once**: the
+  ambition placed in the attacker's prompt *and* where `drop_term`'s linear region
+  ends, and simultaneously the **divisor** of the damage term. So it must be moved
+  together with `rl.reward.attacker.alpha` — the shipped pair is `alpha 5.0 /
+  target 0.10`, keeping `alpha/target = 50` so a point of accuracy is worth what it
+  was at the old `0.02`, including against the absolute `min_reward_spread` /
+  `advantage_std_floor` noise floors. What actually changes at 0.10 is the
+  ceiling on ambition: at 0.02 a 2pp cut already collected nearly all the damage
+  reward available and a 10pp cut was worth only ~1.4x as much, so the reward was
+  telling the attacker to stop at two points.
 - Each round log carries `attack_metadata.curriculum`
   (`algorithm`, `n_poisoners`, `cycle`, `block`, `position`, `block_round`).
 - `curriculum.enabled: false` (or no `curriculum:` block) restores the random draws.
@@ -195,17 +200,70 @@ for algorithm in defense.algorithms:            # fltrust, defl, dnc, multikrum
 
 Both continuous, so GRPO group advantages don't collapse.
 
-- **Attacker**: `α·drop_term(drop, target) + β·stealth − γ·malformed_frac
-  + ζ·diversity·stealth`, with `target` from the goal, `stealth` =
+- **Attacker**: `α·drop_term(drop, target) + β·stealth·potency − γ·malformed_frac
+  + ζ·diversity·stealth·potency`.
+
+  **Damage is the objective; stealth and collaboration are shaping.** They exist
+  only to keep the gradient dense while damage is near zero, and neither is worth
+  anything on its own, so the shaping budget is held below what a real attack earns:
+
+  > `β + ζ  <  α · (smallest drop worth calling an attack) / target`
+  > shipped: `0.10 + 0.05 = 0.15  <  5.0 · 0.01 / 0.10 = 0.5` (a 1pp drop)
+
+  Any genuine damage therefore outbids everything a non-damaging rollout can
+  collect, by >3× — measured against the best damage-free strategy available
+  (5 clients, maximal diversity, maximal potency, fully evading: 0.147, vs 0.549 for
+  a single 1pp drop).
+
+  The invariant has now been lost three times, each time by changing one value in
+  isolation, so it is checked in three places rather than documented in one:
+
+  - `rl.rewards.check_reward_balance` runs at the start of **every** run mode
+    (train / `--baseline` / `--dry-run`), logging the weights and WARNING (not
+    failing — an unbalanced reward is a legitimate experiment) when it breaks.
+  - `tests/test_attack_potency.py` asserts it directly against `configs/base.yaml`,
+    so drift fails the tests rather than a training run.
+  - Every round log carries a `reward_terms` block and every `system.log` round line
+    carries `att_reward=…(dmg=… stl=… mal=… col=… pot=…)`, so "which term is paying"
+    is readable during a run instead of back-solved afterwards.
+
+  The three failures, for the record: (1) moving `target` — which *divides* damage —
+  without moving `α`; (2) assuming the `potency` gate alone was enough, when a large,
+  evading, completely harmless perturbation passes that gate honestly and at `β=0.5`
+  still collected 0.245 against the 0.5 a 1pp drop paid; (3) `--baseline` and
+  `--dry-run` never reading `rl.reward.attacker` at all, so they scored on the bare
+  function defaults (`α=1.0, β=0.5`) — an inverted balance on the very paths used to
+  evaluate. All three run modes now take the weights from the config.
+
+  With `target` from the goal, `stealth` =
   calibrated evasion over the chosen clients (`1 − p_malicious`, 0 when nothing was
   poisoned), `malformed_frac = n_malformed / n_selected` (the waste penalty,
   normalized over the clients the attacker *selected*), and
   `diversity = 1 − mean pairwise cosine` of
   the chosen clients' perturbations (the **collaboration** bonus, 0 for a single
-  client, and **gated on stealth** so a well-coordinated attack that got caught earns
-  nothing for its coordination) — rewarding coordinated, distinct multi-client attacks over identical
+  client) — rewarding coordinated, distinct multi-client attacks over identical
   Sybil-like clones. See `rl/rewards.py` (`attacker_reward`, `drop_term`,
-  `perturbation_diversity`).
+  `attack_potency`, `perturbation_diversity`).
+
+  - **`potency`** (`attack_potency`) is `mean_i s_i/(s_i+1)` over the poisoned
+    clients, with `s_i = ‖poisoned_i − benign_i‖ / ‖benign_i − global‖` — the poison
+    measured against the honest update it hides inside, in the same units the
+    defenses score (`Δ = w_i − global`), so it is dimensionless and
+    architecture-independent like everything else the attacker sees. It **gates the
+    stealth payment**, and that gate is load-bearing. Un-gated, `β·stealth` pays for
+    not being caught, and the cheapest way not to be caught is not to attack: a
+    poison one part in a thousand of the honest update is byte-different (so it
+    clears the `n_malformed` no-op check) and collects full stealth for zero damage.
+    In a recorded 262-round run the damage term supplied ~11% of the attacker's
+    reward and stealth the rest (mean 0.83 under FLTrust, 0.91 under Multi-Krum) at
+    a **median induced drop of 0.0000**, and the global model gained 0.097 accuracy
+    over the run it was being "attacked" through. The gate introduces no new
+    degenerate optimum in its place: a huge perturbation drives potency to 1 but is
+    flagged, so stealth — and with it the whole term — collapses, and a flagged
+    client is dropped from the aggregate so it earns no damage either. Both extremes
+    score ~0; only "big enough to hurt, subtle enough to pass" pays. Same argument
+    as the collaboration bonus's own gate: a term you can max out without attacking
+    is a term the policy farms instead of attacking.
 
   - **`drop = clean_reference_accuracy − post_accuracy`** — the damage measured
     against **this round's clean counterfactual**: the accuracy the aggregate
@@ -231,6 +289,21 @@ Both continuous, so GRPO group advantages don't collapse.
     failed to aggregate the post accuracy was that same number, so `drop` was
     identically `+0.0000` by construction. About a quarter of the rounds in a
     recorded run looked like a measured "the attack achieved nothing".
+
+    **When the defense aggregated, but only after rejecting the honest majority** —
+    the counterfactual exists and looks perfectly ordinary, but it is a reading of
+    the defense's own false-positive rate, and the drop between two such readings is
+    noise wearing the costume of an attack result. `clean_reference_accuracy` tests
+    this on the **unpoisoned** cohort, where every flag is by definition a false
+    positive, and exposes `FLArmsRaceEnv.clean_defense_sane` →
+    `RoundContext.defense_sane` → the same `skip_update=True` path as above, plus
+    `defense_sane: false` in the round log and a `SKIP-defense-broken` tag in
+    `system.log`. Testing it on the clean cohort rather than the poisoned one is
+    what keeps a genuinely strong attack (which legitimately provokes flags) from
+    being mistaken for a broken defense. This was silent for a whole recorded run:
+    45 of 262 rounds (17%) rejected the honest majority under FLTrust — mean FPR
+    0.43, peak 0.81 — `_warn_defense_malfunction` logged a warning after the fact,
+    and the policy was trained on every one of them anyway.
   - **`drop_term(drop, target)`** is `x = drop/target`: linear on `−0.5 ≤ x ≤ 1`
     (hitting the goal scores exactly 1.0), then `1 + 0.5·(x−1)/(x−1+1)` above —
     strictly increasing, asymptotic to 1.5 — and `−0.5 − 0.25·u/(u+1)` with
@@ -242,10 +315,12 @@ Both continuous, so GRPO group advantages don't collapse.
     within-group reward spread: once every rollout lands in the same flat region they
     tie, the spread collapses, and `grpo_step` skips the update. The overshoot flat
     came first — the attacker stopped learning exactly when it got good at overshooting
-    `1.5·target`. The **backfire** flat matters once `target` is small: at the
-    configured `0.02`, `x < −0.5` means "the attack made the model more than 1pp
-    *better* than the clean counterfactual", which several rounds in a recorded run
-    were well past, and every such rollout used to score exactly `−0.5`.
+    `1.5·target`. The **backfire** flat matters once `target` is small: at a target of
+    `0.02`, `x < −0.5` means "the attack made the model more than 1pp *better* than the
+    clean counterfactual", which several rounds in a recorded run were well past, and
+    every such rollout used to score exactly `−0.5`. At the configured `0.10` the knee
+    sits at a 5pp improvement instead, so the backfire side is far less crowded — but
+    the term stays monotone either way, which is the point.
 
     Both saturations are fast (4× the target buys < 0.4 extra), so the objective stays
     "hit the requested drop", not "destroy the model", and a catastrophic backfire
@@ -349,7 +424,11 @@ legacy `round_NNN.json` files, so logs from older runs still load.
   `poisoned_client_ids`, `predicted_labels`, accuracies, `attacker_reward`,
   `defender_reward`, `learning_agent`, and an `attack_metadata` block with
   `clean_accuracy` / `induced_drop` (the counterfactual and the damage the reward
-  actually uses), `n_malformed`, `budget`, `n_used`, `defense` (which algorithm
+  actually uses), `clean_measured` / `defense_sane` (**slice both `false` cases out
+  before reporting damage** — no gradient was applied on them either),
+  `attack_potency` (how hard the committed attack actually pushed; near 0 next to a
+  high reward means the policy is farming stealth rather than attacking),
+  `attack_diversity`, `n_malformed`, `budget`, `n_used`, `defense` (which algorithm
   faced the round, or `"llm"` — rounds are only comparable within one defense),
   plus a `train` sub-block (loss, mean reward, zero-advantage fraction).
 - `logs/metrics/rounds.jsonl` + `summary.json` — ground-truth confusion / TPR /

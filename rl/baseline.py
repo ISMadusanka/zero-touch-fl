@@ -19,7 +19,23 @@ import logging
 import torch
 
 from core.types import DetectionVerdict, RoundLog
-from rl.rewards import attacker_reward, defender_reward
+from rl.rewards import (
+    attack_potency, attacker_reward, check_reward_balance, defender_reward,
+)
+
+
+def _attacker_weights(reward_cfg: dict) -> dict:
+    """The configured attacker reward weights as kwargs for ``attacker_reward``.
+
+    Explicitly resolved (rather than letting the function defaults apply) so the
+    baseline scores actions with the SAME weights training uses — see
+    :func:`run_baseline`."""
+    return {
+        "alpha": float(reward_cfg.get("alpha", 1.0)),
+        "beta": float(reward_cfg.get("beta", 0.5)),
+        "gamma": float(reward_cfg.get("gamma", 1.0)),
+        "zeta": float(reward_cfg.get("zeta", 0.0)),
+    }
 from rl.switch import success_drop_bar
 
 logger = logging.getLogger(__name__)
@@ -72,9 +88,20 @@ def fixed_defender(features: dict[int, dict], rel_norm_thr: float = 2.0,
     return verdicts
 
 
-def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
-    """Run ``n_rounds`` of best-of-N fixed-action attack vs fixed defender."""
+def run_baseline(env, n_rounds, metrics_tracker, save_round_log, reward_cfg=None):
+    """Run ``n_rounds`` of best-of-N fixed-action attack vs fixed defender.
+
+    ``reward_cfg`` is ``rl.reward.attacker`` from the config. It is not optional in
+    spirit: this loop COMMITS the action with the highest reward, so the weights
+    decide which attack the baseline reports. Falling back to the function defaults
+    (alpha 1.0 / beta 0.5) against the shipped target of 0.10 inverts the balance —
+    shaping 0.5 against the 0.1 a 1pp drop earns — i.e. exactly the "reward pays for
+    hiding, not for damaging" bug that the training path was fixed for, silently
+    left in place on the evaluation path. See rl.rewards.attacker_reward_terms.
+    """
+    reward_cfg = reward_cfg or {}
     logger.info(f"[baseline] running {n_rounds} best-of-N round(s) — no LLM, no GPU")
+    check_reward_balance(reward_cfg, env.goal, context="baseline")
     for _ in range(n_rounds):
         ctx = env.begin_round()
         # No LLM to choose clients: poison the first `budget` clients of the pool.
@@ -101,9 +128,16 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             else:
                 verdicts = fixed_defender(env.features(updates))
                 post_acc = env.evaluate_updates(updates, verdicts)
-            # Same reference as training: this round's clean (unpoisoned) aggregate.
+            # Same reference as training: this round's clean (unpoisoned) aggregate,
+            # with stealth gated on how much poison the action actually shipped
+            # (rl.rewards.attack_potency) so the fixed actions are ranked by the same
+            # rule the policy is trained under.
             reward = attacker_reward(ctx.clean_accuracy, post_acc, ctx.goal,
-                                     effective, verdicts, n_malformed)
+                                     effective, verdicts, n_malformed,
+                                     potency=attack_potency(
+                                         {c: poisoned[c] for c in effective},
+                                         ctx.pool_benign, env.global_weights),
+                                     **_attacker_weights(reward_cfg))
             scored.append((label, effective, n_malformed, updates, verdicts, post_acc, reward))
             logger.info(
                 f"[baseline] round {ctx.round_num} action={label:9s} "
@@ -123,8 +157,17 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
             new_acc = env.commit_state(state)
         else:
             new_acc = env.commit(updates, verdicts)
+        # Take the committed weights from the WINNING action's own updates —
+        # `poisoned` above is just whatever the scoring loop left behind, which is
+        # the last action tried, not the one being committed.
+        committed_weights = {u.client_id: u.weights for u in updates
+                             if u.client_id in set(chosen_ids)}
         a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal,
-                                chosen_ids, verdicts, n_malformed)
+                                chosen_ids, verdicts, n_malformed,
+                                potency=attack_potency(committed_weights,
+                                                       ctx.pool_benign,
+                                                       env.global_weights),
+                                **_attacker_weights(reward_cfg))
         d_rew = defender_reward(verdicts, chosen_ids)
 
         # Same damage-based success definition as training (see rl.switch).

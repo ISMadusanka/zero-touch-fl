@@ -128,7 +128,7 @@ them, 10 at each attack strength**. Details:
   of the Phase-2 resume state in `checkpoints/rl_progress.json`, so a restart
   continues mid-block instead of rewinding to `fltrust` × 1 every time.
 - **The target drop is held fixed too** (`attack.sample_target_in_training:
-  false`, `goal.target_accuracy_drop: 0.02`). A block holds the defense and the
+  false`, `goal.target_accuracy_drop: 0.10`). A block holds the defense and the
   poisoner count fixed precisely so its 10 rounds are comparable; a target
   re-drawn each round changes what "success" means *inside* the block, since the
   win gate is `win_fraction × the round's target` and the reward is normalized by
@@ -338,9 +338,20 @@ is **relative** to it: an attack "passes" when its committed drop reaches
 fixed is what makes a curriculum block's 10 rounds — and one block against the
 next — comparable.
 
+> **Move it together with `rl.reward.attacker.alpha`.** The damage term is
+> `alpha * drop/target`, so the target is simultaneously the ambition *and* the
+> divisor of damage's weight in the reward — raising it alone weakens the very
+> thing it asks for. The shipped pair is `alpha 5.0 / target 0.10`; keep
+> `alpha/target = 50` and a point of accuracy stays worth what it was, including
+> against the absolute `min_reward_spread` / `advantage_std_floor` noise floors.
+> What the target genuinely controls is where `drop_term`'s linear region ends —
+> the point past which extra damage stops paying. At `0.02` that ceiling was the
+> binding constraint: a 2pp cut collected nearly all the available damage reward
+> and a 10pp cut was worth only ~1.4× as much.
+
 *Optional target randomization.* Setting
 `attack.sample_target_in_training: true` draws `target_accuracy_drop` per round
-from `attack.target_choices` (`[0.05, 0.10, 0.20, 0.30]`) instead, making the
+from `attack.target_choices` (`[0.05, 0.10, 0.15, 0.20]`) instead, making the
 policy **target-aware** across drops (sampled once per round, so all `G` GRPO
 rollouts in a group share it). It is off because it fights the curriculum: with
 the target moving round-to-round, block-to-block differences are partly just

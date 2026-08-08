@@ -11,11 +11,68 @@ The defender reward uses ground truth, but only as a *training signal*: the
 defender's policy input (its prompt) never contains it.
 """
 
+import logging
+
 from core.types import DetectionVerdict
+
+logger = logging.getLogger(__name__)
 
 
 def _clip(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+# The smallest accuracy drop worth calling an attack. On a 10k-example test set
+# accuracy is quantized to 1e-4, so 1pp is ~100x the measurement quantum: it is
+# unambiguously signal. Used as the anchor for the shaping-budget invariant below.
+MIN_REAL_DROP = 0.01
+
+
+def check_reward_balance(reward_cfg: dict, goal: dict, *, context: str = "") -> bool:
+    """Log the attacker's reward weights and verify the shaping-budget invariant.
+
+        beta + zeta  <  alpha * MIN_REAL_DROP / target
+
+    Damage is the objective; stealth and collaboration are shaping that exists only
+    to keep the gradient dense while damage is near zero. If their combined ceiling
+    reaches what a real attack earns, the reward-maximizing policy is to look busy
+    and harmless — which is what a recorded 262-round run learned to do, ending with
+    a median induced drop of 0.0000 and a global model 0.097 accuracy BETTER than it
+    started.
+
+    Called at the start of every run mode, because the invariant couples four values
+    across two config blocks (``attack.goal.target_accuracy_drop`` and the three
+    ``rl.reward.attacker`` weights) and has been broken twice by changing one of them
+    alone. Returns True when it holds; logs a WARNING naming the fix when it does not
+    — this is deliberately loud rather than fatal, since an intentionally unbalanced
+    reward is a legitimate experiment.
+    """
+    alpha = float(reward_cfg.get("alpha", 1.0))
+    beta = float(reward_cfg.get("beta", 0.5))
+    gamma = float(reward_cfg.get("gamma", 1.0))
+    zeta = float(reward_cfg.get("zeta", 0.0))
+    target = goal_target(goal)
+    shaping = beta + zeta
+    real_damage = alpha * MIN_REAL_DROP / target
+    tag = f"[{context}] " if context else ""
+    logger.info(
+        "%sAttacker reward: alpha=%g beta=%g gamma=%g zeta=%g vs target=%g "
+        "-> a %g drop pays %.3f, shaping (beta+zeta) tops out at %.3f",
+        tag, alpha, beta, gamma, zeta, target, MIN_REAL_DROP, real_damage, shaping,
+    )
+    if shaping < real_damage:
+        return True
+    logger.warning(
+        "%sREWARD IMBALANCE: shaping (beta+zeta=%.3f) is >= what a %g accuracy drop "
+        "earns (alpha*drop/target=%.3f), so a rollout that evades without doing any "
+        "damage can score as well as one that attacks. This is the failure that made "
+        "an earlier run converge on 'perturb as little as possible while still "
+        "changing a byte'. Fix by lowering rl.reward.attacker.beta/zeta, or by "
+        "raising alpha in step with attack.goal.target_accuracy_drop (keep "
+        "alpha/target constant).",
+        tag, shaping, MIN_REAL_DROP, real_damage,
+    )
+    return False
 
 
 # Upper bound of the drop term. Reaching the goal exactly scores 1.0; overshoot
@@ -106,14 +163,62 @@ def attacker_reward(
     gamma: float = 1.0,
     zeta: float = 0.0,
     diversity: float | None = None,
+    potency: float | None = None,
 ) -> float:
+    """Total attacker reward — the sum of :func:`attacker_reward_terms`.
+
+    See that function for the per-term decomposition (and use it instead when you
+    want to report or assert on *which* term paid, which is the only way to catch
+    the failure mode described below before it has cost you a training run).
+    """
+    return attacker_reward_terms(
+        reference_accuracy, post_accuracy, goal, poisoned_ids, verdicts, n_malformed,
+        alpha=alpha, beta=beta, gamma=gamma, zeta=zeta,
+        diversity=diversity, potency=potency,
+    )["total"]
+
+
+def attacker_reward_terms(
+    reference_accuracy: float,
+    post_accuracy: float,
+    goal: dict,
+    poisoned_ids: list[int],
+    verdicts: list[DetectionVerdict],
+    n_malformed: int,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.5,
+    gamma: float = 1.0,
+    zeta: float = 0.0,
+    diversity: float | None = None,
+    potency: float | None = None,
+) -> dict:
     """Reward the attacker for degrading accuracy while staying stealthy and,
     when the exact quota contains several clients, coordinating their plans.
 
-    reward = alpha * drop_term(drop, target)
-           + beta  * stealth
-           - gamma * malformed_fraction
-           + zeta  * diversity * stealth
+    Returns the decomposition ``{damage, stealth, malformed, collab, total, drop,
+    stealth_raw, potency}`` — every weighted term plus the raw inputs — so a caller
+    can log WHICH term paid. ``total`` is what :func:`attacker_reward` returns.
+
+    reward = alpha * drop_term(drop, target)      <- the objective
+           + beta  * stealth * potency            <- shaping, budget-capped
+           - gamma * malformed_fraction           <- penalty
+           + zeta  * diversity * stealth * potency <- shaping, budget-capped
+
+    **Damage is the objective; stealth and collaboration are shaping.** Nothing here
+    is an end in itself except the drop, so the shaping budget ``beta + zeta`` is
+    deliberately held BELOW what a real attack earns: at the shipped
+    ``alpha 5.0 / target 0.10``, a 1pp drop pays 0.5 and the entire shaping budget is
+    0.15, so any genuine damage outbids everything a non-damaging rollout can collect.
+
+    That bound is the actual fix for the failure below, and it is easy to lose. It
+    was lost once by moving ``target`` (which divides damage) without moving
+    ``alpha``; and gating stealth on ``potency`` alone did NOT restore it — a large,
+    evading, completely harmless perturbation still scored ``beta * 0.5 = 0.245``
+    against the 0.5 a real 1pp drop pays, i.e. roughly "half a point of accuracy" for
+    doing no damage whatsoever. Keep the invariant explicit:
+
+        beta + zeta  <  alpha * (smallest drop worth calling an attack) / target
 
     ``drop = reference_accuracy - post_accuracy``.
 
@@ -137,9 +242,34 @@ def attacker_reward(
     with the SAME hard flag. It is 0 when the attacker poisoned nobody — there
     was nothing to sneak past the defender.
 
+    ``potency`` in [0, 1] is how much poison the attack actually put on the wire,
+    relative to the honest update it hides inside (see :func:`attack_potency`). It
+    GATES the stealth payment, and this gate is load-bearing: without it ``beta *
+    stealth`` is an unconditional payment for not being caught, and the cheapest way
+    to not be caught is to not attack. A poison one part in a thousand of the honest
+    update is byte-different (so it escapes the ``n_malformed`` no-op check) and
+    scores stealth ~1.0 while doing no damage at all.
+
+    That is not a hypothetical. Over a recorded 262-round run the damage term
+    supplied ~11% of the attacker's reward and ``beta * stealth`` supplied the rest
+    (mean stealth 0.83 on FLTrust rounds, 0.91 on Multi-Krum); the median induced
+    drop was 0.0000, the max 0.0121 against a 0.02 target, and the global model got
+    0.097 BETTER over the run it was supposedly being attacked through. The policy
+    had correctly maximized the reward it was given — "perturb as little as possible
+    while still changing a byte" — which is the exact inverse of the objective.
+
+    Gating stealth on potency removes that optimum without introducing another: a
+    huge perturbation drives potency to 1 but is flagged, so stealth (and with it
+    the whole term) collapses to ~0, and a flagged client is dropped from the
+    aggregate so it earns no damage either. Both degenerate extremes now score ~0
+    and only "big enough to hurt, subtle enough to pass" pays. This is the same
+    argument that already gates the collaboration bonus on stealth — a term you can
+    max out without attacking is a term the policy will farm instead of attacking.
+
     ``malformed_fraction`` is over the clients the attacker SELECTED
     (``n_used + n_malformed``), not over the ones that landed, so selecting three
-    clients and wasting two is penalized twice as hard as wasting one.
+    clients and wasting two is penalized twice as hard as wasting one. It is NOT
+    gated: unusable output must cost whatever else happened.
 
     ``collab_bonus``
     = ``diversity * stealth`` in [0, 1] (only when >1 client) rewards distinct,
@@ -170,6 +300,13 @@ def attacker_reward(
         stealth += 1.0 if v is None else (1.0 - _soft_malicious_prob(v))
     stealth = stealth / n_used if n_used else 0.0
 
+    # Evading a defender is only worth paying for in proportion to how much poison
+    # there was to evade WITH. ``potency=None`` (no measurement available) keeps the
+    # old ungated behaviour so external callers and unit tests are unaffected.
+    gate = 1.0 if potency is None else _clip(float(potency), 0.0, 1.0)
+    stealth_raw = stealth
+    stealth = stealth * gate
+
     # Normalize the waste penalty by how many clients were SELECTED — a client
     # whose plan did nothing still consumed budget, so it belongs in the
     # denominator even though it is not in ``poisoned_ids``.
@@ -177,15 +314,25 @@ def attacker_reward(
     malformed_fraction = n_malformed / n_selected if n_selected else 0.0
 
     # Collaboration bonus: reward diverse (coordinated) multi-client attacks. Only
-    # meaningful with >1 client; `diversity` in [0, 1]. Scaled by stealth so a
-    # well-coordinated attack that got caught earns nothing for its coordination —
-    # see the docstring.
+    # meaningful with >1 client; `diversity` in [0, 1]. Scaled by the gated stealth
+    # so a well-coordinated attack that got caught — or that never really attacked —
+    # earns nothing for its coordination. See the docstring.
     collab_bonus = 0.0
     if zeta and n_used > 1 and diversity is not None:
         collab_bonus = _clip(float(diversity), 0.0, 1.0) * stealth
 
-    return (alpha * damage + beta * stealth - gamma * malformed_fraction
-            + zeta * collab_bonus)
+    terms = {
+        "damage": alpha * damage,
+        "stealth": beta * stealth,
+        "malformed": -gamma * malformed_fraction,
+        "collab": zeta * collab_bonus,
+        # Raw inputs, so a log line can show what drove each weighted term.
+        "drop": drop,
+        "stealth_raw": stealth_raw,
+        "potency": gate,
+    }
+    terms["total"] = terms["damage"] + terms["stealth"] + terms["malformed"] + terms["collab"]
+    return terms
 
 
 def perturbation_diversity(poisoned_by_client: dict, references: dict) -> float:
@@ -217,6 +364,51 @@ def perturbation_diversity(poisoned_by_client: dict, references: dict) -> float:
             pairs += 1
     mean_cos = total / pairs if pairs else 0.0
     return _clip(1.0 - mean_cos, 0.0, 1.0)
+
+
+def attack_potency(poisoned_by_client: dict, references: dict,
+                   global_weights: dict) -> float:
+    """How much poison the attack actually put on the wire, in [0, 1).
+
+    Per poisoned client, the poison and the honest update it is hidden inside are
+    measured in the same units and divided:
+
+        s_i = ‖poisoned_i − benign_i‖ / ‖benign_i − global‖
+
+    ``s`` is the natural scale for this because it is exactly what the defenses
+    look at — every one of them scores a client on its update ``Δ = w_i − global``,
+    so ``s`` says how far the submitted Δ was displaced as a fraction of the honest
+    Δ. It needs no absolute magnitude and is therefore architecture- and
+    round-independent, like the statistics the attacker is shown.
+
+    The per-client score is squashed ``s / (s + 1)``: 0 poison → 0, poison the size
+    of the honest update → 0.5, 3× → 0.75, asymptotic to 1. Smooth and strictly
+    increasing everywhere, so it never creates a flat region for GRPO to collapse
+    into (the same requirement :func:`drop_term` is built around). Returns the mean
+    over the poisoned clients, and 0.0 when nothing was poisoned.
+
+    This exists to gate the stealth term in :func:`attacker_reward` — see its
+    docstring for the failure it prevents.
+    """
+    import torch
+
+    cids = [cid for cid in poisoned_by_client if cid in references]
+    if not cids:
+        return 0.0
+    eps = 1e-12
+    scores = []
+    for cid in cids:
+        pw, bw = poisoned_by_client[cid], references[cid]
+        keys = [k for k in bw if k in global_weights and k in pw]
+        if not keys:
+            continue
+        poison = torch.cat([(pw[k].flatten().float() - bw[k].flatten().float())
+                            for k in keys])
+        honest = torch.cat([(bw[k].flatten().float() - global_weights[k].flatten().float())
+                            for k in keys])
+        s = float(poison.norm()) / (float(honest.norm()) + eps)
+        scores.append(s / (s + 1.0))
+    return sum(scores) / len(scores) if scores else 0.0
 
 
 def _soft_malicious_prob(v: DetectionVerdict) -> float:
