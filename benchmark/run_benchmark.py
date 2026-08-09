@@ -153,13 +153,32 @@ def _resolve_eval_budget(env, requested, log=None):
     env.budget_cap = budget
     env.sample_target = False       # ...nor the goal
     # ...nor sweeps it. The training curriculum walks the poison quota through
-    # 1..5 in blocks; evaluation must hold it at exactly `budget` for every round
-    # so the panel's columns are comparable. (The benchmark builds its env without
-    # a curriculum, so this is belt-and-braces against that changing.)
+    # its configured counts in blocks; evaluation must hold it at exactly `budget`
+    # for every round so the panel's columns are comparable. (The benchmark builds
+    # its env without a curriculum, so this is belt-and-braces against that changing.)
     env.curriculum = None
+    fixed = getattr(env, "fixed_poison_clients", None)
+    if fixed is not None:
+        # Trained with a FIXED poisoned set. Keep that regime — the eval budget just
+        # says how large the fixed set is — rather than letting env._round_budget's
+        # min(fixed, pool) silently cap a widened --max-poison-clients back down to
+        # the trained count, which would report a larger attack than actually ran.
+        if int(fixed) != budget:
+            log.warning(
+                f"Fixed poisoned set resized from {fixed} to {budget} client(s) for this "
+                f"evaluation (clients 0..{budget - 1}); training pinned it at {fixed}."
+            )
+        env.fixed_poison_clients = budget
+        # In this mode the pool IS the poisoned set, so it must shrink as well as
+        # grow with the budget — otherwise a --max-poison-clients BELOW the trained
+        # count would leave a wider pool than quota, which is the one combination
+        # the fixed-set prompt cannot describe.
+        env.n_compromisable = budget
     log.info(f"Eval poison quota = exactly {budget} of pool {env.n_compromisable} "
              f"(clients {list(range(env.n_compromisable))}); "
-             f"attacker selects which to poison")
+             + ("the SAME clients every round (fixed set); the attacker chooses only "
+                "how to poison them" if fixed is not None
+                else "attacker selects which to poison"))
     _warn_about_adversary_share(budget, n_all, log)
     return budget
 
@@ -399,7 +418,15 @@ def main():
     if "llm_defender" in names:
         policy.load_adapter("defender", adapter_paths["defender"])
 
+    # The prompt must describe the same regime training used: a fixed poisoned set
+    # changes the system prompt from "select k of n" to "plan for all of these",
+    # and the rl: block carries the context-fill budget the observation is
+    # compacted to fit. Bind the real tokenizer so that budget is exact.
+    attacker_cfg["fixed_poison_set"] = (
+        attack_cfg.get("fixed_poison_clients") not in (None, False, 0, ""))
+    attacker_cfg["rl"] = rl_cfg
     attacker_agent = AttackerAgent(attacker_cfg)
+    attacker_agent.bind_tokenizer(policy.count_prompt_tokens)
     # Only meaningful for the llm_defender column; harmless to build either way.
     defender_agent = DefenderAgent(defender_cfg)
 

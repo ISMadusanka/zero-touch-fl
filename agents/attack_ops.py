@@ -69,6 +69,114 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.dot(a, b) / denom)
 
 
+#: Per-layer statistics, in the order the compact row encoding emits them.
+LAYER_STAT_KEYS = ("rel_update", "rms_delta", "energy_frac", "sign_flip_frac",
+                   "std_ratio", "absmean_ratio")
+#: Whole-model statistics, in the order the compact row encoding emits them.
+#: ``energy_frac`` is omitted (trivially 1.0) and ``cos_to_global`` added.
+WHOLE_STAT_KEYS = ("rel_update", "rms_delta", "sign_flip_frac", "std_ratio",
+                   "absmean_ratio", "cos_to_global")
+
+
+def layer_shapes(global_sd: dict) -> dict:
+    """``{param key: shape}`` for the model — the attacker's layer table.
+
+    Shapes are the same for every client (FL shares one architecture), so the
+    compact encoding sends this ONCE instead of repeating it inside each
+    client's stats.
+    """
+    return {k: list(v.shape) for k, v in global_sd.items()}
+
+
+def _sig(x: float, digits: int) -> float:
+    """Round to ``digits`` SIGNIFICANT figures.
+
+    Significant figures rather than decimal places because these statistics span
+    orders of magnitude: ``rms_delta`` is ~1e-2 while ``energy_frac`` is ~1e-1
+    and ``sign_flip_frac`` can be 0. Fixed decimals either waste characters on
+    the large values or quantize the small ones to zero — and ``rms_delta`` is
+    exactly what the attacker calibrates additive operators against.
+    """
+    v = float(x)
+    if v != v or v in (float("inf"), float("-inf")):
+        return 0.0
+    return float(f"{v:.{max(1, int(digits))}g}")
+
+
+def delta_stats(client_sd: dict, global_sd: dict) -> dict:
+    """Raw (unrounded) update statistics — the shared core of both encodings.
+
+    Returns ``{"layers": {key: {stat: float}}, "whole": {stat: float}}``. See
+    :func:`delta_details` for what each statistic means. Callers that render the
+    same client at several compaction levels compute this ONCE and pass it to
+    :func:`format_rows`.
+    """
+    keys = list(global_sd.keys())
+    g_flat = torch.cat([global_sd[k].flatten().float() for k in keys])
+    c_flat = torch.cat([client_sd[k].flatten().float() for k in keys])
+    d_norm_sq = float((c_flat - g_flat).pow(2).sum())
+
+    def _stats(c: torch.Tensor, g: torch.Tensor) -> dict:
+        d = c - g
+        dl_norm = float(d.norm())
+        count = max(1, int(d.numel()))
+        return {
+            "rel_update": dl_norm / (float(g.norm()) + _EPS),
+            "rms_delta": dl_norm / (count ** 0.5),
+            "energy_frac": (dl_norm ** 2) / (d_norm_sq + _EPS),
+            "sign_flip_frac": float((torch.sign(c) != torch.sign(g)).float().mean()),
+            "std_ratio": float(d.std(unbiased=False)) / (float(g.std(unbiased=False)) + _EPS),
+            "absmean_ratio": float(d.abs().mean()) / (float(g.abs().mean()) + _EPS),
+        }
+
+    layers = {k: _stats(client_sd[k].flatten().float(), global_sd[k].flatten().float())
+              for k in keys}
+    whole = _stats(c_flat, g_flat)
+    whole.pop("energy_frac", None)                    # trivially 1.0 for the whole model
+    whole["cos_to_global"] = _cos(c_flat - g_flat, g_flat)
+    return {"layers": layers, "whole": whole}
+
+
+def format_rows(stats: dict, *, sig: int = 4,
+                layer_keys: tuple = LAYER_STAT_KEYS,
+                whole_keys: tuple = WHOLE_STAT_KEYS,
+                include_layers: bool = True) -> dict:
+    """Render :func:`delta_stats` output as compact positional rows.
+
+    See :func:`delta_rows` for the encoding and why it exists.
+    """
+    row = {}
+    if include_layers and layer_keys:
+        for k, s in stats["layers"].items():
+            row[k] = [_sig(s[name], sig) for name in layer_keys]
+    row["whole"] = [_sig(stats["whole"][name], sig) for name in whole_keys]
+    return row
+
+
+def delta_rows(client_sd: dict, global_sd: dict, *, sig: int = 4,
+               layer_keys: tuple = LAYER_STAT_KEYS,
+               whole_keys: tuple = WHOLE_STAT_KEYS,
+               include_layers: bool = True) -> dict:
+    """COMPACT form of :func:`delta_details`: one ARRAY of numbers per layer.
+
+    Same statistics, encoded positionally — ``{"net.2.weight": [rel_update,
+    rms_delta, ...], ..., "whole": [...]}`` — with the stat names sent once in
+    the prompt's legend and the shapes once in :func:`layer_shapes`.
+
+    This exists purely for the CONTEXT BUDGET. The named-key encoding repeats
+    ~90 characters of statistic names and a ``shape`` entry per layer per
+    client, which at a 10-client pool was the single largest term in the
+    attacker's prompt (~4.2k tokens of the ~5.5k total). Positionally the same
+    numbers cost about a third of that, so the observation survives intact
+    instead of having clients or statistics dropped from it. ``layer_keys`` /
+    ``whole_keys`` / ``include_layers`` are the further, lossy steps the
+    attacker agent escalates to only if the compact form still does not fit.
+    """
+    return format_rows(delta_stats(client_sd, global_sd), sig=sig,
+                       layer_keys=layer_keys, whole_keys=whole_keys,
+                       include_layers=include_layers)
+
+
 def delta_details(client_sd: dict, global_sd: dict, precision: int = 4) -> dict:
     """Summarize a client's HONEST UPDATE ``Δ = client − global`` for the attacker.
 
@@ -91,40 +199,21 @@ def delta_details(client_sd: dict, global_sd: dict, precision: int = 4) -> dict:
       whole model also: cos_to_global = cos(Δ, G)
 
     ``client_sd`` and ``global_sd`` must share keys (same architecture).
+
+    This is the VERBOSE, self-describing encoding (named statistics + a ``shape``
+    per layer). :func:`delta_rows` is the positional encoding the attacker prompt
+    now uses; both compute the same numbers via :func:`_delta_stats`.
     """
     def r(x):
         return round(float(x), precision)
 
-    keys = list(global_sd.keys())
-    g_flat = torch.cat([global_sd[k].flatten().float() for k in keys])
-    c_flat = torch.cat([client_sd[k].flatten().float() for k in keys])
-    d_norm_sq = float((c_flat - g_flat).pow(2).sum())
-
-    def _stats(c: torch.Tensor, g: torch.Tensor) -> dict:
-        d = c - g
-        dl_norm = float(d.norm())
-        count = max(1, int(d.numel()))
-        return {
-            "rel_update": r(dl_norm / (float(g.norm()) + _EPS)),
-            "rms_delta": r(dl_norm / (count ** 0.5)),
-            "energy_frac": r((dl_norm ** 2) / (d_norm_sq + _EPS)),
-            "sign_flip_frac": r(float((torch.sign(c) != torch.sign(g)).float().mean())),
-            "std_ratio": r(float(d.std(unbiased=False)) / (float(g.std(unbiased=False)) + _EPS)),
-            "absmean_ratio": r(float(d.abs().mean()) / (float(g.abs().mean()) + _EPS)),
-        }
-
+    stats = delta_stats(client_sd, global_sd)
     layers = {}
-    for k in keys:
-        g = global_sd[k].flatten().float()
-        c = client_sd[k].flatten().float()
+    for k, s in stats["layers"].items():
         entry = {"shape": list(global_sd[k].shape)}   # context only, not a magnitude
-        entry.update(_stats(c, g))
+        entry.update({name: r(v) for name, v in s.items()})
         layers[k] = entry
-
-    whole = _stats(c_flat, g_flat)
-    whole.pop("energy_frac", None)                    # trivially 1.0 for the whole model
-    whole["cos_to_global"] = r(_cos(c_flat - g_flat, g_flat))
-    return {"layers": layers, "whole": whole}
+    return {"layers": layers, "whole": {name: r(v) for name, v in stats["whole"].items()}}
 
 
 # ---------------------------------------------------------------------------

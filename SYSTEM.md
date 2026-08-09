@@ -30,12 +30,18 @@ for each round:
   0. FIX this round's defense algorithm + poison quota b from the training CURRICULUM
      (algorithmic mode; both held for the whole 10-round block — see below.
       No curriculum: the algorithm is drawn per defense.selection and
-      b = randint(1, max_poison_clients))
+      b = randint(1, max_poison_clients).
+      attack.fixed_poison_clients (SHIPPED DEFAULT, 10) overrides all of that:
+      b = 10 every round, so only the algorithm axis is swept)
   1. honest updates for all N clients               # retrain from global, or replay Phase-1 weights
   2. expose the attacker's controllable pool [0..n_compromisable) + exact poison quota b
-     (curriculum block's count in training; fixed = eval budget at eval time)
-  3. ATTACKER LLM → SELECT exactly b clients from the pool + a per-client attack plan
-     (input: round, controllable_client_ids, max_poison_clients, per-client LAYER STATS, acc, goal)
+     (fixed set: the pool IS the poisoned set, b = its size. Otherwise the
+      curriculum block's count in training, the eval budget at eval time)
+  3. ATTACKER LLM → a per-client attack plan for each of the b clients
+     (fixed set: those clients are given as poison_client_ids; otherwise the LLM
+      also SELECTS exactly b of controllable_client_ids)
+     (input: round, the client ids, per-client LAYER STATS, acc, goal — packed
+      positionally and held under rl.max_context_fill of the context window)
      → apply_plan(benign_i, plan_i) → poisoned weights for the CHOSEN clients
   4. build full update list (poisoned ∪ honest)
   5. DEFEND:
@@ -106,9 +112,13 @@ pair every round, so the policy never trained contiguously in any one regime.
 
 ```
 for algorithm in defense.algorithms:            # fltrust, defl, dnc, multikrum
-    for k in curriculum.poisoner_counts:        # 1, 2, 3, 4, 5
+    for k in curriculum.poisoner_counts:        # e.g. 1, 2, 3, 4, 5
         curriculum.rounds_per_block (10) consecutive GRPO rounds at (algorithm, k)
 # 4 x 5 x 10 = 200 rounds per cycle; every algorithm gets exactly 50, 10 per k.
+#
+# AS SHIPPED the poisoner axis is collapsed: attack.fixed_poison_clients: 10
+# poisons the same 10 clients every round, so poisoner_counts becomes [10] and a
+# cycle is 4 x 1 x 10 = 40 rounds, 10 per algorithm. Set it to null to sweep k.
 ```
 
 - **One slot per round, consumed in `env.begin_round()`.** The between-phase
@@ -138,10 +148,14 @@ for algorithm in defense.algorithms:            # fltrust, defl, dnc, multikrum
 ## Attacker contract (client selection + attack-plan DSL)
 
 - **Input** (`agents/attacker_agent.build_user_prompt`): `round`,
-  `current_global_accuracy`, `attack_goal`, `controllable_client_ids` (the pool it
-  may touch), `max_poison_clients` (this round's exact quota; legacy key name), and `client_update_stats`
+  `current_global_accuracy`, `attack_goal`, the client ids — `poison_client_ids` +
+  `n_poison_clients` under a fixed set, otherwise `controllable_client_ids` (the
+  pool it may touch) + `max_poison_clients` (this round's exact quota; legacy key
+  name) — a `layers` shape table, the `stats_key` / `whole_key` legends, and
+  `client_update_stats`
   — per-layer + whole-model **statistics of each pool client's HONEST UPDATE**
-  `Δ = local − global` (`agents/attack_ops.delta_details`): `rel_update`
+  `Δ = local − global` (`agents/attack_ops.delta_stats`), one positional array per
+  layer in `stats_key` order: `rel_update`
   (‖Δ‖/‖G‖), `rms_delta`, `energy_frac`, `sign_flip_frac`, `std_ratio`,
   `absmean_ratio`, and whole-model `cos_to_global`. Every value is normalized
   against the **global model only** — never a median/mean/pairwise reference over

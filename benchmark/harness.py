@@ -97,20 +97,39 @@ def _sample_attack(policy, attacker_agent, ctx, system, user, *, adapter,
     return (*result, attempts)
 
 
-def _check_prompt_fits(policy, system, user, max_new_tokens, pool_size):
+def _check_prompt_fits(policy, attacker_agent, system, user, max_new_tokens, pool_size):
     """Log the attacker prompt's real token cost once, and warn if it crowds the context.
 
-    The prompt carries ``delta_details`` for EVERY client in the controllable pool, so
-    its size scales with the pool — and the benchmark can now widen that pool up to
+    The prompt carries per-layer update statistics for EVERY client in the controllable
+    pool, so its size scales with the pool — and the benchmark can widen that pool up to
     ``fl.n_clients`` via ``--max-poison-clients``. At the top of that range the prompt
     plus ``max_new_tokens`` can approach ``rl.max_seq_len``, at which point generations
     get truncated and the JSON the attacker emits stops parsing (which would show up as
-    a mysteriously ineffective attack rather than as a context error). Measure it rather
-    than let the user guess.
+    a mysteriously ineffective attack rather than as a context error).
+
+    ``AttackerAgent`` already compacts the observation to fit ``rl.max_context_fill``
+    and records what it settled on, so this reports that decision rather than
+    re-deriving it — and still measures the prompt directly when the agent has no
+    budget wired up (an older config with no ``rl:`` block reaching it).
     """
+    stats = getattr(attacker_agent, "last_prompt_stats", None) or {}
+    budget = getattr(attacker_agent, "budget", None)
+    if stats and budget is not None and budget.active:
+        logger.info(
+            f"{budget.describe(stats['prompt_tokens'])} — pool of {pool_size} client(s), "
+            f"observation at level {stats['level']} ({stats['level_label']})"
+        )
+        if not stats["fits"]:
+            logger.warning(
+                f"Attacker prompt is over the {budget.max_fill:.0%} context-fill cap even "
+                f"fully compacted. Raise rl.max_seq_len, lower rl.max_new_tokens, or "
+                f"reduce --max-poison-clients (the pool of {pool_size} is what makes the "
+                f"prompt big)."
+            )
+        return
+
     try:
-        ids = policy._prompt_ids(system, user)
-        n_prompt = int(ids.shape[1])
+        n_prompt = int(policy.count_prompt_tokens(system, user))
         limit = int(getattr(policy, "max_seq_len", 0)) or None
     except Exception:                       # a stub/inference generator: nothing to check
         return
@@ -168,14 +187,17 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
     for r in range(1, n_rounds + 1):
         ctx = env.begin_round()
 
-        # The trained attacker SELECTS exactly the eval-budget count from its
-        # controllable pool and plans ONE attack against the reference state;
-        # the SAME poisoned updates go to every defense (vary defense, hold attack).
+        # The trained attacker fills exactly the eval-budget count from its
+        # controllable pool — selecting which clients, or, under a fixed poisoned
+        # set (attack.fixed_poison_clients), all of them — and plans ONE attack
+        # against the reference state; the SAME poisoned updates go to every
+        # defense (vary defense, hold attack).
         system = attacker_agent.system_prompt()
         user = attacker_agent.build_user_prompt(ctx.round_num, reference_acc,
                                                 ctx.pool_benign, env.global_weights, ctx.budget)
         if r == 1:
-            _check_prompt_fits(policy, system, user, max_new_tokens, len(ctx.pool_benign))
+            _check_prompt_fits(policy, attacker_agent, system, user, max_new_tokens,
+                               len(ctx.pool_benign))
         poisoned, chosen_ids, n_malformed, attempts = _sample_attack(
             policy, attacker_agent, ctx, system, user, adapter=attacker_adapter,
             temperature=attack_temperature, max_new_tokens=max_new_tokens,

@@ -12,13 +12,20 @@ Two phases:
    global model, each client's weights, and the baseline accuracy are
    checkpointed.
 2. **Phase 2 (`simulation_rounds`):** The attacker is a **partial insider** — it
-   controls only the first `n_compromisable` clients (default 5 of 20) and
-   **chooses which of them to poison** each round while always using the round's
-   exact poison-client budget (and coordinating them when it uses more than one).
-   - **Attacker LLM** — input: round number, its `controllable_client_ids`, this
-     round's exact `max_poison_clients` quota, per-layer **statistics** of each pool
-     client's benign weights, current global accuracy, and a configurable attack
-     goal. Output: a **client selection + a per-client attack plan** — for each
+   controls only the first `n_compromisable` clients (10 of 20 as shipped). With
+   `attack.fixed_poison_clients` set (the shipped default, 10) **that whole set is
+   poisoned every round** and the LLM decides only *how*; set it to `null` and the
+   attacker instead **chooses which of its pool to poison** each round, always
+   filling the round's exact poison-client budget. Either way it coordinates the
+   clients it uses.
+   - **Attacker LLM** — input: round number, its `poison_client_ids` (or
+     `controllable_client_ids` + this round's exact `max_poison_clients` quota in
+     selection mode), per-layer **statistics** of each pool client's benign weights,
+     current global accuracy, and a configurable attack goal. The statistics are
+     packed positionally (a `stats_key` legend plus one array per layer) and the whole
+     prompt is held under `rl.max_context_fill` of the context window — see
+     [Attacker prompt budget](#attacker-prompt-budget). Output: a **per-client attack
+     plan** (plus the client selection in selection mode) — for each
      chosen client, an ordered list of primitive weight operators (scale,
      sign_flip, mask, add_gaussian_noise, clip, add_constant, permute,
      scale_neurons, blend_random, quantize). A deterministic interpreter applies
@@ -133,11 +140,16 @@ them, 10 at each attack strength**. Details:
   re-drawn each round changes what "success" means *inside* the block, since the
   win gate is `win_fraction × the round's target` and the reward is normalized by
   it. Turning target sampling back on logs a warning.
-- Knobs: `rounds_per_block` (10), `poisoner_counts` (`[1,2,3,4,5]`; `null` =
+- Knobs: `rounds_per_block` (10), `poisoner_counts` (`null` =
   `1..attack.max_poison_clients`), `algorithms` (`null` = `defense.algorithms`,
   in listed order — set a list to narrow or reorder the outer loop). Counts above
   `fl.n_compromisable` are dropped with a warning rather than clamped, since
   clamping would hand the largest quota several blocks per cycle.
+- **`attack.fixed_poison_clients` collapses the poisoner axis.** As shipped the
+  same 10 clients are poisoned every round, so there is no attack strength left to
+  sweep: `poisoner_counts` becomes `[10]` (logged at startup) and a cycle is just
+  the 4 algorithms × `rounds_per_block` = 40 rounds. Set
+  `attack.fixed_poison_clients: null` to get the count sweep back.
 - `curriculum.enabled: false` (or removing the block) restores the random draws;
   `defense.selection` and `attack.sample_budget_in_training` are ignored while it
   is on, and the startup log says so.
@@ -199,10 +211,35 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   design but is the simplest serving path).
 - **Hardware**: Qwen2.5-3B fits comfortably on a single GPU — ~6 GB of weights
   in the default bf16 LoRA (or ~2–3 GB floor under 4-bit QLoRA), so your 5090
-  (31 GB) has ample headroom for either. Generation is short: the attacker emits a
-  client selection + per-client plans, and the defender emits one verdict per
-  client (20 clients). `rl.max_new_tokens` defaults to 1024 to fit the defender's
-  full verdict list without truncation.
+  (31 GB) has ample headroom for either. Generation is short: the attacker emits
+  one plan per poisoned client, and the defender emits one verdict per
+  client (20 clients). `rl.max_new_tokens` defaults to 1536 to fit ten per-client
+  attack plans and the defender's full verdict list without truncation.
+
+## Attacker prompt budget
+
+The attacker's prompt carries per-layer update statistics for **every** client in
+its pool, so it grows with the pool — and the pool is now 10 clients. Two things
+keep that from crowding the model's context:
+
+- **A positional encoding.** Each layer's statistics are one array of numbers,
+  with the names sent once as `stats_key` / `whole_key` and the parameter shapes
+  once as `layers`. The same numbers cost about a third of the old
+  named-key-per-layer-per-client JSON.
+- **A hard fill cap.** `rl.max_context_fill` (0.5) bounds
+  `prompt_tokens + rl.max_new_tokens` as a fraction of `rl.max_seq_len`. A 3B
+  instruct model's output quality falls off well before its context is actually
+  full, so half the window is the ceiling, not the target — at the shipped
+  settings (16384 window, 10 clients) a round measures ~30%.
+
+The cap is **enforced by compaction, not truncation**: if a prompt would exceed
+it, the observation is re-emitted at the next level down (4 significant figures →
+3 → core per-layer statistics → whole-model statistics only), and a client is
+never dropped, so what the policy sees is always a complete observation. The level
+in use is logged whenever it changes. Token counts come from the real tokenizer
+during training and benchmarking (`LLMPolicy.count_prompt_tokens`) and from a
+character heuristic on the CPU/dry-run path. Set `max_context_fill: 1.0` to
+disable the cap.
 
 ## Setup
 
@@ -265,7 +302,10 @@ python monitor.py --window 50     # smooth over a larger recent window for long 
 ```
 # Attacker — using the REAL system prompt it was trained with (recommended):
 python infer.py --adapter attacker --role \
-  --prompt '{"round":5,"current_global_accuracy":0.8,"attack_goal":{"type":"untargeted_degrade","target_accuracy_drop":0.2},"controllable_client_ids":[0,1,2,3,4],"max_poison_clients":1,"client_update_stats":{}}'
+  --prompt '{"round":5,"current_global_accuracy":0.8,"attack_goal":{"type":"untargeted_degrade","target_accuracy_drop":0.2},"poison_client_ids":[0,1,2],"n_poison_clients":3,"layers":{},"stats_key":[],"whole_key":[],"client_update_stats":{}}'
+# (--role reads attack.fixed_poison_clients from --config to serve the same system
+#  prompt the adapter was trained with; without it, the payload uses
+#  "controllable_client_ids" + "max_poison_clients" instead.)
 
 # Defender — real system prompt, feature JSON as the user message:
 python infer.py --adapter defender --role \
@@ -301,16 +341,20 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
 ## Configuration
 
 - **`configs/base.yaml`** — FL hyperparameters (`n_clients: 20`,
-  `n_compromisable: 5`, `poison_seed`, `benign_retrain_each_round`), the
+  `n_compromisable: 10`, `poison_seed`, `benign_retrain_each_round`), the
   `data.noniid_bias` (FLTrust `q`), the `attack` block (`goal`,
-  `max_poison_clients`, `sample_budget_in_training`, `eval_poison_clients`), and
-  the `rl:` block — GRPO + LoRA + league + reward weights, including the
+  `fixed_poison_clients`, `max_poison_clients`, `sample_budget_in_training`,
+  `eval_poison_clients`), and
+  the `rl:` block — GRPO + LoRA + league + reward weights, the
+  `max_seq_len` / `max_new_tokens` / `max_context_fill` prompt budget, including the
   `.zeta` multi-client collaboration/diversity bonus and `league_max_snapshots`
   (the ring-buffer cap
   on retained opponent snapshots — each costs ~115 MB of host RAM, so leaving it
   unbounded OOMs a long run).
 - **`configs/attacker_agent.yaml`** — attacker goal fallback, layer-detail
-  precision, poisoned-weight clamp, attacker adapter path.
+  precision (significant figures), poisoned-weight clamp, attacker adapter path.
+  `fixed_poison_set` and the `rl.*` prompt-budget knobs are injected from
+  `configs/base.yaml` at startup, not set here.
 - **`configs/base.yaml` → `defense:`** — who defends. `mode` (`algorithmic`, the
   shipped default, vs `llm`), the `algorithms` rotation pool, `selection`
   (`random` / `round_robin`, ignored while the curriculum is on), the

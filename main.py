@@ -207,9 +207,16 @@ def run_phase2(
                 f"{'SIMULATED on the frozen Phase-1 global' if frozen else 'continuing federation'})")
     logger.info(f"  client_data_refresh={fl.get('client_data_refresh', 'rotate')} "
                 f"fraction={fl.get('client_round_fraction', 0.25)}")
-    logger.info(f"  simulation_rounds={n_rounds}, n_compromisable={fl.get('n_compromisable')}, "
-                f"max_poison_clients={attack_cfg.get('max_poison_clients')}, "
-                f"sample_budget={attack_cfg.get('sample_budget_in_training')}")
+    _fixed_poison = attack_cfg.get("fixed_poison_clients")
+    if _fixed_poison not in (None, False, 0, ""):
+        logger.info(f"  simulation_rounds={n_rounds}, FIXED poison set = clients "
+                    f"0..{int(_fixed_poison) - 1} ({_fixed_poison} of "
+                    f"{fl.get('n_clients')}), poisoned every round; the attacker LLM "
+                    f"chooses HOW to poison them, not which")
+    else:
+        logger.info(f"  simulation_rounds={n_rounds}, n_compromisable={fl.get('n_compromisable')}, "
+                    f"max_poison_clients={attack_cfg.get('max_poison_clients')}, "
+                    f"sample_budget={attack_cfg.get('sample_budget_in_training')}")
     goal_cfg = attack_cfg.get("goal", {}) or {}
     logger.info(f"  attack_goal={goal_cfg.get('type')} "
                 f"target_accuracy_drop={goal_cfg.get('target_accuracy_drop')} "
@@ -318,6 +325,10 @@ def run_phase2(
             attn_implementation=rl_cfg.get("attn_implementation", "eager"),
             use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
         )
+        # Measure the attacker's context fill with the REAL tokenizer from here on
+        # (until now the agent used the character heuristic). This is what makes
+        # rl.max_context_fill an exact cap rather than an approximate one.
+        attacker_agent.bind_tokenizer(policy.count_prompt_tokens)
         # Resume adapters if present.
         for name, path in adapter_paths.items():
             if name in adapter_names and adapter_exists(path):
@@ -413,6 +424,15 @@ def main():
     if goal:
         attacker_config["attack_goal"] = goal
 
+    # ...and for the two things the attacker's PROMPT depends on but that live in
+    # the base config: whether the poisoned set is fixed (which changes the system
+    # prompt from "select k of n" to "plan for all of these"), and the context-fill
+    # budget the observation is compacted to fit.
+    _attack_cfg = base_config.get("attack", {}) or {}
+    attacker_config["fixed_poison_set"] = (
+        _attack_cfg.get("fixed_poison_clients") not in (None, False, 0, ""))
+    attacker_config["rl"] = base_config.get("rl", {})
+
     # Reproducibility.
     seed = int(base_config["fl"].get("poison_seed", 0))
     random.seed(seed)
@@ -474,6 +494,7 @@ def main():
                 "client_round_fraction": fl.get("client_round_fraction", 0.25),
                 "n_clients": fl.get("n_clients"),
                 "n_compromisable": fl.get("n_compromisable"),
+                "fixed_poison_clients": base_config.get("attack", {}).get("fixed_poison_clients"),
                 "max_poison_clients": base_config.get("attack", {}).get("max_poison_clients"),
                 "sample_budget": base_config.get("attack", {}).get("sample_budget_in_training"),
                 "noniid_bias": base_config.get("data", {}).get("noniid_bias"),

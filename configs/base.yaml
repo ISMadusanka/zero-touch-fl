@@ -4,8 +4,14 @@ fl:
   training_rounds: 45             # Phase 1: honest training rounds
   simulation_rounds: 2000000         # Phase 2: adversarial RL rounds
   n_clients: 20                   # total federated clients (honest majority)
-  n_compromisable: 5              # the attacker can ONLY access clients [0 .. n_compromisable-1];
+  n_compromisable: 10             # the attacker can ONLY access clients [0 .. n_compromisable-1];
                                   # the remaining clients are always honest & out of reach.
+                                  # OVERRIDDEN by attack.fixed_poison_clients when that is set
+                                  # (the pool is then exactly the fixed poisoned set) — keep the
+                                  # two equal so the config reads the way the run behaves.
+                                  # NOTE at 10 of 20 the federation no longer has a strictly
+                                  # honest majority, which is outside the regime Multi-Krum / DnC /
+                                  # FLTrust are proved under. Raise n_clients to restore it.
   poison_fraction: 0.2            # DEPRECATED for selection: the attacker now CHOOSES which of
                                   # its pool to poison (see attack.max_poison_clients). Kept only
                                   # as a legacy fallback for defenses that assume a #malicious.
@@ -145,15 +151,40 @@ attack:
                                   # 0.05-target round gets 2x the damage authority of a
                                   # 0.20-target round. That is a second reason this stays off
                                   # while the curriculum is enabled.
-  # --- Exact client-selection quota (the attacker chooses WHICH clients) ---
-  max_poison_clients: 5           # TRAINING quota cap; also the default upper end of the curriculum's
+  # --- WHICH clients get poisoned ---
+  fixed_poison_clients: 10        # THE POISONED SET IS FIXED: clients 0..9 are poisoned EVERY
+                                  # round. Null/0 restores the old behaviour (a pool of
+                                  # fl.n_compromisable clients, a per-round quota, and the
+                                  # attacker LLM choosing which of its pool fills it).
+                                  #
+                                  # Implemented by making the controllable pool exactly these N
+                                  # clients AND the quota exactly N, which is what forces it:
+                                  # AttackerAgent.select_and_apply fills unfilled quota slots from
+                                  # the pool in id order, so a quota equal to the pool size always
+                                  # yields the whole pool. The policy's action is then purely the
+                                  # per-client attack plan.
+                                  #
+                                  # Why: with the set fixed, two rounds differ only by the plans and
+                                  # by the round's local data, so a reward difference is
+                                  # attributable to the attack. With a sampled quota and a
+                                  # model-chosen set, one scalar reward also absorbed how many and
+                                  # which clients were hit — three sources of variance in the signal
+                                  # GRPO differentiates.
+                                  #
+                                  # It OVERRIDES fl.n_compromisable, max_poison_clients and
+                                  # sample_budget_in_training below, and collapses the curriculum's
+                                  # poisoner sweep to this single count (the defense sweep is kept).
+                                  # Each override is logged at startup.
+  max_poison_clients: 10          # TRAINING quota cap; also the default upper end of the curriculum's
                                   # poisoner sweep (legacy key name; must be <= n_compromisable).
-  sample_budget_in_training: true # randomly draw the exact per-round quota in
+                                  # Not consulted while fixed_poison_clients is set.
+  sample_budget_in_training: false # randomly draw the exact per-round quota in
                                   # [1..max_poison_clients] for budget-aware generalization.
-                                  # IGNORED while the `curriculum:` block below is enabled — the
-                                  # quota is then the block's fixed count, not a draw.
-  eval_poison_clients: 5          # EVALUATION exact quota — matches max_poison_clients so the
-                                  # benchmark uses all 5 poisoners (benchmark --max-poison-clients override)
+                                  # IGNORED while `curriculum:` is enabled or fixed_poison_clients
+                                  # is set — the quota is then the block's count / the fixed set.
+  eval_poison_clients: 10         # EVALUATION exact quota — matches the fixed set so the benchmark
+                                  # poisons the same clients 0..9 training used
+                                  # (benchmark --max-poison-clients overrides it)
 
 # Server-side defense — what the attacker actually faces every Phase-2 round.
 defense:
@@ -260,11 +291,16 @@ defense:
 curriculum:
   enabled: true                   # false = go back to the random per-round draws
   rounds_per_block: 10            # consecutive GRPO rounds per (algorithm, #poisoners) pair
-  poisoner_counts: [1, 2, 3, 4, 5]  # the attack strengths swept, in order. null = 1..
+  poisoner_counts: [10]           # the attack strengths swept, in order. null = 1..
                                   # attack.max_poison_clients. Counts above
                                   # fl.n_compromisable are dropped (with a warning),
                                   # never clamped — clamping would silently give the
                                   # largest quota several blocks per cycle.
+                                  # COLLAPSED to [attack.fixed_poison_clients] while that
+                                  # is set: the same 10 clients are poisoned every round,
+                                  # so there is no attack-strength axis left to sweep and
+                                  # only the defense algorithm rotates (4 algorithms x
+                                  # rounds_per_block = a 40-round cycle).
   algorithms: null                # null = defense.algorithms, in listed order. Set a
                                   # list to narrow or reorder the outer loop; every
                                   # name must be one defense.algorithms builds.
@@ -279,7 +315,33 @@ rl:
   model: "unsloth/Qwen2.5-3B-Instruct"  # HF/Unsloth base for QLoRA training
   attn_implementation: "eager"    # broadly compatible; Qwen2.5 also supports "sdpa"
   use_fast_generate: true         # KV-cached generation (fast); auto-falls back to no-cache on failure
-  max_seq_len: 8192               # well within Qwen2.5-3B's 32k native context
+  max_seq_len: 16384              # well within Qwen2.5-3B's 32k native context.
+                                  # Raised from 8192 when the poisoned set went to 10 clients:
+                                  # the attacker's prompt carries per-layer update statistics for
+                                  # EVERY client in the pool, so doubling the pool roughly doubled
+                                  # the observation. At 8192 the full-detail observation measured
+                                  # ~54% of the window (prompt + max_new_tokens) and only fit under
+                                  # max_context_fill by dropping two per-layer statistics. This is
+                                  # a CAP, not an allocation — attention memory scales with the
+                                  # ~3.4k tokens actually used, so raising it costs effectively
+                                  # nothing at these lengths.
+  max_context_fill: 0.5           # HARD CEILING on how much of max_seq_len ONE attacker call may
+                                  # occupy, counting max_new_tokens reserved for the completion:
+                                  #     prompt_tokens + max_new_tokens <= max_context_fill * max_seq_len
+                                  # A 3B instruct model's output quality falls off well before its
+                                  # context is actually full — long prompts make the instructions at
+                                  # the top compete with the data in the middle, and the attacker's
+                                  # prompt is mostly data. Staying under half the window keeps the
+                                  # plans well-formed.
+                                  # ENFORCED, not just checked: the observation is emitted at the
+                                  # first compaction level that fits (see
+                                  # agents/attacker_agent.py::_COMPACTION) — 4 significant figures,
+                                  # then 3, then core per-layer statistics only, then whole-model
+                                  # statistics only. It is never truncated and no client is ever
+                                  # dropped, so what the policy sees stays a complete observation.
+                                  # The level in use is logged whenever it changes; at the shipped
+                                  # settings (16384 window, 10 clients) it is level 0, ~30% filled.
+                                  # Set to 1.0 to disable the cap.
   load_in_4bit: false             # bf16 LoRA: 3B needs ~12GB+ VRAM; set true (4-bit QLoRA) if tight
   lora_r: 16
   lora_alpha: 32
@@ -297,8 +359,13 @@ rl:
                                   # within-group spread comes from the attack plans themselves.
   # first_learner / K_a / K_d below are attacker-only under defense.mode: algorithmic
   # (there is no defender policy to train — see the `defense:` block).
-  max_new_tokens: 1024            # headroom for the defender's 20-client verdict list and the
-                                  # attacker's per-client plans (raise if outputs get truncated)
+  max_new_tokens: 1536            # headroom for the defender's 20-client verdict list and the
+                                  # attacker's per-client plans (raise if outputs get truncated).
+                                  # 10 poisoned clients means 10 plans in one JSON object — at
+                                  # ~55 tokens per client plan the old 1024 left little margin,
+                                  # and a plan truncated mid-JSON parses as nothing at all.
+                                  # Counted against rl.max_context_fill above, so raising this
+                                  # tightens the attacker's prompt budget one-for-one.
   grad_clip: 1.0
   save_every: 25                  # checkpoint adapters + progress every N rounds (resume granularity)
   league_snapshot_every: 100      # snapshot adapters into the opponent league

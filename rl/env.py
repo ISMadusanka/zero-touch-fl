@@ -176,6 +176,8 @@ class FLArmsRaceEnv:
         self.budget_cap = max(1, min(
             int(attack.get("max_poison_clients", self.n_compromisable)), self.n_compromisable))
         self.sample_budget = bool(attack.get("sample_budget_in_training", True))
+        # FIXED POISONER SET: poison exactly clients [0 .. N) every round.
+        self.fixed_poison_clients = self._resolve_fixed_poison(attack)
         # Per-round attack-goal target sampling (untargeted_degrade): when on, draw
         # target_accuracy_drop from target_choices each round so the policy generalizes
         # across targets instead of overfitting one. Eval fixes it (sample_target=False ->
@@ -241,8 +243,12 @@ class FLArmsRaceEnv:
         self.current_accuracy = float(baseline_accuracy)
         self.last_round_accuracy = float(baseline_accuracy)
         self.round_index = 0
-        budget_src = ("curriculum" if self.curriculum is not None
-                      else ("sampled" if self.sample_budget else "fixed"))
+        if self.fixed_poison_clients is not None:
+            budget_src = f"fixed set (clients 0..{self.fixed_poison_clients - 1})"
+        elif self.curriculum is not None:
+            budget_src = "curriculum"
+        else:
+            budget_src = "sampled" if self.sample_budget else "fixed"
         logger.info(
             f"Env reset — n_clients={self.n_clients}, n_compromisable={self.n_compromisable}, "
             f"budget_cap={self.budget_cap}, budget={budget_src}, "
@@ -304,14 +310,86 @@ class FLArmsRaceEnv:
         )
 
     # ------------------------------------------------------------------
+    def _resolve_fixed_poison(self, attack: dict) -> int | None:
+        """Read ``attack.fixed_poison_clients`` and pin the poisoner set to it.
+
+        ``None`` / ``0`` / ``false`` keeps the original behaviour: the pool is
+        ``fl.n_compromisable`` clients and the round's quota is a draw (or a
+        curriculum block's count), with the attacker LLM choosing WHICH of its
+        pool fills that quota.
+
+        An integer ``N`` instead makes the poisoned set **deterministic and
+        identical every round: clients 0 .. N-1**. That is implemented by making
+        the controllable pool exactly those N clients and the quota exactly N,
+        which is what actually forces it — ``AttackerAgent.select_and_apply``
+        fills every unfilled quota slot from the pool in id order, so when the
+        quota equals the pool size the chosen set is the whole pool no matter
+        which ids the model emits. The policy's action is then purely the
+        per-client attack plan.
+
+        Why this over leaving selection to the policy: with a fixed set, two
+        rounds differ only by the plans and the round's data, so a reward
+        difference is attributable to the attack. With a sampled quota and a
+        model-chosen set, it also reflects how many and which clients were hit
+        — three sources of variance in one scalar reward.
+
+        This overrides ``fl.n_compromisable``, ``attack.max_poison_clients`` and
+        ``attack.sample_budget_in_training``; each is logged when it disagrees so
+        a stale config never reads as if it were still in charge.
+        """
+        raw = attack.get("fixed_poison_clients")
+        if raw in (None, False, 0, ""):
+            return None
+        n = int(raw)
+        if n < 1:
+            logger.warning(f"attack.fixed_poison_clients={raw} is < 1 — ignoring it; "
+                           f"the attacker selects its own poison set again.")
+            return None
+        if n > self.n_clients:
+            logger.warning(
+                f"attack.fixed_poison_clients={n} exceeds fl.n_clients={self.n_clients} "
+                f"— clamped to {self.n_clients} (every client poisoned)."
+            )
+            n = self.n_clients
+
+        if n != self.n_compromisable:
+            logger.info(
+                f"attack.fixed_poison_clients={n} overrides fl.n_compromisable="
+                f"{self.n_compromisable}: the controllable pool IS the poisoned set."
+            )
+        if self.sample_budget:
+            logger.info("attack.fixed_poison_clients supersedes "
+                        "attack.sample_budget_in_training: the quota is fixed, not drawn.")
+        self.n_compromisable = n
+        self.budget_cap = n
+        self.sample_budget = False
+        if n * 2 >= self.n_clients:
+            logger.warning(
+                f"{n} of {self.n_clients} clients are poisoned every round "
+                f"({n / self.n_clients:.0%}) — at or past half the federation, so the "
+                f"'honest majority' the robust aggregators (Multi-Krum, DnC, FLTrust's "
+                f"trust scores) are proved under no longer holds. Their results are still "
+                f"measurable, just outside the regime they are guaranteed in; raise "
+                f"fl.n_clients to keep the majority honest."
+            )
+        logger.info(f"FIXED poisoner set: clients {list(range(n))} are poisoned EVERY round "
+                    f"(the attacker LLM only chooses HOW, not which).")
+        return n
+
     def _round_budget(self, slot=None) -> int:
         """This round's exact poison quota.
 
-        A curriculum ``slot`` pins it to the block's count (clamped to the
-        controllable pool, which the attacker's selection clamps to anyway).
-        Otherwise it is drawn in [1, cap] when ``sample_budget`` is on, or fixed
-        at the cap (evaluation).
+        A fixed poisoner set (``attack.fixed_poison_clients``) pins it to that
+        count unconditionally — the set is the whole controllable pool, so there
+        is no quota left to sample or to sweep.
+
+        Otherwise a curriculum ``slot`` pins it to the block's count (clamped to
+        the controllable pool, which the attacker's selection clamps to anyway);
+        failing that it is drawn in [1, cap] when ``sample_budget`` is on, or
+        fixed at the cap (evaluation).
         """
+        if self.fixed_poison_clients is not None:
+            return max(1, min(self.fixed_poison_clients, self.n_compromisable))
         if slot is not None:
             return max(1, min(int(slot.n_poisoners), self.n_compromisable))
         if self.sample_budget:
@@ -391,8 +469,10 @@ class FLArmsRaceEnv:
         self.round_defense = self._round_defense(slot)
 
         clean_acc = self.clean_reference_accuracy()
+        pool_label = ("poisoned_set" if self.fixed_poison_clients is not None
+                      else "controllable_pool")
         logger.info(
-            f"Round {round_num}: controllable_pool={self.pool_ids} "
+            f"Round {round_num}: {pool_label}={self.pool_ids} "
             f"budget={self.round_budget} goal={self.round_goal} "
             f"defense={self.round_defense or 'llm'} "
             + (f"curriculum=block{slot.block}[{slot.block_round + 1}/"

@@ -12,8 +12,22 @@ attack_goal:
   target_accuracy_drop: 0.20
 
 # Attack-plan settings (the attacker emits a plan of primitive operators).
-detail_precision: 4               # decimals in the per-layer stats shown to the LLM
+detail_precision: 4               # SIGNIFICANT FIGURES in the per-layer stats shown to the LLM.
+                                  # (Significant figures, not decimal places: the stats span orders
+                                  # of magnitude — rms_delta ~1e-2 next to energy_frac ~1e-1 — and
+                                  # fixed decimals would quantize the small ones away. At 4 this is
+                                  # the same resolution the old 4-decimal encoding gave.)
+                                  # A prompt over the rl.max_context_fill budget is re-emitted at
+                                  # 3 figures automatically; see agents/attacker_agent.py.
 max_weight_abs: 100.0             # clamp bound on the resulting poisoned weights
+
+# fixed_poison_set and the rl.* context-budget knobs are injected at runtime from
+# configs/base.yaml (attack.fixed_poison_clients and the rl: block) — see main.py.
+# They are listed here only so the agent's inputs are documented in one place:
+#   fixed_poison_set: bool   the poisoned clients are the whole controllable pool
+#                            (the first N ids), so the LLM plans but does not select.
+#   rl.max_seq_len / rl.max_new_tokens / rl.max_context_fill
+#                            the context-fill cap enforced on every attacker prompt.
 
 # RL checkpoint — a LoRA adapter over the shared Qwen2.5 base.
 adapter_path: "checkpoints/attacker_adapter"

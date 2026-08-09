@@ -45,11 +45,20 @@ def _load_policy(cfg):
     )
 
 
-def _role_system(adapter: str) -> str:
-    """The exact system prompt the given agent was trained with."""
+def _role_system(adapter: str, cfg: dict | None = None) -> str:
+    """The exact system prompt the given agent was trained with.
+
+    The attacker has two variants and the config picks between them: with
+    ``attack.fixed_poison_clients`` set it was trained to plan for a FIXED client
+    set, without it to select clients itself. Reading the config here is what
+    keeps "exact" true — the two prompts differ in their rules, so serving the
+    wrong one to a trained adapter is off-distribution.
+    """
     if adapter == "attacker":
         from agents.attacker_agent import AttackerAgent
-        return AttackerAgent().system_prompt()
+        attack = ((cfg or {}).get("attack") or {})
+        fixed = attack.get("fixed_poison_clients") not in (None, False, 0, "")
+        return AttackerAgent({"fixed_poison_set": fixed}).system_prompt()
     from agents.defender_agent import DefenderAgent
     return DefenderAgent().system_prompt()
 
@@ -90,7 +99,7 @@ def main():
     if args.system is not None:
         system = args.system
     elif args.role:
-        system = _role_system(args.adapter)
+        system = _role_system(args.adapter, cfg)
     else:
         system = ""
 

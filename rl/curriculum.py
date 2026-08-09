@@ -302,11 +302,30 @@ def build_training_curriculum(cfg: dict, algorithms=None) -> TrainingCurriculum 
             seen.add(name)
         available = names
 
-    counts = resolve_poisoner_counts(
-        ccfg.get("poisoner_counts"),
-        max_poison_clients=int(attack.get("max_poison_clients", n_compromisable)),
-        n_compromisable=n_compromisable,
-    )
+    # A fixed poisoner set (attack.fixed_poison_clients) removes the attack-strength
+    # axis entirely: every round poisons the same N clients, so a sweep over counts
+    # has nothing left to vary. Collapse it to that single count rather than letting
+    # the curriculum request quotas the env will not honour — env._round_budget
+    # ignores the slot's count in this mode, so a sweep would show up in the logs
+    # and in RoundLog.attack_metadata as blocks that never actually differed.
+    fixed_poison = attack.get("fixed_poison_clients")
+    if fixed_poison not in (None, False, 0, ""):
+        fixed_n = max(1, min(int(fixed_poison), n_clients))
+        counts = [fixed_n]
+        configured = ccfg.get("poisoner_counts")
+        if configured and [int(k) for k in configured] != counts:
+            logger.info(
+                f"  curriculum supersedes curriculum.poisoner_counts {list(configured)}: "
+                f"attack.fixed_poison_clients={fixed_n} poisons clients "
+                f"0..{fixed_n - 1} every round, so the sweep collapses to [{fixed_n}] "
+                f"and only the defense algorithm is swept."
+            )
+    else:
+        counts = resolve_poisoner_counts(
+            ccfg.get("poisoner_counts"),
+            max_poison_clients=int(attack.get("max_poison_clients", n_compromisable)),
+            n_compromisable=n_compromisable,
+        )
     curriculum = TrainingCurriculum(
         algorithms=available,
         poisoner_counts=counts,
@@ -325,7 +344,10 @@ def build_training_curriculum(cfg: dict, algorithms=None) -> TrainingCurriculum 
     if attack.get("sample_budget_in_training", True):
         logger.info(
             "  curriculum supersedes attack.sample_budget_in_training: the round's "
-            "poison quota is the block's, not a draw in [1, max_poison_clients]"
+            "poison quota is "
+            + ("the fixed poisoner set, not a draw in [1, max_poison_clients]"
+               if len(counts) == 1 and fixed_poison not in (None, False, 0, "")
+               else "the block's, not a draw in [1, max_poison_clients]")
         )
     if attack.get("sample_target_in_training", False):
         logger.warning(

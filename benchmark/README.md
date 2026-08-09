@@ -38,9 +38,11 @@ python -m benchmark.run_benchmark --rounds 200 \
     --multikrum-m 4 --out logs/benchmark
 
 # sweep the adversary's size: 1 .. fl.n_clients (20) poisoners per round.
-# Evaluation is NOT limited to fl.n_compromisable (5) the way training is — the
-# controllable pool is widened to match the quota, so `10` really does poison
-# exactly 10 clients (clients 0..9 in that widened case).
+# Evaluation is NOT limited to fl.n_compromisable (10) the way training is — the
+# controllable pool is resized to match the quota, so `15` really does poison
+# exactly 15 clients (clients 0..14 in that widened case).
+# Under a fixed poisoned set (attack.fixed_poison_clients, the shipped default)
+# --max-poison-clients resizes that set: the first k clients, the same every round.
 for k in 1 3 5 10 15 20; do
   python -m benchmark.run_benchmark --rounds 50 --max-poison-clients $k \
       --out logs/benchmark/poisoners_$k
@@ -64,7 +66,7 @@ Valid range is **1 .. `fl.n_clients`** (20 by default). Two things to keep in mi
   run warns about each of these thresholds as it starts.
 
 Going above `fl.n_compromisable` also means the policy is being evaluated outside the
-threat model it was fitted to (it trained against a 5-client foothold). That is a
+threat model it was fitted to (it trained against a 10-client foothold). That is a
 legitimate generalization test, and the run says so — raise `fl.n_compromisable` and
 retrain if you want it in-distribution.
 

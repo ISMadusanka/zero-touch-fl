@@ -218,6 +218,18 @@ class LLMPolicy:
         enc = self._tok(text, return_tensors="pt", add_special_tokens=False)
         return enc["input_ids"].to(self.device)
 
+    def count_prompt_tokens(self, system: str, user: str) -> int:
+        """Exact prompt length in tokens, chat template included.
+
+        This is what the agents' ``PromptBudget`` measures the context fill
+        against (``AttackerAgent.bind_tokenizer``), so it deliberately goes
+        through the same ``_render_chat`` path generation uses — an estimate off
+        by the template's own scaffolding would mis-size the budget. It only
+        tokenizes (no model forward), so it is cheap enough to call per round.
+        """
+        text = self._render_chat(system, user)
+        return len(self._tok(text, add_special_tokens=False).input_ids)
+
     def _render_chat(self, system: str, user: str) -> str:
         """Render the chat template, preferring a native system role.
 
