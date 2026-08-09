@@ -31,14 +31,16 @@ Two phases:
      scale_neurons, blend_random, quantize). A deterministic interpreter applies
      each plan to that client's benign weights to produce the poisoned weights
      sent to the server.
-   - **Defense** — see [Defense: the defender LLM is currently
-     disabled](#defense-the-defender-llm-is-currently-disabled). By default the
-     server defends with a published **algorithm** drawn at random each round
-     (FLTrust / DeFL / DnC / Multi-Krum), and only the attacker trains. The
-     alternative (`defense.mode: llm`) is the **defender LLM** — input:
-     per-client, per-layer statistical feature vectors; output: a direct
+   - **Defense** — see [Defense: the defender LLM](#defense-the-defender-llm). By
+     default the server defends with the **defender LLM** — input: per-client,
+     per-layer statistical feature vectors, packed positionally and held inside
+     `rl.defender_max_prompt_fill` of the context window (see
+     [Defender prompt budget](#defender-prompt-budget)); output: a direct
      **benign/malicious classification** per client, after which the server
-     FedAvg-aggregates the clients it did not flag.
+     FedAvg-aggregates the clients it did not flag. Both sides train, alternating
+     on a three-win streak. The alternative (`defense.mode: algorithmic`) replaces
+     it with a published algorithm drawn per round (FLTrust / DeFL / DnC /
+     Multi-Krum) and trains the attacker only.
    - Because we know the ground-truth poisoned set, the agents get an exact
      **verifiable reward** and are trained online with **GRPO**.
    - Usable under-filled selections are expanded to the exact quota with remaining
@@ -53,11 +55,34 @@ Two phases:
 There are no hardcoded attack plugins and no episodic-memory feedback loop — the
 attacker learns everything via RL.
 
-## Defense: the defender LLM is currently disabled
+## Defense: the defender LLM
 
-`configs/base.yaml` ships with **`defense.mode: algorithmic`**. The defender LLM
-is switched off and the server defends with the published algorithms already
-implemented for the benchmark, **one per round** (chosen by the
+`configs/base.yaml` ships with **`defense.mode: llm`** — the two-sided arms race.
+A trainable defender LLM classifies every client from the per-client statistics in
+`detector/features.py`, and the server FedAvgs the updates it did not flag. Both
+policies train, and the learner **alternates on a success streak** rather than a
+clock (`rl/switch.py`):
+
+- The **attacker** trains against the frozen defender until `rl.success_streak`
+  (3) consecutive attacks **pass** — every poisoned client evades detection *and*
+  the round loses at least `rl.win_fraction × target_accuracy_drop` of accuracy.
+  It is then snapshotted and frozen.
+- The **defender** trains against that frozen attacker until it wins 3 rounds in a
+  row — TPR ≥ `rl.defender_min_tpr` with FPR ≤ `rl.defender_max_fpr`. Then it
+  freezes and the attacker starts again, one rung higher.
+- `rl.max_phase_rounds` (200) ends a phase that never gets its streak, so a
+  hopeless matchup cannot stall the run. Every phase boundary — win or cap — runs
+  the honest FL interlude and may hand the next learner an earlier league snapshot
+  of its opponent (`rl.curriculum_on_cap`).
+
+Each side's prompt is budgeted separately; see
+[Defender prompt budget](#defender-prompt-budget).
+
+### The algorithmic alternative
+
+Setting **`defense.mode: algorithmic`** switches the defender LLM off. The server
+then defends with the published algorithms already implemented for the benchmark,
+**one per round** (chosen by the
 [training curriculum](#training-curriculum-fair-defense--poisoner-coverage)):
 
 | Algorithm | What it does |
@@ -95,8 +120,19 @@ Details that matter:
   `logs/round_data/rounds.jsonl`). Compare rounds **within** a defense —
   accuracy drops are not comparable across them.
 
-To restore the original two-sided LLM arms race, set `defense.mode: llm`. Nothing
-else changes; the defender adapter resumes from where it left off.
+These algorithms are **not dead under `mode: llm`** — they are what the trained
+defender is measured against. `python -m benchmark.run_benchmark` scores the
+`llm_defender` column beside every one of them (plus `fedavg` as the no-defense
+reference and `oracle` as the upper bound) on identical rounds, against the same
+trained attacker:
+
+```bash
+python -m benchmark.run_benchmark --rounds 200 --defenses fedavg,oracle,llm_defender,fltrust,defl,dnc,multikrum
+```
+
+The `llm_defender` column needs a trained defender adapter; without one it is
+dropped with a warning and the rest of the panel still runs. See
+[`benchmark/README.md`](benchmark/README.md).
 
 ## Training curriculum: fair defense × poisoner coverage
 
@@ -241,6 +277,50 @@ during training and benchmarking (`LLMPolicy.count_prompt_tokens`) and from a
 character heuristic on the CPU/dry-run path. Set `max_context_fill: 1.0` to
 disable the cap.
 
+## Defender prompt budget
+
+The defender gets **one LLM call per round** and must label **every** client in it,
+so that single pass is the whole defense — a prompt that pushes the output schema
+out of the model's attention produces an unparseable verdict list, which scores as
+"flagged nothing". It is budgeted on **two axes**, both enforced:
+
+```
+prompt_tokens                                    <= rl.defender_max_prompt_fill  x rl.max_seq_len   # 30%
+prompt_tokens + rl.defender_max_new_tokens       <= rl.defender_max_context_fill x rl.max_seq_len   # 60%
+```
+
+One total cap cannot express that, because it trades prompt room against
+generation room: a small `max_new_tokens` would silently let the observation grow
+to fill the entire call budget. `rl.defender_min_prompt_fill` (20%) is the other
+edge of the band — a **reporting-only floor**, never a rejection. Under it the log
+says there is room for a richer observation.
+
+Three things make the single call decidable:
+
+- **A positional encoding.** Each layer's statistics are one array of numbers, with
+  the names sent once as `layer_key` / `whole_key` and the layer names once as
+  `layers`. That is under half the old named-key-per-layer-per-client JSON.
+- **A `cohort` reference block**, shaped like a client's own row but holding
+  `[medians, mads]` — the across-client median and median absolute deviation of
+  every statistic. `rel_norm` arrives cohort-relative already, but `cos_to_mean`,
+  `max_pairwise_cos`, `dnc_score` and the per-layer cosines are absolute, so
+  without it the model has to invent a scale for "typical". Deviation is then
+  `|value - median| / (mad + 1e-6)`, read position by position.
+- **A `ranked` block** pre-sorting client ids by the statistics that carry the most
+  signal, most suspicious first. Presentation only — the same numbers are in
+  `clients` — but sorting 20 rows by a positional column is exactly what a small
+  model does unreliably in one pass, and getting it wrong costs the whole round.
+
+The savings from the encoding are spent back on those two blocks rather than
+banked; that is the point of the floor.
+
+Over the cap the observation is **compacted, not truncated** (4 significant figures
+→ 3 → core per-layer statistics → rankings dropped → whole-model statistics only),
+and **a client is never dropped** — a missing client is an automatic wrong verdict.
+`rl.defender_max_new_tokens` (1024) is the defender's own generation cap, separate
+from the attacker's `rl.max_new_tokens`, and the benchmark's `llm_defender` column
+uses it too so the evaluated configuration is the trained one.
+
 ## Setup
 
 ### GPU machine (training)
@@ -355,12 +435,17 @@ ssh -i <key> -L 8084:<server>:8084 <user>@<server>
   precision (significant figures), poisoned-weight clamp, attacker adapter path.
   `fixed_poison_set` and the `rl.*` prompt-budget knobs are injected from
   `configs/base.yaml` at startup, not set here.
-- **`configs/base.yaml` → `defense:`** — who defends. `mode` (`algorithmic`, the
-  shipped default, vs `llm`), the `algorithms` rotation pool, `selection`
-  (`random` / `round_robin`, ignored while the curriculum is on), the
-  algorithm-draw `seed`, `assumed_byzantine` (DnC / Multi-Krum's assumed
+- **`configs/base.yaml` → `defense:`** — who defends. `mode` (`llm`, the shipped
+  default, vs `algorithmic`), the `algorithms` rotation pool, `selection`
+  (`random` / `round_robin`, ignored under `mode: llm` and while the curriculum is
+  on), the algorithm-draw `seed`, `assumed_byzantine` (DnC / Multi-Krum's assumed
   adversary budget), and each algorithm's own knobs.
-  See [Defense](#defense-the-defender-llm-is-currently-disabled).
+  See [Defense](#defense-the-defender-llm).
+- **`configs/base.yaml` → `rl.defender_*`** — the defender's own prompt/response
+  budget: `defender_max_prompt_fill` (30%), `defender_min_prompt_fill` (20%),
+  `defender_max_context_fill` (60%) and `defender_max_new_tokens` (1024). Each
+  falls back to the shared un-prefixed key when unset. See
+  [Defender prompt budget](#defender-prompt-budget).
 - **`configs/base.yaml` → `curriculum:`** — the order training rounds face each
   (defense, #poisoners) pair: `enabled`, `rounds_per_block`, `poisoner_counts`,
   `algorithms`. See
@@ -436,7 +521,7 @@ model/        Tiny MLP (~970 params) — the schema both LLMs operate over
 data/         MNIST loading & partitioning
 clients/      Honest client local training
 server/       Central server + FedAvg aggregation + algo_defender.py (the round-rotating
-              algorithmic defense that currently replaces the defender LLM)
+              algorithmic defense used under defense.mode: algorithmic)
 detector/     features.py — per-client per-layer statistical feature extractor
 agents/       attacker_agent.py / defender_agent.py (pure prompt+parse), attack_ops.py (operator DSL), llm_client.py
 rl/           env, rewards, turns, inference (dry-run), policy (Unsloth+LoRA), grpo, schedule, baseline

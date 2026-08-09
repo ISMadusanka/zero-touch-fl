@@ -188,28 +188,44 @@ attack:
 
 # Server-side defense — what the attacker actually faces every Phase-2 round.
 defense:
-  mode: "algorithmic"             # algorithmic | llm
+  mode: "llm"                     # algorithmic | llm
+                                  # llm = THE TWO-SIDED ARMS RACE (this run). A trainable
+                                  #   defender LLM classifies every client benign/malicious
+                                  #   from the per-client statistics in detector/features.py,
+                                  #   and the server FedAvgs the un-flagged updates. BOTH
+                                  #   policies train, alternating on the success gate below
+                                  #   (rl.success_streak): the attacker climbs against a
+                                  #   frozen defender until `success_streak` consecutive
+                                  #   attacks pass, then the defender climbs against the
+                                  #   frozen attacker until it catches it `success_streak`
+                                  #   rounds in a row, and so on. See rl/switch.py.
                                   # algorithmic = the DEFENDER LLM IS DISABLED. The server
                                   #   defends with the published algorithms below instead;
                                   #   only the attacker trains (rl/schedule.py runs
                                   #   attacker-only phases and never touches the defender
-                                  #   adapter on disk, so `llm` can be restored later).
-                                  # llm = the original two-sided arms race (trainable
-                                  #   defender LLM + FedAvg over the un-flagged clients).
+                                  #   adapter on disk).
+                                  #
+                                  # The algorithms below are NOT dead under `llm` — the
+                                  # benchmark builds its own panel from them, so
+                                  # `python -m benchmark.run_benchmark` scores the trained
+                                  # llm_defender against every one of them on the same
+                                  # rounds. They are simply not what this run TRAINS against.
   algorithms: ["fltrust", "defl", "dnc", "multikrum"]
-                                  # the rotation pool. ONE is used per round and defends
-                                  # the whole round (clean counterfactual, all G scored
-                                  # rollouts, and the commit), so the group's rewards stay
-                                  # comparable. Each algorithm also produces the round's
-                                  # AGGREGATE — FLTrust's trust-weighted rescaling, DeFL's
-                                  # Beta weighting, DnC/Multi-Krum's filtered mean — rather
-                                  # than only a drop-list. 'oracle' (reads ground truth) and
+                                  # the rotation pool used under `mode: algorithmic`. ONE is
+                                  # used per round and defends the whole round (clean
+                                  # counterfactual, all G scored rollouts, and the commit),
+                                  # so the group's rewards stay comparable. Each algorithm
+                                  # also produces the round's AGGREGATE — FLTrust's
+                                  # trust-weighted rescaling, DeFL's Beta weighting,
+                                  # DnC/Multi-Krum's filtered mean — rather than only a
+                                  # drop-list. 'oracle' (reads ground truth) and
                                   # 'llm_defender' are not selectable here.
   selection: "random"             # random = draw one algorithm per round (uniform).
                                   # round_robin = cycle them in listed order (controlled
                                   # comparisons / even coverage).
-                                  # IGNORED while the `curriculum:` block below is enabled —
-                                  # the round's algorithm is then the current block's.
+                                  # IGNORED under `mode: llm` (the defender LLM defends every
+                                  # round) and while the `curriculum:` block below is enabled
+                                  # — the round's algorithm is then the current block's.
   seed: null                      # RNG seed for the algorithm draw; null = fl.poison_seed.
                                   # A dedicated stream, so it never shifts the env's
                                   # poison/budget/target sampling.
@@ -342,6 +358,48 @@ rl:
                                   # The level in use is logged whenever it changes; at the shipped
                                   # settings (16384 window, 10 clients) it is level 0, ~30% filled.
                                   # Set to 1.0 to disable the cap.
+  # --- Defender prompt/response budget (its own band; see agents/prompt_budget.py) ---
+  # The defender gets ONE LLM call per round and must label EVERY client in it, so
+  # the quality of that single pass is the whole defense. It is budgeted separately
+  # from the attacker because the two prompts are shaped differently: the attacker
+  # observes only its controllable pool (10 clients) and writes long per-client
+  # plans, while the defender observes ALL 20 clients and writes one short verdict
+  # each. One shared `max_context_fill` cannot express both.
+  #
+  # Two caps, both enforced (a single total cap cannot do this — it trades prompt
+  # room against generation room, so a small max_new_tokens would silently let the
+  # observation grow to fill the entire call budget):
+  #     prompt_tokens                          <= defender_max_prompt_fill  * max_seq_len
+  #     prompt_tokens + defender_max_new_tokens <= defender_max_context_fill * max_seq_len
+  defender_max_prompt_fill: 0.30  # HARD CEILING on the observation: at most 30% of the
+                                  # 16384-token window (~4915 prompt tokens). Over it, the
+                                  # payload is COMPACTED — 4 significant figures, then 3,
+                                  # then core per-layer statistics, then rankings dropped,
+                                  # then whole-model statistics only (see
+                                  # agents/defender_agent.py::_COMPACTION). It is never
+                                  # truncated and no client is ever dropped: a missing client
+                                  # is an automatic wrong (default-benign) verdict.
+  defender_min_prompt_fill: 0.20  # TARGET FLOOR, reporting only — never rejects a prompt.
+                                  # Below 20% the richest rung of the ladder is cheaper than
+                                  # the band allows, which is logged as "room for a richer
+                                  # observation". That is why the positional encoding's
+                                  # savings are spent back on the `cohort` (per-statistic
+                                  # across-client median + MAD) and `ranked` (client ids
+                                  # pre-sorted by each key statistic) blocks rather than
+                                  # banked: both make ONE call more decidable, which is
+                                  # exactly what a 20-verdict single-pass output needs.
+  defender_max_context_fill: 0.60 # HARD CEILING on the whole call, prompt + reserved
+                                  # completion. At the settings here the call lands near
+                                  # 30% + 1024/16384 = ~36%, well inside it; the 60% figure
+                                  # is the headroom for a larger federation or a re-enabled
+                                  # per-client `reason` (configs/defender_agent.yaml).
+  defender_max_new_tokens: 1024   # generation cap for DEFENDER calls (the attacker keeps
+                                  # max_new_tokens below). 20 clients x ~25 tokens per verdict
+                                  # is ~500 tokens with `emit_reason: false`, so 1024 is ~2x
+                                  # headroom. Counted against defender_max_context_fill, so
+                                  # raising it tightens the defender's prompt budget
+                                  # one-for-one. Turning `emit_reason` back on adds one short
+                                  # string per client and wants roughly double this.
   load_in_4bit: false             # bf16 LoRA: 3B needs ~12GB+ VRAM; set true (4-bit QLoRA) if tight
   lora_r: 16
   lora_alpha: 32

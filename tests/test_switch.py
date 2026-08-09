@@ -159,6 +159,66 @@ def test_next_phase_flips_learner_and_sets_capped_flag():
     assert ctrl.learner == "attacker" and ctrl.capped is True
 
 
+def test_three_consecutive_wins_hand_off_in_both_directions():
+    """The shipped arms-race contract, end to end.
+
+    Three attacks in a row that PASS freeze the attacker and hand the phase to the
+    defender; three rounds in a row where the defender CATCHES that frozen attacker
+    hand it straight back. With ``min_phase_rounds == success_streak`` the streak is
+    the only gate, so a handoff lands on the third win and not before.
+    """
+    cfg = _cfg(min_phase_rounds=3, success_streak=3, max_phase_rounds=200)
+    ctrl = PhaseController(cfg, first_learner="attacker",
+                           learners=("attacker", "defender"))
+
+    for role, next_role in (("attacker", "defender"), ("defender", "attacker")):
+        assert ctrl.learner == role
+        assert ctrl.record(True) == (False, None)          # win 1
+        assert ctrl.record(True) == (False, None)          # win 2
+        assert ctrl.record(True) == (True, "success")      # win 3 -> freeze + swap
+        ctrl.next_phase("success")
+        assert ctrl.learner == next_role
+        assert ctrl.streak == 0 and ctrl.phase_round == 0  # the next side starts clean
+
+    assert ctrl.learner == "attacker" and ctrl.phase_index == 2
+
+
+def test_a_broken_streak_does_not_hand_off():
+    """Two wins, a loss, then two more wins is NOT three in a row."""
+    cfg = _cfg(min_phase_rounds=3, success_streak=3)
+    ctrl = PhaseController(cfg, first_learner="defender",
+                           learners=("attacker", "defender"))
+    for outcome in (True, True, False, True, True):
+        switch, _reason = ctrl.record(outcome)
+        assert not switch
+    assert ctrl.record(True) == (True, "success")   # the third consecutive win
+    assert ctrl.learner == "defender"               # unchanged until next_phase()
+
+
+def test_shipped_config_trains_both_sides_on_a_three_win_streak():
+    """configs/base.yaml must actually request the two-sided three-win schedule.
+
+    The controller is only half the contract: with ``defense.mode: algorithmic``
+    rl/schedule.py collapses the rotation to ``("attacker",)`` and no defender
+    phase ever runs, however the streak is configured. This pins both halves.
+    """
+    import yaml
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = yaml.safe_load(open(os.path.join(root, "configs", "base.yaml")))
+
+    assert str(cfg["defense"]["mode"]).lower() == "llm", (
+        "the defender LLM must be enabled for a two-sided arms race")
+
+    sw = SwitchConfig.from_cfg(cfg["rl"])
+    assert sw.success_streak == 3
+    # min_phase_rounds above the streak would delay the handoff past the third win.
+    assert sw.min_phase_rounds <= sw.success_streak
+    assert cfg["rl"]["first_learner"] == "attacker"
+    # A hard cap must still exist so a phase that never wins cannot run forever.
+    assert 0 < sw.max_phase_rounds < 10 ** 6
+
+
 def test_from_cfg_reads_yaml_dict():
     cfg = SwitchConfig.from_cfg({"min_phase_rounds": 5, "success_streak": 4})
     assert cfg.min_phase_rounds == 5 and cfg.success_streak == 4

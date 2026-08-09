@@ -88,7 +88,7 @@ def layer_shapes(global_sd: dict) -> dict:
     return {k: list(v.shape) for k, v in global_sd.items()}
 
 
-def _sig(x: float, digits: int) -> float:
+def sig_round(x: float, digits: int) -> float:
     """Round to ``digits`` SIGNIFICANT figures.
 
     Significant figures rather than decimal places because these statistics span
@@ -96,6 +96,10 @@ def _sig(x: float, digits: int) -> float:
     and ``sign_flip_frac`` can be 0. Fixed decimals either waste characters on
     the large values or quantize the small ones to zero — and ``rms_delta`` is
     exactly what the attacker calibrates additive operators against.
+
+    Public because the defender's observation encoder needs the same rounding
+    (``agents/defender_agent.py``) — its per-client statistics span the same
+    range of magnitudes for the same reason.
     """
     v = float(x)
     if v != v or v in (float("inf"), float("-inf")):
@@ -148,8 +152,8 @@ def format_rows(stats: dict, *, sig: int = 4,
     row = {}
     if include_layers and layer_keys:
         for k, s in stats["layers"].items():
-            row[k] = [_sig(s[name], sig) for name in layer_keys]
-    row["whole"] = [_sig(stats["whole"][name], sig) for name in whole_keys]
+            row[k] = [sig_round(s[name], sig) for name in layer_keys]
+    row["whole"] = [sig_round(stats["whole"][name], sig) for name in whole_keys]
     return row
 
 

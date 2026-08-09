@@ -14,8 +14,8 @@ checkpoint layout. It supersedes the old feedback/episodic-memory design.
 | Server | `server/fed_server.py`, `server/aggregation.py` | Global model + eval; FedAvg over non-flagged clients. |
 | Features | `detector/features.py` | Per-client, per-layer statistical feature vectors (no decisions). |
 | Attacker | `agents/attacker_agent.py` + `agents/attack_ops.py` | Prompt (layer stats) + parse/apply of an attack plan (operator DSL). |
-| Defender (default) | `server/algo_defender.py` | **Active defense.** Rotating pool of published algorithms (FLTrust / DeFL / DnC / Multi-Krum from `benchmark/defenses/`); one drawn per round, producing both the verdicts and the aggregate. |
-| Defender (LLM) | `agents/defender_agent.py` | Prompt + parse of per-client benign/malicious labels. **Disabled** unless `defense.mode: llm`. |
+| Defender (LLM, default) | `agents/defender_agent.py` | **Active defense.** Prompt (per-client stats, positionally packed + cohort reference + rankings) + parse of per-client benign/malicious labels; the server FedAvgs the un-flagged clients. Trainable. |
+| Defender (algorithmic) | `server/algo_defender.py` | Rotating pool of published algorithms (FLTrust / DeFL / DnC / Multi-Krum from `benchmark/defenses/`); one drawn per round, producing both the verdicts and the aggregate. Used only under `defense.mode: algorithmic`. |
 | RL | `rl/*` | Environment, rewards, turns, GRPO, schedule, policy, baseline, inference. |
 | Metrics | `metrics/*` | Ground-truth confusion/TPR/FPR/ASR/APR (research + reward source). |
 
@@ -27,12 +27,15 @@ the realized updates.
 ```
 reset env from Phase-1 checkpoint (per-client benign weights, global, baseline acc)
 for each round:
-  0. FIX this round's defense algorithm + poison quota b from the training CURRICULUM
-     (algorithmic mode; both held for the whole 10-round block — see below.
+  0. FIX this round's defense + poison quota b from the training CURRICULUM
+     (under defense.mode: llm the defender LLM defends every round, so only the
+      quota axis exists; under algorithmic mode both are held for the whole
+      10-round block — see below.
       No curriculum: the algorithm is drawn per defense.selection and
       b = randint(1, max_poison_clients).
       attack.fixed_poison_clients (SHIPPED DEFAULT, 10) overrides all of that:
-      b = 10 every round, so only the algorithm axis is swept)
+      b = 10 every round. Combined with mode: llm that leaves the sweep with
+      nothing to vary, so the curriculum degenerates to a single block)
   1. honest updates for all N clients               # retrain from global, or replay Phase-1 weights
   2. expose the attacker's controllable pool [0..n_compromisable) + exact poison quota b
      (fixed set: the pool IS the poisoned set, b = its size. Otherwise the
@@ -45,12 +48,14 @@ for each round:
      → apply_plan(benign_i, plan_i) → poisoned weights for the CHOSEN clients
   4. build full update list (poisoned ∪ honest)
   5. DEFEND:
-     algorithmic (default) — env.defend(): the round's algorithm emits per-client
-       verdicts AND its own aggregate (FLTrust trust-weighting, DeFL Beta+CLP,
-       DnC/Multi-Krum filtered mean) → new global (None → keep prev)
-     llm — detector/features → per-client stat vectors → DEFENDER LLM emits a
-       benign/malicious label + confidence per client (input: features ONLY),
+     llm (default) — detector/features → per-client stat vectors → DEFENDER LLM
+       emits a benign/malicious label + confidence per client (input: features
+       ONLY, packed positionally with a cohort median/MAD reference and pre-sorted
+       rankings, held inside rl.defender_max_prompt_fill of the context window),
        then FedAvg over the clients labelled benign
+     algorithmic — env.defend(): the round's algorithm emits per-client verdicts
+       AND its own aggregate (FLTrust trust-weighting, DeFL Beta+CLP,
+       DnC/Multi-Krum filtered mean) → new global (None → keep prev)
   6. evaluate global accuracy
   7. attacker_reward + defender_reward (ground truth = the CHOSEN poisoned set)  ← train-time only
   8. GRPO update for the learning agent; write round log + metrics
@@ -69,14 +74,24 @@ for all clients, no attacker/detector — the refreshed client weights + global 
 kept), and the defender trains (attacker frozen) until it wins 3 in a row, then
 another benign FL round runs, and so on. Every GRPO phase after the first starts
 from a freshly advanced client state (see "Between-phase benign FL round" below).
-With the defender LLM disabled there is no defender phase: every phase is an
-attacker phase, still bounded by the same win-streak / cap gate, so the benign FL
-interlude keeps firing between them.
+This is the SHIPPED schedule (`defense.mode: llm`, `rl.success_streak: 3`, with
+`rl.min_phase_rounds: 3 ≤ success_streak` so the streak is the only gate and
+`rl.max_phase_rounds: 200` ending a phase that never gets one).
+
+An "attack passes" = every poisoned client evaded **and** the round lost at least
+`rl.win_fraction × target_accuracy_drop`. A "defender win" = TPR ≥
+`rl.defender_min_tpr` with FPR ≤ `rl.defender_max_fpr` (or, on a round whose
+attacker degenerated to no-ops, simply staying quiet). See `rl/switch.py`.
+
+With the defender LLM disabled (`defense.mode: algorithmic`) there is no defender
+phase: every phase is an attacker phase, still bounded by the same win-streak /
+cap gate, so the benign FL interlude keeps firing between them.
 
 ## Defense (`defense.mode`, `server/algo_defender.py`)
 
-The shipped config is **`defense.mode: algorithmic`** — the defender LLM is off.
-`AlgorithmicDefender` holds the pool named by `defense.algorithms` (default
+Setting **`defense.mode: algorithmic`** switches the defender LLM off (the shipped
+config is `llm`). `AlgorithmicDefender` then holds the pool named by
+`defense.algorithms` (default
 `fltrust, defl, dnc, multikrum`, the same classes the benchmark panel uses). The
 training curriculum `select()`s one per round; without a curriculum it
 `choose()`s one from a dedicated RNG, so the draw never shifts the env's poison /
@@ -97,8 +112,11 @@ budget / target sampling.
 - **Attacker-only training.** `rl/schedule.py` builds one optimizer, keeps the
   `PhaseController` on `learners=("attacker",)`, skips league/curriculum opponent
   swaps, and never writes `checkpoints/defender_adapter/`. `main.py` doesn't even
-  create the defender LoRA adapter. Set `defense.mode: llm` to restore the
-  two-sided race — the defender adapter resumes untouched.
+  create the defender LoRA adapter. Back on `defense.mode: llm` the two-sided race
+  resumes and the defender adapter picks up untouched.
+- **Not dead under `mode: llm`.** These same classes are the benchmark panel the
+  trained `llm_defender` is scored against, so switching the training defense to
+  the LLM does not remove them from evaluation.
 - Each round log carries `attack_metadata.defense` (the algorithm name, or
   `"llm"`); rounds are only comparable within one defense.
 
@@ -191,24 +209,46 @@ for algorithm in defense.algorithms:            # fltrust, defl, dnc, multikrum
   poisoned made the ASR metric report 100% success for an attack that did nothing
   and trained the defender to flag undetectable clients.
 
-## Defender-LLM contract (classification) — only under `defense.mode: llm`
+## Defender-LLM contract (classification) — the shipped defense
+
+**One call per round labels every client**, so the whole defense is a single pass.
+That is what the input design and the budget below are for.
 
 - **Input** (`agents/defender_agent.build_user_prompt`): per-client features
   from `detector/features.compute_client_features` — **only** features, never the
   ground truth.
-  - Per layer (one per model layer; e.g. `net.2`, `net.4` for MnistNet): `l2_norm`,
-    `rel_norm` (vs the median over all clients), `cos_to_median` (vs the
-    coordinate-wise median over all clients — references include the scored client
-    itself, not leave-one-out; with a benign majority the median is honest either
-    way), `sign_agreement` (fraction of coords matching the median sign — catches
-    sign-flip/targeted attacks that preserve norm).
-  - Whole model: `l2_norm`, `rel_norm`, `cos_to_mean`, `max_pairwise_cos`
-    (FoolsGold), `dnc_score` (SVD spectral outlier).
+  - Per layer (one per model layer; e.g. `net.2`, `net.4` for MnistNet): `rel_norm`
+    (vs the median over all clients), `cos_to_median` (vs the coordinate-wise
+    median over all clients — references include the scored client itself, not
+    leave-one-out; with a benign majority the median is honest either way),
+    `sign_agreement` (fraction of coords matching the median sign — catches
+    sign-flip/targeted attacks that preserve norm), `l2_norm`.
+  - Whole model: `rel_norm`, `cos_to_mean`, `max_pairwise_cos` (FoolsGold),
+    `dnc_score` (SVD spectral outlier), `l2_norm`.
+  - **Positionally packed.** One array of numbers per layer, with the statistic
+    names sent once as `layer_key` / `whole_key` and the layer names once as
+    `layers` — under half the named-key-per-layer-per-client JSON.
+  - **`cohort`** — shaped like a client's own row but holding `[medians, mads]`:
+    the across-client median and MAD of every statistic. Most of these statistics
+    are absolute, so this is the reference scale that makes "unusual" computable
+    (`|value − median| / (mad + 1e-6)`) instead of guessed.
+  - **`ranked`** — client ids pre-sorted by `rel_norm`↓, `cos_to_mean`↑,
+    `dnc_score`↓, `max_pairwise_cos`↓. Presentation only; it removes the in-context
+    sort a small model does least reliably.
+  - **Budgeted on two axes**, both enforced by compaction (never truncation, and a
+    client is never dropped — a missing client is an automatic wrong verdict):
+    `prompt ≤ rl.defender_max_prompt_fill × rl.max_seq_len` (30%) **and**
+    `prompt + rl.defender_max_new_tokens ≤ rl.defender_max_context_fill ×
+    rl.max_seq_len` (60%). `rl.defender_min_prompt_fill` (20%) is a reporting-only
+    floor marking "there is room for a richer observation". Ladder: 4 significant
+    figures → 3 → core per-layer statistics → rankings dropped → whole-model only.
 - **Output**: `{"clients": [{client_id, is_suspicious, confidence}, ...]}`
-  → one `DetectionVerdict` per client (missing/garbled entries default benign). A
-  short free-text `reason` per client is **off by default** to save generation
-  tokens (informational only — never used by the reward/metrics); re-enable it
-  with `emit_reason: true` in `configs/defender_agent.yaml`.
+  → one `DetectionVerdict` per client (missing/garbled entries default benign),
+  generated under `rl.defender_max_new_tokens` (1024, separate from the attacker's
+  `rl.max_new_tokens`). A short free-text `reason` per client is **off by default**
+  to save generation tokens (informational only — never used by the
+  reward/metrics); re-enable it with `emit_reason: true` in
+  `configs/defender_agent.yaml`, and budget roughly double the output tokens.
 
 ## Verifiable rewards (`rl/rewards.py`)
 

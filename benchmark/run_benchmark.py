@@ -428,7 +428,13 @@ def main():
     attacker_agent = AttackerAgent(attacker_cfg)
     attacker_agent.bind_tokenizer(policy.count_prompt_tokens)
     # Only meaningful for the llm_defender column; harmless to build either way.
+    # It gets the same rl: block and the same real tokenizer, so the observation it
+    # is EVALUATED on is compacted to the identical band it was TRAINED on — a
+    # benchmark prompt at a different detail level would be measuring a different
+    # input than the policy learned to read.
+    defender_cfg["rl"] = rl_cfg
     defender_agent = DefenderAgent(defender_cfg)
+    defender_agent.bind_tokenizer(policy.count_prompt_tokens)
 
     root_loader = None
     root_epochs = 1
@@ -484,7 +490,11 @@ def main():
         root_loader=root_loader, root_lr=args.root_lr or float(fl["lr"]),
         root_epochs=root_epochs, eta=args.eta,
         defender_temperature=args.defender_temperature,
-        max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)),
+        # The DEFENDER's own generation cap (`max_new_tokens` below is the
+        # attacker's) — the same one its prompt budget reserved room for in
+        # training, so the eval column runs the configuration that was trained.
+        max_new_tokens=int(rl_cfg.get("defender_max_new_tokens")
+                           or rl_cfg.get("max_new_tokens", 512)),
         defl_delta=args.defl_delta, defl_tau=args.defl_tau,
         dnc_num_byzantine=dnc_m, dnc_c=args.dnc_c, dnc_niters=args.dnc_niters,
         dnc_sub_dim=args.dnc_sub_dim, dnc_seed=seed,

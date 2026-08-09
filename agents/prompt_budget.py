@@ -19,6 +19,24 @@ actually within budget. Callers that exceed the cap COMPACT the payload (see
 ``AttackerAgent._COMPACTION``) rather than truncating it — a truncated JSON
 observation is worse than a coarser complete one.
 
+A second, optional cap bounds the **prompt on its own** (``max_prompt_fill``)::
+
+    prompt_tokens  <=  max_prompt_fill * context_window
+
+Both caps apply; ``prompt_limit`` is whichever binds first. The total cap alone
+cannot express "the observation gets at most 30% of the window and the whole
+call at most 60%", because it trades prompt room against generation room — a
+tiny ``max_new_tokens`` would silently let the observation grow to fill the
+entire call budget. Splitting them is what makes the defender's input size an
+independent knob from its output size (see ``configs/base.yaml``'s
+``rl.defender_max_prompt_fill`` / ``rl.defender_max_context_fill``).
+
+``min_prompt_fill`` is the other side of the same band: a TARGET FLOOR, never
+enforced. Under it, the observation is leaving usable context unspent, which is
+worth saying out loud — the compaction ladder's job is to pick the richest
+payload that fits, and a prompt far under the floor means the richest level is
+poorer than it needs to be.
+
 Token counting uses the real tokenizer when one is available (``bind`` it to
 ``LLMPolicy.count_prompt_tokens``, which renders the chat template exactly as
 generation does). On the CPU / dry-run path there is no local tokenizer, so a
@@ -76,16 +94,26 @@ class PromptBudget:
     case the budget never binds and only reports). ``reserved_output`` is
     ``rl.max_new_tokens``. ``max_fill`` is the fraction of the window a single
     call may occupy, counting the reserved completion.
+
+    ``max_prompt_fill`` optionally caps the PROMPT on its own (``None`` = only
+    the total cap applies, which is the attacker's configuration).
+    ``min_prompt_fill`` is a reporting-only floor marking the bottom of the
+    intended prompt band; it never rejects a prompt.
     """
 
     def __init__(self, context_window: int | None = None,
                  max_fill: float = DEFAULT_MAX_FILL,
                  reserved_output: int = 0,
                  token_counter=None,
-                 label: str = "prompt"):
+                 label: str = "prompt",
+                 max_prompt_fill: float | None = None,
+                 min_prompt_fill: float = 0.0):
         self.context_window = int(context_window or 0)
         self.max_fill = max(0.0, min(1.0, float(max_fill)))
         self.reserved_output = max(0, int(reserved_output))
+        self.max_prompt_fill = (None if max_prompt_fill is None
+                                else max(0.0, min(1.0, float(max_prompt_fill))))
+        self.min_prompt_fill = max(0.0, min(1.0, float(min_prompt_fill or 0.0)))
         self.label = label
         self._token_counter = token_counter
         self._counter_failed = False
@@ -114,26 +142,48 @@ class PromptBudget:
         return int(self.context_window * self.max_fill) if self.active else 0
 
     @property
-    def prompt_limit(self) -> int:
-        """Max PROMPT tokens, i.e. the call limit less the reserved completion.
+    def prompt_cap(self) -> int:
+        """Max PROMPT tokens from ``max_prompt_fill`` alone (0 = no such cap)."""
+        if not self.active or self.max_prompt_fill is None:
+            return 0
+        return int(self.context_window * self.max_prompt_fill)
 
-        A configuration whose reserved completion alone exceeds the call limit
-        leaves no room for a prompt; that is a config error, not something to
-        silently swallow, so it is reported once and floored at 1 (which just
-        means "compact as hard as you can").
+    @property
+    def prompt_floor(self) -> int:
+        """Prompt tokens below which the call is leaving context unspent (0 = no floor)."""
+        if not self.active or self.min_prompt_fill <= 0:
+            return 0
+        return int(self.context_window * self.min_prompt_fill)
+
+    @property
+    def prompt_limit(self) -> int:
+        """Max PROMPT tokens: the tighter of the two caps.
+
+        That is the call limit less the reserved completion, and — when
+        ``max_prompt_fill`` is set — the prompt-only cap.
+
+        A configuration that leaves no room for a prompt at all is a config
+        error, not something to silently swallow, so it is reported once and
+        floored at 1 (which just means "compact as hard as you can").
         """
         if not self.active:
             return 0
         limit = self.call_limit - self.reserved_output
+        cap = self.prompt_cap
+        if cap:
+            limit = min(limit, cap)
         if limit < 1:
             if not self._degenerate_warned:
                 self._degenerate_warned = True
                 logger.error(
-                    f"{self.label}: rl.max_new_tokens ({self.reserved_output}) alone "
-                    f"fills the {self.max_fill:.0%} budget of a {self.context_window}-token "
-                    f"context ({self.call_limit} tokens), leaving no room for a prompt. "
-                    f"Raise rl.max_seq_len, lower rl.max_new_tokens, or raise "
-                    f"rl.max_context_fill."
+                    f"{self.label}: no room left for a prompt in a "
+                    f"{self.context_window}-token context — rl.max_new_tokens "
+                    f"({self.reserved_output}) against a {self.max_fill:.0%} call budget "
+                    f"({self.call_limit} tokens)"
+                    + (f", and a {self.max_prompt_fill:.0%} prompt cap ({cap} tokens)"
+                       if cap else "")
+                    + ". Raise rl.max_seq_len, lower rl.max_new_tokens, or raise the "
+                      "fill caps."
                 )
             return 1
         return limit
@@ -158,9 +208,25 @@ class PromptBudget:
             return 0.0
         return (int(prompt_tokens) + self.reserved_output) / self.context_window
 
+    def prompt_fill(self, prompt_tokens: int) -> float:
+        """Fraction of the context window the PROMPT alone occupies."""
+        if not self.active:
+            return 0.0
+        return int(prompt_tokens) / self.context_window
+
     def fits(self, prompt_tokens: int) -> bool:
-        """Is this prompt within the cap? Always true with no known window."""
+        """Is this prompt within the cap(s)? Always true with no known window."""
         return (not self.active) or int(prompt_tokens) <= self.prompt_limit
+
+    def underfilled(self, prompt_tokens: int) -> bool:
+        """Is this prompt BELOW the intended band, i.e. leaving context unspent?
+
+        Reporting only — an under-filled prompt is always emitted as-is. It means
+        the richest rung of the caller's detail ladder is poorer than the budget
+        allows, which is a signal to put more into the observation, not an error.
+        """
+        floor = self.prompt_floor
+        return bool(floor) and int(prompt_tokens) < floor
 
     def exact(self) -> bool:
         """Is the count coming from a real tokenizer rather than the heuristic?"""
@@ -172,19 +238,44 @@ class PromptBudget:
         how = "measured" if self.exact() else "estimated"
         if not self.active:
             return f"{self.label}: {n} tokens ({how}; no context window configured)"
+        band = ""
+        if self.max_prompt_fill is not None or self.prompt_floor:
+            lo = f"{self.min_prompt_fill:.0%}" if self.prompt_floor else "0%"
+            hi = (f"{self.max_prompt_fill:.0%}" if self.max_prompt_fill is not None
+                  else f"{self.max_fill:.0%}")
+            band = f", prompt {self.prompt_fill(n):.0%} of window (band {lo}-{hi})"
         return (f"{self.label}: {n} {how} prompt tokens + {self.reserved_output} reserved "
                 f"for output = {self.fill(n):.0%} of {self.context_window} "
-                f"(cap {self.max_fill:.0%})")
+                f"(cap {self.max_fill:.0%}){band}")
 
 
 def build_prompt_budget(rl_cfg: dict | None, label: str = "attacker prompt",
-                        token_counter=None) -> PromptBudget:
-    """Construct the budget described by the ``rl:`` config block."""
+                        token_counter=None, prefix: str = "") -> PromptBudget:
+    """Construct the budget described by the ``rl:`` config block.
+
+    ``prefix`` selects a per-agent override family: ``prefix="defender_"`` reads
+    ``defender_max_context_fill``, ``defender_max_new_tokens``,
+    ``defender_max_prompt_fill`` and ``defender_min_prompt_fill``, each falling
+    back to the un-prefixed key when unset. ``max_seq_len`` is never prefixed —
+    the context window belongs to the shared base model, not to one agent.
+    """
     rl_cfg = rl_cfg or {}
+
+    def get(key, default=None):
+        if prefix:
+            v = rl_cfg.get(f"{prefix}{key}")
+            if v is not None:
+                return v
+        v = rl_cfg.get(key)
+        return default if v is None else v
+
     return PromptBudget(
         context_window=int(rl_cfg.get("max_seq_len", 0) or 0),
-        max_fill=float(rl_cfg.get("max_context_fill", DEFAULT_MAX_FILL)),
-        reserved_output=int(rl_cfg.get("max_new_tokens", 0) or 0),
+        max_fill=float(get("max_context_fill", DEFAULT_MAX_FILL)),
+        reserved_output=int(get("max_new_tokens", 0) or 0),
+        max_prompt_fill=(None if get("max_prompt_fill") is None
+                         else float(get("max_prompt_fill"))),
+        min_prompt_fill=float(get("min_prompt_fill", 0.0)),
         token_counter=token_counter,
         label=label,
     )

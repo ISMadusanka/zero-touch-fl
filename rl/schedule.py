@@ -239,6 +239,15 @@ def train(
     opp_temp = float(rl.get("opponent_temperature", 0.0))
     scoring_opp_temp = float(rl.get("scoring_opponent_temperature", opp_temp))
     max_new_tokens = int(rl.get("max_new_tokens", 2048))
+    # Generation cap PER ROLE. The two agents write very different outputs — the
+    # attacker emits long per-client attack plans, the defender one short verdict
+    # per client — and each role's cap is counted against its own context-fill
+    # budget (see agents/prompt_budget.py), so a shared value forces the defender
+    # to reserve room it never uses and charges that room to its prompt.
+    role_max_new_tokens = {
+        "attacker": max_new_tokens,
+        "defender": int(rl.get("defender_max_new_tokens", max_new_tokens) or max_new_tokens),
+    }
     grad_clip = float(rl.get("grad_clip", 1.0))
     save_every = int(rl.get("save_every", 50))
     snap_every = int(rl.get("league_snapshot_every", 100))
@@ -306,6 +315,7 @@ def train(
     # Per-round knobs bundled so both schedules share one round body.
     knobs = dict(
         G=G, kl_beta=kl_beta, learner_temp=learner_temp, max_new_tokens=max_new_tokens,
+        role_max_new_tokens=role_max_new_tokens,
         grad_clip=grad_clip, opp_temp=opp_temp, scoring_opp_temp=scoring_opp_temp,
         skip_zero_adv=skip_zero_adv, resample_zero_adv=resample_zero_adv,
         resample_temp=resample_temp, reward_att=reward_att, reward_def=reward_def,
@@ -319,7 +329,8 @@ def train(
         metrics_tracker=metrics_tracker, save_round_log=save_round_log,
         adapter_paths=adapter_paths, progress_cb=progress_cb, total_rounds=total_rounds,
         save_every=save_every, snap_every=snap_every, league_prob=league_prob,
-        max_new_tokens=max_new_tokens, rng=rng, curriculum_on_cap=curriculum_on_cap,
+        max_new_tokens=max_new_tokens, role_max_new_tokens=role_max_new_tokens,
+        rng=rng, curriculum_on_cap=curriculum_on_cap,
         fl_interlude=fl_interlude, controller=None,
         fl_state_cb=fl_state_cb, borrowed_opponent=None,
         trainable=trainable, algorithmic_defense=algorithmic_defense,
@@ -417,7 +428,9 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     stats = grpo_step(
         state["policy"], learner, state["optimizers"][learner], turn,
         G=k["G"], kl_beta=k["kl_beta"], temperature=k["learner_temp"],
-        max_new_tokens=k["max_new_tokens"], grad_clip=k["grad_clip"],
+        max_new_tokens=(k.get("role_max_new_tokens") or {}).get(
+            learner, k["max_new_tokens"]),
+        grad_clip=k["grad_clip"],
         skip_zero_advantage=k["skip_zero_adv"],
         resample_on_zero_advantage=k["resample_zero_adv"],
         resample_temperature=k["resample_temp"],
@@ -494,7 +507,10 @@ def _opponent_generator(state, opp, face_snapshot):
         used = True
         state["borrowed_opponent"] = (opp, live_opp)
         logger.info(f"Phase: facing a LEAGUE snapshot of {opp}")
-    opp_gen = PolicyGenerator(policy, opp, state["max_new_tokens"])
+    # The frozen opponent generates under ITS OWN cap, not the learner's — that is
+    # the cap its prompt budget reserved room for.
+    opp_tokens = (state.get("role_max_new_tokens") or {}).get(opp, state["max_new_tokens"])
+    opp_gen = PolicyGenerator(policy, opp, opp_tokens)
 
     def restore():
         if used:

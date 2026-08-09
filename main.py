@@ -20,14 +20,24 @@ branching off the SAME Phase-1 final model:
 Set ``fl.freeze_global_in_phase2: false`` to restore the original continuing
 federation, where each committed aggregate becomes the next round's global.
 
-The DEFENDER LLM IS CURRENTLY DISABLED (``defense.mode: algorithmic`` in
-configs/base.yaml). The server instead defends with the published algorithms —
-FLTrust, DeFL, DnC and Multi-Krum — using ONE of them, drawn at random, per
-round (see ``server/algo_defender.py``). Only the attacker is trained with GRPO.
-Setting ``defense.mode: llm`` restores the original two-sided arms race, where a
-defender LLM classifies each client benign/malicious from per-client per-layer
-statistics and both sides get a verifiable per-round reward and train with GRPO
-(separate LoRA adapters over one frozen Qwen2.5-3B-Instruct base).
+THE DEFENDER IS AN LLM (``defense.mode: llm`` in configs/base.yaml) — a two-sided
+arms race. A defender LLM classifies each client benign/malicious from the
+per-client per-layer statistics in ``detector/features.py``, the server FedAvgs
+the un-flagged updates, and BOTH sides get a verifiable per-round reward and train
+with GRPO (separate LoRA adapters over one frozen Qwen2.5-3B-Instruct base).
+
+The two policies alternate on a SUCCESS GATE rather than a clock (see
+``rl/switch.py``): the attacker trains against the frozen defender until
+``rl.success_streak`` consecutive attacks pass, at which point it is frozen and
+the defender trains against it until IT wins ``rl.success_streak`` rounds in a
+row, and so on. ``rl.max_phase_rounds`` ends a phase that never gets its streak.
+
+Setting ``defense.mode: algorithmic`` disables the defender LLM: the server then
+defends with the published algorithms — FLTrust, DeFL, DnC and Multi-Krum — using
+ONE of them per round (see ``server/algo_defender.py``) and only the attacker
+trains. Those algorithms are still what the trained defender is MEASURED against;
+``python -m benchmark.run_benchmark`` scores the ``llm_defender`` column beside
+each of them on identical rounds.
 
 Modes:
   python main.py --env linux                 # full GRPO training (needs a GPU)
@@ -232,10 +242,11 @@ def run_phase2(
     # reproduce the same honest updates and there would be nothing for the attacker
     # to generalize over. ``fl.client_data_refresh: none`` turns it off.
     round_data = build_round_data_sampler(config, client_loaders, seed=seed)
-    # Server-side defense. With ``defense.mode: algorithmic`` (the default) the
-    # defender LLM is disabled and one published algorithm — FLTrust / DeFL / DnC /
-    # Multi-Krum — defends each round, drawn at random; only the attacker trains.
-    # ``defense.mode: llm`` restores the trainable defender LLM.
+    # Server-side defense. Under ``defense.mode: llm`` (the shipped setting) this is
+    # None and the trainable defender LLM defends every round. With
+    # ``defense.mode: algorithmic`` the defender LLM is disabled and one published
+    # algorithm — FLTrust / DeFL / DnC / Multi-Krum — defends each round instead,
+    # and only the attacker trains.
     # An honest client's per-round SGD iteration count. FLTrust's root fine-tuning is
     # sized to match it (defense.fltrust.root_epochs: null), because FLTrust rescales
     # every accepted update to ||g0|| — so the server's reference update, not the
@@ -325,10 +336,12 @@ def run_phase2(
             attn_implementation=rl_cfg.get("attn_implementation", "eager"),
             use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
         )
-        # Measure the attacker's context fill with the REAL tokenizer from here on
-        # (until now the agent used the character heuristic). This is what makes
-        # rl.max_context_fill an exact cap rather than an approximate one.
+        # Measure both agents' context fill with the REAL tokenizer from here on
+        # (until now they used the character heuristic). This is what makes
+        # rl.max_context_fill / rl.defender_max_prompt_fill exact caps rather than
+        # approximate ones.
         attacker_agent.bind_tokenizer(policy.count_prompt_tokens)
+        defender_agent.bind_tokenizer(policy.count_prompt_tokens)
         # Resume adapters if present.
         for name, path in adapter_paths.items():
             if name in adapter_names and adapter_exists(path):
@@ -432,6 +445,10 @@ def main():
     attacker_config["fixed_poison_set"] = (
         _attack_cfg.get("fixed_poison_clients") not in (None, False, 0, ""))
     attacker_config["rl"] = base_config.get("rl", {})
+    # Same for the defender: its observation is compacted to fit the ``defender_*``
+    # context-fill band in the same ``rl:`` block (see agents/prompt_budget.py).
+    # Without this the budget is inert and the prompt only ever gets reported.
+    defender_config["rl"] = base_config.get("rl", {})
 
     # Reproducibility.
     seed = int(base_config["fl"].get("poison_seed", 0))
