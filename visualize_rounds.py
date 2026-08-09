@@ -96,58 +96,141 @@ def _rolling(vals, window):
     return np.convolve(vals, kernel, mode="same")
 
 
+def is_targeted_run(rounds) -> bool:
+    """True iff the attack goal is ``targeted_label``.
+
+    NOTE: this used to check ``goal.get("strategy") == "targeted"``, which never
+    matches -- the actual schema (``rl/env.py``) stores ``goal["type"]``, with
+    value ``"targeted_label"``. That bug meant every targeted-mode chart below
+    silently fell back to the untargeted branch regardless of the real goal.
+    """
+    if not rounds:
+        return False
+    goal = rounds[0].get("attack_goal", {}) or {}
+    return goal.get("type") == "targeted_label"
+
+
+def target_class_series(rounds):
+    """Per round: (accuracy of the target class, its drop vs baseline, which
+    class id). Returns ``NaN``/``None`` for rounds with no per-class data yet
+    (e.g. rounds before ``baseline_class_accuracy`` was added to the logs, or
+    the benign-FL-interlude rounds).
+
+    Under ``label: "menu"`` the attacker may pick a DIFFERENT class each round,
+    so "the target class" is redefined per round as whichever class shows the
+    largest drop vs its own baseline that round -- the same definition
+    ``rl/rewards.py::attacker_reward`` and ``rl/schedule.py``'s switch logic
+    already use, so this chart reports the class the reward is actually
+    computed against, not an arbitrary proxy fixed from the final round.
+    """
+    goal = rounds[0].get("attack_goal", {}) if rounds else {}
+    label_cfg = str(goal.get("label", "menu"))
+    acc_series, drop_series, class_series = [], [], []
+    for r in rounds:
+        meta = r.get("attack_metadata", {}) or {}
+        baseline = meta.get("baseline_class_accuracy")
+        post = meta.get("post_class_accuracy")
+        if not baseline or not post:
+            acc_series.append(np.nan); drop_series.append(np.nan); class_series.append(None)
+            continue
+        drops = {c: baseline.get(c, 0.0) - post.get(c, 0.0) for c in post}
+        if not drops:
+            acc_series.append(np.nan); drop_series.append(np.nan); class_series.append(None)
+            continue
+        if label_cfg.lower() == "menu":
+            cls = max(drops, key=drops.get)
+        else:
+            cls = label_cfg if label_cfg in post else str(label_cfg)
+            if cls not in post:
+                cls = max(drops, key=drops.get)   # fixed label missing this round -> fall back
+        acc_series.append(post.get(cls, np.nan))
+        drop_series.append(drops.get(cls, np.nan))
+        class_series.append(cls)
+    return acc_series, drop_series, class_series
+
+
 # ─── Charts ──────────────────────────────────────────────────────────────────
 def plot_accuracy(rounds, out_dir):
     rns = [r["round_num"] for r in rounds]
     test = [r["test_accuracy"] for r in rounds]
     base = [r["baseline_accuracy"] for r in rounds]
-    
-    goal = rounds[0].get("attack_goal", {})
-    is_targeted = goal.get("strategy") == "targeted"
-    target_class = str(goal.get("label", "menu"))
 
     fig, ax = plt.subplots(figsize=(12, 5))
     apply_dark_style(ax, "Model Accuracy Over Rounds", "Round", "Accuracy")
-    
-    if is_targeted:
-        # Extract targeted class accuracies
-        cls_acc = []
-        best_class = None
-        for r in rounds:
-            pc = r.get("attack_metadata", {}).get("post_class_accuracy")
-            if not pc:
-                cls_acc.append(np.nan)
-                continue
-            
-            # If label is menu, the attacker dynamically targets the most vulnerable class each round.
-            # We track the class that was worst-hit in the final round to plot as the main target.
-            if target_class == "menu":
-                if best_class is None and r == rounds[-1]:
-                     best_class = min(pc, key=pc.get)
-                target = best_class if best_class is not None else 0 # fallback
-                cls_acc.append(pc.get(str(target), pc.get(target, np.nan)))
-            else:
-                cls_acc.append(pc.get(str(target_class), pc.get(int(target_class), np.nan)))
-                
-        # Fill missing values with the first valid one if necessary
+
+    if is_targeted_run(rounds):
+        cls_acc, _drop, cls_id = target_class_series(rounds)
+        # Forward-fill rounds with no per-class data yet (e.g. interlude rounds
+        # or rounds logged before baseline_class_accuracy was added).
         for i in range(1, len(cls_acc)):
-            if np.isnan(cls_acc[i]) and not np.isnan(cls_acc[i-1]):
-                 cls_acc[i] = cls_acc[i-1]
-                 
+            if np.isnan(cls_acc[i]) and not np.isnan(cls_acc[i - 1]):
+                cls_acc[i] = cls_acc[i - 1]
+
+        last_known = next((c for c in reversed(cls_id) if c is not None), None)
+        label_cfg = str(rounds[0].get("attack_goal", {}).get("label", "menu"))
+        target_name = f"worst-hit class (dynamic)" if label_cfg.lower() == "menu" else f"class {label_cfg}"
+        if last_known is not None:
+            target_name += f" — class {last_known} most recently"
+
         ax.plot(rns, base, "--", color=COLORS["text_dim"], linewidth=1.5, label="Global Baseline", alpha=0.5)
         ax.plot(rns, test, "-", color=COLORS["accent"], linewidth=2.0, label="Global Accuracy (Constrained)")
-        target_name = f"Class {best_class}" if target_class == "menu" else f"Class {target_class}"
-        ax.plot(rns, cls_acc, "-", color=COLORS["accent2"], linewidth=2.5, label=f"Target {target_name} Accuracy")
+        ax.plot(rns, cls_acc, "-", color=COLORS["accent2"], linewidth=2.5, label=f"Target accuracy ({target_name})")
         ax.fill_between(rns, cls_acc, 1.0, alpha=0.15, color=COLORS["accent2"])
     else:
         ax.plot(rns, base, "--", color=COLORS["accent3"], linewidth=1.5, label="Baseline", alpha=0.7)
         ax.plot(rns, test, "-", color=COLORS["accent"], linewidth=1.8, label="Test Accuracy")
         ax.fill_between(rns, test, base, alpha=0.12, color=COLORS["accent"])
-        
+
     ax.legend(facecolor=COLORS["card"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"])
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "01_accuracy.png"), dpi=150)
     plt.close(fig)
+
+
+def plot_target_class_drop(rounds, out_dir):
+    """Dedicated targeted-attack chart: target-class accuracy DROP over rounds,
+    plotted against global accuracy so the stealth-vs-damage story (global
+    barely moves while the target class collapses) is directly visible. Skips
+    (no file written) for untargeted runs or runs with no per-class data.
+    """
+    if not is_targeted_run(rounds):
+        return False
+    cls_acc, cls_drop, cls_id = target_class_series(rounds)
+    if all(np.isnan(d) for d in cls_drop):
+        return False
+
+    rns = [r["round_num"] for r in rounds]
+    test = [r["test_accuracy"] for r in rounds]
+    base = [r["baseline_accuracy"] for r in rounds]
+    goal = rounds[0].get("attack_goal", {})
+    max_global_drop = float(goal.get("max_global_drop", 0.03))
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+
+    ax = axes[0]
+    apply_dark_style(ax, "Global vs. Target-Class Accuracy", "Round", "Accuracy")
+    ax.plot(rns, base, "--", color=COLORS["text_dim"], linewidth=1.3, alpha=0.6, label="Global baseline")
+    ax.plot(rns, test, "-", color=COLORS["accent"], linewidth=2.0, label="Global accuracy")
+    ax.plot(rns, cls_acc, "-", color=COLORS["accent2"], linewidth=2.2, label="Target-class accuracy")
+    ax.set_ylim(-0.03, 1.03)
+    ax.legend(facecolor=COLORS["card"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=9)
+
+    ax = axes[1]
+    apply_dark_style(ax, "Target-Class Accuracy Drop vs. Stealth Ceiling", "Round", "Accuracy drop")
+    global_drop = [b - t for b, t in zip(base, test)]
+    ax.plot(rns, cls_drop, "-", color=COLORS["accent2"], linewidth=2.2, label="Target-class drop")
+    ax.plot(rns, global_drop, "-", color=COLORS["accent"], linewidth=1.4, alpha=0.75, label="Global accuracy drop")
+    ax.axhline(max_global_drop, color=COLORS["missed"], linewidth=1.2, linestyle=":",
+              label=f"Stealth ceiling (max_global_drop={max_global_drop:.2f})")
+    final_drop = next((d for d in reversed(cls_drop) if not np.isnan(d)), float("nan"))
+    ax.text(0.99, 0.95, f"Final target-class drop: {final_drop:.3f}", transform=ax.transAxes,
+           ha="right", va="top", fontsize=12, fontweight="bold", color=COLORS["accent2"])
+    ax.legend(facecolor=COLORS["card"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "11_target_class_drop.png"), dpi=150)
+    plt.close(fig)
+    return True
 
 
 def plot_rewards(rounds, out_dir):
@@ -404,15 +487,19 @@ def generate_html_report(rounds, out_dir, summary=None):
     mean_d = np.mean([r.get("defender_reward", 0.0) for r in rounds])
     final_acc = rounds[-1]["test_accuracy"]
     
-    goal = rounds[0].get("attack_goal", {})
-    is_targeted = goal.get("strategy") == "targeted"
-    
     target_info_html = ""
-    if is_targeted:
-        pc = rounds[-1].get("attack_metadata", {}).get("post_class_accuracy", {})
-        if pc:
-            worst_class, worst_acc = min(pc.items(), key=lambda x: x[1])
-            target_info_html = f'<div class="stat"><div class="val">{worst_acc:.4f}</div><div class="lbl">Class {worst_class} Acc</div></div>'
+    if is_targeted_run(rounds):
+        cls_acc, cls_drop, cls_id = target_class_series(rounds)
+        final_acc_val = next((v for v in reversed(cls_acc) if not np.isnan(v)), None)
+        final_drop_val = next((v for v in reversed(cls_drop) if not np.isnan(v)), None)
+        final_cls = next((c for c in reversed(cls_id) if c is not None), None)
+        if final_acc_val is not None:
+            target_info_html = (
+                f'<div class="stat"><div class="val">{final_acc_val:.4f}</div>'
+                f'<div class="lbl">Class {final_cls} Accuracy</div></div>'
+                f'<div class="stat"><div class="val">{final_drop_val:.4f}</div>'
+                f'<div class="lbl">Class {final_cls} Drop vs Baseline</div></div>'
+            )
 
     metrics_html = ""
     if summary and "aggregate" in summary:
@@ -496,6 +583,10 @@ def main():
     plot_attack_success_rate(rounds, args.out_dir); print("  ✓ 07_attack_success_rate.png")
     plot_defense_success_rate(rounds, args.out_dir); print("  ✓ 09_defense_success_rate.png")
     plot_flagged_breakdown(rounds, args.out_dir); print("  ✓ 10_flagged_breakdown.png")
+    if plot_target_class_drop(rounds, args.out_dir):
+        print("  ✓ 11_target_class_drop.png")
+    else:
+        print("  [INFO] not a targeted_label run (or no per-class data yet) — skipping 11_target_class_drop.png")
 
     if have_metrics:
         plot_confusion_matrix(rounds, args.out_dir); print("  ✓ 05_confusion_matrix.png")

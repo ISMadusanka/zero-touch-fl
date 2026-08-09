@@ -296,6 +296,7 @@ def _run_fl_interlude(state, next_learner, phase_index):
             "prev_accuracy": info["prev_accuracy"],
             "post_accuracy": info["post_accuracy"],
             "post_class_accuracy": info.get("post_class_accuracy"),
+            "baseline_class_accuracy": env.baseline_class_accuracies,
             "n_clients": info["n_clients"],
             "clients": [
                 {"client_id": u.client_id, **(u.metadata or {})} for u in updates
@@ -449,6 +450,7 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             "controllable_pool": ctx.pool_ids,
             "attack_diversity": round(float(diversity), 4),
             "post_class_accuracy": info.get("post_class_accuracy"),
+            "baseline_class_accuracy": env.baseline_class_accuracies,
             "phase_index": phase_index,
             "phase_round": phase_round,
             "learner_success": success,
