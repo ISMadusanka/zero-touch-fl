@@ -305,12 +305,19 @@ signal: the mean over poisoned clients of `1 − P(malicious)`, where `P(malicio
 is derived from the defender's **confidence** (`_soft_malicious_prob`). Continuous
 (not 0/1) on purpose — it gives GRPO a usable spread even when the hard flags tie.
 
-**`defender_reward`** ([rl/rewards.py:82](rl/rewards.py), default `soft_f1`):
-a confidence-weighted F1 of "flagged the poisoned clients, spared the honest ones."
-Range [0, 1].
+**`defender_reward`** ([rl/rewards.py](rl/rewards.py), default `soft_balanced`):
+`mean soft P(malicious | poisoned) − fpr_penalty × mean soft P(malicious | benign)`.
+Range `[-fpr_penalty, 1]`. Class-balanced, so it stays informative at realistic
+poisoned/honest ratios — `soft_f1`'s precision term is `tp/(tp+fp)`, which with one
+poisoned client in twenty caps F1 at 0.50 after just two false positives and flattens
+into a band indistinguishable from flagging nobody.
 
-**`group_advantages`** ([rl/rewards.py:119](rl/rewards.py)): the z-scoring from §4,
-plus the `zero_advantage_fraction` signal.
+**`group_advantages`** ([rl/rewards.py](rl/rewards.py)): the z-scoring from §4, plus
+the `zero_advantage_fraction` signal. The degeneracy test is **relative** (`std` below
+`rel_floor × the group's reward scale`, default 1%), not just `std < 1e-6`: a reward
+function that has flattened out produces a narrow band that the absolute test waves
+through, and z-scoring then rescales that noise into full ±1 advantages — a healthy
+looking `zero_adv=0.00` while the policy trains on nothing.
 
 ---
 

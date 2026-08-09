@@ -25,15 +25,20 @@ class RoundMetrics:
     tn: int
 
     # Per-round derived rates
-    attack_success: bool            # at least one malicious client passed detection
+    attack_success: bool            # the attack GOAL was met (see `goal_evaluated`)
+    attack_evaded: bool             # at least one malicious client passed detection
+    goal_evaluated: bool            # False => the caller could not judge the goal and
+                                    #   `attack_success` falls back to `attack_evaded`
     tpr: float                      # recall on malicious clients (TP / (TP + FN))
     fpr: float                      # FP / (FP + TN)
     recall: float                   # alias of TPR — kept explicit for clarity
-    accuracy_preservation_rate: float  # current_accuracy / baseline_accuracy
+    accuracy_preservation_rate: float  # current_accuracy / reference_accuracy
+    baseline_preservation_rate: float  # current_accuracy / baseline_accuracy
 
     # Raw accuracies, helpful for downstream analysis
     current_accuracy: float
-    baseline_accuracy: float
+    baseline_accuracy: float        # immutable Phase-1 anchor
+    reference_accuracy: float       # THIS round's clean counterfactual
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -52,14 +57,18 @@ class AggregateMetrics:
     tn: int
 
     # Cumulative rates
-    attack_success_rate: float      # rounds_with_attack_success / total_rounds
+    attack_success_rate: float      # rounds the attack GOAL was met / total_rounds
+    attack_evasion_rate: float      # rounds a malicious client slipped through / total
+    goal_evaluated_rounds: int      # rounds where the goal could actually be judged
     tpr: float                      # sum(TP) / (sum(TP) + sum(FN))
     fpr: float                      # sum(FP) / (sum(FP) + sum(TN))
     recall: float                   # alias of TPR
 
     # Accuracy preservation uses the final round's accuracy
-    accuracy_preservation_rate: float
+    accuracy_preservation_rate: float   # vs. the final round's clean reference
+    baseline_preservation_rate: float   # vs. the immutable Phase-1 anchor
     baseline_accuracy: float
+    reference_accuracy: float
     final_accuracy: float
 
     def to_dict(self) -> dict[str, Any]:

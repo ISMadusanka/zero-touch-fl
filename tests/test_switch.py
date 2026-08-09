@@ -10,7 +10,8 @@ from dataclasses import dataclass
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rl.switch import (  # noqa: E402
-    PhaseController, SwitchConfig, attacker_succeeded, committed_success, defender_succeeded,
+    PhaseController, SwitchConfig, attacker_succeeded, attacker_win_bar,
+    committed_success, defender_succeeded,
 )
 
 
@@ -39,6 +40,29 @@ def test_attacker_success_predicate():
     assert not attacker_succeeded(0.05, [V(0, True)], [0], cfg)
     # No poisoned clients -> never a win.
     assert not attacker_succeeded(0.5, [V(0, False)], [], cfg)
+
+
+def test_win_bar_is_the_fraction_not_the_target():
+    """The logged run printed `drop=+0.400/0.500` and read like a failure, but
+    with win_fraction=0.6 the bar was 0.300 and the round had cleared it. The
+    bar is now derivable from one function so logs and the gate agree."""
+    cfg = _cfg(win_fraction=0.6)
+    terms = {"effective_target": 0.50, "collateral": 0.004, "max_collateral": 0.05}
+    goal = {"type": "targeted_label", "label": 0, "target_class_drop": 0.50}
+
+    assert abs(attacker_win_bar(cfg, goal, terms) - 0.30) < 1e-9
+    # 0.400 clears the real bar even though it is short of the 0.500 target.
+    assert attacker_succeeded(0.400, [V(0, False)], [0], cfg, goal, terms)
+    assert not attacker_succeeded(0.299, [V(0, False)], [0], cfg, goal, terms)
+
+    # Collateral over tolerance still loses, however much damage was done.
+    over = dict(terms, collateral=0.09)
+    assert not attacker_succeeded(0.942, [V(0, False)], [0], cfg, goal, over)
+
+    # Without targeted terms the bar falls back to win_fraction * goal target.
+    assert abs(attacker_win_bar(cfg, goal, None) - 0.30) < 1e-9
+    # With neither, the absolute floor applies.
+    assert abs(attacker_win_bar(cfg, None, None) - cfg.attacker_min_drop) < 1e-9
 
 
 def test_defender_success_predicate():

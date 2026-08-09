@@ -101,12 +101,95 @@ def test_defender_rewarded_for_silence_on_a_clean_round():
     assert abs(noisy - 0.0) < 1e-9
 
 
-def test_defender_still_scored_on_f1_when_poison_exists():
+def test_defender_scored_on_detection_when_poison_exists():
     verdicts = [DetectionVerdict(0, True, 1.0, "")] + [
         DetectionVerdict(i, False, 1.0, "") for i in range(1, 20)]
     assert abs(defender_reward(verdicts, [0]) - 1.0) < 1e-6      # perfect catch
     missed = [DetectionVerdict(i, False, 1.0, "") for i in range(20)]
     assert defender_reward(missed, [0]) < 0.01                   # missed it entirely
+
+
+# --- 4. defender reward separability at a realistic class ratio --------------
+
+def _flagging(flagged: set, n_clients=20):
+    """Confident verdicts: every id in `flagged` is called malicious."""
+    return [DetectionVerdict(i, i in flagged, 1.0, "") for i in range(n_clients)]
+
+
+def test_defender_reward_separates_every_false_positive_count():
+    """With 1 poisoned client in 20, soft_f1's precision term collapsed: flagging
+    the attacker + 17 honest clients scored 0.105 while flagging NOBODY scored
+    ~0.09 — indistinguishable, so a GRPO group had no usable spread and the
+    defender phases trained on noise. soft_balanced must stay strictly ordered."""
+    catch_plus = [defender_reward(_flagging({0} | set(range(1, 1 + k))), [0])
+                  for k in (0, 2, 5, 17)]
+    assert all(a > b for a, b in zip(catch_plus, catch_plus[1:])), catch_plus
+    # Every rung is separated by a real margin, not F1's ~0.01 tail.
+    assert min(a - b for a, b in zip(catch_plus, catch_plus[1:])) > 0.05
+
+    # The logged pathology: round 46 flagged the attacker + 17 honest clients
+    # and round 67 flagged nobody, and soft_f1 scored them 0.095 vs 0.094. The
+    # ordering is now correct and the margin is ~100x wider.
+    did_nothing = defender_reward(_flagging(set()), [0])
+    assert catch_plus[-1] - did_nothing > 0.1
+
+    # Flagging ALL 20 nets to exactly `did_nothing`: it catches the attacker but
+    # empties the aggregate. That tie is deliberate — paralysing the round and
+    # waving the poison through are both worthless, and neither is safer than
+    # the other. What matters is that both sit far below an actual catch.
+    panic = defender_reward(_flagging(set(range(20))), [0])
+    assert abs(panic - did_nothing) < 1e-9
+    assert catch_plus[0] - panic > 0.9
+
+
+def test_soft_f1_still_available_and_still_collapses():
+    """Documents WHY the default moved: same verdicts, two modes."""
+    v = _flagging({0, 1, 2})                       # attacker + 2 false positives
+    assert defender_reward(v, [0], mode="soft_f1") < 0.55
+    assert defender_reward(v, [0], mode="soft_balanced") > 0.85
+
+
+# --- 5. stealth centering ----------------------------------------------------
+
+def _caught(ids, n_clients=20):
+    return [DetectionVerdict(cid, cid in ids, 1.0, "") for cid in range(n_clients)]
+
+
+def test_centered_stealth_makes_detection_an_actual_penalty():
+    """Uncentered, being caught only forgoes +beta while damage pays 1.0+, so the
+    policy learns 'wreck the class, ignore the detector'. Centered, it costs."""
+    kw = dict(goal=GOAL, poisoned_ids=[0], n_malformed=0, pool_size=5)
+    caught_plain = attacker_reward(0.90, 0.88, verdicts=_caught({0}), **kw)
+    caught_centered = attacker_reward(0.90, 0.88, verdicts=_caught({0}),
+                                      stealth_centered=True, **kw)
+    assert caught_plain > 0.0            # old behaviour: caught, still rewarded
+    assert caught_centered < 0.0         # now it is a loss
+
+    # The swing between caught and clean doubles to 2*beta, comparable to alpha.
+    clean_centered = attacker_reward(0.90, 0.88, verdicts=_evaded([0]),
+                                     stealth_centered=True, **kw)
+    assert abs((clean_centered - caught_centered) - 1.0) < 1e-9
+
+
+# --- 6. group-advantage stall detection --------------------------------------
+
+def test_flat_reward_band_is_reported_as_zero_advantage():
+    """A defender group landing in 0.087..0.094 has no signal, but the old
+    absolute `std < 1e-6` test passed it and the normalization then rescaled
+    that noise into full +/-1 advantages — `zero_adv=0.00` while training on
+    nothing."""
+    flat = [0.087, 0.0905, 0.094, 0.0885]
+    _adv, zero_frac = group_advantages(flat)
+    assert zero_frac == 1.0
+    # The old absolute-only behaviour is still reachable, and still fooled.
+    _adv, legacy = group_advantages(flat, rel_floor=0.0)
+    assert legacy == 0.0
+
+
+def test_real_spread_still_trains():
+    adv, zero_frac = group_advantages([-0.8, 0.1, 0.5, 1.4])
+    assert zero_frac == 0.0
+    assert max(adv) > 0 > min(adv)
 
 
 def test_attacker_punished_for_a_wasted_round():

@@ -15,7 +15,8 @@ import logging
 import torch
 
 from core.types import DetectionVerdict, RoundLog
-from rl.rewards import attacker_reward, defender_reward
+from rl.rewards import attacker_reward, defender_reward, goal_drop, targeted_terms
+from rl.switch import SwitchConfig, attacker_succeeded
 
 logger = logging.getLogger(__name__)
 
@@ -67,14 +68,19 @@ def fixed_defender(features: dict[int, dict], rel_norm_thr: float = 2.0,
     return verdicts
 
 
-def run_baseline(env, n_rounds, metrics_tracker, save_round_log, defender=None):
+def run_baseline(env, n_rounds, metrics_tracker, save_round_log, defender=None,
+                 switch_cfg: SwitchConfig | None = None):
     """Run ``n_rounds`` of best-of-N fixed-action attack vs a fixed defense.
 
     ``defender`` defaults to the norm/sign heuristic :func:`fixed_defender`. Pass a
     defender policy (``rl/defenders.py``) to substitute another non-LLM defense —
     ``main.py --baseline --freeze defender`` passes the algorithmic ensemble, which
     exercises env + ensemble + rewards end-to-end with no LLM and no GPU.
+
+    ``switch_cfg`` supplies the win-gate thresholds used to judge each round's
+    attack GOAL; defaults to :class:`SwitchConfig`'s own defaults.
     """
+    switch_cfg = switch_cfg or SwitchConfig()
     logger.info(f"[baseline] running {n_rounds} best-of-N round(s) — no LLM, no GPU "
                 f"(defense: {defender.describe() if defender else 'norm/sign heuristic'})")
 
@@ -133,7 +139,16 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log, defender=None):
                                 clean_eval=ctx.clean_eval, post_eval=committed_eval)
         d_rew = defender_reward(verdicts, chosen_ids)
 
-        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
+        # Judge the round on the attack GOAL (damage + collateral + evasion), the
+        # same way training does — a scripted baseline that merely slips past the
+        # detector is not a successful targeted attack.
+        terms = targeted_terms(ctx.goal, ctx.clean_eval, committed_eval)
+        goal_met = attacker_succeeded(
+            goal_drop(ctx.goal, ctx.clean_accuracy, new_acc, ctx.clean_eval, committed_eval),
+            verdicts, chosen_ids, switch_cfg, ctx.goal, terms)
+        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids),
+                               reference_accuracy=ctx.clean_accuracy,
+                               attack_goal_met=goal_met)
         save_round_log(RoundLog(
             round_num=ctx.round_num,
             attack_goal=ctx.goal,

@@ -70,9 +70,11 @@ average, so no push; **D** is mildly rewarded. The defender drifts toward
 **"flag the real outlier confidently, don't miss it, don't falsely accuse
 anyone."**
 
-> **What the defender is rewarded for:** a confidence-weighted F1 score — catch
-> the bad client (recall), spare the good ones (precision), and be confident when
-> right. See `defender_reward` (`soft_f1`) in `rl/rewards.py`. Ground truth is
+> **What the defender is rewarded for:** confidence-weighted detection minus
+> confidence-weighted false alarms — catch the bad client, spare the good ones,
+> and be confident when right. See `defender_reward` (`soft_balanced`) in
+> `rl/rewards.py`; the older `soft_f1` mode is still selectable but its precision
+> term collapses when only one client in twenty is poisoned. Ground truth is
 > used **only** to compute the reward; the defender never sees the answer in its
 > prompt — it must infer it from the statistical clues (`detector/features.py`).
 
@@ -432,8 +434,18 @@ A healthy attacker phase shows `WIN` appearing more often as the phase goes on,
 ### 7.6 Other data sources
 
 - **`logs/metrics/` (`metrics.tracker`)** — per-round `tp/fn/fp/tn`, `tpr`, `fpr`,
-  `apr` (accuracy-preservation ratio = current/baseline), and `attack_success`
-  (was any poisoned client missed). Good for a ground-truth view of detection.
+  `apr` (accuracy-preservation ratio = current / **this round's clean reference**;
+  `baseline_preservation_rate` is the same thing against the fixed Phase-1 anchor),
+  and two separate success flags:
+  - **`attack_success`** — the attack GOAL was met: enough of the target class
+    destroyed, collateral within tolerance, and the poisoned client evaded. Same
+    predicate as the schedule's win-gate (`rl.switch.attacker_succeeded`).
+  - **`attack_evaded`** — merely "was any poisoned client missed".
+
+  These are **not** interchangeable. Evasion alone counts a round where the
+  detector stayed quiet as a success even if the model came out healthier than
+  baseline. `goal_evaluated=false` marks rounds where the caller had no goal
+  information and `attack_success` fell back to evasion.
 - **`logs/round_data/round_*.json`** — the raw record per round. Beyond what the
   monitor charts, each file now also stores `attack_metadata.phase_index`,
   `phase_round`, `learner_success`, and `train.stepped` / `train.resampled` — useful

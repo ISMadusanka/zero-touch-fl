@@ -253,17 +253,34 @@ def plot_detection_rates(rounds, out_dir):
 
 
 def plot_attack_success_rate(rounds, out_dir):
+    """Cumulative ASR (goal met) against cumulative evasion.
+
+    The two are NOT the same thing and used to be plotted as one: evasion only
+    asks whether the poisoned client slipped past the detector, so under a
+    targeted goal a round that left the model healthier than baseline still
+    counted as a successful attack. Both series are drawn so the gap between
+    "got through" and "actually did the damage" is visible.
+    """
     rns, flags = _metric_series(rounds, "attack_success")
     if not rns:
         return
-    flags = np.array([1 if x else 0 for x in flags])
-    cum = np.cumsum(flags) / np.arange(1, len(flags) + 1)
+    n = np.arange(1, len(flags) + 1)
+    cum = np.cumsum(np.array([1 if x else 0 for x in flags])) / n
     fig, ax = plt.subplots(figsize=(12, 4.5))
-    apply_dark_style(ax, "Attack Success Rate (cumulative)", "Round", "ASR")
-    ax.plot(rns, cum, color=COLORS["accent2"], linewidth=2.2, label="Cumulative ASR")
+    apply_dark_style(ax, "Attack Success Rate (cumulative)", "Round", "rate")
+    ax.plot(rns, cum, color=COLORS["accent2"], linewidth=2.2, label="ASR (goal met)")
     ax.fill_between(rns, 0, cum, color=COLORS["accent2"], alpha=0.12)
+
+    ev_rns, ev_flags = _metric_series(rounds, "attack_evaded")
+    label = f"Final ASR: {cum[-1]:.3f}"
+    if ev_rns:
+        ev_cum = (np.cumsum(np.array([1 if x else 0 for x in ev_flags]))
+                  / np.arange(1, len(ev_flags) + 1))
+        ax.plot(ev_rns, ev_cum, color=COLORS["accent3"], linewidth=1.6,
+                linestyle="--", label="Evasion (slipped past detector)")
+        label += f"   Evasion: {ev_cum[-1]:.3f}"
     ax.set_ylim(0, 1.05)
-    ax.text(0.99, 0.95, f"Final ASR: {cum[-1]:.3f}", transform=ax.transAxes, ha="right", va="top",
+    ax.text(0.99, 0.95, label, transform=ax.transAxes, ha="right", va="top",
             fontsize=12, fontweight="bold", color=COLORS["accent2"])
     ax.legend(facecolor=COLORS["card"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=9)
     fig.tight_layout()

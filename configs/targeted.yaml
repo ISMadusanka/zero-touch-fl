@@ -164,6 +164,13 @@ rl:
     attacker:
       alpha: 1.0                  # weight on the TARGET CLASS's recall-drop term
       beta: 0.5                   # weight on evasion (stealth)
+      stealth_centered: true      # map stealth to [-1, +1] instead of [0, 1], so getting
+                                  # CAUGHT costs -beta instead of merely forgoing +beta.
+                                  # Uncentered, detection is worth at most `beta` while the
+                                  # damage term pays 1.0+, so the policy learns "wreck the
+                                  # class, ignore the detector" — an indiscriminate attack
+                                  # wearing a targeted goal. Centering makes the swing
+                                  # between caught and clean 2*beta, comparable to alpha.
       gamma: 1.0                  # penalty for malformed / wasted clients
       delta: 0.3                  # penalty for using MORE poison clients than needed
                                   # (INERT at n_compromisable=1 / max_poison_clients=1 —
@@ -175,5 +182,15 @@ rl:
                                   # merely destructive — with eta=0 the policy just
                                   # rediscovers the untargeted whole-model attack.
     defender:
-      mode: "soft_f1"
-      fpr_penalty: 1.0
+      mode: "soft_balanced"       # soft_balanced | soft_f1 | tpr_minus_fpr
+                                  # soft_f1's precision term collapses at this class
+                                  # ratio (1 poisoned client in 20): flagging the attacker
+                                  # plus 2 honest clients already caps F1 at 0.50, plus 17
+                                  # at 0.105 — and flagging NOBODY also scores ~0.09, so
+                                  # "caught it but destroyed the aggregate" and "did
+                                  # nothing" were numerically identical and the GRPO group
+                                  # had no usable spread. soft_balanced degrades linearly
+                                  # in the false-positive RATE instead.
+      fpr_penalty: 1.0            # weight on the benign-flagging term. Every honest client
+                                  # flagged is dropped from FedAvg, so this is also what
+                                  # charges the defender for wrecking the round.

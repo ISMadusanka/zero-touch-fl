@@ -8,8 +8,12 @@ def parse_log(log_path):
     learn_dict = {}
     
     # Regexes to capture relevant fields
-    # Example: [metrics.tracker] INFO: Metrics [round=22] ... attack_success=True
-    metrics_re = re.compile(r'Metrics \[round=(\d+)\].*attack_success=(True|False)')
+    # Example: [metrics.tracker] INFO: Metrics [round=22] ... goal_met=True evaded=True
+    # `goal_met` is the attack GOAL (damage + collateral + evasion); the older
+    # `attack_success=` spelling meant evasion alone and is still accepted so
+    # logs from before the rename keep parsing.
+    metrics_re = re.compile(
+        r'Metrics \[round=(\d+)\].*?(?:goal_met|attack_success)=(True|False)')
     # Example: [rl.schedule] INFO: Round 22 [learn=attacker
     learn_re = re.compile(r'Round (\d+) \[learn=(attacker|defender)')
     

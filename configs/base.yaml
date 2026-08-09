@@ -162,5 +162,8 @@ rl:
                                   # 1 - mean pairwise cosine of chosen clients' perturbations
                                   # (0 for a single client). Rewards distinct, coordinated roles.
     defender:
-      mode: "soft_f1"             # soft_f1 | tpr_minus_fpr
+      mode: "soft_balanced"       # soft_balanced | soft_f1 | tpr_minus_fpr
+                                  # soft_f1's precision term is swamped when only a
+                                  # handful of clients are poisoned — see rl/rewards.py
+                                  # defender_reward for the numbers.
       fpr_penalty: 1.0

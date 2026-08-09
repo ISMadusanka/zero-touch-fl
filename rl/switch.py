@@ -72,6 +72,23 @@ def _tpr_fpr(verdicts, poisoned_ids) -> tuple[float, float]:
     return tpr, fpr
 
 
+def attacker_win_bar(cfg: SwitchConfig, goal: dict | None = None,
+                     terms: dict | None = None) -> float:
+    """The drop the attacker must actually reach this round to count as a win.
+
+    This is ``win_fraction * target``, NOT the target itself — with the shipped
+    ``win_fraction=0.6`` and a 0.50 target the real bar is 0.30. Exposed so logs
+    and metrics quote the same number :func:`attacker_succeeded` compares
+    against, instead of printing the target and leaving a cleared round looking
+    like a failure.
+    """
+    if terms is not None:
+        return cfg.win_fraction * terms["effective_target"]
+    if goal is not None:
+        return cfg.win_fraction * goal_target(goal)
+    return cfg.attacker_min_drop
+
+
 def attacker_succeeded(drop: float, verdicts, poisoned_ids, cfg: SwitchConfig,
                        goal: dict | None = None, terms: dict | None = None) -> bool:
     """True when the committed attack 'passed': enough poisoned clients evaded
@@ -102,11 +119,9 @@ def attacker_succeeded(drop: float, verdicts, poisoned_ids, cfg: SwitchConfig,
     if not evaded_frac >= cfg.attacker_min_evaded:
         return False
     if terms is not None:
-        return (drop >= cfg.win_fraction * terms["effective_target"]
+        return (drop >= attacker_win_bar(cfg, goal, terms)
                 and terms["collateral"] <= terms["max_collateral"])
-    min_drop = (cfg.win_fraction * goal_target(goal) if goal is not None
-                else cfg.attacker_min_drop)
-    return drop >= min_drop
+    return drop >= attacker_win_bar(cfg, goal, terms)
 
 
 def defender_succeeded(verdicts, poisoned_ids, cfg: SwitchConfig) -> bool:

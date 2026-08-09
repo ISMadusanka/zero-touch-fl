@@ -49,7 +49,15 @@ class MetricsTracker:
         self._total_rounds = 0
         self._tp = self._fn = self._fp = self._tn = 0
         self._n_attack_successes = 0
+        self._n_attack_evasions = 0
+        self._n_goal_evaluated = 0
         self._final_accuracy = 0.0
+        # The clean counterfactual of the most recent round. Unlike
+        # `baseline_accuracy` (pinned at the Phase-1 value for the whole run) this
+        # tracks the model an honest FL interlude leaves behind, so accuracy
+        # preservation keeps meaning "vs. what this round would have been without
+        # the attack" instead of drifting against a stale anchor.
+        self._reference_accuracy: float = float(baseline_accuracy)
 
         os.makedirs(self.output_dir, exist_ok=True)
         logger.info(
@@ -65,17 +73,27 @@ class MetricsTracker:
         verdicts: list[DetectionVerdict],
         current_accuracy: float,
         malicious_ids: set[int],
+        reference_accuracy: float | None = None,
+        attack_goal_met: bool | None = None,
     ) -> RoundMetrics:
         """Compute and store metrics for a single round. Returns them.
 
         ``malicious_ids`` is this round's ground-truth poisoned set.
+        ``reference_accuracy`` is the round's clean counterfactual and
+        ``attack_goal_met`` the goal-level verdict from
+        ``rl.switch.attacker_succeeded`` — see :func:`compute_round_metrics` for
+        why detection metrics alone cannot stand in for either.
         """
+        if reference_accuracy is not None:
+            self._reference_accuracy = float(reference_accuracy)
         metrics = compute_round_metrics(
             round_num=round_num,
             verdicts=verdicts,
             malicious_ids=set(malicious_ids),
             current_accuracy=current_accuracy,
             baseline_accuracy=self.baseline_accuracy,
+            reference_accuracy=self._reference_accuracy,
+            attack_goal_met=attack_goal_met,
         )
         self.rounds.append(metrics)
         self._total_rounds += 1
@@ -84,6 +102,8 @@ class MetricsTracker:
         self._fp += metrics.fp
         self._tn += metrics.tn
         self._n_attack_successes += int(metrics.attack_success)
+        self._n_attack_evasions += int(metrics.attack_evaded)
+        self._n_goal_evaluated += int(metrics.goal_evaluated)
         self._final_accuracy = metrics.current_accuracy
         self._log_round(metrics)
         self._save_round(metrics)
@@ -101,24 +121,29 @@ class MetricsTracker:
             logger.warning("MetricsTracker.aggregate() called with no rounds recorded")
             return AggregateMetrics(
                 total_rounds=0, tp=0, fn=0, fp=0, tn=0,
-                attack_success_rate=0.0, tpr=0.0, fpr=0.0, recall=0.0,
-                accuracy_preservation_rate=0.0,
-                baseline_accuracy=self.baseline_accuracy, final_accuracy=0.0,
+                attack_success_rate=0.0, attack_evasion_rate=0.0,
+                goal_evaluated_rounds=0, tpr=0.0, fpr=0.0, recall=0.0,
+                accuracy_preservation_rate=0.0, baseline_preservation_rate=0.0,
+                baseline_accuracy=self.baseline_accuracy,
+                reference_accuracy=self._reference_accuracy, final_accuracy=0.0,
             )
 
         tp, fn, fp, tn = self._tp, self._fn, self._fp, self._tn
-        n_attack_successes = self._n_attack_successes
         final_accuracy = self._final_accuracy
 
         return AggregateMetrics(
             total_rounds=total_rounds,
             tp=tp, fn=fn, fp=fp, tn=tn,
-            attack_success_rate=_safe_div(n_attack_successes, total_rounds),
+            attack_success_rate=_safe_div(self._n_attack_successes, total_rounds),
+            attack_evasion_rate=_safe_div(self._n_attack_evasions, total_rounds),
+            goal_evaluated_rounds=self._n_goal_evaluated,
             tpr=_safe_div(tp, tp + fn),
             fpr=_safe_div(fp, fp + tn),
             recall=_safe_div(tp, tp + fn),
-            accuracy_preservation_rate=_safe_div(final_accuracy, self.baseline_accuracy),
+            accuracy_preservation_rate=_safe_div(final_accuracy, self._reference_accuracy),
+            baseline_preservation_rate=_safe_div(final_accuracy, self.baseline_accuracy),
             baseline_accuracy=self.baseline_accuracy,
+            reference_accuracy=self._reference_accuracy,
             final_accuracy=final_accuracy,
         )
 
@@ -146,21 +171,27 @@ class MetricsTracker:
     def _log_round(self, m: RoundMetrics) -> None:
         logger.info(
             "Metrics [round=%d] tp=%d fn=%d fp=%d tn=%d | "
-            "attack_success=%s tpr=%.3f fpr=%.3f apr=%.3f (acc=%.4f / baseline=%.4f)",
+            "goal_met=%s%s evaded=%s tpr=%.3f fpr=%.3f apr=%.3f "
+            "(acc=%.4f / clean_ref=%.4f / baseline=%.4f)",
             m.round_num, m.tp, m.fn, m.fp, m.tn,
-            m.attack_success, m.tpr, m.fpr, m.accuracy_preservation_rate,
-            m.current_accuracy, m.baseline_accuracy,
+            m.attack_success, "" if m.goal_evaluated else "(unjudged)",
+            m.attack_evaded, m.tpr, m.fpr, m.accuracy_preservation_rate,
+            m.current_accuracy, m.reference_accuracy, m.baseline_accuracy,
         )
 
     def _log_summary(self, agg: AggregateMetrics, out_path: str) -> None:
         logger.info("=" * 60)
         logger.info("AGGREGATE METRICS (over %d round(s))", agg.total_rounds)
         logger.info("  Confusion: TP=%d FN=%d FP=%d TN=%d", agg.tp, agg.fn, agg.fp, agg.tn)
-        logger.info("  Attack Success Rate (ASR):     %.4f", agg.attack_success_rate)
+        logger.info("  Attack Success Rate (goal met): %.4f  [%d/%d rounds judged]",
+                    agg.attack_success_rate, agg.goal_evaluated_rounds, agg.total_rounds)
+        logger.info("  Attack Evasion Rate (slipped): %.4f", agg.attack_evasion_rate)
         logger.info("  True Positive Rate (TPR):      %.4f", agg.tpr)
         logger.info("  False Positive Rate (FPR):     %.4f", agg.fpr)
-        logger.info("  Accuracy Preservation Rate:    %.4f (final=%.4f / baseline=%.4f)",
-                    agg.accuracy_preservation_rate, agg.final_accuracy, agg.baseline_accuracy)
+        logger.info("  Accuracy Preservation Rate:    %.4f (final=%.4f / clean_ref=%.4f)",
+                    agg.accuracy_preservation_rate, agg.final_accuracy, agg.reference_accuracy)
+        logger.info("  vs. Phase-1 baseline:          %.4f (final=%.4f / baseline=%.4f)",
+                    agg.baseline_preservation_rate, agg.final_accuracy, agg.baseline_accuracy)
         logger.info("  Summary saved to %s", out_path)
         logger.info("=" * 60)
 

@@ -268,7 +268,7 @@ overall accuracy and the ten recalls from the same single pass over the test set
 
 ```
 Round 312 [learn=attacker ph=4.7 WIN]: acc 0.7810->0.7003 (clean_ref=0.7814 drop=+0.0811)
-  | TGT[3] 0.812->0.041 (drop=+0.771/0.812) collat=0.004/0.050
+  | TGT[3] 0.812->0.041 (drop=+0.771 bar=0.487 of tgt=0.812) collat=0.004/0.050 goal=MET
   | att_reward=1.284 def_reward=0.220 | grpo_loss=-0.0113 mean_r=0.842 zero_adv=0.00 step
 ```
 
@@ -277,6 +277,11 @@ says the other nine classes lost 0.4 points of mean recall against a 5-point tol
 this was a genuinely targeted hit. Note overall accuracy only fell 8 points; on 10
 classes, destroying one **cannot** cost more than ~10. Judging a targeted run by overall
 accuracy will always make a total success look like a near-miss.
+
+**`bar` is the number that matters, not `tgt`.** The win-gate compares the drop against
+`win_fraction × effective_target` (0.6 × 0.812 = 0.487 here), not against the effective
+target itself. A round reading `drop=+0.400 bar=0.300 of tgt=0.500` has *cleared* the
+gate. `goal=MET|no` states the verdict outright so there is nothing to infer.
 
 Every round also lands in `logs/targeted/round_data/rounds.jsonl` under
 `attack_metadata.targeted` with the full `per_class_clean` / `per_class_post` vectors.

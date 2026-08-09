@@ -11,8 +11,9 @@ import logging
 
 from core.types import RoundLog
 from rl.rewards import (
-    attacker_reward, defender_reward, perturbation_diversity, targeted_terms,
+    attacker_reward, defender_reward, goal_drop, perturbation_diversity, targeted_terms,
 )
+from rl.switch import SwitchConfig, attacker_succeeded
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ def run_inference(
     metrics_tracker,
     save_round_log,
     temperature: float = 0.7,
+    switch_cfg: SwitchConfig | None = None,
 ):
     """Run ``n_rounds`` of the arms race with frozen LLMs (no learning).
 
@@ -47,7 +49,12 @@ def run_inference(
     LLM normally, or the non-LLM algorithmic ensemble under ``--freeze defender``
     — which makes this the cheapest end-to-end check of that defense (CPU only,
     one LLM call per round).
+
+    ``switch_cfg`` supplies the win-gate thresholds used to judge whether each
+    round's attack GOAL was met (not merely whether it evaded detection);
+    defaults to :class:`SwitchConfig`'s own defaults when the caller has none.
     """
+    switch_cfg = switch_cfg or SwitchConfig()
     logger.info(f"[dry-run] running {n_rounds} inference round(s) — no weight updates "
                 f"(defense: {defender.describe()})")
     for _ in range(n_rounds):
@@ -87,7 +94,14 @@ def run_inference(
                                 clean_eval=ctx.clean_eval, post_eval=post_eval)
         d_rew = defender_reward(verdicts, chosen_ids)
 
-        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
+        # Same goal-level verdict the trainer records, so a --dry-run summary is
+        # comparable with a training run instead of reporting bare evasion.
+        goal_met = attacker_succeeded(
+            goal_drop(ctx.goal, ctx.clean_accuracy, new_acc, ctx.clean_eval, post_eval),
+            verdicts, chosen_ids, switch_cfg, ctx.goal, terms)
+        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids),
+                               reference_accuracy=ctx.clean_accuracy,
+                               attack_goal_met=goal_met)
         save_round_log(RoundLog(
             round_num=ctx.round_num,
             attack_goal=ctx.goal,

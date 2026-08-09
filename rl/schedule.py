@@ -43,7 +43,9 @@ from rl.policy import PolicyGenerator
 from rl.rewards import (
     attacker_reward, defender_reward, goal_drop, perturbation_diversity, targeted_terms,
 )
-from rl.switch import PhaseController, SwitchConfig, committed_success
+from rl.switch import (
+    PhaseController, SwitchConfig, attacker_succeeded, attacker_win_bar, committed_success,
+)
 from rl.turns import AttackerTurn, DefenderTurn
 
 logger = logging.getLogger(__name__)
@@ -341,7 +343,8 @@ def _step_round(state, learner, opp, opp_gen, phase_index, phase_round):
     _log_round(env, ctx, info, learner, stats, state["metrics_tracker"],
                state["save_round_log"], reward_att=k["reward_att"], reward_def=k["reward_def"],
                phase_index=phase_index, phase_round=phase_round, success=success,
-               best_index=best, poisoned_ids=poisoned_ids, terms=terms)
+               best_index=best, poisoned_ids=poisoned_ids, terms=terms,
+               switch_cfg=state["switch_cfg"], drop=drop)
     return stats, drop, success
 
 
@@ -645,7 +648,8 @@ def _save_adapters(state):
 
 def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                reward_att=None, reward_def=None, phase_index=0, phase_round=0,
-               success=False, best_index=0, poisoned_ids=None, terms=None):
+               success=False, best_index=0, poisoned_ids=None, terms=None,
+               switch_cfg=None, drop=None):
     verdicts = info["verdicts"]
     post_acc = info["post_accuracy"]
     n_malformed = info["n_malformed"]
@@ -668,13 +672,23 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                             delta=reward_att.get("delta", 0.0),
                             zeta=reward_att.get("zeta", 0.0),
                             eta=reward_att.get("eta", 1.0),
+                            stealth_centered=reward_att.get("stealth_centered", False),
                             pool_size=env.n_compromisable,
                             diversity=diversity,
                             clean_eval=ctx.clean_eval,
                             post_eval=info.get("post_eval"))
     d_rew = defender_reward(verdicts, poisoned_ids,
-                            mode=reward_def.get("mode", "soft_f1"),
+                            mode=reward_def.get("mode", "soft_balanced"),
                             fpr_penalty=reward_def.get("fpr_penalty", 1.0))
+
+    # The ATTACKER's goal-level verdict, regardless of whose phase this is —
+    # `success` above is the current LEARNER's win, so on a defender phase it
+    # answers a different question entirely. Same function the win-gate uses, so
+    # the metrics and the schedule can never drift apart.
+    attack_goal_met = None
+    if switch_cfg is not None and drop is not None:
+        attack_goal_met = attacker_succeeded(
+            drop, verdicts, poisoned_ids, switch_cfg, goal, terms)
 
     # Per-class record for a targeted round: everything a reader (or monitor.py /
     # visualize_rounds.py) needs to answer "did ONLY the target class break?".
@@ -687,6 +701,12 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
             "post_recall": round(terms["post_recall"], 6),
             "target_class_drop": round(terms["target_drop"], 6),
             "effective_target": round(terms["effective_target"], 6),
+            # The bar `target_class_drop` is actually compared against
+            # (win_fraction * effective_target), so a reader is not left
+            # inferring it from two other fields.
+            "win_bar": (None if switch_cfg is None
+                        else round(attacker_win_bar(switch_cfg, goal, terms), 6)),
+            "goal_met": attack_goal_met,
             "collateral": round(terms["collateral"], 6),
             "max_collateral": round(terms["max_collateral"], 6),
             "others_clean": round(terms["others_clean"], 6),
@@ -696,7 +716,9 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
                                if post_eval is not None else None),
         }
 
-    metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(poisoned_ids))
+    metrics_tracker.update(ctx.round_num, verdicts, post_acc, set(poisoned_ids),
+                           reference_accuracy=ctx.clean_accuracy,
+                           attack_goal_met=attack_goal_met)
     save_round_log(RoundLog(
         round_num=ctx.round_num,
         attack_goal=goal,
@@ -746,10 +768,16 @@ def _log_round(env, ctx, info, learner, stats, metrics_tracker, save_round_log,
     # overall accuracy — print it so a run can be read at a glance.
     tgt_s = ""
     if terms is not None:
+        # Quote the bar the win-gate actually applies (win_fraction * effective
+        # target), not the effective target — printing `drop=+0.400/0.500` made
+        # rounds that CLEARED a 0.300 bar read as failures.
+        bar_s = ("" if switch_cfg is None
+                 else f" bar={attacker_win_bar(switch_cfg, goal, terms):.3f}")
         tgt_s = (f" | TGT[{terms['label']}] {terms['clean_recall']:.3f}->"
-                 f"{terms['post_recall']:.3f} (drop={terms['target_drop']:+.3f}/"
-                 f"{terms['effective_target']:.3f}) collat={terms['collateral']:.3f}"
-                 f"/{terms['max_collateral']:.3f}")
+                 f"{terms['post_recall']:.3f} (drop={terms['target_drop']:+.3f}{bar_s}"
+                 f" of tgt={terms['effective_target']:.3f})"
+                 f" collat={terms['collateral']:.3f}/{terms['max_collateral']:.3f}"
+                 f" goal={'?' if attack_goal_met is None else ('MET' if attack_goal_met else 'no')}")
     logger.info(
         f"Round {ctx.round_num} [learn={learner} ph={phase_index}.{phase_round} "
         f"{'WIN' if success else '...'}]: acc {ctx.global_accuracy:.4f}->{post_acc:.4f} "

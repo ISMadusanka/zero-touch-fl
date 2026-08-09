@@ -73,6 +73,16 @@ _MIN_CLASS_TARGET = 0.05
 # GRPO group's reward spread and kills the gradient for every other rollout.
 _MAX_COLLATERAL_COST = 3.0
 
+# --- group-advantage stall detection ----------------------------------------
+# An exactly-degenerate group (every rollout scored identically).
+_ADV_ABS_EPS = 1e-6
+# A group whose spread is below this FRACTION of the reward scale carries no
+# usable signal either: ``(r - mean) / (std + eps)`` happily renormalizes a
+# 0.004-wide band of scoring noise into full +/-1 advantages, so the gradient
+# looks healthy while training on nothing. Rewards here are O(1) by
+# construction, so the scale floors at 1.0 and only grows if a reward does.
+_ADV_REL_FLOOR = 0.01
+
 
 def goal_target(goal: dict) -> float:
     """The target drop this goal asks for (>0).
@@ -184,6 +194,7 @@ def attacker_reward(
     delta: float = 0.0,
     zeta: float = 0.0,
     eta: float = 1.0,
+    stealth_centered: bool = False,
     pool_size: int | None = None,
     diversity: float | None = None,
     clean_eval=None,
@@ -244,6 +255,11 @@ def attacker_reward(
     with the SAME hard flag. It is 0 when the attacker poisoned nobody — there
     was nothing to sneak past the defender.
 
+    ``stealth_centered=True`` remaps that term to ``[-1, 1]``, so a caught
+    attacker is penalized instead of merely un-bonused. Recommended for
+    ``targeted_label`` goals, where stealth is half the objective — see the
+    inline note at the ``stealth`` accumulation below.
+
     ``malformed_fraction`` is over the clients the attacker SELECTED
     (``n_used + n_malformed``), not over the ones that landed, so selecting three
     clients and wasting two is penalized twice as hard as wasting one.
@@ -272,7 +288,13 @@ def attacker_reward(
     for cid in poisoned_ids:
         v = verdict_by_id.get(cid)
         # No verdict for a poisoned client => treat as undetected (passed).
-        stealth += 1.0 if v is None else (1.0 - _soft_malicious_prob(v))
+        evaded = 1.0 if v is None else (1.0 - _soft_malicious_prob(v))
+        # Centered: map [0, 1] -> [-1, 1] so being CAUGHT is an actual loss
+        # rather than merely a forgone bonus. Uncentered, the worst detection
+        # can cost is `beta`, while the damage term pays 1.0+ — so the policy
+        # learns "wreck the class, ignore the detector", which is exactly the
+        # indiscriminate behaviour a targeted goal exists to train out.
+        stealth += (2.0 * evaded - 1.0) if stealth_centered else evaded
     stealth = stealth / n_used if n_used else 0.0
 
     # Normalize the waste penalty by how many clients were SELECTED — a client
@@ -341,23 +363,46 @@ def defender_reward(
     verdicts: list[DetectionVerdict],
     poisoned_ids: list[int],
     *,
-    mode: str = "soft_f1",
+    mode: str = "soft_balanced",
     fpr_penalty: float = 1.0,
 ) -> float:
     """Reward the defender for correctly identifying the poisoned clients.
 
-    ``soft_f1`` (default): confidence-weighted soft F1 in [0, 1].
-    ``tpr_minus_fpr``:     clip(TPR - fpr_penalty * FPR, 0, 1) using hard flags.
+    ``soft_balanced`` (default): ``mean soft P(malicious | poisoned) -
+    fpr_penalty * mean soft P(malicious | benign)``, in
+    ``[-fpr_penalty, 1]``. Class-balanced, so it does not care how many benign
+    clients there are, and smooth in the defender's confidence.
+    ``soft_f1``:       confidence-weighted soft F1 in [0, 1].
+    ``tpr_minus_fpr``: clip(TPR - fpr_penalty * FPR, 0, 1) using hard flags.
+
+    **Why the default is not soft_f1.** F1's precision term is
+    ``tp / (tp + fp)``, and with ONE poisoned client in twenty that single true
+    positive is swamped: flagging the attacker plus 2 honest clients already
+    caps F1 at 0.50, plus 5 caps it at 0.29, plus 17 at 0.105 — while flagging
+    *nobody* also scores ~0.09, because soft probabilities never reach 0. The
+    reward collapses to "~0.8 if near-perfect, ~0.09 otherwise", which makes
+    "caught the attacker but destroyed the aggregate" and "did nothing at all"
+    numerically indistinguishable, and leaves a GRPO group with no usable
+    spread. ``soft_balanced`` degrades linearly in the false-positive rate
+    instead of hyperbolically in the false-positive *count*, so every rung
+    between those extremes is separable.
+
+    ``fpr_penalty`` is also what keeps the defender from wrecking the round:
+    every honest client it flags is dropped from FedAvg, and the benign term is
+    the no-extra-evaluation proxy for that damage. (Scoring the post-aggregation
+    model directly would cost one aggregation + test pass per rollout, which is
+    why defender scoring stays verdict-only.)
 
     **Clean rounds.** ``poisoned_ids`` can legitimately be empty — the attacker
     may select clients whose plans turn out to be no-ops, in which case every
     update the server receives really is honest (see
-    ``AttackerAgent.select_and_apply``). F1 is undefined there and would score a
-    perfectly-behaved defender 0, training it to invent detections. Instead we
-    score the only thing that matters on a clean round: staying quiet. The result
-    is ``1 - mean soft P(malicious)`` — 1.0 for a confident all-benign verdict,
-    0.5 for maximal uncertainty, 0.0 for confidently flagging everyone — which
-    stays continuous, stays in [0, 1], and agrees with soft-F1's direction.
+    ``AttackerAgent.select_and_apply``). Detection recall is undefined there and
+    would score a perfectly-behaved defender 0, training it to invent
+    detections. Instead we score the only thing that matters on a clean round:
+    staying quiet. The result is ``1 - mean soft P(malicious)`` — 1.0 for a
+    confident all-benign verdict, 0.5 for maximal uncertainty, 0.0 for
+    confidently flagging everyone — which stays continuous and agrees with every
+    mode's direction.
     """
     poisoned = set(poisoned_ids)
     if not poisoned:
@@ -365,6 +410,17 @@ def defender_reward(
             return 1.0
         mean_p = sum(_soft_malicious_prob(v) for v in verdicts) / len(verdicts)
         return _clip(1.0 - mean_p, 0.0, 1.0)
+
+    if mode == "soft_balanced":
+        hits = [_soft_malicious_prob(v) for v in verdicts if v.client_id in poisoned]
+        noise = [_soft_malicious_prob(v) for v in verdicts if v.client_id not in poisoned]
+        # A poisoned client with no verdict is a clean miss, not a free pass.
+        detection = sum(hits) / len(poisoned)
+        false_alarm = sum(noise) / len(noise) if noise else 0.0
+        # Deliberately NOT clipped at 0: "flag everything" must score strictly
+        # below "flag nothing", or the defender that gave up and the defender
+        # that panicked look identical again.
+        return _clip(detection - fpr_penalty * false_alarm, -abs(fpr_penalty), 1.0)
 
     if mode == "tpr_minus_fpr":
         tp = sum(1 for v in verdicts if v.client_id in poisoned and v.is_suspicious)
@@ -390,12 +446,24 @@ def defender_reward(
     return 2 * precision * recall / (precision + recall + eps)
 
 
-def group_advantages(rewards: list[float]) -> tuple[list[float], float]:
+def group_advantages(rewards: list[float],
+                     rel_floor: float = _ADV_REL_FLOOR) -> tuple[list[float], float]:
     """Group-relative normalized advantages plus the zero-advantage fraction.
 
     A_i = (r_i - mean) / (std + eps). When the group has (near-)zero spread the
     advantages are ~0 → no learning signal; we report that fraction so the
     schedule can surface a stalled-gradient warning.
+
+    **Why the floor is relative.** An absolute ``std < 1e-6`` test only catches
+    a group that is *exactly* degenerate. A reward function that has flattened
+    out — every rollout landing in, say, 0.087..0.094 — sails past it, and the
+    normalization then rescales that 0.004-wide band of scoring noise into
+    advantages of +/-1. The step looks healthy (``zero_adv=0.00``, non-zero
+    loss) while the policy is being pushed around by noise. Anything below
+    ``rel_floor`` x the group's reward scale is therefore reported as
+    zero-advantage so ``rl.grpo.grpo_step`` can resample or skip the step.
+
+    ``rel_floor=0`` restores the old absolute-only behaviour.
     """
     n = len(rewards)
     if n == 0:
@@ -404,7 +472,10 @@ def group_advantages(rewards: list[float]) -> tuple[list[float], float]:
     var = sum((r - mean) ** 2 for r in rewards) / n
     std = var ** 0.5
     eps = 1e-6
-    if std < eps:
+    # Rewards are O(1) by design, so 1.0 is the natural scale; a group that does
+    # run large (heavy collateral penalties) raises it rather than lowering it.
+    scale = max(1.0, max(abs(r) for r in rewards))
+    if std < _ADV_ABS_EPS or std < rel_floor * scale:
         return [0.0] * n, 1.0
     adv = [(r - mean) / (std + eps) for r in rewards]
     return adv, 0.0

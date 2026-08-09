@@ -278,8 +278,10 @@ def run_phase2(
 
     if mode == "baseline":
         from rl.baseline import run_baseline
+        from rl.switch import SwitchConfig
         run_baseline(env, n_rounds, metrics_tracker, _save_round_log,
-                     defender=algorithmic_defender)
+                     defender=algorithmic_defender,
+                     switch_cfg=SwitchConfig.from_cfg(config.get("rl", {})))
 
     elif mode == "dry-run":
         from rl.defenders import LLMDefenderPolicy
@@ -294,9 +296,11 @@ def run_phase2(
         gen = InferenceGenerator(backend, max_new_tokens=int(config.get("rl", {}).get("max_new_tokens", 2048)))
         defender = algorithmic_defender or LLMDefenderPolicy(defender_agent, gen,
                                                             who="dry-run")
+        from rl.switch import SwitchConfig
         run_inference(env, attacker_agent, defender, gen, n_rounds,
                       metrics_tracker, _save_round_log,
-                      temperature=float(llm_cfg.get("temperature", 0.7)))
+                      temperature=float(llm_cfg.get("temperature", 0.7)),
+                      switch_cfg=SwitchConfig.from_cfg(config.get("rl", {})))
 
     else:  # full GRPO training
         from rl.policy import LLMPolicy

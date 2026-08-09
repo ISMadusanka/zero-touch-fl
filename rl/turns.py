@@ -115,6 +115,7 @@ class AttackerTurn:
             delta=self.reward_cfg.get("delta", 0.0),
             zeta=self.reward_cfg.get("zeta", 0.0),
             eta=self.reward_cfg.get("eta", 1.0),
+            stealth_centered=self.reward_cfg.get("stealth_centered", False),
             pool_size=self.pool_size,
             diversity=diversity,
             # Targeted goals need the per-class view on BOTH sides; for every other
@@ -190,7 +191,7 @@ class DefenderTurn:
         verdicts = self.defender_agent.parse(defender_text, self.client_ids)
         r = defender_reward(
             verdicts, self.poisoned_ids,
-            mode=self.reward_cfg.get("mode", "soft_f1"),
+            mode=self.reward_cfg.get("mode", "soft_balanced"),
             fpr_penalty=self.reward_cfg.get("fpr_penalty", 1.0),
         )
         dbg.rollout_outcome(reward=r, verdicts=verdicts, poisoned_ids=self.poisoned_ids)
