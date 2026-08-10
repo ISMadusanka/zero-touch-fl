@@ -381,7 +381,7 @@ rank. All three fail in ways that are invisible in the logs:
 
 | defense | reported | what went wrong |
 |---|---|---|
-| FLTrust | `1 − ReLU(cos)` | Cosines are ~0.05 on a 970-parameter model, so every **accepted** client reported `p ≈ 0.95`. Stealth was ~0.03 whether the attack evaded detection or not — 3% of its configured 0.5 weight. |
+| FLTrust | `1 − ReLU(cos)` | Cosines are ~0.05 on a model this small (the ~970-parameter image model those runs used; 681 now), so every **accepted** client reported `p ≈ 0.95`. Stealth was ~0.03 whether the attack evaded detection or not — 3% of its configured 0.5 weight. |
 | DeFL | `votes/L` | The flag test is `votes >= threshold` with an **adaptive** threshold; on a two-layer model it settles at `votes >= 1`, so a **flagged** client reported `p = 1/2 = 0.5`. One recorded round paid `att_reward = 0.440` — the highest in the sample — for an attack that was fully detected and did no damage. |
 | Multi-Krum / DnC | cohort rank | Bounded and monotone, but the ranks are a fixed 0..1 spread every round: the mean is always ~0.5, and a client's `p` moved when *other* clients moved. It carried no information about whether this client was detected. |
 

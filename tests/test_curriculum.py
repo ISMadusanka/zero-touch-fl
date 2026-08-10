@@ -2,7 +2,7 @@
 
 Covers ``rl/curriculum.py``, its wiring into ``rl/env.py`` /
 ``server/algo_defender.py``, and the resume path in ``rl/schedule.py``. Torch is
-used only for the env-level tests (synthetic MNIST-shaped tensors — no download,
+used only for the env-level tests (synthetic 5G-NIDD-shaped tensors — no CSV,
 no GPU, no LLM):
 
     python tests/test_curriculum.py
@@ -17,7 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
 
-from model.mnist_net import MnistNet  # noqa: E402
+from data.feature_spec import DEFAULT_SPEC  # noqa: E402
+
+from model.nidd_net import NiddNet  # noqa: E402
 from rl.curriculum import (  # noqa: E402
     TrainingCurriculum, build_training_curriculum, resolve_poisoner_counts,
 )
@@ -32,8 +34,8 @@ ALGS = ["defl", "dnc", "multikrum"]     # FLTrust needs a real root set (test_fl
 def _loader(seed: int, n: int = 64):
     g = torch.Generator().manual_seed(seed)
     return DataLoader(
-        TensorDataset(torch.randn(n, 1, 28, 28, generator=g),
-                      torch.randint(0, 10, (n,), generator=g)),
+        TensorDataset(torch.randn(n, DEFAULT_SPEC.input_dim, generator=g),
+                      torch.randint(0, DEFAULT_SPEC.n_classes, (n,), generator=g)),
         batch_size=32, shuffle=True)
 
 
@@ -44,7 +46,7 @@ def _cfg(**curriculum):
         "fl": {"n_clients": N_CLIENTS, "device": "cpu", "lr": 0.05, "local_epochs": 1,
                "benign_retrain_each_round": False, "training_rounds": 5,
                "n_compromisable": 3, "poison_seed": 0, "batch_size": 32},
-        "data": {"data_dir": "./data/mnist_raw"},
+        "data": {"source": "synthetic"},
         "attack": {"goal": {"type": "untargeted_degrade", "target_accuracy_drop": 0.1},
                    "max_poison_clients": 3, "sample_budget_in_training": True,
                    "sample_target_in_training": False},
@@ -59,7 +61,7 @@ def _env(cfg=None):
     curriculum = build_training_curriculum(cfg, algorithms=defense.names)
     env = FLArmsRaceEnv(cfg, [_loader(i) for i in range(N_CLIENTS)], _loader(99, n=128),
                         random.Random(0), defense=defense, curriculum=curriculum)
-    gw = {k: v.clone() for k, v in MnistNet().state_dict().items()}
+    gw = {k: v.clone() for k, v in NiddNet().state_dict().items()}
     cw = [{k: v + torch.randn_like(v) * 0.01 for k, v in gw.items()}
           for _ in range(N_CLIENTS)]
     env.reset(gw, cw, 0.5)
@@ -271,7 +273,7 @@ def test_env_without_a_curriculum_keeps_the_random_draws():
     assert build_training_curriculum(cfg, algorithms=defense.names) is None
     env = FLArmsRaceEnv(cfg, [_loader(i) for i in range(N_CLIENTS)], _loader(99, n=128),
                         random.Random(0), defense=defense)
-    gw = {k: v.clone() for k, v in MnistNet().state_dict().items()}
+    gw = {k: v.clone() for k, v in NiddNet().state_dict().items()}
     env.reset(gw, [dict(gw) for _ in range(N_CLIENTS)], 0.5)
     env.begin_round()
     assert env.round_curriculum is None

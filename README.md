@@ -1,8 +1,14 @@
 # Zero-Touch Federated Learning — LLM-Direct Adversarial RL
 
 A research testbed where two LLMs **directly generate** the attack and the
-defense in a federated-learning arms race on MNIST, and are **reinforcement-
-trained** against each other with verifiable rewards.
+defense in a federated-learning arms race on **5G-NIDD** (network intrusion
+detection over a 5G testbed), and are **reinforcement-trained** against each other
+with verifiable rewards.
+
+The federated task is 9-class attack classification over ~52 Argus flow features,
+learned by a **681-parameter fully-connected network** (`model/nidd_net.py`). The
+dataset is not redistributable — see [Dataset](#dataset) for how to obtain it and
+how to smoke-test without it.
 
 ## Overview
 
@@ -201,8 +207,11 @@ alternate** schedule plus an **opponent league** to damp co-adaptation cycling.
   `Qwen2.5-3B-Instruct`. If `checkpoints/attacker_adapter/` or
   `checkpoints/defender_adapter/` exist from an old base, delete them (and
   `checkpoints/rl_progress.json` + `checkpoints/fl_state.pt`) and retrain from
-  scratch. The Phase-1 MNIST checkpoint (`global_model.pt`, `client_updates.pt`,
-  `baseline.json`) is model-agnostic and can stay.
+  scratch. The Phase-1 FL checkpoint (`global_model.pt`, `client_updates.pt`,
+  `baseline.json`) is LLM-agnostic and can stay — but note it is **not**
+  preprocessing-agnostic: changing `data.n_features`, `data.label_mode` or
+  `model.hidden` changes the FL model's shape, and the run detects that and
+  re-runs Phase 1 automatically (`storage.checkpoint.shape_mismatch`).
 - **`gpt-4o-mini` (OpenAI) and Ollama `qwen2.5` are inference/baseline only** —
   used by `--dry-run` and `--baseline`. They are **not** fine-tuned.
 - **Serving a trained adapter**: use **vLLM** (multi-LoRA hot-swap), or **merge**
@@ -253,10 +262,43 @@ pip install -r requirements.txt   # installs unsloth/peft/transformers/bitsandby
 ### CPU machine (logic dry-run / baseline only)
 
 ```bash
-pip install torch torchvision numpy pyyaml matplotlib openai requests
+pip install torch numpy pandas pyyaml matplotlib openai requests
 # For --dry-run you also need an Ollama server with qwen2.5:
 #   ollama serve & ; ollama pull qwen2.5:3b
 ```
+
+## Dataset
+
+The FL task is **5G-NIDD** (Samarakoon et al., 2022): 1,215,890 labelled network
+flows from the University of Oulu 5G Test Network — benign traffic plus eight
+attacks (UDPFlood, HTTPFlood, SlowrateDoS, TCPConnectScan, SYNScan, UDPScan,
+SYNFlood, ICMPFlood) over ~52 Argus flow features. Nine classes counting benign.
+
+It is **not redistributable**, so it is not vendored here:
+
+1. Download it from [IEEE DataPort](https://ieee-dataport.org/documents/5g-nidd-comprehensive-network-intrusion-detection-dataset-generated-over-5g-wireless).
+2. Point `data.csv_path` in `configs/base.yaml` at the combined CSV, or at a
+   directory of the per-attack CSVs (they are concatenated).
+
+Nothing hardcodes a column list — the label column is auto-detected and every
+other column is classified numeric or categorical by parsing it — so mirrors that
+spell things differently still load. The ~1.2M-row parse is cached under
+`data.cache_dir`, so it happens once rather than per run.
+
+To exercise the pipeline **without** the data:
+
+```bash
+# configs/base.yaml:  data.source: synthetic
+python main.py --baseline --rounds 3
+```
+
+That generates 5G-NIDD-shaped traffic (same nine classes, same class imbalance)
+through the identical preprocessing path. It exists to test plumbing: every such
+run logs a warning, and no accuracy, attack-success or defense number it produces
+means anything.
+
+See `DATA_PARTION.md` for the preprocessing order, the leakage columns that are
+dropped and why, the feature selection, and the non-IID partition.
 
 ## Usage
 
@@ -432,8 +474,10 @@ python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.1' -
 
 ```
 core/         Shared types (ModelUpdate, DetectionVerdict, RoundLog) + aggregator interface
-model/        Tiny MLP (~970 params) — the schema both LLMs operate over
-data/         MNIST loading & partitioning
+model/        nidd_net.py — 681-param fully-connected net; the schema both LLMs operate over
+data/         nidd_loader.py (5G-NIDD ingest, preprocessing, partitioning),
+              feature_spec.py (the preprocessing→model shape contract),
+              round_sampler.py (per-round client data slices)
 clients/      Honest client local training
 server/       Central server + FedAvg aggregation + algo_defender.py (the round-rotating
               algorithmic defense that currently replaces the defender LLM)

@@ -1,7 +1,7 @@
 """Tests for the between-phase benign FL round (rl.env.run_benign_fl_round).
 
-Uses tiny synthetic client loaders (random tensors shaped like MNIST), so no
-MNIST download and no GPU are needed:  python tests/test_fl_interlude.py
+Uses tiny synthetic client loaders (random tensors shaped like preprocessed
+5G-NIDD flows), so no CSV and no GPU are needed:  python tests/test_fl_interlude.py
 
 Covers the contract the arms-race schedule relies on: a benign FL round advances
 BOTH the global model and the per-client benign references, and hands those
@@ -19,7 +19,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
 
-from model.mnist_net import MnistNet  # noqa: E402
+from data.feature_spec import DEFAULT_SPEC  # noqa: E402
+
+from model.nidd_net import NiddNet  # noqa: E402
 from rl.env import FLArmsRaceEnv  # noqa: E402
 
 N_CLIENTS = 4
@@ -29,8 +31,8 @@ TRAINING_ROUNDS = 20
 
 def _loader(seed: int, n: int = 64):
     g = torch.Generator().manual_seed(seed)
-    x = torch.randn(n, 1, 28, 28, generator=g)
-    y = torch.randint(0, 10, (n,), generator=g)
+    x = torch.randn(n, DEFAULT_SPEC.input_dim, generator=g)
+    y = torch.randint(0, DEFAULT_SPEC.n_classes, (n,), generator=g)
     return DataLoader(TensorDataset(x, y), batch_size=32, shuffle=True)
 
 
@@ -63,7 +65,7 @@ def _make_env():
     test_loader = _loader(999, n=128)
     env = FLArmsRaceEnv(_cfg(), client_loaders, test_loader, random.Random(0))
 
-    net = MnistNet()
+    net = NiddNet()
     global_weights = {k: v.clone() for k, v in net.state_dict().items()}
     # Distinct per-client "frozen Phase-1" weights so we can detect a refresh.
     client_weights = []
@@ -137,7 +139,7 @@ def test_sequential_round_numbers_across_multiple_interludes():
 
 
 def test_noop_without_client_loaders():
-    net = MnistNet()
+    net = NiddNet()
     gw = {k: v.clone() for k, v in net.state_dict().items()}
     cw = [copy.deepcopy(gw) for _ in range(N_CLIENTS)]
     env = FLArmsRaceEnv(_cfg(), None, _loader(1), random.Random(0))

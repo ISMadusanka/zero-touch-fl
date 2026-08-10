@@ -1,7 +1,7 @@
 """Tests for the per-round CLEAN counterfactual (rl.env.clean_reference_accuracy)
 and the round-budget / league-cap plumbing in rl.schedule.
 
-Synthetic tensors shaped like MNIST — no download, no GPU:
+Synthetic tensors shaped like preprocessed 5G-NIDD flows — no CSV, no GPU:
     python tests/test_clean_reference.py
 """
 
@@ -14,6 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
 
+from data.feature_spec import DEFAULT_SPEC  # noqa: E402
+
 from core.types import DetectionVerdict  # noqa: E402
 from rl.env import FLArmsRaceEnv  # noqa: E402
 from rl.schedule import League, resolve_round_budget  # noqa: E402
@@ -25,8 +27,8 @@ TRAINING_ROUNDS = 10
 def _loader(seed: int, n: int = 64):
     g = torch.Generator().manual_seed(seed)
     return DataLoader(
-        TensorDataset(torch.randn(n, 1, 28, 28, generator=g),
-                      torch.randint(0, 10, (n,), generator=g)),
+        TensorDataset(torch.randn(n, DEFAULT_SPEC.input_dim, generator=g),
+                      torch.randint(0, DEFAULT_SPEC.n_classes, (n,), generator=g)),
         batch_size=32, shuffle=True)
 
 
@@ -46,8 +48,8 @@ def _env(benign_retrain=False):
     }
     loaders = [_loader(i) for i in range(N_CLIENTS)]
     env = FLArmsRaceEnv(cfg, loaders, _loader(99, n=128), random.Random(0))
-    from model.mnist_net import MnistNet
-    gw = {k: v.clone() for k, v in MnistNet().state_dict().items()}
+    from model.nidd_net import NiddNet
+    gw = {k: v.clone() for k, v in NiddNet().state_dict().items()}
     cw = [{k: v + torch.randn_like(v) * 0.01 for k, v in gw.items()}
           for _ in range(N_CLIENTS)]
     env.reset(gw, cw, 0.5)

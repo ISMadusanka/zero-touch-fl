@@ -5,7 +5,8 @@ import torch
 import torch.nn as nn
 
 from core.types import ModelUpdate
-from model.mnist_net import MnistNet, count_parameters
+from data.feature_spec import FeatureSpec, active
+from model import build_model, count_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -13,10 +14,24 @@ logger = logging.getLogger(__name__)
 class FedServer:
     """Holds the global model and provides evaluation."""
 
-    def __init__(self, device: str = "cpu"):
+    def __init__(self, device: str = "cpu", spec: FeatureSpec | None = None,
+                 hidden: int | None = None):
+        """
+        Args:
+            device: Torch device for the global model.
+            spec: Feature shape to build the model for. ``None`` uses whatever
+                ``data.nidd_loader`` published for this run (or the documented
+                default when no data has been loaded — see
+                ``data.feature_spec.active``). Every ``FedServer`` in a process
+                therefore agrees on the architecture without the callers having to
+                thread the preprocessing result through the round loop.
+            hidden: Hidden layer width override (``model.hidden`` in the config).
+        """
         self.device = device
-        self.model = MnistNet().to(device)
-        logger.info(f"Global model initialized — {count_parameters(self.model)} params")
+        self.spec = spec if spec is not None else active()
+        self.model = build_model(self.spec, hidden=hidden).to(device)
+        logger.info(f"Global model initialized — {count_parameters(self.model)} params "
+                    f"({self.spec.describe()})")
 
     def get_global_weights(self) -> dict:
         """Return a CPU copy of the global model state dict."""

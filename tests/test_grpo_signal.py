@@ -35,6 +35,7 @@ from benchmark.defenses.base import (  # noqa: E402
     boundary_calibrated_p, selection_boundary,
 )
 from core.types import DetectionVerdict  # noqa: E402
+from data.feature_spec import DEFAULT_SPEC  # noqa: E402
 from rl.grpo import grpo_step  # noqa: E402
 from rl.rewards import (  # noqa: E402
     DEFAULT_MIN_REWARD_SPREAD, _soft_malicious_prob, attacker_reward,
@@ -133,13 +134,14 @@ def test_fltrust_reference_is_stable_across_scored_rollouts():
 
     from benchmark.defenses.fltrust import FLTrust
     from core.types import ModelUpdate
-    from model.mnist_net import MnistNet
+    from model.nidd_net import NiddNet
     from server.algo_defender import AlgorithmicDefender
     from torch.utils.data import DataLoader, TensorDataset
 
     torch.manual_seed(0)
-    gw = MnistNet().state_dict()
-    root = TensorDataset(torch.randn(128, 1, 28, 28), torch.randint(0, 10, (128,)))
+    gw = NiddNet().state_dict()
+    root = TensorDataset(torch.randn(128, DEFAULT_SPEC.input_dim),
+                         torch.randint(0, DEFAULT_SPEC.n_classes, (128,)))
     ft = FLTrust(DataLoader(root, batch_size=32, shuffle=True), lr=0.05, local_epochs=1)
     ft.reset(gw)
     defender = AlgorithmicDefender({"fltrust": ft}, random.Random(0))
@@ -442,7 +444,7 @@ def test_matching_iterations_makes_the_global_actually_move():
     from benchmark.defenses.fltrust import FLTrust, _flatten
     from clients.benign_client import BenignClient
     from core.types import ModelUpdate
-    from model.mnist_net import MnistNet
+    from model.nidd_net import NiddNet
     from server.fed_server import FedServer
     from torch.utils.data import DataLoader, TensorDataset
 
@@ -452,8 +454,8 @@ def test_matching_iterations_makes_the_global_actually_move():
     keys = list(gw.keys())
 
     def loader(n, batch):
-        return DataLoader(TensorDataset(_torch.randn(n, 1, 28, 28),
-                                        _torch.randint(0, 10, (n,))),
+        return DataLoader(TensorDataset(_torch.randn(n, DEFAULT_SPEC.input_dim),
+                                        _torch.randint(0, DEFAULT_SPEC.n_classes, (n,))),
                           batch_size=batch, shuffle=False)
 
     client_loader = loader(3072, 64)                       # 48 batches
@@ -471,7 +473,15 @@ def test_matching_iterations_makes_the_global_actually_move():
 
     old_frac = norms["old"] / float(client_delta)
     new_frac = norms["matched"] / float(client_delta)
-    assert old_frac < 0.05, old_frac              # was a rounding error
+    # `root_epochs: 1` gives the server 2 SGD iterations against a client's 144, so
+    # ||g0|| lands at a small fraction of an honest step — and since FLTrust rescales
+    # EVERY accepted delta to ||g0|| (Eq. 3), that fraction is how far the global is
+    # allowed to move per round. The bound is loose because it is architecture- and
+    # seed-dependent (0.042-0.053 measured across seeds on the 681-parameter NiddNet,
+    # smaller on the 970-parameter image model this replaced); what the test pins is
+    # that it is a small fraction, not that it is one specific number.
+    assert old_frac < 0.08, old_frac              # was a rounding error
+    # Iteration-matching is what buys the real step: measured 70-77x, not the bare 10x.
     assert new_frac > 10 * old_frac, (old_frac, new_frac)
 
 

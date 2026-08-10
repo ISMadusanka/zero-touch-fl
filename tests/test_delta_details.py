@@ -1,6 +1,6 @@
 """Tests for the attacker's delta-based observation (agents.attack_ops.delta_details).
 
-Pure torch on tiny hand-built state dicts — no MNIST, no GPU, no LLM:
+Pure torch on tiny hand-built state dicts — no dataset, no GPU, no LLM:
     python tests/test_delta_details.py
 
 The contract these lock in: the attacker's per-client stats are computed from ONLY

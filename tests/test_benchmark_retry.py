@@ -36,8 +36,8 @@ _NOOP = '{"clients":[{"id":0,"operations":[{"op":"scale","target":"all","factor"
 def _sd(scale=1.0):
     """A REAL model state_dict — the harness feeds these through delta_details and
     FedServer.load_state_dict, so the keys/shapes have to be the model's own."""
-    from model.mnist_net import MnistNet
-    return {k: v.detach().clone() * scale for k, v in MnistNet().state_dict().items()}
+    from model.nidd_net import NiddNet
+    return {k: v.detach().clone() * scale for k, v in NiddNet().state_dict().items()}
 
 
 class _Ctx:

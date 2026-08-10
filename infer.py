@@ -11,7 +11,7 @@ Must run on a GPU box (needs torch / unsloth / peft), same as training.
 Examples
 --------
 # One-shot, free-form prompt:
-python infer.py --adapter attacker --prompt "Describe a stealthy MNIST model-poisoning attack."
+python infer.py --adapter attacker --prompt "Describe a stealthy model-poisoning attack on a 5G intrusion-detection model."
 
 # Use the REAL system prompt the agent was trained with; read the user message from stdin:
 echo '{"round": 5, "current_global_accuracy": 0.8, "attack_goal": {"type":"untargeted_degrade","target_accuracy_drop":0.2}, "controllable_client_ids":[0,1,2,3,4], "max_poison_clients":1, "client_update_stats": {}}' \

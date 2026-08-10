@@ -8,7 +8,7 @@ nothing the round produces leaks into the next one.
 Plus the per-round data refresh (data.round_sampler.RoundDataSampler) that makes
 consecutive frozen rounds differ at all.
 
-Synthetic tensors shaped like MNIST — no download, no GPU:
+Synthetic tensors shaped like preprocessed 5G-NIDD flows — no CSV, no GPU:
     python tests/test_frozen_rounds.py
 """
 
@@ -21,9 +21,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
 
+from data.feature_spec import DEFAULT_SPEC  # noqa: E402
+
 from core.types import DetectionVerdict  # noqa: E402
 from data.round_sampler import RoundDataSampler, build_round_data_sampler  # noqa: E402
-from model.mnist_net import MnistNet  # noqa: E402
+from model.nidd_net import NiddNet  # noqa: E402
 from rl.env import FLArmsRaceEnv  # noqa: E402
 
 N_CLIENTS = 4
@@ -33,8 +35,8 @@ TRAINING_ROUNDS = 45
 def _loader(seed: int, n: int = 128):
     g = torch.Generator().manual_seed(seed)
     return DataLoader(
-        TensorDataset(torch.randn(n, 1, 28, 28, generator=g),
-                      torch.randint(0, 10, (n,), generator=g)),
+        TensorDataset(torch.randn(n, DEFAULT_SPEC.input_dim, generator=g),
+                      torch.randint(0, DEFAULT_SPEC.n_classes, (n,), generator=g)),
         batch_size=32, shuffle=True)
 
 
@@ -54,7 +56,7 @@ def _env(frozen=True, benign_retrain=True, round_data=None):
     loaders = [_loader(i) for i in range(N_CLIENTS)]
     env = FLArmsRaceEnv(_cfg(frozen, benign_retrain), loaders, _loader(99, n=256),
                         random.Random(0), round_data=round_data)
-    gw = {k: v.clone() for k, v in MnistNet().state_dict().items()}
+    gw = {k: v.clone() for k, v in NiddNet().state_dict().items()}
     cw = [{k: v + torch.randn_like(v) * 0.01 for k, v in gw.items()}
           for _ in range(N_CLIENTS)]
     env.reset(gw, cw, 0.5)
@@ -222,7 +224,7 @@ def test_each_round_trains_clients_on_different_data():
     sampler = RoundDataSampler(loaders, fraction=0.25, batch_size=16, seed=0)
     env = FLArmsRaceEnv(_cfg(), loaders, _loader(99, n=256), random.Random(0),
                         round_data=sampler)
-    gw = {k: v.clone() for k, v in MnistNet().state_dict().items()}
+    gw = {k: v.clone() for k, v in NiddNet().state_dict().items()}
     env.reset(gw, [gw for _ in range(N_CLIENTS)], 0.5)
 
     env.begin_round()

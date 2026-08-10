@@ -50,9 +50,10 @@ from dataclasses import asdict
 
 import yaml
 
-from data.mnist_loader import get_data_loaders, build_root_loader
+from data.nidd_loader import get_data_loaders, build_root_loader
 from data.round_sampler import build_round_data_sampler
 from clients.benign_client import BenignClient
+from model import set_default_hidden
 from server.fed_server import FedServer
 from server.aggregation import FedAvgAggregator
 from server.algo_defender import build_algorithmic_defender
@@ -61,7 +62,7 @@ from agents.defender_agent import DefenderAgent
 from agents.llm_client import create_llm_client
 from storage.checkpoint import (
     save_state, load_state, state_exists, save_progress, load_progress, adapter_exists,
-    save_fl_state, load_fl_state,
+    save_fl_state, load_fl_state, shape_mismatch as checkpoint_shape_mismatch,
 )
 from core.types import RoundLog, DetectionVerdict
 from core.debug import dbg
@@ -258,7 +259,7 @@ def run_phase2(
             root_size=int(((config.get("defense") or {}).get("fltrust") or {})
                           .get("root_size", 100)),
             batch_size=int(fl["batch_size"]),
-            data_dir=config.get("data", {}).get("data_dir", "./data/mnist_raw"),
+            data_cfg=config.get("data", {}),
             seed=seed,
         ),
     )
@@ -444,9 +445,12 @@ def main():
 
     fl = base_config["fl"]
     data_cfg = base_config["data"]
+    # The architecture knob, installed before any FedServer is built (the four
+    # construction sites have no config access — see model.set_default_hidden).
+    set_default_hidden((base_config.get("model") or {}).get("hidden"))
     client_loaders, test_loader = get_data_loaders(
         n_clients=fl["n_clients"], batch_size=fl["batch_size"],
-        data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), iid=data_cfg.get("iid", True),
+        data_cfg=data_cfg, iid=data_cfg.get("iid", True),
         bias_q=float(data_cfg.get("noniid_bias", 0.5)), seed=seed,
     )
 
@@ -457,6 +461,16 @@ def main():
             f"— ignoring the stale checkpoint and re-running Phase 1."
         )
         state = None
+    # A checkpoint from a different feature/class count cannot be loaded into this
+    # run's model at all, and `load_state_dict` would otherwise raise deep inside
+    # Phase-2 resume. Catch it here, where the fix (re-run Phase 1) is automatic.
+    # This is the shape guard that makes changing `data.n_features`,
+    # `data.label_mode` or `model.hidden` safe rather than a confusing crash.
+    if state is not None:
+        stale = checkpoint_shape_mismatch(state[0])
+        if stale:
+            logger.warning(f"Checkpoint {stale} — ignoring it and re-running Phase 1.")
+            state = None
     if state is not None:
         logger.info("Checkpoint found — skipping Phase 1, loading saved state")
         global_weights, client_weights, baseline_accuracy = state

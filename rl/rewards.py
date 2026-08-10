@@ -504,10 +504,15 @@ def defender_reward(
 
 
 # Default noise floor for a group's reward spread. The rewards are built from a
-# test-set accuracy measured on 10k MNIST examples, so accuracy is quantized to
-# 1e-4; divided by the smallest sampled ``target_accuracy_drop`` (0.05) that is
-# ~2e-3 of reward per SINGLE flipped test example. Anything below this floor is
-# measurement noise, not a difference between the plans. See group_advantages.
+# test-set accuracy measured on the 5G-NIDD test split — 20k flows at the shipped
+# ``data.max_samples``/``test_fraction`` — so accuracy is quantized to 5e-5;
+# divided by the smallest sampled ``target_accuracy_drop`` (0.05) that is ~1e-3 of
+# reward per SINGLE flipped test example. Anything below this floor is measurement
+# noise, not a difference between the plans. See group_advantages.
+# (The floor is ABSOLUTE, so shrinking the test split via ``data.max_samples``
+# coarsens the quantization underneath it — at a 2k test split one flipped flow
+# moves reward by 1e-2, half this floor, and genuine one-example differences start
+# being discarded as noise. Raise max_samples rather than lower this.)
 DEFAULT_MIN_REWARD_SPREAD = 0.02
 # Floor on the z-score denominator, in reward units. Stops a barely-separated
 # group from being rescaled up to full-magnitude advantages. See group_advantages.

@@ -224,7 +224,11 @@ also give a softer view than the binary flag.
 `--root-size` (clean root samples, default 100, the paper's default) · `--root-epochs`
 (server local epochs `R_l`, default 1) · `--root-lr` (default `fl.lr`) · `--eta`
 (global learning rate, default 1.0). The root set is carved once from the clean
-MNIST train set with a fixed seed.
+5G-NIDD train split with a fixed seed. It is drawn **uniformly**, as in the paper —
+not class-balanced — so on a dataset this imbalanced the root set is mostly benign
+and UDPFlood traffic, which is a real property of FLTrust's threat model (the
+server's clean data is just clean, not curated) and shapes the trust direction
+`g0` it derives.
 
 ## DeFL knobs
 
@@ -233,8 +237,8 @@ fewer early rounds declared critical ⇒ fewer hard removals) · `--defl-tau` (M
 per-layer outlier z-threshold, default **2.5** — lower ⇒ more aggressive flagging,
 higher TPR but higher FPR). DeFL takes **no** root set: it derives everything from
 the per-layer FGNV of the submitted updates. A "layer" = one module (its weight +
-bias grouped), so MnistNet has L = 2 layers. The Beta trust then keeps the run
-robust to the occasional false positive.
+bias grouped), so NiddNet has L = 2 layers (`net.0`, `net.2`). The Beta trust then
+keeps the run robust to the occasional false positive.
 
 ## DnC knobs
 
@@ -244,7 +248,7 @@ adversary budget, **not** per-round ground truth) ·
 `--dnc-c` (filtering fraction `c`, paper iid default **1** → drop `c·m` clients each
 round) · `--dnc-niters` (subsampling iterations, default **1**) · `--dnc-sub-dim`
 (subsample dimension `b`, default **10000**, the paper's value — clamped to the
-model's dimension, so for the tiny MnistNet (d=970) all coordinates are used and no
+model's dimension, so for the tiny NiddNet (d=681) all coordinates are used and no
 subsampling occurs). DnC centers by the client-mean, which cancels the global
 reference, so it runs on the absolute weights directly and its aggregate is FedAvg
 over the surviving clients.

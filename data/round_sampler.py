@@ -30,9 +30,9 @@ logger = logging.getLogger(__name__)
 def _flatten(loader):
     """``(base_dataset, absolute indices)`` behind a client's loader.
 
-    Client loaders are built as ``DataLoader(Subset(mnist, shard))``; unwrapping
+    Client loaders are built as ``DataLoader(Subset(flows, shard))``; unwrapping
     to the base dataset + absolute index list lets us re-cut the shard every
-    round without touching ``data.mnist_loader``'s partitioning.
+    round without touching ``data.nidd_loader``'s partitioning.
     """
     ds = loader.dataset
     idx = list(range(len(ds)))
@@ -72,7 +72,12 @@ class RoundDataSampler:
             base, idx = _flatten(loader)
             self._base.append(base)
             self._shards.append(idx)
-        # Per client, because a non-IID partition gives clients unequal shards.
+        # Per client, because a non-IID partition gives clients unequal shards — and on
+        # 5G-NIDD they are unequal by a wide margin: the FLTrust partition builds one
+        # group per class, and the two dominant classes (Benign ~39% of flows, UDPFlood
+        # ~38%) swell their groups, giving a measured 3.6x spread across the 20 clients
+        # (2510 / 2946 / 9078 examples at min / median / max). A single federation-wide
+        # slice size would over-draw the small shards and starve the large ones.
         self._per_round = [max(1, min(len(s), int(round(self.fraction * len(s)))))
                            for s in self._shards]
         # Disjoint slices a shard yields before it is re-shuffled (rotate only).

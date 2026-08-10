@@ -14,7 +14,9 @@ from benchmark.defenses.defl import DeFL, fgnv_for_update, group_layers  # noqa:
 
 
 def _zeros_global():
-    """A tiny 2-layer (net.2, net.4) zero state_dict matching MnistNet's key style."""
+    """A tiny 2-layer zero state_dict matching NiddNet's `net.<i>.<weight|bias>`
+    key style (the real model's layers are net.0 and net.2; the names here only
+    have to group the same way under the prefix rule)."""
     return {
         "net.2.weight": torch.zeros(2, 2),
         "net.2.bias": torch.zeros(2),

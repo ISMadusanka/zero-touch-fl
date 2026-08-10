@@ -35,7 +35,7 @@ Codebase specifics:
     in I_final) — i.e. exactly the clients dropped from the aggregate. Like FLTrust,
     this is a DERIVED flag of an aggregator (not a trained classifier); compare its
     TPR/FPR loosely and treat acc_drop as the primary metric — see benchmark/README.md.
-  * Our model is tiny (d=970 << b=10000), so b clamps to d and no subsampling
+  * Our model is tiny (d=681 << b=10000), so b clamps to d and no subsampling
     happens; with niters=1 DnC is then deterministic. Subsampling (d > b) uses a
     seeded RNG for reproducibility.
 

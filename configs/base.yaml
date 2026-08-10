@@ -54,9 +54,19 @@ fl:
                                   # A slice always comes from the client's OWN shard, so the non-IID
                                   # skew the FLTrust partition built is preserved.
   client_round_fraction: 0.25     # fraction of its shard a client trains on per round.
-                                  # 20 clients over MNIST = ~3000-example shards, so 0.25 is ~750
-                                  # examples (12 batches, 36 SGD iterations at local_epochs: 3) and
+                                  # 20 clients over 80k 5G-NIDD training flows (data.max_samples
+                                  # 100k, test_fraction 0.2) = 4000 examples per client ON
+                                  # AVERAGE, so 0.25 is ~1000 examples (16 batches, 48 SGD
+                                  # iterations at local_epochs: 3) against MNIST's ~750, and
                                   # `rotate` covers the whole shard every 4 rounds.
+                                  # The average is not the typical client, though: the non-IID
+                                  # partition builds one group per class and 5G-NIDD's two big
+                                  # classes (Benign ~39% of flows, UDPFlood ~38%) swell their
+                                  # groups, so measured shards run 2510 / 2946 / 9078
+                                  # (min / median / max) — a 3.6x spread, i.e. 628 to 2270
+                                  # examples per round. The fraction is therefore applied PER
+                                  # CLIENT, not once for the federation — see
+                                  # data/round_sampler.py.
                                   # It is a REAL knob on the FL dynamics, not just bookkeeping:
                                   # fewer examples per round = fewer SGD iterations = smaller honest
                                   # updates, so a poisoned update of a given size stands out more.
@@ -79,7 +89,7 @@ fl:
                                   # clients it accepted were the poisoned ones). Retraining keeps the
                                   # honest deltas on the same descent direction the server sees. It
                                   # costs one local-training pass per client per round, which on this
-                                  # 970-parameter model is negligible next to LLM generation.
+                                  # 681-parameter model is negligible next to LLM generation.
                                   # FORCED ON when freeze_global_in_phase2 is true: a frozen global
                                   # plus frozen client weights makes every round byte-identical, so
                                   # the retrain IS the "clients train with new data" step there.
@@ -89,11 +99,132 @@ fl:
   device: "cuda"                  # RL training needs a GPU; use "cpu" only for --dry-run/--baseline
 
 data:
-  dataset: "mnist"
+  dataset: "5gnidd"               # 5G-NIDD (Samarakoon et al. 2022): 1,215,890 labelled
+                                  # network flows from the University of Oulu 5G Test
+                                  # Network — benign traffic plus 8 attacks (UDPFlood,
+                                  # HTTPFlood, SlowrateDoS, TCPConnectScan, SYNScan,
+                                  # UDPScan, SYNFlood, ICMPFlood) over ~52 Argus flow
+                                  # features. TABULAR, which is why the FL model is a
+                                  # plain fully-connected net (see the `model:` block).
   iid: false
-  noniid_bias: 0.5                # FLTrust bias probability q (iid=false only). 1/n_classes=0.1
-                                  # is IID; larger = more non-IID; paper default 0.5.
-  data_dir: "./data/mnist_raw"
+  noniid_bias: 0.5                # FLTrust bias probability q (iid=false only). 1/n_classes
+                                  # (=0.111 at 9 classes) is IID; larger = more non-IID;
+                                  # paper default 0.5. The group count M is now taken from
+                                  # the DATA (9 multiclass / 2 binary), not a constant.
+  source: "csv"                   # csv = the real dataset at `csv_path`.
+                                  # synthetic = generate 5G-NIDD-SHAPED traffic instead
+                                  #   (same 9 classes, same class imbalance, same
+                                  #   preprocessing path) so the pipeline can be smoke-
+                                  #   tested on a box without the data. It is NOT a
+                                  #   substitute for the dataset: no accuracy, attack-
+                                  #   success or defense number from a synthetic run means
+                                  #   anything. Every such run logs a warning saying so.
+  csv_path: "./data/5gnidd_raw/Combined.csv"
+                                  # The dataset is not redistributable, so it is not
+                                  # vendored. Download it from IEEE DataPort:
+                                  #   https://ieee-dataport.org/documents/5g-nidd-comprehensive-network-intrusion-detection-dataset-generated-over-5g-wireless
+                                  # and point this at the combined CSV, or at a DIRECTORY
+                                  # of the per-attack CSVs (they are concatenated).
+  cache_dir: "./data/5gnidd_processed"
+                                  # Preprocessed arrays + schema.json land here, keyed by
+                                  # the options below plus the CSV's size/mtime, so the
+                                  # ~1.2M-row parse happens once instead of on every run,
+                                  # benchmark and resume.
+  use_cache: true
+  label_mode: "multiclass"        # multiclass = predict the ATTACK TYPE (9 classes incl.
+                                  #   benign). This is the default because it keeps the
+                                  #   machinery the MNIST setup was tuned for: ~9-10
+                                  #   classes means the non-IID partition still forms one
+                                  #   group per class, `targeted_label` still means
+                                  #   something, and accuracy sits well above the chance
+                                  #   floor so a 10-point drop is a real 10 points.
+                                  # binary = Benign vs Malicious. Note the majority class
+                                  #   is ~61% of flows, so accuracy starts near that floor
+                                  #   and the attack targets below need re-thinking.
+  label_column: null              # null = auto-detect ("Attack Type" for multiclass,
+                                  # "Label" for binary). Set explicitly if your CSV
+                                  # spells it differently.
+  drop_columns: []                # EXTRA columns to drop, on top of the built-in list in
+                                  # data/nidd_loader.py:DEFAULT_DROP_COLUMNS. That list
+                                  # removes `Attack Tool` (a restatement of the label) and
+                                  # the host/port/time identifiers — SrcAddr, DstAddr,
+                                  # Sport, Dport, StartTime, Seq, ... — and dropping them
+                                  # is LOAD-BEARING, not tidiness: 5G-NIDD's attack
+                                  # traffic comes from a handful of testbed hosts, so a
+                                  # model given the source address scores ~100% by
+                                  # memorising "this IP is the attacker" and learns
+                                  # nothing about traffic. Since the reward here IS test
+                                  # accuracy, that would make the whole arms race
+                                  # measure address lookup.
+  n_features: 32                  # how many flow features the model sees, chosen by ANOVA
+                                  # F-statistic ON THE TRAIN SPLIT (ties broken by column
+                                  # name, so the selection is identical on every machine).
+                                  #
+                                  # This is what makes the parameter count a CONFIG
+                                  # CONSTANT instead of a property of whichever CSV was
+                                  # handed over — the model is (K+1)*H + (H+1)*C
+                                  # parameters, so K and `model.hidden` fully determine it.
+                                  # Lower it to shrink the model further; the ANOVA
+                                  # ranking means the columns dropped first are the ones
+                                  # that separate the attack classes least.
+  max_samples: 100000             # stratified subsample of the 1,215,890 flows; null =
+                                  # all of them. 100k keeps a Phase-2 round costing about
+                                  # what it cost on MNIST: 80k train over 20 clients is a
+                                  # ~4000-example shard, and at fl.client_round_fraction
+                                  # 0.25 that is ~1000 examples (16 batches) per client
+                                  # per round, against MNIST's ~750 (12 batches). The full
+                                  # dataset would be ~60k examples per client per round —
+                                  # a different experiment, not a slower one.
+                                  # The 20k test split also makes the accuracy measurement
+                                  # FINER than MNIST's 10k (quantized to 5e-5 rather than
+                                  # 1e-4), which only helps the reward noise floor at
+                                  # rl.min_reward_spread.
+  test_fraction: 0.2              # stratified, seeded. The split happens BEFORE the
+                                  # scaler / feature selector are fitted, so no test-set
+                                  # statistics leak into the model.
+  class_balance: "natural"        # natural = keep 5G-NIDD's real class mix, which is
+                                  #   severely imbalanced (UDPFlood ~38% of all flows,
+                                  #   ICMPFlood ~0.09%). Faithful to the dataset, and what
+                                  #   the literature's accuracy numbers mean. At
+                                  #   max_samples 100k the rarest class has ~90 rows, so
+                                  #   the model will effectively not learn it — that is a
+                                  #   property of the dataset, not a bug.
+                                  # balanced = cap every class at the same count. Every
+                                  #   class becomes learnable, at the cost of no longer
+                                  #   being the published distribution.
+
+# FL model — a plain fully-connected network over the flow features.
+#
+# Linear(n_features, hidden) -> ReLU -> Linear(hidden, n_classes), i.e. no
+# convolution and no pooling: averaging neighbouring COLUMNS of an Argus record
+# ("source TTL" next to "destination TTL") is meaningless, unlike averaging
+# neighbouring pixels. At the defaults that is
+#     (32+1)*16 + (16+1)*9 = 528 + 153 = 681 trainable parameters,
+# down from the 970 of the MNIST model this replaces. The exact count is logged at
+# startup.
+model:
+  hidden: 16                      # hidden layer width — the other lever on model size
+                                  # besides data.n_features.
+                                  #
+                                  # 16 is the KNEE of the accuracy/size curve, not an
+                                  # arbitrary pick. Measured over 45 honest FedAvg rounds
+                                  # at 20 clients and n_features 32:
+                                  #     hidden  8 ->   345 params, acc 0.7655
+                                  #     hidden 16 ->   681 params, acc 0.8298   <- shipped
+                                  #     hidden 32 -> 1,353 params, acc 0.8302
+                                  #     hidden 64 -> 2,697 params, acc 0.8379
+                                  # Doubling the model buys 0.0004; halving it costs 6.4
+                                  # points. Go smaller only if you want the parameter
+                                  # count more than the accuracy — and note accuracy IS
+                                  # the reward signal here, so a capacity-starved model
+                                  # leaves the attacker less to take away.
+                                  # (Those runs used data.source: synthetic, so read the
+                                  # differences between rows, not the absolute values.)
+                                  #
+                                  # Two layers, not three: depth buys little on tabular
+                                  # flow data, and every extra layer is another tensor the
+                                  # attacker's operator DSL can target and every defense
+                                  # has to flatten.
 
 # Attack goal (configurable). First experiment = untargeted accuracy reduction.
 attack:
@@ -132,7 +263,16 @@ attack:
                                   # noise floors, which are absolute. Only (1) changes.
                                   # KEEP alpha * (1/target) CONSTANT whenever you move this.
     # per_round_drop: 0.02        # slow_degrade
-    # label: 7                    # targeted_label (per-class eval is a TODO; falls back to overall)
+    # label: 7                    # targeted_label (per-class eval is a TODO; falls back to overall).
+                                  # Class indices are the ALPHABETICAL order of the label strings
+                                  # found in the CSV, which for the full 9-class dataset is
+                                  #   0 Benign        3 SYNFlood   6 TCPConnectScan
+                                  #   1 HTTPFlood     4 SYNScan    7 UDPFlood
+                                  #   2 ICMPFlood     5 SlowrateDoS 8 UDPScan
+                                  # The mapping is logged at startup and stored in
+                                  # data/5gnidd_processed/schema.json — read it there rather than
+                                  # trusting this comment, since a subsample that wipes out a rare
+                                  # class re-encodes the remaining ones contiguously.
   # --- Attack-goal target sampling (generalize instead of overfitting a single target) ---
   sample_target_in_training: false # OFF. true = randomize untargeted_degrade's target_accuracy_drop
                                   # each round from `target_choices`. That was on, and it fought the
@@ -260,7 +400,7 @@ defense:
   dnc:
     c: 1.0                        # filtering fraction
     niters: 1                     # subsampling iterations
-    sub_dim: 10000                # subsample dim b (clamped to the model's 970 dims)
+    sub_dim: 10000                # subsample dim b (clamped to the model's 681 dims)
     seed: null                    # null = defense.seed / fl.poison_seed
   multikrum:
     m: null                       # #selected/averaged; null = n - assumed_byzantine
@@ -381,10 +521,12 @@ rl:
   resample_temperature: 1.3       # temperature for that re-roll
   skip_zero_advantage: true       # if still degenerate, skip the step (apply NO gradient)
   min_reward_spread: 0.02         # NOISE FLOOR: a group whose rewards span less than this is
-                                  # DEGENERATE (resample, then skip). Accuracy is measured on 10k
-                                  # test examples -> quantized to 1e-4, which at the smallest
-                                  # sampled target (0.05) is ~2e-3 of reward per single flipped
-                                  # example. The old test was std < 1e-6, so identical rollouts
+                                  # DEGENERATE (resample, then skip). Accuracy is measured on the
+                                  # 20k-flow 5G-NIDD test split -> quantized to 5e-5, which at the
+                                  # smallest sampled target (0.05) is ~1e-3 of reward per single
+                                  # flipped example (MNIST's 10k test set gave 2e-3, so this floor
+                                  # is if anything more generous now). The old test was
+                                  # std < 1e-6, so identical rollouts
                                   # that differed by measurement noise were z-scored up to
                                   # A = +-1.2 and trained on. A real 1% accuracy gap scores 0.2
                                   # at that target, so this bar is easy for genuine differences.

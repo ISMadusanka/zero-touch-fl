@@ -1,14 +1,18 @@
-"""Tests for the FLTrust non-IID partition (data/mnist_loader.partition_noniid_fltrust).
+"""Tests for the FLTrust non-IID partition (data/nidd_loader.partition_noniid_fltrust).
 
-Uses a tiny fake dataset (a `.targets` list), so no MNIST download is needed.
-Run on any box with torch/torchvision installed:  python tests/test_partition.py
+Uses a tiny fake dataset (a `.targets` list), so no 5G-NIDD CSV is needed.
+Run on any box with torch installed:  python tests/test_partition.py
+
+The partition is dataset-agnostic — it only reads labels — so most cases here use a
+balanced 10-class set to keep the arithmetic obvious. The 5G-NIDD-specific cases
+(9 classes, and the severe class imbalance that dataset really has) are at the end.
 """
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.mnist_loader import partition_noniid_fltrust  # noqa: E402
+from data.nidd_loader import partition_noniid_fltrust  # noqa: E402
 
 
 class FakeDS:
@@ -93,6 +97,49 @@ def test_fewer_clients_than_classes_still_covers():
     assert len(shards) == 5
     flat = [i for s in shards for i in s]
     assert sorted(flat) == list(range(len(targets)))
+
+
+# --- 5G-NIDD specifics: 9 classes, and a severely imbalanced label mix ---------
+
+def test_nine_classes_over_twenty_clients_covers_exactly():
+    """The shipped configuration: 9 attack classes (incl. benign), 20 clients.
+
+    9 does not divide 20, so groups get 2 or 3 clients — the round-robin split must
+    still produce an exact, disjoint cover.
+    """
+    targets = _balanced_targets(90, n_classes=9)          # 810 samples, 9 classes
+    ds = FakeDS(targets)
+    shards = partition_noniid_fltrust(ds, n_clients=20, n_classes=9, bias_q=0.5, seed=0)
+    assert len(shards) == 20
+    assert all(len(s) > 0 for s in shards)                # nobody starved
+    flat = [i for s in shards for i in s]
+    assert sorted(flat) == list(range(len(targets)))
+
+
+def test_imbalanced_labels_still_cover_and_stay_bounded():
+    """5G-NIDD's real mix: two dominant classes and one that is ~0.1% of flows.
+
+    Two properties matter downstream. Coverage must hold (no flow silently
+    dropped), and at bias_q=0.5 the shard spread must stay MODEST despite a 400x
+    class ratio — half of every class is spread uniformly over the other groups,
+    which floors the rare-class groups. `data/round_sampler.py` and the
+    `client_round_fraction` comment in configs/base.yaml both quote that bound, so
+    a change in this behaviour should fail here rather than silently invalidate
+    those notes.
+    """
+    # Benign 39%, UDPFlood 38%, then a long tail down to ICMPFlood at ~0.1%.
+    mix = [3900, 3800, 1150, 600, 164, 164, 127, 79, 9]
+    targets = [c for c, n in enumerate(mix) for _ in range(n)]
+    ds = FakeDS(targets)
+    shards = partition_noniid_fltrust(ds, n_clients=20, n_classes=9, bias_q=0.5, seed=0)
+
+    flat = [i for s in shards for i in s]
+    assert sorted(flat) == list(range(len(targets)))       # exact, disjoint cover
+    sizes = sorted(len(s) for s in shards)
+    assert sizes[0] > 0
+    # Measured ~3.6x at these proportions; assert an order-of-magnitude bound so the
+    # test documents the effect without being brittle to the exact draw.
+    assert sizes[-1] / sizes[0] < 10, sizes
 
 
 def _run():

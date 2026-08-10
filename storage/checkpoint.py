@@ -11,11 +11,82 @@ def _ensure_dir():
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 
+#: The feature spec the saved Phase-1 model was trained under.
+_SPEC_FILE = "feature_spec.json"
+
+
+def saved_spec():
+    """The :class:`~data.feature_spec.FeatureSpec` Phase 1 was trained under, or ``None``.
+
+    ``None`` for a checkpoint written before specs were recorded — treated as
+    "unknown provenance", not as a mismatch.
+    """
+    from data.feature_spec import FeatureSpec
+
+    return FeatureSpec.from_json(os.path.join(CHECKPOINT_DIR, _SPEC_FILE))
+
+
+def shape_mismatch(global_weights: dict) -> str | None:
+    """Describe why the saved Phase 1 must not be reused, or ``None`` if it is fine.
+
+    On MNIST the model's shape was a constant, so a checkpoint either existed or
+    did not. 5G-NIDD's follows the PREPROCESSING — ``data.n_features``,
+    ``data.label_mode`` (9 classes or 2), and ``model.hidden`` — so it can
+    legitimately differ between two runs of the same repo. Two failure modes
+    follow, and both are caught here so the fix (re-run Phase 1) is automatic:
+
+    * **Unloadable.** Different layer names or tensor shapes. Checking up front
+      turns "RuntimeError: size mismatch for net.0.weight", raised deep inside a
+      Phase-2 resume, into a warning and a fresh Phase 1.
+    * **Loadable but wrong.** The shapes match and the weights load, yet the model
+      was trained on different data — most dangerously a ``data.source:
+      synthetic`` smoke run, whose 32-feature/9-class model is shape-identical to a
+      real one. Resuming from it would make every accuracy, drop and defense number
+      in the run a measurement of generated traffic. The recorded spec is what
+      distinguishes them.
+
+    Callers: ``main.py`` and ``benchmark/run_benchmark.py``, right after
+    :func:`load_state`.
+    """
+    from data.feature_spec import active
+    from model import build_model            # deferred: keeps this module torch-only
+
+    expected = build_model().state_dict()
+    saved = global_weights or {}
+    missing = sorted(set(expected) - set(saved))
+    extra = sorted(set(saved) - set(expected))
+    if missing or extra:
+        return (f"has different layers than the current model "
+                f"(missing {missing or 'none'}, unexpected {extra or 'none'})")
+    bad = [f"{k}: saved {tuple(saved[k].shape)} vs model {tuple(v.shape)}"
+           for k, v in expected.items()
+           if tuple(saved[k].shape) != tuple(v.shape)]
+    if bad:
+        return "was trained at a different feature/class count — " + "; ".join(bad)
+
+    # Shapes agree; now the provenance the shapes cannot reveal.
+    was, now = saved_spec(), active()
+    if was is not None and was.source != now.source:
+        return (f"was trained on {was.source!r} data but this run loads {now.source!r} "
+                f"— a synthetic-trained baseline would invalidate every number in the run")
+    if was is not None and was.feature_names and now.feature_names \
+            and was.feature_names != now.feature_names:
+        return (f"was trained on a different feature set "
+                f"({len(was.feature_names)} columns, first differing entry "
+                f"{next((a for a, b in zip(was.feature_names, now.feature_names) if a != b), '?')!r})")
+    return None
+
+
 def save_state(global_model_state: dict, client_updates: list[dict], baseline_accuracy: float):
-    """Persist Phase 1 results to disk."""
+    """Persist Phase 1 results to disk, including the feature spec it was trained
+    under so a later run can tell whether reusing it is valid (see
+    :func:`shape_mismatch`)."""
+    from data.feature_spec import active
+
     _ensure_dir()
     torch.save(global_model_state, os.path.join(CHECKPOINT_DIR, "global_model.pt"))
     torch.save(client_updates, os.path.join(CHECKPOINT_DIR, "client_updates.pt"))
+    active().to_json(os.path.join(CHECKPOINT_DIR, _SPEC_FILE))
     with open(os.path.join(CHECKPOINT_DIR, "baseline.json"), "w") as f:
         json.dump({"baseline_accuracy": baseline_accuracy}, f)
 
@@ -45,7 +116,7 @@ def state_exists() -> bool:
 # weights). Phase 1 saves the *initial* baseline via save_state(); this saves
 # the LIVE Phase-2 arms-race state at each checkpoint so a resume continues the
 # shared model where it left off instead of rewinding to the Phase-1 baseline
-# (the global model is a ~970-param MnistNet, so this is a few KB).
+# (the global model is a ~681-param NiddNet, so this is a few KB).
 # ---------------------------------------------------------------------------
 
 _FL_STATE_FILE = "fl_state.pt"

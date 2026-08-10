@@ -11,7 +11,7 @@ fills it. These tests cover the three places that has to hold together:
     ``select_and_apply`` poison exactly clients 0..N-1 for ANY model output,
     and the system prompt says so.
 
-Torch is used for synthetic MNIST-shaped tensors — no download, no GPU, no LLM:
+Torch is used for synthetic 5G-NIDD-shaped tensors — no CSV, no GPU, no LLM:
 
     python tests/test_fixed_poison_set.py
 """
@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
 
+from data.feature_spec import DEFAULT_SPEC  # noqa: E402
+
 from agents.attacker_agent import AttackerAgent  # noqa: E402
 from rl.curriculum import build_training_curriculum  # noqa: E402
 from rl.env import FLArmsRaceEnv  # noqa: E402
@@ -39,8 +41,8 @@ ALGS = ["defl", "dnc", "multikrum"]     # FLTrust needs a real root set (test_fl
 def _loader(seed: int, n: int = 64):
     g = torch.Generator().manual_seed(seed)
     return DataLoader(
-        TensorDataset(torch.randn(n, 1, 28, 28, generator=g),
-                      torch.randint(0, 10, (n,), generator=g)),
+        TensorDataset(torch.randn(n, DEFAULT_SPEC.input_dim, generator=g),
+                      torch.randint(0, DEFAULT_SPEC.n_classes, (n,), generator=g)),
         batch_size=32, shuffle=True)
 
 
@@ -56,7 +58,7 @@ def _cfg(fixed=N_POISON, **attack):
                "benign_retrain_each_round": False, "training_rounds": 5,
                "n_compromisable": 3, "poison_seed": 0, "batch_size": 32,
                "freeze_global_in_phase2": False},
-        "data": {"data_dir": "./data/mnist_raw"},
+        "data": {"source": "synthetic"},
         "attack": a,
         "defense": {"mode": "algorithmic", "algorithms": list(ALGS), "selection": "random"},
         "curriculum": {"enabled": True, "rounds_per_block": 2,
@@ -70,8 +72,8 @@ def _env(cfg=None):
     curriculum = build_training_curriculum(cfg, algorithms=defense.names)
     env = FLArmsRaceEnv(cfg, [_loader(i) for i in range(N_CLIENTS)], _loader(99, n=128),
                         random.Random(0), defense=defense, curriculum=curriculum)
-    from model.mnist_net import MnistNet
-    gw = MnistNet().state_dict()
+    from model.nidd_net import NiddNet
+    gw = NiddNet().state_dict()
     env.reset(gw, [{k: v.clone() for k, v in gw.items()} for _ in range(N_CLIENTS)], 0.5)
     return env
 

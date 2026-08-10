@@ -1,6 +1,11 @@
 # Runtime artifacts
+# (gitignore has no trailing comments — every pattern needs its own line.)
+# The 5G-NIDD dataset itself: not redistributable, see configs/base.yaml.
+data/5gnidd_raw/
+# Preprocessing cache + schema.json, rebuilt on demand.
+data/5gnidd_processed/
+# Leftover from the MNIST version of this testbed; nothing reads it any more.
 data/mnist_raw/
-data/cifar10_raw/
 checkpoints/
 logs/
 

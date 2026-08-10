@@ -2,7 +2,7 @@
 
 Covers ``server/algo_defender.py``, the env's defense hooks (``rl/env.py``) and
 the attacker-only phase rotation (``rl/switch.py``). Synthetic tensors shaped
-like MNIST — no download, no GPU, no LLM:
+like preprocessed 5G-NIDD flow vectors — no CSV, no GPU, no LLM:
 
     python tests/test_algo_defender.py
 """
@@ -16,7 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
 
-from model.mnist_net import MnistNet  # noqa: E402
+from data.feature_spec import DEFAULT_SPEC  # noqa: E402
+
+from model.nidd_net import NiddNet  # noqa: E402
 from rl.env import FLArmsRaceEnv  # noqa: E402
 from rl.switch import PhaseController, SwitchConfig  # noqa: E402
 from server.algo_defender import (  # noqa: E402
@@ -31,8 +33,8 @@ POISONED = [0, 1]
 def _loader(seed: int, n: int = 64):
     g = torch.Generator().manual_seed(seed)
     return DataLoader(
-        TensorDataset(torch.randn(n, 1, 28, 28, generator=g),
-                      torch.randint(0, 10, (n,), generator=g)),
+        TensorDataset(torch.randn(n, DEFAULT_SPEC.input_dim, generator=g),
+                      torch.randint(0, DEFAULT_SPEC.n_classes, (n,), generator=g)),
         batch_size=32, shuffle=True)
 
 
@@ -46,12 +48,12 @@ def _cfg(**defense):
                "benign_retrain_each_round": False, "training_rounds": 5,
                "freeze_global_in_phase2": False,
                "n_compromisable": 2, "poison_seed": 0, "batch_size": 32},
-        "data": {"data_dir": "./data/mnist_raw"},
+        "data": {"source": "synthetic"},
         "attack": {"goal": {"type": "untargeted_degrade", "target_accuracy_drop": 0.2},
                    "max_poison_clients": 2, "sample_budget_in_training": False},
         "defense": {"mode": "algorithmic",
                     # FLTrust is excluded by default here: it needs a real clean root
-                    # dataset (MNIST download). It is covered by tests/test_fltrust.py.
+                    # dataset (the 5G-NIDD CSV). It is covered by tests/test_fltrust.py.
                     "algorithms": ["defl", "dnc", "multikrum"],
                     "selection": "random"},
     }
@@ -70,7 +72,7 @@ def _env(cfg=None, defense="build"):
     loaders = [_loader(i) for i in range(N_CLIENTS)]
     env = FLArmsRaceEnv(cfg, loaders, _loader(99, n=128), random.Random(0),
                         defense=defense)
-    gw = {k: v.clone() for k, v in MnistNet().state_dict().items()}
+    gw = {k: v.clone() for k, v in NiddNet().state_dict().items()}
     cw = [{k: v + torch.randn_like(v) * 0.01 for k, v in gw.items()}
           for _ in range(N_CLIENTS)]
     env.reset(gw, cw, 0.5)

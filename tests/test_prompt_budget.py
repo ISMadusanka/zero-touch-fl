@@ -25,14 +25,15 @@ from agents.attack_ops import (  # noqa: E402
 )
 from agents.attacker_agent import AttackerAgent  # noqa: E402
 from agents.prompt_budget import PromptBudget, build_prompt_budget, estimate_tokens  # noqa: E402
-from model.mnist_net import MnistNet  # noqa: E402
+from data.feature_spec import DEFAULT_SPEC  # noqa: E402
+from model.nidd_net import DEFAULT_HIDDEN, NiddNet  # noqa: E402
 
 RL_CFG = {"max_seq_len": 16384, "max_new_tokens": 1536, "max_context_fill": 0.5}
 
 
 def _global():
     torch.manual_seed(0)
-    return MnistNet().state_dict()
+    return NiddNet().state_dict()
 
 
 def _client(g, seed):
@@ -108,8 +109,11 @@ def test_compact_encoding_is_much_smaller():
 
 def test_layer_shapes_are_sent_once():
     g = _global()
-    assert layer_shapes(g) == {"net.2.weight": [16, 49], "net.2.bias": [16],
-                               "net.4.weight": [10, 16], "net.4.bias": [10]}
+    spec = DEFAULT_SPEC
+    h = DEFAULT_HIDDEN
+    assert layer_shapes(g) == {"net.0.weight": [h, spec.input_dim], "net.0.bias": [h],
+                               "net.2.weight": [spec.n_classes, h],
+                               "net.2.bias": [spec.n_classes]}
     assert "shape" not in json.dumps(delta_rows(_client(g, 1), g))
 
 

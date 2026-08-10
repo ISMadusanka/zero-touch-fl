@@ -10,7 +10,7 @@ Guards the four resume bugs fixed in rl/schedule.py + rl/env.py + storage:
   #1  a checkpoint taken during a borrowed (league/curriculum) phase persists the
       opponent's LIVE weights, never the swapped-in snapshot.
 
-Uses tiny synthetic loaders + a stubbed round body, so no MNIST/GPU/LLM is needed:
+Uses tiny synthetic loaders + a stubbed round body, so no CSV/GPU/LLM is needed:
     python tests/test_resume.py
 """
 
@@ -25,7 +25,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
 
-from model.mnist_net import MnistNet  # noqa: E402
+from data.feature_spec import DEFAULT_SPEC  # noqa: E402
+
+from model.nidd_net import NiddNet  # noqa: E402
 from rl.env import FLArmsRaceEnv  # noqa: E402
 import rl.schedule as sched  # noqa: E402
 import storage.checkpoint as ckpt  # noqa: E402
@@ -33,8 +35,8 @@ import storage.checkpoint as ckpt  # noqa: E402
 
 def _loader(seed, n=64):
     g = torch.Generator().manual_seed(seed)
-    x = torch.randn(n, 1, 28, 28, generator=g)
-    y = torch.randint(0, 10, (n,), generator=g)
+    x = torch.randn(n, DEFAULT_SPEC.input_dim, generator=g)
+    y = torch.randint(0, DEFAULT_SPEC.n_classes, (n,), generator=g)
     return DataLoader(TensorDataset(x, y), batch_size=32, shuffle=True)
 
 
@@ -59,7 +61,7 @@ def _cfg():
 
 def _make_env():
     env = FLArmsRaceEnv(_cfg(), [_loader(i) for i in range(4)], _loader(999, 128), random.Random(0))
-    net = MnistNet()
+    net = NiddNet()
     gw = {k: v.clone() for k, v in net.state_dict().items()}
     cw = [{k: v.clone() + 0.01 * (i + 1) for k, v in gw.items()} for i in range(4)]
     env.reset(gw, cw, baseline_accuracy=0.10)

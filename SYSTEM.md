@@ -8,8 +8,9 @@ checkpoint layout. It supersedes the old feedback/episodic-memory design.
 
 | Layer | Module | Role |
 |-------|--------|------|
-| Model | `model/mnist_net.py` | `MnistNet`, ~970 params. State_dict keys: `net.2.weight [16,49]`, `net.2.bias [16]`, `net.4.weight [10,16]`, `net.4.bias [10]`. The schema both LLMs operate over. |
-| Data | `data/mnist_loader.py` | MNIST load + per-client partition: IID, or the FLTrust non-IID bias-`q` scheme (`partition_noniid_fltrust`). |
+| Model | `model/nidd_net.py` | `NiddNet`, 681 params — a plain fully-connected net (`Linear(32,16) → ReLU → Linear(16,9)`), no convolution or pooling. State_dict keys: `net.0.weight [16,32]`, `net.0.bias [16]`, `net.2.weight [9,16]`, `net.2.bias [9]`. The schema both LLMs operate over. |
+| Data | `data/nidd_loader.py` | 5G-NIDD CSV ingest + leakage-safe preprocessing (train-only fit, top-K ANOVA feature selection) + per-client partition: IID, or the FLTrust non-IID bias-`q` scheme (`partition_noniid_fltrust`). See `DATA_PARTION.md`. |
+| Feature schema | `data/feature_spec.py` | The contract between preprocessing and the model: the loader publishes `input_dim`/`n_classes`, everything that builds a model reads it. Unlike MNIST's fixed `1×28×28 → 10`, this shape follows the config. |
 | Clients | `clients/benign_client.py` | Honest local SGD → `ModelUpdate`. |
 | Server | `server/fed_server.py`, `server/aggregation.py` | Global model + eval; FedAvg over non-flagged clients. |
 | Features | `detector/features.py` | Per-client, per-layer statistical feature vectors (no decisions). |
@@ -170,7 +171,9 @@ for algorithm in defense.algorithms:            # fltrust, defl, dnc, multikrum
   `add_gaussian_noise`, `mask`, `clip`, `add_constant`, `permute`,
   `scale_neurons`, `blend_random`, `quantize`. `target` is `"all"`, a layer name,
   or a full parameter key — the exact names come from `client_update_stats` (for
-  MnistNet e.g. `"net.2"` / `"net.4.weight"`). Operations apply in order.
+  NiddNet e.g. `"net.0"` / `"net.2.weight"`). Nothing hardcodes those names, which
+  is why the model can change shape without touching the DSL. Operations apply in
+  order.
 - **Selection + application** (`agents/attacker_agent.select_and_apply` →
   `attack_ops.apply_plan`): filters ids to the pool, dedups, truncates excess ids,
   and fills an under-sized usable selection to the **exact quota** with remaining
@@ -196,7 +199,7 @@ for algorithm in defense.algorithms:            # fltrust, defl, dnc, multikrum
 - **Input** (`agents/defender_agent.build_user_prompt`): per-client features
   from `detector/features.compute_client_features` — **only** features, never the
   ground truth.
-  - Per layer (one per model layer; e.g. `net.2`, `net.4` for MnistNet): `l2_norm`,
+  - Per layer (one per model layer; e.g. `net.0`, `net.2` for NiddNet): `l2_norm`,
     `rel_norm` (vs the median over all clients), `cos_to_median` (vs the
     coordinate-wise median over all clients — references include the scored client
     itself, not leave-one-out; with a benign majority the median is honest either

@@ -104,10 +104,9 @@ def _parse_goal(spec: str) -> dict:
 
 
 def _build_root_loader(data_cfg, root_size, batch_size, seed):
-    from data.mnist_loader import build_root_loader
+    from data.nidd_loader import build_root_loader
     return build_root_loader(root_size=root_size, batch_size=batch_size,
-                             data_dir=data_cfg.get("data_dir", "./data/mnist_raw"),
-                             seed=seed)
+                             data_cfg=data_cfg, seed=seed)
 
 
 def _resolve_eval_budget(env, requested, log=None):
@@ -285,8 +284,11 @@ def main():
     log = logging.getLogger("benchmark")
 
     # Heavy / FL imports are deferred so --help works without torch.
-    from data.mnist_loader import get_data_loaders
-    from storage.checkpoint import state_exists, load_state, adapter_exists
+    from data.nidd_loader import get_data_loaders
+    from model import set_default_hidden
+    from storage.checkpoint import (
+        state_exists, load_state, adapter_exists, shape_mismatch,
+    )
     from agents.attacker_agent import AttackerAgent
     from agents.defender_agent import DefenderAgent
     from rl.env import FLArmsRaceEnv
@@ -330,9 +332,11 @@ def main():
     import torch
     torch.manual_seed(seed)
 
+    # Must precede every FedServer construction (see model.set_default_hidden).
+    set_default_hidden((base_cfg.get("model") or {}).get("hidden"))
     client_loaders, test_loader = get_data_loaders(
         n_clients=fl["n_clients"], batch_size=fl["batch_size"],
-        data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), iid=data_cfg.get("iid", True),
+        data_cfg=data_cfg, iid=data_cfg.get("iid", True),
         bias_q=float(data_cfg.get("noniid_bias", 0.5)), seed=seed,
     )
 
@@ -344,6 +348,14 @@ def main():
         log.warning(f"Checkpoint has {len(state[1])} client(s) but config n_clients={fl['n_clients']} "
                     f"— ignoring the stale checkpoint and re-running Phase-1.")
         state = None
+    # Same feature/class-count guard main.py applies: the model's shape follows
+    # `data.n_features` / `data.label_mode` / `model.hidden`, so a checkpoint from a
+    # different preprocessing must be rejected here rather than raise mid-panel.
+    if state is not None:
+        stale = shape_mismatch(state[0])
+        if stale:
+            log.warning(f"Checkpoint {stale} — ignoring it and re-running Phase-1.")
+            state = None
     if state is not None:
         log.info("Loading saved Phase-1 state (global model + client weights + baseline acc)")
         global_weights, client_weights, baseline_accuracy = state

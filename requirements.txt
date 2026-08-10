@@ -1,9 +1,12 @@
 # --- Core FL + tooling (CPU is fine for --dry-run / --baseline) ---
 torch>=2.0
-torchvision
 numpy
+pandas             # 5G-NIDD CSV ingest (~1.2M flows x ~52 columns)
 pyyaml
 matplotlib
+# NOTE torchvision is deliberately absent: the FL task is 5G-NIDD, a TABULAR
+# intrusion-detection dataset read from CSV, so there is no image pipeline left
+# to need it. Nothing in the repo imports it.
 openai>=1.0          # OpenAI inference/baseline backend
 requests             # Ollama HTTP backend
 

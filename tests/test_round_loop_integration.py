@@ -12,7 +12,7 @@ run and that no single-component test can see:
 * the calibration invariant holds on EVERY verdict of EVERY round, and
 * damage-based ``attack_success`` and the recorded drop stay consistent.
 
-Real MNIST is not needed (synthetic tensors shaped like it) and no LLM is involved —
+The real 5G-NIDD CSV is not needed (synthetic tensors of the same shape) and no LLM is involved —
 the attacker is ``rl.baseline``'s fixed action set:
     python tests/test_round_loop_integration.py
 """
@@ -27,9 +27,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
 
+from data.feature_spec import DEFAULT_SPEC  # noqa: E402
+
 from benchmark.defenses import build_defenses  # noqa: E402
 from metrics.tracker import MetricsTracker  # noqa: E402
-from model.mnist_net import MnistNet  # noqa: E402
+from model.nidd_net import NiddNet  # noqa: E402
 from rl.baseline import run_baseline  # noqa: E402
 from rl.curriculum import TrainingCurriculum  # noqa: E402
 from rl.env import FLArmsRaceEnv  # noqa: E402
@@ -46,8 +48,8 @@ FULL_SWEEP = len(ALGORITHMS) * len(POISONER_COUNTS)
 def _loader(seed, n=96, batch=32):
     g = torch.Generator().manual_seed(seed)
     return DataLoader(
-        TensorDataset(torch.randn(n, 1, 28, 28, generator=g),
-                      torch.randint(0, 10, (n,), generator=g)),
+        TensorDataset(torch.randn(n, DEFAULT_SPEC.input_dim, generator=g),
+                      torch.randint(0, DEFAULT_SPEC.n_classes, (n,), generator=g)),
         batch_size=batch, shuffle=True)
 
 
@@ -67,7 +69,7 @@ def _build(rounds_per_block=1):
         dnc_num_byzantine=3, dnc_c=1.0, dnc_niters=1, dnc_sub_dim=10000, dnc_seed=0,
         multikrum_num_byzantine=3, multikrum_m=None,
     )
-    gw = {k: v.clone() for k, v in MnistNet().state_dict().items()}
+    gw = {k: v.clone() for k, v in NiddNet().state_dict().items()}
     for d in defenses.values():
         d.reset(gw)
     defender = AlgorithmicDefender(defenses, random.Random(0), selection="round_robin")

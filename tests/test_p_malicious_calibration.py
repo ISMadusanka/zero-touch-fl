@@ -41,7 +41,8 @@ from benchmark.defenses.dnc import DnC  # noqa: E402
 from benchmark.defenses.fltrust import FLTrust  # noqa: E402
 from benchmark.defenses.multikrum import MultiKrum  # noqa: E402
 from core.types import ModelUpdate  # noqa: E402
-from model.mnist_net import MnistNet  # noqa: E402
+from data.feature_spec import DEFAULT_SPEC  # noqa: E402
+from model.nidd_net import NiddNet  # noqa: E402
 from rl.rewards import _soft_malicious_prob, attacker_reward  # noqa: E402
 
 N_CLIENTS = 20
@@ -51,7 +52,7 @@ GOAL = {"type": "untargeted_degrade", "target_accuracy_drop": 0.02}
 
 def _global():
     torch.manual_seed(0)
-    return MnistNet().state_dict()
+    return NiddNet().state_dict()
 
 
 def _updates(gw, n=N_CLIENTS, n_pois=N_POISONED, scale=6.0):
@@ -68,7 +69,8 @@ def _updates(gw, n=N_CLIENTS, n_pois=N_POISONED, scale=6.0):
 
 def _defenses():
     torch.manual_seed(2)
-    root = TensorDataset(torch.randn(100, 1, 28, 28), torch.randint(0, 10, (100,)))
+    root = TensorDataset(torch.randn(100, DEFAULT_SPEC.input_dim),
+                         torch.randint(0, DEFAULT_SPEC.n_classes, (100,)))
     return {
         "fltrust": FLTrust(DataLoader(root, batch_size=64, shuffle=True),
                            lr=0.002, local_epochs=5),
