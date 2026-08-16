@@ -1,6 +1,7 @@
 # Runtime artifacts
 data/mnist_raw/
 data/cifar10_raw/
+data/5gnidd_processed/
 checkpoints/
 logs/
 
