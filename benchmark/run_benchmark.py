@@ -36,6 +36,21 @@ def _parse_args():
                          "(no per-round sampling). Default: attack.goal from --config.")
     ap.add_argument("--defenses", default="fedavg,oracle,llm_defender,fltrust,defl,dnc,multikrum",
                     help="comma-separated; 'fedavg' is always included (attacker reference)")
+    ap.add_argument("--attacker", default="llm",
+                    help="who attacks: 'llm' (trained adapter, default) or a published "
+                         "baseline: noise, sign_flip, scaling, lie, ipm, min_max, min_sum, "
+                         "fang. A scripted baseline needs NO adapter and runs on CPU.")
+    ap.add_argument("--attack-scale", type=float, default=None,
+                    help="primary magnitude for the trivial baselines: sigma (noise) or "
+                         "factor (sign_flip/scaling). Default: per-attack.")
+    ap.add_argument("--lie-z", type=float, default=None,
+                    help="LIE std multiplier z (default: derived from n_clients + quota)")
+    ap.add_argument("--ipm-eps", type=float, default=None,
+                    help="IPM scale epsilon (default: auto-sized to flip the aggregate)")
+    ap.add_argument("--attack-dev", default="sign", choices=["sign", "std", "unit"],
+                    help="Min-Max / Min-Sum perturbation direction (default: sign)")
+    ap.add_argument("--fang-lambda", type=float, default=3.0,
+                    help="Fang directed-deviation strength lambda (default: 3.0)")
     ap.add_argument("--attacker-adapter", default=None, help="override attacker checkpoint dir")
     ap.add_argument("--defender-adapter", default=None, help="override defender checkpoint dir")
     ap.add_argument("--attack-temperature", type=float, default=0.7,
@@ -273,6 +288,7 @@ def main():
     from rl.env import FLArmsRaceEnv
     from rl.policy import LLMPolicy
     from benchmark.defenses import AVAILABLE, build_defenses
+    from benchmark.attacks import AVAILABLE_ATTACKS, build_attacker
     from benchmark.harness import run_benchmark
     from benchmark import report
     from benchmark.phase1 import run_phase1
@@ -306,6 +322,11 @@ def main():
     bad = [n for n in names if n not in AVAILABLE]
     if bad:
         sys.exit(f"ERROR: unknown defense(s) {bad}; available: {AVAILABLE}")
+
+    if args.attacker != "llm" and args.attacker not in AVAILABLE_ATTACKS:
+        sys.exit(f"ERROR: unknown --attacker {args.attacker!r}; "
+                 f"available: llm, {', '.join(AVAILABLE_ATTACKS)}")
+    scripted = args.attacker != "llm"
 
     random.seed(seed)
     import torch
@@ -368,9 +389,11 @@ def main():
     if args.defender_adapter:
         adapter_paths["defender"] = args.defender_adapter
 
-    # The ATTACKER adapter is what is under evaluation — without it there is nothing
-    # to benchmark, so this one really is fatal.
-    if not adapter_exists(adapter_paths["attacker"]):
+    # The ATTACKER adapter is what is under evaluation when the LLM attacks —
+    # without it there is nothing to benchmark, so that case is fatal. A scripted
+    # baseline needs no adapter (it crafts weights directly), so this check is
+    # skipped and the attacker LoRA is never loaded.
+    if not scripted and not adapter_exists(adapter_paths["attacker"]):
         sys.exit(f"ERROR: no trained attacker adapter at {adapter_paths['attacker']}")
 
     # The DEFENDER adapter is needed ONLY by the `llm_defender` column, and a missing
@@ -382,22 +405,40 @@ def main():
     # also materialise an unused defender LoRA (~115 MB of VRAM at lora_r=16).
     names, skipped_llm_defender = _resolve_llm_defender(names, adapter_paths, base_cfg)
 
-    adapter_names = (("attacker", "defender") if "llm_defender" in names
-                     else ("attacker",))
-    policy = LLMPolicy(
-        base_model=rl_cfg.get("model", "unsloth/Qwen2.5-3B-Instruct"),
-        max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
-        lora_r=int(rl_cfg.get("lora_r", 16)),
-        lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
-        load_in_4bit=bool(rl_cfg.get("load_in_4bit", True)),
-        seed=seed,
-        adapters=adapter_names,
-        attn_implementation=rl_cfg.get("attn_implementation", "eager"),
-        use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
+    # Load the LLM policy only when something actually needs it: the LLM attacker,
+    # or the llm_defender column. A scripted attacker with an algorithmic-only
+    # panel needs no model at all — so those runs never touch the GPU / adapters.
+    needs_attacker_llm = not scripted
+    needs_defender_llm = "llm_defender" in names
+    policy = None
+    if needs_attacker_llm or needs_defender_llm:
+        adapter_names = tuple(
+            a for a, need in (("attacker", needs_attacker_llm),
+                              ("defender", needs_defender_llm)) if need)
+        policy = LLMPolicy(
+            base_model=rl_cfg.get("model", "unsloth/Qwen2.5-3B-Instruct"),
+            max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
+            lora_r=int(rl_cfg.get("lora_r", 16)),
+            lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
+            load_in_4bit=bool(rl_cfg.get("load_in_4bit", True)),
+            seed=seed,
+            adapters=adapter_names,
+            attn_implementation=rl_cfg.get("attn_implementation", "eager"),
+            use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
+        )
+        if needs_attacker_llm:
+            policy.load_adapter("attacker", adapter_paths["attacker"])
+        if needs_defender_llm:
+            policy.load_adapter("defender", adapter_paths["defender"])
+
+    # Build the scripted baseline (None for the LLM attacker). n_clients is the
+    # known federation size LIE/IPM auto-size against; the pool it sees is still
+    # only the compromised clients (partial-insider knowledge).
+    scripted_attacker = build_attacker(
+        args.attacker, seed=seed, n_clients=int(fl["n_clients"]),
+        attack_scale=args.attack_scale, lie_z=args.lie_z, ipm_eps=args.ipm_eps,
+        attack_dev=args.attack_dev, fang_lambda=args.fang_lambda,
     )
-    policy.load_adapter("attacker", adapter_paths["attacker"])
-    if "llm_defender" in names:
-        policy.load_adapter("defender", adapter_paths["defender"])
 
     attacker_agent = AttackerAgent(attacker_cfg)
     # Only meaningful for the llm_defender column; harmless to build either way.
@@ -464,8 +505,10 @@ def main():
         multikrum_num_byzantine=mk_f, multikrum_m=args.multikrum_m,
     )
 
-    log.info(f"Benchmark: {args.rounds} rounds | defenses={list(defenses)} | "
-             f"baseline_acc={baseline_accuracy:.4f} | attack_temp={args.attack_temperature}"
+    attacker_label = (f"scripted:{args.attacker}" if scripted
+                      else f"llm (temp={args.attack_temperature})")
+    log.info(f"Benchmark: {args.rounds} rounds | attacker={attacker_label} | "
+             f"defenses={list(defenses)} | baseline_acc={baseline_accuracy:.4f}"
              + (" | llm_defender SKIPPED (no defender adapter)"
                 if skipped_llm_defender else ""))
     summaries, _metrics = run_benchmark(
@@ -474,7 +517,7 @@ def main():
         n_rounds=args.rounds, attack_temperature=args.attack_temperature,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)), device=device,
         log_every=args.log_every, target_drop=target_drop,
-        attack_retries=max(0, args.attack_retries),
+        attack_retries=max(0, args.attack_retries), scripted_attacker=scripted_attacker,
     )
 
     # Rounds the harness could not get a usable attacker action for are skipped, so

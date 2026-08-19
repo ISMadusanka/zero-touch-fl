@@ -140,9 +140,18 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
                   attack_temperature: float = 0.7, max_new_tokens: int = 512,
                   device: str = "cpu", attacker_adapter: str = "attacker",
                   log_every: int = 10, target_drop: float | None = None,
-                  attack_retries: int = 3):
+                  attack_retries: int = 3, scripted_attacker=None):
     """Run ``n_rounds`` of attacker-vs-defenses. Returns (summaries, metrics) where
     summaries = {name: summary-dict} and metrics = {name: DefenseMetrics}.
+
+    ``scripted_attacker`` swaps the trained attacker LLM for a published
+    model-poisoning baseline (see ``benchmark/attacks``): a
+    :class:`~benchmark.attacks.base.ScriptedAttacker` that turns each round's
+    context into ``(poisoned, chosen_ids, n_malformed)`` with no LLM call. When it
+    is given, ``policy`` and ``attacker_agent`` are unused for the attack (they
+    may be ``None`` unless a defense in the panel needs the policy). Holding the
+    defense panel fixed and varying only this is what makes the LLM-vs-baseline
+    comparison fair. ``None`` (the default) keeps the trained-attacker path.
 
     ``target_drop`` (the goal's requested accuracy drop) enables the per-defense
     goal-success rate: the fraction of rounds that defense's accuracy fell to/below
@@ -168,18 +177,22 @@ def run_benchmark(env, policy, attacker_agent, defenses, test_loader,
     for r in range(1, n_rounds + 1):
         ctx = env.begin_round()
 
-        # The trained attacker SELECTS exactly the eval-budget count from its
-        # controllable pool and plans ONE attack against the reference state;
-        # the SAME poisoned updates go to every defense (vary defense, hold attack).
-        system = attacker_agent.system_prompt()
-        user = attacker_agent.build_user_prompt(ctx.round_num, reference_acc,
-                                                ctx.pool_benign, env.global_weights, ctx.budget)
-        if r == 1:
-            _check_prompt_fits(policy, system, user, max_new_tokens, len(ctx.pool_benign))
-        poisoned, chosen_ids, n_malformed, attempts = _sample_attack(
-            policy, attacker_agent, ctx, system, user, adapter=attacker_adapter,
-            temperature=attack_temperature, max_new_tokens=max_new_tokens,
-            retries=attack_retries)
+        # One attack per round, the SAME poisoned updates fed to every defense
+        # (vary defense, hold attack). Either a scripted baseline crafts it
+        # directly, or the trained attacker LLM selects clients + plans it.
+        if scripted_attacker is not None:
+            poisoned, chosen_ids, n_malformed = scripted_attacker.act(env, ctx)
+            attempts = 1
+        else:
+            system = attacker_agent.system_prompt()
+            user = attacker_agent.build_user_prompt(ctx.round_num, reference_acc,
+                                                    ctx.pool_benign, env.global_weights, ctx.budget)
+            if r == 1:
+                _check_prompt_fits(policy, system, user, max_new_tokens, len(ctx.pool_benign))
+            poisoned, chosen_ids, n_malformed, attempts = _sample_attack(
+                policy, attacker_agent, ctx, system, user, adapter=attacker_adapter,
+                temperature=attack_temperature, max_new_tokens=max_new_tokens,
+                retries=attack_retries)
         if len(chosen_ids) != ctx.budget:
             # No usable action after every retry. Measuring this round anyway would
             # score the panel on an attack that never happened (all-honest updates,

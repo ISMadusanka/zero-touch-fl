@@ -115,6 +115,52 @@ dnc           ...      ...    ...   ...   ...        ...       ...       ...
 multikrum     ...      ...    ...   ...   ...        ...       ...       ...
 ```
 
+## The attackers (`--attacker`)
+
+By default the benchmark runs the **trained attacker LLM** (`--attacker llm`). To
+measure how it stacks up against the literature, `--attacker` also selects a
+**published model-poisoning baseline** — the same crafted updates go through the
+same env and the same defense panel, so the only thing that changes is *who
+generated the attack*. A scripted baseline needs **no adapter and no GPU** (it
+crafts weights directly), so `python -m benchmark.run_benchmark --attacker lie
+--device cpu` runs anywhere.
+
+All baselines are **untargeted** (goal: degrade accuracy) and operate under the
+*same partial-insider knowledge the LLM has* — they estimate the benign update
+mean `μ` and std `σ` from **only the compromised clients**, never the honest
+majority's updates.
+
+| `--attacker` | what it is |
+|---|---|
+| `llm` | **Trained attacker adapter** — the policy under evaluation (default). |
+| `noise` | Gaussian-noise Byzantine baseline (Blanchard et al., NeurIPS 2017): each malicious client adds `𝒩(0, σ²)` to its own update. |
+| `sign_flip` | Each malicious client negates its own update: `Δ→ −factor·Δ`. |
+| `scaling` | Naive boosting: each malicious client sends `factor·Δ`. |
+| `lie` | **LIE — "A Little Is Enough"** (Baruch et al., NeurIPS 2019): `Δ_mal = μ − z·σ`. Stealthy; hides inside the honest variance. |
+| `ipm` | **IPM — Inner Product Manipulation** (Xie et al., UAI 2019): `Δ_mal = −ε·μ`, flipping the aggregate's direction. |
+| `min_max` | **Min-Max** (Shejwalkar & Houmansadr, NDSS 2021): largest deviation whose *max* distance to any honest update stays within the honest spread. AGR-agnostic. |
+| `min_sum` | **Min-Sum** (same paper): same idea with the *sum-of-squared-distances* bound. AGR-agnostic. |
+| `fang` | **Fang directed deviation** (Fang et al., USENIX Security 2020), AGR-agnostic variant: deviate `μ` against its own sign, scaled by the honest spread. |
+
+Knobs: `--attack-scale` (σ for `noise`, factor for `sign_flip`/`scaling`),
+`--lie-z`, `--ipm-eps` (both auto-derived from the federation size + quota when
+omitted), `--attack-dev {sign,std,unit}` (Min-Max/Min-Sum direction),
+`--fang-lambda`.
+
+Notes on faithfulness:
+- The optimization attacks (`lie`, `ipm`, `min_max`, `min_sum`, `fang`) are
+  **colluding** — all malicious clients send the *same* crafted update, as in the
+  papers. This can trip the panel's Sybil / pairwise-cosine checks; that is a real
+  property of the published attack, not a bug. The trivial baselines (`noise`,
+  `sign_flip`, `scaling`) manipulate each client's own update independently.
+- `min_max`/`min_sum` need ≥2 controllable clients to estimate the honest spread;
+  with one they reduce to the honest mean (no attack).
+- `fang` is the **AGR-agnostic** form (one fixed attack for the whole panel), not
+  the per-aggregation-rule tailored version — see the fairness section.
+
+New baselines live in `benchmark/attacks/` (one file per attack, registered in
+`benchmark/attacks/__init__.py`), mirroring `benchmark/defenses/`.
+
 ## The defenses
 
 | name | what it is |
