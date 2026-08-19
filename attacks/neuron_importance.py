@@ -55,12 +55,8 @@ def compute_neuron_importance(model: nn.Module, dataloader, target_class: int, d
     # Process only samples of the target class
     samples_processed = 0
     for inputs, labels in dataloader:
-        mask = labels == target_class
-        if not mask.any():
-            continue
-        
-        inputs = inputs[mask].to(device)
-        labels = labels[mask].to(device)
+        inputs = inputs.to(device)
+        labels = labels.to(device)
         samples_processed += inputs.size(0)
 
         model.zero_grad()
