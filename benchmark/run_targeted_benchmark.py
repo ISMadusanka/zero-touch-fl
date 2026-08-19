@@ -403,9 +403,6 @@ def _run(args, log, events):
 
     attacker_agent = AttackerAgent(attacker_cfg)
     defender_agent = DefenderAgent(defender_cfg)
-    if not attacker_agent.targeted:
-        sys.exit("ERROR: attacker agent did not enter targeted mode — check attack.goal.type")
-
     # The `ensemble` entry contains fltrust by default, so it needs a root set too.
     ensemble_members = (base_cfg.get("defense", {}) or {}).get("members")
     ensemble_vote = (base_cfg.get("defense", {}) or {}).get("vote", "majority")
