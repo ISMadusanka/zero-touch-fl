@@ -350,7 +350,7 @@ attack:
 
 # Server-side defense — what the attacker actually faces every Phase-2 round.
 defense:
-  mode: "algorithmic"             # algorithmic | llm
+  mode: "llm"             # algorithmic | llm
                                   # algorithmic = the DEFENDER LLM IS DISABLED. The server
                                   #   defends with the published algorithms below instead;
                                   #   only the attacker trains (rl/schedule.py runs
@@ -570,7 +570,7 @@ rl:
 
   # --- Schedule: success-gated iterated best response (the arms-race ratchet) ---
   switch_mode: "best_response"    # best_response | fixed (legacy K_a/K_d alternation)
-  first_learner: "attacker"       # who trains first
+  first_learner: "defender"       # who trains first. defender | attacker
   min_phase_rounds: 3             # earliest a phase may switch on a sustained win. Set equal to
                                   # success_streak so a phase switches as soon as the learner wins
                                   # success_streak times IN A ROW (no extra minimum-length gate).
