@@ -128,6 +128,26 @@ class FLArmsRaceEnv:
             f"benign_retrain={self.benign_retrain}, baseline_acc={self.baseline_accuracy:.4f}"
         )
 
+    def snapshot_fl_state(self) -> dict:
+        """Snapshot the live Phase-2 FL state (global model + client weights)."""
+        return {
+            "global_weights": copy.deepcopy(self.server.get_global_weights()),
+            "client_weights": [copy.deepcopy(w) for w in self.client_weights],
+            "current_accuracy": self.current_accuracy,
+            "round_index": self.round_index,
+        }
+
+    def restore_fl_state(self, state: dict) -> None:
+        """Restore the live Phase-2 FL state from a snapshot."""
+        self.server.set_global_weights(copy.deepcopy(state["global_weights"]))
+        self.client_weights = [copy.deepcopy(w) for w in state["client_weights"]]
+        self.current_accuracy = state["current_accuracy"]
+        self.round_index = state["round_index"]
+        logger.info(
+            f"Restored FL state: round_index={self.round_index}, "
+            f"accuracy={self.current_accuracy:.4f}"
+        )
+
     # ------------------------------------------------------------------
     def _round_budget(self) -> int:
         """This round's poison budget: randomized in [1, cap] when sampling, else the cap."""

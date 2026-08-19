@@ -172,7 +172,7 @@ def test_attacker_turn_uses_the_algorithmic_defense():
     env = _env()
     env.begin_round()
     defense = _algorithmic_defender()
-    turn = AttackerTurn(env, AttackerAgent({"n_clients": N_CLIENTS}), defense)
+    turn = AttackerTurn(env, AttackerAgent({"n_clients": N_CLIENTS}), DefenderAgent({}), defense)
 
     # The ensemble — not an LLM — decides, and the attacker's reward moves with
     # it: the 50x client is flagged by every member (stealth ~0), the 1% one
@@ -189,7 +189,7 @@ def test_attacker_turn_uses_the_algorithmic_defense():
         "verdicts should carry the ensemble's vote, not an LLM's free text"
     # ...and a blatant attack IS caught.
     env.begin_round()
-    turn = AttackerTurn(env, AttackerAgent({"n_clients": N_CLIENTS}), defense)
+    turn = AttackerTurn(env, AttackerAgent({"n_clients": N_CLIENTS}), DefenderAgent({}), defense)
     caught = turn.commit(PLANS[1])
     assert caught["poisoned_ids"] == [1]
     assert 1 in {v.client_id for v in caught["verdicts"] if v.is_suspicious}

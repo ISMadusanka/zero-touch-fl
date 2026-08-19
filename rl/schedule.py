@@ -79,6 +79,7 @@ def train(
     rng,
     progress_cb=None,
     start_round: int = 0,
+    **kwargs,
 ):
     """Run the alternating GRPO training loop over ``simulation_rounds`` rounds."""
     rl = cfg.get("rl", {})
@@ -102,16 +103,16 @@ def train(
     first_learner = str(rl.get("first_learner", "attacker"))
     curriculum_on_cap = bool(rl.get("curriculum_on_cap", True))
     fl_interlude = bool(rl.get("fl_interlude_between_phases", True))
-    adapter_paths = rl.get("adapter_paths", {
+    adapter_paths = kwargs.get("adapter_paths", rl.get("adapter_paths", {
         "attacker": "checkpoints/attacker_adapter",
         "defender": "checkpoints/defender_adapter",
-    })
+    }))
     reward_cfg = rl.get("reward", {})
     reward_att = reward_cfg.get("attacker", {})
     reward_def = reward_cfg.get("defender", {})
     switch_cfg = SwitchConfig.from_cfg(rl)
 
-    total_rounds = int(cfg["fl"]["simulation_rounds"])
+    total_rounds = kwargs.get("total_rounds", int(cfg["fl"]["simulation_rounds"]))
 
     import torch
     optimizers = {
@@ -136,6 +137,8 @@ def train(
         save_every=save_every, snap_every=snap_every, league_prob=league_prob,
         max_new_tokens=max_new_tokens, rng=rng, curriculum_on_cap=curriculum_on_cap,
         fl_interlude=fl_interlude,
+        fl_state_cb=kwargs.get("fl_state_cb"),
+        resume=kwargs.get("resume", {}),
     )
 
     if switch_mode == "best_response":
@@ -149,7 +152,7 @@ def train(
         logger.info(f"Schedule=fixed: K_a={K_a}, K_d={K_d}")
         done = _train_fixed(state, K_a, K_d, start_round)
 
-    _checkpoint(policy, adapter_paths, progress_cb, done)   # final save
+    _checkpoint(policy, adapter_paths, progress_cb, done, fl_state_cb=state.get("fl_state_cb"), env=env)   # final save
     logger.info(f"Training complete — {done} rounds. Adapters saved to {adapter_paths}")
 
 
@@ -230,7 +233,7 @@ def _post_round_bookkeeping(state, done):
     # Checkpoint adapters + progress TOGETHER so a resume is always consistent
     # (the saved round count never points past the saved adapter weights).
     if state["save_every"] and done % state["save_every"] == 0:
-        _checkpoint(state["policy"], state["adapter_paths"], state["progress_cb"], done)
+        _checkpoint(state["policy"], state["adapter_paths"], state["progress_cb"], done, fl_state_cb=state.get("fl_state_cb"), env=state.get("env"))
 
 
 def _opponent_generator(state, opp, face_snapshot):
@@ -313,6 +316,10 @@ def _run_fl_interlude(state, next_learner, phase_index):
 def _train_best_response(state, first_learner, start_round):
     """Success-gated iterated best response. Returns the final round count."""
     ctrl = PhaseController(state["switch_cfg"], first_learner=first_learner)
+    resume = state.get("resume", {})
+    if resume and resume.get("controller"):
+        ctrl.__dict__.update(resume["controller"])
+        
     rng = state["rng"]
     done = start_round
 
@@ -388,9 +395,11 @@ def _train_fixed(state, K_a, K_d, start_round):
     return done
 
 
-def _checkpoint(policy, adapter_paths, progress_cb, done):
+def _checkpoint(policy, adapter_paths, progress_cb, done, fl_state_cb=None, env=None):
     """Atomically-ish save: adapters first, then advance the progress counter."""
     _save_adapters(policy, adapter_paths)
+    if fl_state_cb and env:
+        fl_state_cb(env.snapshot_fl_state())
     if progress_cb:
         progress_cb(done)
 
