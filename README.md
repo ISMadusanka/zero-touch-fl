@@ -346,3 +346,5 @@ definitions, feature spec, GRPO schedule, checkpoint layout) and
 
 benchmark
 python -m benchmark.run_benchmark --rounds 200
+
+screen -r fl

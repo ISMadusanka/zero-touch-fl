@@ -39,11 +39,9 @@ from server.fed_server import FedServer
 
 from benchmark.defenses.base import Defense, StepResult
 
-
 def _flatten(state_dict: dict, keys: list) -> "torch.Tensor":
     """Concatenate the given keys into one float vector (fixed key order)."""
     return torch.cat([state_dict[k].reshape(-1).float() for k in keys])
-
 
 def _unflatten(flat: "torch.Tensor", ref: dict, keys: list) -> dict:
     out, i = {}, 0
@@ -53,7 +51,8 @@ def _unflatten(flat: "torch.Tensor", ref: dict, keys: list) -> dict:
         i += n
     return out
 
-
+# deltas: The list of updates submitted by the Clients.
+# g0: The trusted, "perfect" update created by the Server itself using clean data.
 def fltrust_combine(deltas: list, g0: "torch.Tensor"):
     """Pure FLTrust aggregation on flattened vectors (no model/data needed).
 
@@ -67,10 +66,23 @@ def fltrust_combine(deltas: list, g0: "torch.Tensor"):
     ``agg`` is None when every trust score is 0 (guard against /0). Kept separate
     from ``FLTrust.step`` so the math is unit-testable in isolation.
     """
+
+# g0_norm: The Server calculates the "size" or magnitude of its own perfect update.
+# trust: An empty list where the Server will write down the score for each Client.
+# agg: An empty bucket where the Server will mix the trusted Client updates together.
+# ts_sum: A running total of the trust scores.
+
     g0_norm = g0.norm()
     trust: list[float] = []
     agg = torch.zeros_like(g0)
     ts_sum = 0.0
+
+# The Server looks at each Client's update (di) one by one.
+# di_norm: The Server measures the "size" of this Client's update.
+
+# cos: The Server compares the direction of the Client's update against its own perfect update.
+# torch.relu: If the Client is moving the model in the wrong direction (a negative match), the Server zeroes out their score. Otherwise, they get a positive trust score (ts).
+
     for di in deltas:
         di_norm = di.norm()
         if di_norm.item() <= 0.0 or g0_norm.item() <= 0.0:
