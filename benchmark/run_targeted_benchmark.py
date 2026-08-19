@@ -267,6 +267,10 @@ def _run(args, log, events):
     attacker_cfg["attack_goal"] = goal
     attacker_cfg["n_clients"] = int(base_cfg["fl"]["n_clients"])
     attacker_cfg["n_classes"] = n_classes
+    # Stealth blending alpha for FLTrust evasion (None = disabled).
+    stealth_alpha = base_cfg.get("attack", {}).get("stealth_alpha")
+    if stealth_alpha is not None:
+        attacker_cfg["stealth_alpha"] = stealth_alpha
     # NOTE: `label` may still be replaced below, once the data is partitioned, when the
     # config derives it from a client's own shard (attack.target_label_from_client).
     log.info(f"Targeted goal from config/flags: {goal}")

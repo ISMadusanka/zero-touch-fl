@@ -54,6 +54,17 @@ attack:
                                   # they may lose before the attack stops counting as targeted.
                                   # The reward charges collateral in units of this.
 
+  # --- Stealth blending: evade cosine-similarity defenses (FLTrust) --------
+  # After the LLM emits its attack plan, blend the poisoned delta with the
+  # benign delta:  Δ_final = (1-α)·Δ_benign + α·Δ_poison.  A small α keeps
+  # the update directionally aligned with honest updates (cos > 0) so FLTrust
+  # accepts it, while the α·Δ_poison component accumulates over rounds.
+  #   0.0  = fully benign (no attack — useful as a sanity check)
+  #   0.2  = recommended sweet spot (passes FLTrust, accumulates damage)
+  #   1.0  = fully poisoned (no stealth — FLTrust drops it)
+  #   null = disabled (same as 1.0, no blending applied)
+  stealth_alpha: 0.2
+
   # --- WHICH label: derived at runtime from the poisoner's own data -------------
   # The data split is non-IID (FLTrust bias-q), so WHICH classes client 0 owns is
   # decided by the partition RNG (`data.noniid_bias`, `fl.poison_seed`, `fl.n_clients`)

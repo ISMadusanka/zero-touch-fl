@@ -27,6 +27,7 @@ from agents.attack_ops import (
     OPERATOR_DOCS, apply_plan, delta_details, extract_plan, extract_selection,
     output_layer_keys,
 )
+from attacks.stealth_blend import stealth_blend
 from core.debug import dbg
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,11 @@ class AttackerAgent:
         # prompt. The goal TYPE is fixed for a run (only the label varies per
         # round, and that travels in the user message), so this is chosen once.
         self.targeted = self.goal.get("type") == "targeted_label"
+        self.stealth_alpha = config.get("stealth_alpha", None)
+        if self.stealth_alpha is not None:
+            self.stealth_alpha = float(self.stealth_alpha)
+            logger.info(f"Stealth blending enabled: alpha={self.stealth_alpha}")
+        self._global_weights = None  # set each round via set_global_weights()
         base = TARGETED_SYSTEM_PROMPT if self.targeted else SYSTEM_PROMPT
         self._system = base.replace("%OPERATOR_DOCS%", OPERATOR_DOCS)
 
@@ -164,6 +170,7 @@ class AttackerAgent:
         pool_ids = list(benign_by_client.keys())
         if budget is None:
             budget = len(pool_ids)
+        self._global_weights = global_weights  # cached for stealth_blend
         round_goal = goal if goal is not None else self.goal
         payload = {
             "round": round_num,
@@ -231,7 +238,8 @@ class AttackerAgent:
 
     # ------------------------------------------------------------------
     def select_and_apply(
-        self, text, pool_references: dict[int, dict], budget: int
+        self, text, pool_references: dict[int, dict], budget: int,
+        global_weights: dict | None = None,
     ) -> tuple[dict[int, dict], list[int], int]:
         """Parse the attacker's client selection + per-client plans and apply them.
 
@@ -325,6 +333,15 @@ class AttackerAgent:
             poisoned[cid] = pw
             plan_for_dbg[cid] = ops
 
+        # Stealth blend: re-blend poisoned deltas with benign deltas so the
+        # update's direction stays aligned with honest updates (evades FLTrust).
+        gw = global_weights or self._global_weights
+        if self.stealth_alpha is not None and self.stealth_alpha < 1.0 and gw is not None:
+            for cid in list(poisoned.keys()):
+                poisoned[cid] = stealth_blend(
+                    gw, pool_references[cid], poisoned[cid], self.stealth_alpha
+                )
+
         poisoned_ids = [cid for cid, _ in chosen if cid in poisoned]
         dbg.poison(plan_for_dbg, {cid: pool_references[cid] for cid in poisoned_ids},
                    poisoned, n_malformed=n_malformed, n_invalid_ops=n_invalid_ops)
@@ -353,5 +370,14 @@ class AttackerAgent:
             pw, n_invalid = apply_plan(ref, plan, self.max_abs)
             poisoned[cid] = pw
             n_invalid_total += n_invalid
+
+        # Stealth blend (same logic as select_and_apply).
+        gw = self._global_weights
+        if self.stealth_alpha is not None and self.stealth_alpha < 1.0 and gw is not None:
+            for cid in list(poisoned.keys()):
+                poisoned[cid] = stealth_blend(
+                    gw, references[cid], poisoned[cid], self.stealth_alpha
+                )
+
         dbg.poison(plan, references, poisoned, n_malformed=0, n_invalid_ops=n_invalid_total)
         return poisoned, 0

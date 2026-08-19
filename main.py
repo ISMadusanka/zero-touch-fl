@@ -431,6 +431,10 @@ def main():
     # dilutes a poisoned client) and the class count (to locate the output layer).
     attacker_config["n_clients"] = int(base_config["fl"]["n_clients"])
     attacker_config["n_classes"] = int(base_config.get("data", {}).get("n_classes", 10))
+    # Stealth blending alpha for FLTrust evasion (None = disabled).
+    stealth_alpha = base_config.get("attack", {}).get("stealth_alpha")
+    if stealth_alpha is not None:
+        attacker_config["stealth_alpha"] = stealth_alpha
 
     # Reproducibility.
     seed = int(base_config["fl"].get("poison_seed", 0))
