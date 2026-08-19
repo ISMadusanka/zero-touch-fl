@@ -15,8 +15,7 @@ import logging
 import torch
 
 from core.types import DetectionVerdict, RoundLog
-from rl.rewards import attacker_reward, defender_reward, goal_drop, targeted_terms
-from rl.switch import SwitchConfig, attacker_succeeded
+from rl.rewards import attacker_reward, defender_reward
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +30,6 @@ def _add_noise(sd, sigma):
 
 def _sign_flip(sd):
     return {k: -v.float() for k, v in sd.items()}
-
-
-def _same_weights(a: dict, b: dict) -> bool:
-    """True when two state_dicts are element-wise identical (a no-op 'attack')."""
-    return all(torch.equal(a[k].float(), b[k].float()) for k in b)
 
 
 def fixed_attacker_actions(benign_by_client: dict[int, dict]) -> list[tuple[str, dict]]:
@@ -68,90 +62,53 @@ def fixed_defender(features: dict[int, dict], rel_norm_thr: float = 2.0,
     return verdicts
 
 
-def run_baseline(env, n_rounds, metrics_tracker, save_round_log, defender=None,
-                 switch_cfg: SwitchConfig | None = None):
-    """Run ``n_rounds`` of best-of-N fixed-action attack vs a fixed defense.
-
-    ``defender`` defaults to the norm/sign heuristic :func:`fixed_defender`. Pass a
-    defender policy (``rl/defenders.py``) to substitute another non-LLM defense —
-    ``main.py --baseline --freeze defender`` passes the algorithmic ensemble, which
-    exercises env + ensemble + rewards end-to-end with no LLM and no GPU.
-
-    ``switch_cfg`` supplies the win-gate thresholds used to judge each round's
-    attack GOAL; defaults to :class:`SwitchConfig`'s own defaults.
-    """
-    switch_cfg = switch_cfg or SwitchConfig()
-    logger.info(f"[baseline] running {n_rounds} best-of-N round(s) — no LLM, no GPU "
-                f"(defense: {defender.describe() if defender else 'norm/sign heuristic'})")
-
-    def _verdicts(updates, commit):
-        if defender is None:
-            return fixed_defender(env.features(updates))
-        return defender.verdicts(env, updates, commit=commit)
-
+def run_baseline(env, n_rounds, metrics_tracker, save_round_log):
+    """Run ``n_rounds`` of best-of-N fixed-action attack vs fixed defender."""
+    logger.info(f"[baseline] running {n_rounds} best-of-N round(s) — no LLM, no GPU")
     for _ in range(n_rounds):
         ctx = env.begin_round()
         # No LLM to choose clients: poison the first `budget` clients of the pool.
-        selected_ids = list(ctx.pool_ids[:ctx.budget])
-        selected_benign = {cid: ctx.pool_benign[cid] for cid in selected_ids}
+        chosen_ids = list(ctx.pool_ids[:ctx.budget])
+        selected_benign = {cid: ctx.pool_benign[cid] for cid in chosen_ids}
+        env.set_committed_poison(chosen_ids)
         actions = fixed_attacker_actions(selected_benign)
 
         scored = []
         for label, poisoned in actions:
-            # Ground truth is the clients whose weights the action ACTUALLY changed
-            # — the "none" control leaves them byte-identical to benign, so nothing
-            # was poisoned and the wasted clients are charged as malformed. This
-            # mirrors AttackerAgent.select_and_apply; without it the no-op action
-            # scored a free evasion bonus and won every round.
-            effective = [cid for cid in selected_ids
-                         if not _same_weights(poisoned[cid], selected_benign[cid])]
-            n_malformed = len(selected_ids) - len(effective)
-            updates = env.build_updates({cid: poisoned[cid] for cid in effective})
-            verdicts = _verdicts(updates, commit=False)
-            post_eval = env.evaluate_updates_full(updates, verdicts)
-            post_acc = post_eval.overall
-            # Same reference as training: this round's clean (unpoisoned) aggregate.
-            # Passing the per-class evals keeps the harness honest under a
-            # targeted_label goal (it then scores the target class, not overall acc).
-            reward = attacker_reward(ctx.clean_accuracy, post_acc, ctx.goal,
-                                     effective, verdicts, n_malformed,
-                                     clean_eval=ctx.clean_eval, post_eval=post_eval)
-            scored.append((label, effective, n_malformed, updates, verdicts, post_acc, reward))
+            updates = env.build_updates(poisoned)
+            verdicts = fixed_defender(env.features(updates))
+            # evaluate_updates ALWAYS returns (accuracy, class_accuracy_or_None) --
+            # class_accuracy is None for the untargeted goal. Previously this was
+            # left unpacked and the raw tuple was passed straight into
+            # attacker_reward as if it were a float, crashing on the very first
+            # round regardless of goal (TypeError: float - tuple).
+            post_acc, post_class_acc = env.evaluate_updates(updates, verdicts)
+            reward = attacker_reward(ctx.global_accuracy, post_acc, env.goal,
+                                     chosen_ids, verdicts, n_malformed=0,
+                                     post_class_acc=post_class_acc,
+                                     baseline_class_acc=env.baseline_class_accuracies)
+            scored.append((label, poisoned, updates, verdicts, post_acc, reward))
             logger.info(
                 f"[baseline] round {ctx.round_num} action={label:9s} "
-                f"acc->{post_acc:.4f} att_reward={reward:.3f} poisoned={effective} "
+                f"acc->{post_acc:.4f} att_reward={reward:.3f} "
                 f"flagged={[v.client_id for v in verdicts if v.is_suspicious]}"
             )
 
         # Commit the best attacker action.
-        label, chosen_ids, n_malformed, updates, verdicts, _, _ = max(
-            scored, key=lambda s: s[6])
-        # Re-run the defense on the winning action as the COMMITTING call, so a
-        # stateful defense advances its cross-round memory exactly once per round
-        # (the scoring pass above deliberately leaves it untouched). Deterministic,
-        # so the verdicts themselves are the ones already scored.
-        verdicts = _verdicts(updates, commit=True)
-        env.set_committed_poison(chosen_ids)
-        committed_eval = env.commit_full(updates, verdicts)
-        new_acc = committed_eval.overall
-        a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal,
-                                chosen_ids, verdicts, n_malformed,
-                                clean_eval=ctx.clean_eval, post_eval=committed_eval)
+        best = max(scored, key=lambda s: s[5])
+        label, poisoned, updates, verdicts, _, _ = best
+        new_acc = env.commit(updates, verdicts)
+        post_class_acc = env.current_class_accuracies   # env.commit() refreshed this internally
+        a_rew = attacker_reward(ctx.global_accuracy, new_acc, env.goal,
+                                chosen_ids, verdicts, n_malformed=0,
+                                post_class_acc=post_class_acc,
+                                baseline_class_acc=env.baseline_class_accuracies)
         d_rew = defender_reward(verdicts, chosen_ids)
 
-        # Judge the round on the attack GOAL (damage + collateral + evasion), the
-        # same way training does — a scripted baseline that merely slips past the
-        # detector is not a successful targeted attack.
-        terms = targeted_terms(ctx.goal, ctx.clean_eval, committed_eval)
-        goal_met = attacker_succeeded(
-            goal_drop(ctx.goal, ctx.clean_accuracy, new_acc, ctx.clean_eval, committed_eval),
-            verdicts, chosen_ids, switch_cfg, ctx.goal, terms)
-        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids),
-                               reference_accuracy=ctx.clean_accuracy,
-                               attack_goal_met=goal_met)
+        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
         save_round_log(RoundLog(
             round_num=ctx.round_num,
-            attack_goal=ctx.goal,
+            attack_goal=env.goal,
             poisoned_client_ids=chosen_ids,
             predicted_labels=[
                 {"client_id": v.client_id, "is_suspicious": v.is_suspicious,
@@ -164,13 +121,11 @@ def run_baseline(env, n_rounds, metrics_tracker, save_round_log, defender=None,
             defender_reward=d_rew,
             learning_agent="none",
             attack_metadata={"baseline_action": label, "budget": ctx.budget,
-                             "n_used": len(chosen_ids), "n_malformed": n_malformed,
-                             "clean_accuracy": round(float(ctx.clean_accuracy), 6),
-                             "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6)},
+                             "n_used": len(chosen_ids),
+                             "post_class_accuracy": post_class_acc,
+                             "baseline_class_accuracy": env.baseline_class_accuracies},
         ))
         logger.info(
             f"[baseline] round {ctx.round_num}: committed '{label}' "
-            f"acc {ctx.global_accuracy:.4f}->{new_acc:.4f} "
-            f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - new_acc:+.4f}) "
-            f"def_reward={d_rew:.3f}"
+            f"acc {ctx.global_accuracy:.4f}->{new_acc:.4f} def_reward={d_rew:.3f}"
         )

@@ -10,10 +10,7 @@ parse + apply, feature extraction, FedAvg, reward computation) on a CPU box.
 import logging
 
 from core.types import RoundLog
-from rl.rewards import (
-    attacker_reward, defender_reward, goal_drop, perturbation_diversity, targeted_terms,
-)
-from rl.switch import SwitchConfig, attacker_succeeded
+from rl.rewards import attacker_reward, defender_reward, perturbation_diversity
 
 logger = logging.getLogger(__name__)
 
@@ -35,36 +32,22 @@ class InferenceGenerator:
 def run_inference(
     env,
     attacker_agent,
-    defender,
+    defender_agent,
     generator: InferenceGenerator,
     n_rounds: int,
     metrics_tracker,
     save_round_log,
     temperature: float = 0.7,
-    switch_cfg: SwitchConfig | None = None,
 ):
-    """Run ``n_rounds`` of the arms race with frozen LLMs (no learning).
-
-    ``defender`` is a defender policy (``rl/defenders.py``): the frozen defender
-    LLM normally, or the non-LLM algorithmic ensemble under ``--freeze defender``
-    — which makes this the cheapest end-to-end check of that defense (CPU only,
-    one LLM call per round).
-
-    ``switch_cfg`` supplies the win-gate thresholds used to judge whether each
-    round's attack GOAL was met (not merely whether it evaded detection);
-    defaults to :class:`SwitchConfig`'s own defaults when the caller has none.
-    """
-    switch_cfg = switch_cfg or SwitchConfig()
-    logger.info(f"[dry-run] running {n_rounds} inference round(s) — no weight updates "
-                f"(defense: {defender.describe()})")
+    """Run ``n_rounds`` of the arms race with frozen LLMs (no learning)."""
+    logger.info(f"[dry-run] running {n_rounds} inference round(s) — no weight updates")
     for _ in range(n_rounds):
         ctx = env.begin_round()
 
         # Attacker SELECTS which of its controllable pool to poison (<= budget) and how.
         a_sys = attacker_agent.system_prompt()
         a_user = attacker_agent.build_user_prompt(
-            ctx.round_num, ctx.global_accuracy, ctx.pool_benign, env.global_weights,
-            ctx.budget, goal=ctx.goal,
+            ctx.round_num, env.current_accuracy, ctx.pool_benign, env.global_weights, ctx.budget, ctx.target_neuron_indices
         )
         a_text = generator.generate(a_sys, a_user, n=1, temperature=temperature)[0]
         poisoned, chosen_ids, n_malformed = attacker_agent.select_and_apply(
@@ -72,39 +55,27 @@ def run_inference(
         env.set_committed_poison(chosen_ids)
         updates = env.build_updates(poisoned)
 
-        # The defense classifies every client (LLM verdicts, or the algorithmic
-        # ensemble's vote). There is one aggregation per round here, so this call
-        # is the committing one.
-        verdicts = defender.verdicts(env, updates, temperature=temperature, commit=True)
+        # Defender classifies every client from the feature vectors.
+        feats = env.features(updates)
+        client_ids = [u.client_id for u in updates]
+        d_sys = defender_agent.system_prompt()
+        d_user = defender_agent.build_user_prompt(feats)
+        d_text = generator.generate(d_sys, d_user, n=1, temperature=temperature)[0]
+        verdicts = defender_agent.parse(d_text, client_ids)
 
         prev_acc = ctx.global_accuracy
-        post_eval = env.commit_full(updates, verdicts)
-        new_acc = post_eval.overall
+        new_acc = env.commit(updates, verdicts)
 
         diversity = perturbation_diversity(
             poisoned, {cid: ctx.pool_benign[cid] for cid in chosen_ids})
-        # Damage is scored against the round's clean counterfactual, exactly as in
-        # training (see FLArmsRaceEnv.clean_reference_accuracy). Passing the
-        # per-class evaluations makes a targeted_label goal score its target class
-        # here too, so --dry-run is a faithful CPU smoke test of the targeted setup.
-        terms = targeted_terms(ctx.goal, ctx.clean_eval, post_eval)
-        a_rew = attacker_reward(ctx.clean_accuracy, new_acc, ctx.goal, chosen_ids,
-                                verdicts, n_malformed,
-                                pool_size=env.n_compromisable, diversity=diversity,
-                                clean_eval=ctx.clean_eval, post_eval=post_eval)
+        a_rew = attacker_reward(prev_acc, new_acc, env.goal, chosen_ids, verdicts, n_malformed,
+                                pool_size=env.n_compromisable, diversity=diversity)
         d_rew = defender_reward(verdicts, chosen_ids)
 
-        # Same goal-level verdict the trainer records, so a --dry-run summary is
-        # comparable with a training run instead of reporting bare evasion.
-        goal_met = attacker_succeeded(
-            goal_drop(ctx.goal, ctx.clean_accuracy, new_acc, ctx.clean_eval, post_eval),
-            verdicts, chosen_ids, switch_cfg, ctx.goal, terms)
-        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids),
-                               reference_accuracy=ctx.clean_accuracy,
-                               attack_goal_met=goal_met)
+        metrics_tracker.update(ctx.round_num, verdicts, new_acc, set(chosen_ids))
         save_round_log(RoundLog(
             round_num=ctx.round_num,
-            attack_goal=ctx.goal,
+            attack_goal=env.goal,
             poisoned_client_ids=chosen_ids,
             predicted_labels=[
                 {"client_id": v.client_id, "is_suspicious": v.is_suspicious,
@@ -117,26 +88,10 @@ def run_inference(
             defender_reward=d_rew,
             learning_agent="none",
             attack_metadata={"n_malformed": n_malformed, "budget": ctx.budget,
-                             "n_used": len(chosen_ids),
-                             "clean_accuracy": round(float(ctx.clean_accuracy), 6),
-                             "induced_drop": round(float(ctx.clean_accuracy - new_acc), 6),
-                             "targeted": (None if terms is None else {
-                                 "label": terms["label"],
-                                 "clean_recall": round(terms["clean_recall"], 6),
-                                 "post_recall": round(terms["post_recall"], 6),
-                                 "target_class_drop": round(terms["target_drop"], 6),
-                                 "collateral": round(terms["collateral"], 6),
-                                 "per_class_clean": [round(v, 6) for v in ctx.clean_eval.per_class],
-                                 "per_class_post": [round(v, 6) for v in post_eval.per_class],
-                             })},
+                             "n_used": len(chosen_ids)},
         ))
-        tgt_s = "" if terms is None else (
-            f" | TGT[{terms['label']}] {terms['clean_recall']:.3f}->{terms['post_recall']:.3f}"
-            f" collat={terms['collateral']:.3f}")
         logger.info(
             f"[dry-run] round {ctx.round_num}: poisoned={chosen_ids} budget={ctx.budget} "
-            f"acc {prev_acc:.4f}->{new_acc:.4f} "
-            f"(clean_ref={ctx.clean_accuracy:.4f} drop={ctx.clean_accuracy - new_acc:+.4f})"
-            f"{tgt_s} "
-            f"| att_reward={a_rew:.3f} def_reward={d_rew:.3f} malformed={n_malformed}"
+            f"acc {prev_acc:.4f}->{new_acc:.4f} | att_reward={a_rew:.3f} "
+            f"def_reward={d_rew:.3f} malformed={n_malformed}"
         )

@@ -21,11 +21,8 @@ RL-trainable.
 import json
 import logging
 
-import torch
-
 from agents.attack_ops import (
     OPERATOR_DOCS, apply_plan, delta_details, extract_plan, extract_selection,
-    output_layer_keys,
 )
 from core.debug import dbg
 
@@ -36,75 +33,79 @@ logger = logging.getLogger(__name__)
 DEFAULT_GOAL = {"type": "untargeted_degrade", "target_accuracy_drop": 0.20}
 
 
-SYSTEM_PROMPT = """You are the adversary in a federated-learning (FL) system. Each round, clients send model updates and the server averages the accepted ones (FedAvg) into a global model. A defender inspects statistics of every update and drops the ones it judges malicious before averaging: updates that stand out from the honest majority (much larger norm, flipped signs, low cosine similarity) get caught, and several of your clients that look nearly identical get caught as colluding Sybils.
+SYSTEM_PROMPT = """You are an adversarial participant in a federated-learning system trained on MNIST.
 
-You are a partial insider: you control ONLY the clients in `controllable_client_ids`; every other client is honest and out of reach.
+Setup you must reason about:
+- Many clients each submit a model update every round. The server averages the
+  accepted clients' weights (FedAvg) into the new global model.
+- A defender inspects statistical features of every client's update and removes
+  the clients it judges malicious BEFORE averaging. Updates that look wildly
+  different from the others (much larger norm, opposite sign pattern, low cosine
+  similarity) are the easiest to catch. Several of YOUR clients that look nearly
+  IDENTICAL to each other are also easy to catch — they look like colluding Sybils.
+- You are a partial insider: you control ONLY the clients listed in
+  `controllable_client_ids`. Every other client is honest and out of your reach.
 
-Each round choose an action with TWO parts:
-1. SELECT which controllable clients to poison, AT MOST `max_poison_clients`. Prefer the FEWEST that can work: every extra client is penalized and easier to catch. Clients hold different (non-IID) data, so which you pick matters.
-2. For each selected client, give an ordered ATTACK PLAN: operators applied to that client's benign weights. With several clients, give each a DISTINCT, coordinated role (e.g. one amplifies a layer while another shifts a different layer) so their average moves the model your way without the clients looking alike.
+Your action each round has TWO parts:
+  1. SELECT which of your controllable clients to poison. You may poison AT MOST
+     `max_poison_clients` of them. Using FEWER clients is better: every extra
+     client is penalized and is more likely to be detected. Only recruit more
+     clients if a single one cannot achieve the goal. The clients hold different
+     data (non-IID), so WHICH ones you pick matters — use `client_update_stats`.
+  2. For each selected client, output an ATTACK PLAN: an ordered list of primitive
+     operations applied to THAT client's benign weights to produce its poisoned
+     weights. When you use more than one client, give each a DIFFERENT, COORDINATED
+     role (e.g. one amplifies one layer while another shifts a different layer) so
+     their average moves the global model where you want WITHOUT the clients
+     looking alike.
 
-Objective (`attack_goal`):
-- untargeted_degrade: cut global accuracy by about `target_accuracy_drop`.
-- slow_degrade: lower accuracy only slightly (`per_round_drop`) to stay stealthy.
-- targeted_label: harm class `label` while keeping overall accuracy high.
+You are given, per controllable client, statistics of its HONEST UPDATE
+Δ = (local weights − current global model), in `client_update_stats` — per layer
+and for the whole model, never the raw values. You canNOT see the other clients'
+updates, so these are normalized against the GLOBAL model ONLY, which makes them
+dimensionless:
+- `rel_update`     = ‖Δ‖ / ‖global‖ for that layer — how large this client's honest
+                     change already is. Your poison ADDS to this; the bigger it
+                     grows, the more the update stands out and the easier the
+                     defender flags it.
+- `rms_delta`      = per-coordinate size of Δ (its typical step per weight).
+- `energy_frac`    = share of the client's total update that lives in this layer
+                     (where its honest change is concentrated).
+- `sign_flip_frac` = fraction of weights whose sign differs from the global.
+- `std_ratio` / `absmean_ratio` = spread / typical magnitude of Δ vs the global's own.
+- whole-model `cos_to_global` = how aligned the update is with the current model.
+Use these to decide which clients and layers to hit and how hard, while keeping
+each poisoned update close to a normal honest update so it is not filtered out.
 
-`client_update_stats` gives, per controllable client, dimensionless stats of its HONEST update D = local - global (per layer and whole-model), normalized to the global model only:
-- rel_update: norm(D)/norm(global) for the layer -- how large the honest change already is; your poison adds to it, and bigger stands out more.
-- rms_delta: per-weight step size. energy_frac: share of the update in that layer.
-- sign_flip_frac: fraction of weights whose sign differs from global.
-- std_ratio, absmean_ratio: spread / typical size of D vs the global's own.
-- whole-model cos_to_global: alignment with the current model.
-Larger changes degrade accuracy more but are easier to flag -- balance the two, and keep each poisoned update close to an honest one so it is not filtered.
+Your objective is in `attack_goal`:
+- "untargeted_degrade": lower global test accuracy by about `target_accuracy_drop`
+  WHILE staying similar enough to benign updates to avoid being filtered out.
+- "slow_degrade": reduce accuracy only slightly (`per_round_drop`) to stay stealthy.
+- "targeted_label": harm a specific class `label` while keeping overall accuracy high.
+  If the label is "menu", you will receive `target_neuron_indices` showing the most
+  vulnerable neurons grouped by class. YOU must autonomously decide which class(es) 
+  to sabotage by passing those specific indices into your operators via the `"indices"` parameter.
 
-IMPORTANT -- what your operators act on: every operator transforms the client's FULL weight vector W, NOT the small update D. The server then sees that client's update as D' = op(W) - global. Because W is close to the global model, a mild-looking multiplicative edit is a huge update: `scale` with factor f alone gives roughly rel_update ~ |f - 1|. So if the honest rel_update is about 0.2, then f=1.05 is a normal-sized update, f=1.5 is about 7x the honest size (very likely flagged), and f=2 or a full `sign_flip` is enormous. Additive operators are absolute: `add_constant`/`add_gaussian_noise` of size v change rel_update by about v * sqrt(count) / norm(global), so compare v against `rms_delta`, which is the honest per-weight step. Calibrate every operator against the honest `rel_update` shown for that client.
+There is a tension: large changes degrade accuracy more but are easier to detect;
+subtle changes evade detection but do less damage. Compose operators to balance
+them and to invent non-obvious attacks.
 
 %OPERATOR_DOCS%
 
-Respond with ONLY one JSON object -- no prose, no markdown:
-{"clients":[{"id":<controllable id>,"operations":[{"op":"<name>","target":"<target>", ...params}]}]}
+OUTPUT FORMAT — respond with ONLY a single JSON object, no prose, no markdown:
+{"clients": [
+   {"id": <a controllable client id>, "operations": [
+      {"op": "<name>", "target": "<all|layer-group|key>", "indices": [optional list of integers], ...params},
+      ...
+   ]},
+   ...
+]}
 Rules:
-- Use ids only from `controllable_client_ids`, AT MOST `max_poison_clients`; prefer the fewest.
-- Each client's "operations" is its own ordered list (1-6 ops); order matters.
-- Use only the operators and params listed above."""
-
-
-TARGETED_SYSTEM_PROMPT = """You are the adversary in a federated-learning (FL) system. Each round, clients send model updates and the server averages the accepted ones (FedAvg) into a global model. A defender inspects statistics of every update and drops the ones it judges malicious before averaging: updates that stand out from the honest majority (much larger norm, flipped signs, low cosine similarity) get caught, and several of your clients that look nearly identical get caught as colluding Sybils.
-
-You are a partial insider: you control ONLY the clients in `controllable_client_ids`; every other client is honest and out of reach.
-
-YOUR OBJECTIVE IS TARGETED. `attack_goal` names ONE class, `label`. You must make the global model FAIL on that class -- its test samples should be classified as anything else -- while EVERY OTHER CLASS KEEPS WORKING AS BEFORE. An attack that wrecks the whole model scores badly even though it also breaks the target class: you are scored on (recall lost on `label`) MINUS (mean recall lost across all other classes). Surgical beats destructive. The target `label` CHANGES between rounds -- read it from `attack_goal` every time and attack that class, not a memorized one.
-
-HOW TO HIT ONE CLASS. `output_layer` tells you the model's final classification layer. Its weight has one ROW PER CLASS: row c together with bias entry c produces class c's score, logit[c] = weight[c] . features + bias[c]. So the ONLY parameters specific to your target are row `label` of `output_layer.weight` and entry `label` of `output_layer.bias`. Everything below that layer is shared by all classes -- editing it damages every class and costs you the collateral penalty. Use the `rows` parameter to confine an operator to that one row:
-  {"op":"scale","target":"<output_layer.weight>","rows":[<label>],"factor":-3.0}
-Make logit[label] small (or negative) relative to the other classes and the model stops predicting that class.
-
-DILUTION -- THE KEY NUMBER. The server AVERAGES all `federation.n_clients` clients, so if you poison k of them your edit reaches the global model at strength k/n_clients. Scaling the target row by `factor` f on k clients leaves the aggregated row at ((n-k) + k*f)/n of its honest value. Therefore f = 1 - n/k drives the aggregated row to ZERO, and going further past it drives the logit negative. `federation.row_zero_factor` gives that f for each k you might use -- start from it. A timid factor like -1 or 0.5 barely moves the average and does nothing.
-
-STEALTH. The defender scores each layer separately, so a colossal edit to the output layer shows up in THAT layer's norm and sign statistics even when the whole-model norm still looks normal. Your advantage is that one row is a tiny slice of the model: concentrating the whole perturbation there keeps the whole-model update small. Push the row hard enough to survive dilution, no harder, and consider spreading it over a few clients (smaller f each) when one client's edit would be too loud. `client_update_stats` shows each client's honest `rel_update` -- keep yours in that neighbourhood.
-
-`client_update_stats` gives, per controllable client, dimensionless stats of its HONEST update D = local - global (per layer and whole-model), normalized to the global model only:
-- rel_update: norm(D)/norm(global) for the layer -- how large the honest change already is; your poison adds to it, and bigger stands out more.
-- rms_delta: per-weight step size. energy_frac: share of the update in that layer.
-- sign_flip_frac: fraction of weights whose sign differs from global.
-- std_ratio, absmean_ratio: spread / typical size of D vs the global's own.
-- whole-model cos_to_global: alignment with the current model.
-
-IMPORTANT -- what your operators act on: every operator transforms the client's FULL weight vector W, NOT the small update D. The server then sees that client's update as D' = op(W) - global. Additive operators are absolute: `add_constant` of size v changes that entry by exactly v, so on a bias row it shifts the aggregated logit by k*v/n_clients -- compare v against `rms_delta`, the honest per-weight step.
-
-%OPERATOR_DOCS%
-
-Each round choose an action with TWO parts:
-1. SELECT which controllable clients to poison, AT MOST `max_poison_clients`. Prefer the FEWEST that can work: every extra client is penalized and easier to catch.
-2. For each selected client, give an ordered ATTACK PLAN. With several clients, give each a DISTINCT, coordinated role (e.g. different factors, or one hitting the weight row while another shifts the bias) so their average moves the target class your way without the clients looking alike.
-
-Respond with ONLY one JSON object -- no prose, no markdown:
-{"clients":[{"id":<controllable id>,"operations":[{"op":"<name>","target":"<target>","rows":[<label>], ...params}]}]}
-Rules:
-- Use ids only from `controllable_client_ids`, AT MOST `max_poison_clients`; prefer the fewest.
-- Each client's "operations" is its own ordered list (1-6 ops); order matters.
-- Use only the operators and params listed above.
-- Keep every operator confined to the target class's row unless you have a reason to pay the collateral cost."""
+- Only choose ids from `controllable_client_ids`, and AT MOST `max_poison_clients`
+  of them. Prefer the fewest clients that achieve the goal.
+- Each client's "operations" is its own ordered plan (1-6 ops); order matters.
+- Use only the operators listed above with their stated params.
+- To poison a single client, return a "clients" list with exactly ONE entry."""
 
 
 class AttackerAgent:
@@ -115,19 +116,7 @@ class AttackerAgent:
         self.goal = config.get("attack_goal", dict(DEFAULT_GOAL))
         self.detail_precision = int(config.get("detail_precision", 4))
         self.max_abs = float(config.get("max_weight_abs", 100.0))
-        self.n_classes = int(config.get("n_classes", 10))
-        # Total federated clients. Needed only by the targeted prompt, to state how
-        # much FedAvg dilutes a poisoned client's edit (and hence how far the
-        # attacker must overshoot). ``None`` -> the dilution block is omitted.
-        n_clients = config.get("n_clients")
-        self.n_clients = int(n_clients) if n_clients else None
-        # The targeted goal needs a different objective, a different notion of
-        # "damage", and the class<->row explanation, so it gets its own system
-        # prompt. The goal TYPE is fixed for a run (only the label varies per
-        # round, and that travels in the user message), so this is chosen once.
-        self.targeted = self.goal.get("type") == "targeted_label"
-        base = TARGETED_SYSTEM_PROMPT if self.targeted else SYSTEM_PROMPT
-        self._system = base.replace("%OPERATOR_DOCS%", OPERATOR_DOCS)
+        self._system = SYSTEM_PROMPT.replace("%OPERATOR_DOCS%", OPERATOR_DOCS)
 
     # ------------------------------------------------------------------
     def system_prompt(self) -> str:
@@ -140,7 +129,7 @@ class AttackerAgent:
         benign_by_client: dict[int, dict],
         global_weights: dict,
         budget: int | None = None,
-        goal: dict | None = None,
+        target_neuron_indices: dict | None = None,
     ) -> str:
         """Serialize the attacker's per-round observation into a user message.
 
@@ -157,18 +146,16 @@ class AttackerAgent:
                 clients' updates.
             budget: max number of clients the attacker may poison this round
                 (defaults to the whole pool).
-            goal: this round's attack goal (e.g. a per-round-sampled
-                ``target_accuracy_drop``). Defaults to the agent's fixed
-                ``self.goal`` when not given (inference / benchmark paths).
+            target_neuron_indices: Optional {cid: {layer: [indices]}} or {cid: {class: {layer: [indices]}}}
+                identifying the most important neurons for targeted attacks.
         """
         pool_ids = list(benign_by_client.keys())
         if budget is None:
             budget = len(pool_ids)
-        round_goal = goal if goal is not None else self.goal
         payload = {
             "round": round_num,
             "current_global_accuracy": round(float(global_accuracy), 4),
-            "attack_goal": round_goal,
+            "attack_goal": self.goal,
             "controllable_client_ids": pool_ids,
             "max_poison_clients": int(budget),
             "client_update_stats": {
@@ -176,58 +163,9 @@ class AttackerAgent:
                 for cid, sd in benign_by_client.items()
             },
         }
-        if self.targeted:
-            payload.update(self._targeted_observation(global_weights, round_goal, int(budget)))
+        if target_neuron_indices is not None:
+            payload["target_neuron_indices"] = target_neuron_indices
         return json.dumps(payload)
-
-    # ------------------------------------------------------------------
-    def _targeted_observation(self, global_weights: dict, goal: dict, budget: int) -> dict:
-        """Extra observation fields a TARGETED round needs.
-
-        Two things the attacker cannot work out from the layer statistics alone:
-
-        ``output_layer`` — which parameter is the classifier head and which row
-        belongs to the class named in this round's goal. Row ``c`` of that weight
-        (plus bias entry ``c``) is class ``c``'s logit, so this hands the policy
-        the exact 17 numbers worth touching instead of making it guess a layer
-        name. Derived from the real state_dict, so it stays correct if the model
-        changes (:func:`agents.attack_ops.output_layer_keys`).
-
-        ``federation`` — how hard FedAvg dilutes a poisoned client. Poisoning ``k``
-        of ``n`` clients leaves the aggregated row at ``((n-k) + k*f)/n`` of its
-        honest value after scaling by ``f``, so ``row_zero_factor[k] = 1 - n/k`` is
-        the factor that zeroes it. Without this the policy has no way to calibrate
-        magnitude and reliably under-shoots (a factor of -1 moves a 20-client
-        average by 10%, which does nothing).
-        """
-        out: dict = {}
-        head = output_layer_keys(global_weights, self.n_classes)
-        if head is not None:
-            entry = {
-                "weight": head["weight_key"],
-                "bias": head["bias_key"],
-                "n_classes": head["n_rows"],
-                "note": "row c of this weight (and bias entry c) IS class c's logit",
-            }
-            label = goal.get("label")
-            if label is not None:
-                try:
-                    entry["row_for_target_label"] = int(label)
-                except (TypeError, ValueError):
-                    pass
-            out["output_layer"] = entry
-        if self.n_clients:
-            n = self.n_clients
-            out["federation"] = {
-                "n_clients": n,
-                "note": "the server averages ALL n_clients; poisoning k of them "
-                        "applies your edit at strength k/n_clients",
-                "row_zero_factor": {
-                    str(k): round(1.0 - n / k, 3)
-                    for k in range(1, max(1, min(budget, n)) + 1)
-                },
-            }
-        return out
 
     # ------------------------------------------------------------------
     def select_and_apply(
@@ -240,44 +178,28 @@ class AttackerAgent:
             pool_references: {client_id: benign_state_dict} for the controllable pool.
             budget: max number of clients that may be poisoned this round.
 
-        Returns ``(poisoned_by_client, poisoned_ids, n_malformed)``:
-          * poisoned_by_client: {client_id: poisoned_state_dict} — ONLY the clients
-            whose weights the plan actually changed.
-          * poisoned_ids: those same clients (ordered, subset of pool, <= budget).
-            This is the round's **ground truth** for the defender's reward and for
-            the research metrics.
-          * n_malformed: how many SELECTED clients produced no change at all —
-            unparseable output, an empty plan, ops that were all skipped as
-            invalid, or a plan that is arithmetically a no-op (e.g.
-            ``scale factor=1.0``). Each is a wasted client and a reward penalty.
+        Returns ``(poisoned_by_client, chosen_ids, n_malformed)``:
+          * poisoned_by_client: {client_id: poisoned_state_dict} for chosen clients.
+          * chosen_ids: clients actually poisoned (subset of pool, ordered, <= budget).
+          * n_malformed: number of chosen clients whose plan was missing/unusable
+            (they fall back to benign weights — a wasted client, a reward penalty).
 
-        A selected client whose plan does nothing sends **byte-identical benign
-        weights**, so counting it as poisoned was actively harmful: the research
-        ASR metric (``fn > 0``) reported a 100% success rate for an attack that
-        did nothing, and the defender's reward punished it for failing to detect
-        an update that is, by construction, undetectable. Such clients are now
-        excluded from the ground truth and charged to ``n_malformed`` instead.
-
-        Consequently ``poisoned_ids`` **can be empty** (the attacker selected
-        clients but achieved nothing). Every consumer handles that: the reward
-        gives 0 stealth and a full malformed penalty, ``rl.switch`` treats it as
-        no attack, and the metrics record a clean round. Parsing never raises.
+        Always returns at least one chosen client (falls back to the first pool
+        client with benign weights on total garbage) so the reward/metrics that
+        divide by the poison count stay well-defined.
         """
         pool_ids = list(pool_references.keys())
         budget = max(1, min(int(budget), len(pool_ids)))
 
-        def _unchanged(cid, weights) -> bool:
-            ref = pool_references[cid]
-            return all(torch.equal(weights[k], ref[k]) for k in ref)
-
-        def _nothing_happened(n_malformed: int):
-            """No client was effectively poisoned this round."""
-            dbg.poison({}, {}, {}, n_malformed=n_malformed)
-            return {}, [], n_malformed
+        def _benign_fallback():
+            cid = pool_ids[0]
+            poisoned = {cid: {k: v.clone() for k, v in pool_references[cid].items()}}
+            dbg.poison(None, {cid: pool_references[cid]}, poisoned, n_malformed=1)
+            return poisoned, [cid], 1
 
         sel = extract_selection(text)
         if sel is None:
-            return _nothing_happened(1)
+            return _benign_fallback()
 
         # Ordered list of (id, ops) candidates from the parsed selection.
         candidates: list[tuple[int, list | None]] = []
@@ -289,7 +211,7 @@ class AttackerAgent:
             # Shared plan, no ids -> auto-select the first `budget` pool clients.
             candidates = [(cid, sel["shared_ops"]) for cid in pool_ids[:budget]]
         else:
-            return _nothing_happened(1)
+            return _benign_fallback()
 
         # Keep only pool ids, dedup (first wins), truncate to the budget.
         chosen: list[tuple[int, list | None]] = []
@@ -302,33 +224,24 @@ class AttackerAgent:
             if len(chosen) >= budget:
                 break
         if not chosen:
-            return _nothing_happened(1)
+            return _benign_fallback()
 
         poisoned: dict[int, dict] = {}
         n_malformed = 0
-        n_invalid_ops = 0
         plan_for_dbg: dict[int, list] = {}
         for cid, ops in chosen:
             if not ops:                        # empty/missing plan -> wasted client
+                poisoned[cid] = {k: v.clone() for k, v in pool_references[cid].items()}
                 n_malformed += 1
                 plan_for_dbg[cid] = []
                 continue
-            pw, n_invalid = apply_plan(pool_references[cid], ops, self.max_abs)
-            n_invalid_ops += n_invalid
-            if _unchanged(cid, pw):
-                # The plan parsed but changed nothing (all ops skipped as invalid,
-                # or arithmetically a no-op). The server would receive this
-                # client's honest weights, so it is NOT poisoned — it is wasted.
-                n_malformed += 1
-                plan_for_dbg[cid] = ops
-                continue
+            pw, _n_invalid = apply_plan(pool_references[cid], ops, self.max_abs)
             poisoned[cid] = pw
             plan_for_dbg[cid] = ops
-
-        poisoned_ids = [cid for cid, _ in chosen if cid in poisoned]
-        dbg.poison(plan_for_dbg, {cid: pool_references[cid] for cid in poisoned_ids},
-                   poisoned, n_malformed=n_malformed, n_invalid_ops=n_invalid_ops)
-        return poisoned, poisoned_ids, n_malformed
+        chosen_ids = [cid for cid, _ in chosen]
+        dbg.poison(plan_for_dbg, {cid: pool_references[cid] for cid in chosen_ids},
+                   poisoned, n_malformed=n_malformed)
+        return poisoned, chosen_ids, n_malformed
 
     # ------------------------------------------------------------------
     def parse(self, text, references: dict[int, dict]) -> tuple[dict[int, dict], int]:

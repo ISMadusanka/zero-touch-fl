@@ -25,8 +25,6 @@ objects (anything exposing ``.client_id`` and ``.is_suspicious``).
 
 from dataclasses import dataclass
 
-from rl.rewards import goal_target
-
 
 @dataclass
 class SwitchConfig:
@@ -37,10 +35,8 @@ class SwitchConfig:
     success_streak: int = 3          # consecutive winning rounds needed to freeze+switch
 
     # Attacker "an attack passed through the defender".
-    attacker_min_drop: float = 0.02  # absolute drop bar, used only when the round's goal/target
-                                     # is unknown (fallback); normally the RELATIVE gate applies.
-    win_fraction: float = 0.6        # RELATIVE damage bar: fraction of the round's requested
-                                     # target drop the attack must achieve to count as a win.
+    attacker_min_drop: float = 0.02  # committed accuracy drop (prev-post) to count as damage
+    attacker_min_class_drop: float = 0.10  # targeted_label: min per-class drop to count as damage
     attacker_min_evaded: float = 1.0 # fraction of poisoned clients that must evade detection
 
     # Defender "defense succeeded against the frozen attacker".
@@ -54,7 +50,7 @@ class SwitchConfig:
             max_phase_rounds=int(rl.get("max_phase_rounds", 200)),
             success_streak=int(rl.get("success_streak", 3)),
             attacker_min_drop=float(rl.get("attacker_min_drop", 0.02)),
-            win_fraction=float(rl.get("win_fraction", 0.6)),
+            attacker_min_class_drop=float(rl.get("attacker_min_class_drop", 0.10)),
             attacker_min_evaded=float(rl.get("attacker_min_evaded", 1.0)),
             defender_min_tpr=float(rl.get("defender_min_tpr", 0.99)),
             defender_max_fpr=float(rl.get("defender_max_fpr", 0.10)),
@@ -72,83 +68,49 @@ def _tpr_fpr(verdicts, poisoned_ids) -> tuple[float, float]:
     return tpr, fpr
 
 
-def attacker_win_bar(cfg: SwitchConfig, goal: dict | None = None,
-                     terms: dict | None = None) -> float:
-    """The drop the attacker must actually reach this round to count as a win.
-
-    This is ``win_fraction * target``, NOT the target itself — with the shipped
-    ``win_fraction=0.6`` and a 0.50 target the real bar is 0.30. Exposed so logs
-    and metrics quote the same number :func:`attacker_succeeded` compares
-    against, instead of printing the target and leaving a cleared round looking
-    like a failure.
-    """
-    if terms is not None:
-        return cfg.win_fraction * terms["effective_target"]
-    if goal is not None:
-        return cfg.win_fraction * goal_target(goal)
-    return cfg.attacker_min_drop
-
-
 def attacker_succeeded(drop: float, verdicts, poisoned_ids, cfg: SwitchConfig,
-                       goal: dict | None = None, terms: dict | None = None) -> bool:
+                       class_drop: float | None = None) -> bool:
     """True when the committed attack 'passed': enough poisoned clients evaded
-    detection AND the round did enough of the damage the goal asked for.
+    detection AND the round caused damage.
 
-    The damage bar is RELATIVE to the round's requested target when ``goal`` is
-    given — ``win_fraction * target`` (``target`` via :func:`rl.rewards.goal_target`)
-    — so a per-round-sampled target is judged on its own scale (a 0.05-target round
-    and a 0.30-target round need proportional drops, not one absolute floor). Without
-    a goal it falls back to the absolute ``attacker_min_drop``. A flagged client is
-    dropped from FedAvg, so meaningful ``drop`` already implies evasion — we keep the
-    explicit evasion check for the multi-poisoner case.
+    For targeted attacks, ``class_drop`` (the most-damaged class's accuracy drop)
+    is checked against ``attacker_min_class_drop`` instead of global ``drop``.
+    A flagged client is dropped from FedAvg, so meaningful damage already implies
+    evasion — we keep the explicit evasion check for the multi-poisoner case."""
+    import logging
+    _logger = logging.getLogger("rl.switch")
 
-    **Targeted rounds** pass ``terms`` (:func:`rl.rewards.targeted_terms`), and then
-    ``drop`` must be the TARGET CLASS's recall drop (the caller gets both from
-    :func:`rl.rewards.goal_drop`). Two things change: the bar is a fraction of the
-    *clamped* ``effective_target`` (so a label whose clean recall is below the
-    requested drop is still winnable), and the round additionally has to keep
-    ``collateral`` within the goal's tolerance. Without that second condition an
-    indiscriminate model-wrecking round would count as a targeted "win" and the
-    schedule would freeze the attacker on exactly the behaviour we are trying to
-    train out of it."""
     if not poisoned_ids:
         return False
     flagged = {v.client_id for v in verdicts if v.is_suspicious}
     evaded = sum(1 for cid in poisoned_ids if cid not in flagged)
     evaded_frac = evaded / len(poisoned_ids)
-    if not evaded_frac >= cfg.attacker_min_evaded:
-        return False
-    if terms is not None:
-        return (drop >= attacker_win_bar(cfg, goal, terms)
-                and terms["collateral"] <= terms["max_collateral"])
-    return drop >= attacker_win_bar(cfg, goal, terms)
+
+    if class_drop is not None:
+        # Targeted mode: check class-level damage
+        success = evaded_frac >= cfg.attacker_min_evaded and class_drop >= cfg.attacker_min_class_drop
+        _logger.info(
+            f"Targeted attacker_succeeded: class_drop={class_drop:.4f} "
+            f"(min={cfg.attacker_min_class_drop}), evaded={evaded_frac:.2f} "
+            f"(min={cfg.attacker_min_evaded}) → {success}"
+        )
+        return success
+
+    return evaded_frac >= cfg.attacker_min_evaded and drop >= cfg.attacker_min_drop
 
 
 def defender_succeeded(verdicts, poisoned_ids, cfg: SwitchConfig) -> bool:
     """True when the committed verdicts catch the poisoned client(s) (TPR high)
-    without over-flagging honest clients (FPR low).
-
-    ``poisoned_ids`` may be empty — the frozen attacker can select clients whose
-    plans turn out to be no-ops, leaving every update honest. TPR is undefined
-    there, and treating it as 0 would make a flawless clean round a loss (and
-    stall the defender's phase whenever its opponent degenerates). On a clean
-    round the defender wins by staying quiet, i.e. by keeping FPR in bounds.
-    """
+    without over-flagging honest clients (FPR low)."""
     tpr, fpr = _tpr_fpr(verdicts, poisoned_ids)
-    if not poisoned_ids:
-        return fpr <= cfg.defender_max_fpr
     return tpr >= cfg.defender_min_tpr and fpr <= cfg.defender_max_fpr
 
 
 def committed_success(learner: str, drop: float, verdicts, poisoned_ids,
-                      cfg: SwitchConfig, goal: dict | None = None,
-                      terms: dict | None = None) -> bool:
-    """Did the learner win on this committed round? ``goal`` (this round's attack
-    goal) enables the attacker's relative win-gate and ``terms``
-    (:func:`rl.rewards.targeted_terms`) its targeted variant; both are ignored for
-    the defender."""
+                      cfg: SwitchConfig, class_drop: float | None = None) -> bool:
+    """Did the learner win on this committed round?"""
     if learner == "attacker":
-        return attacker_succeeded(drop, verdicts, poisoned_ids, cfg, goal, terms)
+        return attacker_succeeded(drop, verdicts, poisoned_ids, cfg, class_drop)
     return defender_succeeded(verdicts, poisoned_ids, cfg)
 
 
@@ -158,47 +120,17 @@ class PhaseController:
     Call :meth:`record` once per *committed* round with whether the learner won.
     It returns ``(switch, reason)``: when ``switch`` is True the driver should
     snapshot+freeze the current learner, then call :meth:`next_phase(reason)`.
-
-    ``alternate=False`` PINS the learner: phases still start and end on the same
-    gates, but :meth:`next_phase` keeps the same agent learning instead of handing
-    over. That is the ``--freeze defender`` schedule — the defense is a fixed
-    non-LLM ensemble, so there is no second policy to hand over to, yet the phase
-    boundary is still what paces checkpoints and the honest FL interlude that
-    refreshes the shared client weights.
     """
 
-    def __init__(self, cfg: SwitchConfig, first_learner: str = "attacker",
-                 alternate: bool = True):
+    def __init__(self, cfg: SwitchConfig, first_learner: str = "attacker"):
         if first_learner not in ("attacker", "defender"):
             raise ValueError(f"first_learner must be attacker|defender, got {first_learner!r}")
         self.cfg = cfg
         self.learner = first_learner
-        self.alternate = bool(alternate)
         self.phase_index = 0
         self.phase_round = 0
         self.streak = 0
         self.capped = False   # did the most recently *completed* phase hit the cap?
-
-    def state_dict(self) -> dict:
-        """Serializable snapshot of the schedule state, for resume."""
-        return {
-            "learner": self.learner,
-            "phase_index": self.phase_index,
-            "phase_round": self.phase_round,
-            "streak": self.streak,
-            "capped": self.capped,
-        }
-
-    def load_state_dict(self, state: dict) -> None:
-        """Restore a snapshot from :meth:`state_dict` (missing keys keep current)."""
-        learner = state.get("learner", self.learner)
-        if learner not in ("attacker", "defender"):
-            raise ValueError(f"controller learner must be attacker|defender, got {learner!r}")
-        self.learner = learner
-        self.phase_index = int(state.get("phase_index", self.phase_index))
-        self.phase_round = int(state.get("phase_round", self.phase_round))
-        self.streak = int(state.get("streak", self.streak))
-        self.capped = bool(state.get("capped", self.capped))
 
     @property
     def opponent(self) -> str:
@@ -215,13 +147,11 @@ class PhaseController:
         return False, None
 
     def next_phase(self, reason: str) -> None:
-        """Advance to the next phase — the opponent's, unless the learner is pinned
-        (``alternate=False``). ``reason`` is the switch reason of the phase just
-        completed; ``capped`` flags that the NEXT phase may want to face an earlier
-        opponent snapshot (curriculum) because this one stalled."""
+        """Advance to the opponent's phase. ``reason`` is the switch reason of the
+        phase just completed; ``capped`` flags that the NEXT phase may want to
+        face an earlier opponent snapshot (curriculum) because this one stalled."""
         self.capped = (reason == "cap")
-        if self.alternate:
-            self.learner = self.opponent
+        self.learner = self.opponent
         self.phase_index += 1
         self.phase_round = 0
         self.streak = 0

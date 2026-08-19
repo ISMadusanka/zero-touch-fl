@@ -10,11 +10,6 @@ The attacker's action now includes CLIENT SELECTION: from its controllable pool
 (see ``AttackerAgent.select_and_apply``). Different rollouts may pick different
 subsets, so each rollout's reward is computed against ITS OWN chosen set.
 
-``AttackerTurn`` gets its per-client verdicts from a *defender policy*
-(``rl/defenders.py``) rather than talking to an LLM itself, so the same round body
-serves both the frozen defender LLM and the non-LLM algorithmic ensemble used by
-``--freeze defender``.
-
 Generators are duck-typed: any object with
 ``generate(system, user, n, temperature) -> list[str]`` works — a
 ``PolicyGenerator`` (trainable LoRA adapter) during RL, or an
@@ -30,28 +25,22 @@ logger = logging.getLogger(__name__)
 
 
 class AttackerTurn:
-    """Learning agent = attacker. Opponent = the frozen defense.
+    """Learning agent = attacker. Opponent = frozen defender (greedy)."""
 
-    ``defender`` is a defender policy from ``rl/defenders.py`` — the frozen
-    defender LLM in the normal arms race, or the algorithmic ensemble under
-    ``--freeze defender``. Everything else about the round is identical either way.
-    """
-
-    def __init__(self, env, attacker_agent, defender,
+    def __init__(self, env, attacker_agent, defender_agent, defender_gen,
                  reward_cfg: dict | None = None, opponent_temperature: float = 0.0,
                  scoring_opponent_temperature: float | None = None):
         self.env = env
         self.attacker_agent = attacker_agent
-        self.defender = defender
+        self.defender_agent = defender_agent
+        self.defender_gen = defender_gen
         self.reward_cfg = reward_cfg or {}
         self.opp_temp = opponent_temperature
-        # When SCORING the G candidate plans we sample the frozen defender LLM at a
+        # When SCORING the G candidate plans we sample the frozen defender at a
         # (usually nonzero) temperature so different plans see different verdicts
         # — this restores within-group reward spread and is the key fix for the
         # attacker's zero-advantage collapse. The COMMITTED round still uses the
         # greedy ``opp_temp`` so success is measured against the real defender.
-        # Both are ignored by a deterministic (algorithmic) defense, which gets its
-        # spread from the candidate plans themselves.
         self.scoring_opp_temp = (
             opponent_temperature if scoring_opponent_temperature is None
             else scoring_opponent_temperature
@@ -62,23 +51,12 @@ class AttackerTurn:
         self.pool_references = env.pool_benign            # {cid: benign state_dict}
         self.budget = env.round_budget
         self.pool_size = env.n_compromisable
-        # Damage is scored against THIS round's clean counterfactual (the accuracy
-        # the aggregate reaches with no poison), not against the current global's
-        # accuracy — see FLArmsRaceEnv.clean_reference_accuracy. All G rollouts
-        # share it, so the within-group ordering is still purely "which plan hurt
-        # more", while the absolute scale now means "how much of the goal did this
-        # attack achieve" in every round, not "how much worse than last round".
-        # Per-class breakdown of the SAME counterfactual (one test pass, no extra
-        # cost). A ``targeted_label`` round is scored on the target class's recall
-        # drop against this reference — see ``rl.rewards.targeted_terms``.
-        self.reference_eval = env.clean_reference_eval()
-        self.reference_accuracy = self.reference_eval.overall
-        self.goal = env.round_goal                        # this round's (maybe sampled) goal
+        self.prev_accuracy = env.current_accuracy
 
         self.system = attacker_agent.system_prompt()
         self.user = attacker_agent.build_user_prompt(
             env.round_index + env.training_rounds, env.current_accuracy,
-            self.pool_references, env.global_weights, self.budget, goal=self.goal,
+            self.pool_references, env.global_weights, self.budget,
         )
         dbg.attacker_prompt(self.system, self.user, who="learner")
 
@@ -86,42 +64,45 @@ class AttackerTurn:
     def messages(self) -> tuple[str, str]:
         return self.system, self.user
 
-    def _apply(self, attacker_text, temperature, commit: bool = False):
+    def _defender_verdicts(self, updates, temperature):
+        feats = self.env.features(updates)
+        client_ids = [u.client_id for u in updates]
+        d_sys = self.defender_agent.system_prompt()
+        d_user = self.defender_agent.build_user_prompt(feats)
+        text = self.defender_gen.generate(d_sys, d_user, n=1, temperature=temperature)[0]
+        verdicts = self.defender_agent.parse(text, client_ids)
+        dbg.defender_io(d_sys, d_user, text, verdicts, who="opponent",
+                        temperature=temperature)
+        return verdicts
+
+    def _apply(self, attacker_text, temperature):
         poisoned, chosen_ids, n_malformed = self.attacker_agent.select_and_apply(
             attacker_text, self.pool_references, self.budget
         )
         updates = self.env.build_updates(poisoned)
-        # ``commit`` marks the ONE call per round whose verdicts are applied to
-        # the shared model, so a stateful defense advances its cross-round memory
-        # exactly once instead of once per scored rollout.
-        verdicts = self.defender.verdicts(
-            self.env, updates, temperature=temperature, commit=commit)
+        verdicts = self._defender_verdicts(updates, temperature)
         return updates, verdicts, n_malformed, chosen_ids, poisoned
 
     def reward(self, attacker_text) -> float:
         dbg.scoring_rollout(attacker_text)
         updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
             attacker_text, self.scoring_opp_temp)
-        post_eval = self.env.evaluate_updates_full(updates, verdicts)
-        post_acc = post_eval.overall
+        post_acc, post_class_acc = self.env.evaluate_updates(updates, verdicts)
         diversity = perturbation_diversity(
             poisoned, {cid: self.pool_references[cid] for cid in chosen_ids})
         r = attacker_reward(
-            self.reference_accuracy, post_acc, self.goal, chosen_ids,
+            self.prev_accuracy, post_acc, self.env.goal, chosen_ids,
             verdicts, n_malformed,
             alpha=self.reward_cfg.get("alpha", 1.0),
             beta=self.reward_cfg.get("beta", 0.5),
             gamma=self.reward_cfg.get("gamma", 1.0),
             delta=self.reward_cfg.get("delta", 0.0),
             zeta=self.reward_cfg.get("zeta", 0.0),
-            eta=self.reward_cfg.get("eta", 1.0),
-            stealth_centered=self.reward_cfg.get("stealth_centered", False),
             pool_size=self.pool_size,
             diversity=diversity,
-            # Targeted goals need the per-class view on BOTH sides; for every other
-            # goal these are ignored and the reward is computed exactly as before.
-            clean_eval=self.reference_eval,
-            post_eval=post_eval,
+            prev_class_acc=self.env.current_class_accuracies,
+            post_class_acc=post_class_acc,
+            baseline_class_acc=self.env.baseline_class_accuracies,
         )
         dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed,
                             verdicts=verdicts, poisoned_ids=chosen_ids)
@@ -130,15 +111,15 @@ class AttackerTurn:
     def commit(self, attacker_text) -> dict:
         dbg.committing()
         updates, verdicts, n_malformed, chosen_ids, poisoned = self._apply(
-            attacker_text, self.opp_temp, commit=True)
+            attacker_text, self.opp_temp)
         self.env.set_committed_poison(chosen_ids)
-        post_eval = self.env.commit_full(updates, verdicts)
+        new_acc = self.env.commit(updates, verdicts)
         return {
             "updates": updates,
             "verdicts": verdicts,
             "n_malformed": n_malformed,
-            "post_accuracy": post_eval.overall,
-            "post_eval": post_eval,
+            "post_accuracy": new_acc,
+            "post_class_accuracy": self.env.current_class_accuracies,
             "poisoned_ids": chosen_ids,
             "poisoned_by_client": poisoned,
         }
@@ -162,12 +143,16 @@ class DefenderTurn:
         # pool to poison (<= budget) and how.
         dbg.opponent_move(opponent_temperature)
         a_sys = attacker_agent.system_prompt()
-        a_user = attacker_agent.build_user_prompt(
-            env.round_index + env.training_rounds, env.current_accuracy,
-            env.pool_benign, env.global_weights, env.round_budget, goal=env.round_goal,
+        self.user = attacker_agent.build_user_prompt(
+            env.round_index + env.training_rounds,
+            env.current_accuracy,
+            env.pool_benign,
+            env.global_weights,
+            env.round_budget,
+            env.target_neuron_indices,
         )
-        dbg.attacker_prompt(a_sys, a_user, who="frozen-opponent")
-        a_text = attacker_gen.generate(a_sys, a_user, n=1, temperature=opponent_temperature)[0]
+        dbg.attacker_prompt(a_sys, self.user, who="frozen-opponent")
+        a_text = attacker_gen.generate(a_sys, self.user, n=1, temperature=opponent_temperature)[0]
         dbg.attacker_output(a_text, who="frozen-opponent")
         poisoned, chosen_ids, self.n_malformed = attacker_agent.select_and_apply(
             a_text, env.pool_benign, env.round_budget)
@@ -189,10 +174,21 @@ class DefenderTurn:
     def reward(self, defender_text) -> float:
         dbg.scoring_rollout(defender_text)
         verdicts = self.defender_agent.parse(defender_text, self.client_ids)
+
+        # Opt-in, OFF by default (see rl/rewards.py::defender_reward docstring):
+        # only pay the extra FedAvg+eval pass when damage_weight > 0.
+        damage_weight = float(self.reward_cfg.get("damage_weight", 0.0))
+        accuracy_drop = None
+        if damage_weight > 0.0:
+            post_acc, _ = self.env.evaluate_updates(self.updates, verdicts)
+            accuracy_drop = self.env.current_accuracy - post_acc
+
         r = defender_reward(
             verdicts, self.poisoned_ids,
-            mode=self.reward_cfg.get("mode", "soft_balanced"),
+            mode=self.reward_cfg.get("mode", "soft_f1"),
             fpr_penalty=self.reward_cfg.get("fpr_penalty", 1.0),
+            damage_weight=damage_weight,
+            accuracy_drop=accuracy_drop,
         )
         dbg.rollout_outcome(reward=r, verdicts=verdicts, poisoned_ids=self.poisoned_ids)
         return r
@@ -200,13 +196,13 @@ class DefenderTurn:
     def commit(self, defender_text) -> dict:
         dbg.committing()
         verdicts = self.defender_agent.parse(defender_text, self.client_ids)
-        post_eval = self.env.commit_full(self.updates, verdicts)
+        new_acc = self.env.commit(self.updates, verdicts)
         return {
             "updates": self.updates,
             "verdicts": verdicts,
             "n_malformed": self.n_malformed,
-            "post_accuracy": post_eval.overall,
-            "post_eval": post_eval,
+            "post_accuracy": new_acc,
+            "post_class_accuracy": self.env.current_class_accuracies,
             "poisoned_ids": self.poisoned_ids,
             "poisoned_by_client": self.poisoned_by_client,
         }
