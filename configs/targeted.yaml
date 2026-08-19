@@ -44,15 +44,12 @@ attack:
     label: 2                      # FALLBACK ONLY — used when `target_label_from_client`
                                   # below is null. Otherwise it is REPLACED at runtime by
                                   # the class client 0 actually holds most of.
-    target_class_drop: 0.50       # how much of the target class's RECALL to destroy.
+    target_class_drop: 0.80       # how much of the target class's RECALL to destroy.
                                   # 0.50 = "lose half the class": a class the clean model gets
                                   # 0.86 right must fall to ~0.36. Set 0.80 to demand near-total
-                                  # destruction instead. Clamped per-round to that class's clean
-                                  # recall, so a class the honest model only gets 0.42 right is
-                                  # asked to reach ~0 rather than an impossible 0.50.
-    max_collateral: 0.05          # tolerance for damage to the OTHER classes: the mean recall
-                                  # they may lose before the attack stops counting as targeted.
-                                  # The reward charges collateral in units of this.
+                                  # destruction instead.
+    max_global_drop: 0.03         # stealth constraint: maximum allowed global accuracy drop
+                                  # before the attack incurs a harsh stealth penalty.
 
   # --- WHICH label: derived at runtime from the poisoner's own data -------------
   # The data split is non-IID (FLTrust bias-q), so WHICH classes client 0 owns is
@@ -141,9 +138,9 @@ rl:
   success_streak: 3
   fl_interlude_between_phases: true
   curriculum_on_cap: true
-  attacker_min_drop: 0.02         # fallback only; the relative win-gate applies
-  win_fraction: 0.6               # "attack passed" = target-class recall drop >= 0.6 * the
-                                  # round's effective target AND collateral within tolerance
+  attacker_min_drop: 0.02         # fallback only; untargeted attacks
+  attacker_min_class_drop: 0.10   # targeted_label: min per-class drop to count as "attack passed"
+                                  # AND global drop within max_global_drop tolerance
   attacker_min_evaded: 1.0
   defender_min_tpr: 0.99
   defender_max_fpr: 0.10
