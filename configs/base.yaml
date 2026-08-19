@@ -111,7 +111,13 @@ data:
                                   # (=0.111 at 9 classes) is IID; larger = more non-IID;
                                   # paper default 0.5. The group count M is now taken from
                                   # the DATA (9 multiclass / 2 binary), not a constant.
-  source: "csv"                   # csv = the real dataset at `csv_path`.
+  source: "kaggle"                # kaggle = DOWNLOAD the real dataset automatically via
+                                  #   `kagglehub` (see `kaggle_dataset`). Nothing to place
+                                  #   by hand: a fresh clone trains straight away. The
+                                  #   mirror is public and CC BY 4.0, so no Kaggle account
+                                  #   or API token is needed.
+                                  # csv = the real dataset already on disk at `csv_path`,
+                                  #   for an air-gapped box or the IEEE DataPort release.
                                   # synthetic = generate 5G-NIDD-SHAPED traffic instead
                                   #   (same 9 classes, same class imbalance, same
                                   #   preprocessing path) so the pipeline can be smoke-
@@ -119,17 +125,33 @@ data:
                                   #   substitute for the dataset: no accuracy, attack-
                                   #   success or defense number from a synthetic run means
                                   #   anything. Every such run logs a warning saying so.
+  kaggle_dataset: "humera11/5g-nidd-dataset"
+                                  # `source: kaggle` only. The mirror to pull: ~275 MB
+                                  # holding the full 1,215,890-flow Combined.csv. kagglehub
+                                  # caches it under ~/.cache/kagglehub (move that with the
+                                  # KAGGLEHUB_CACHE env var), so it is one transfer per
+                                  # machine, not per run.
+  kaggle_version: null            # null = whatever Kaggle currently serves as latest (1 at
+                                  # the time of writing). Set an integer to pin a version
+                                  # if you need bit-identical data across machines.
+  kaggle_file: null               # null = take every CSV in the dataset (concatenated, as
+                                  # with a csv_path directory). Set a member filename, e.g.
+                                  # "Combined.csv", to download just that one file.
   csv_path: "./data/5gnidd_raw/Combined.csv"
-                                  # The dataset is not redistributable, so it is not
-                                  # vendored. Download it from IEEE DataPort:
+                                  # `source: csv` only — ignored under `source: kaggle`.
+                                  # Point this at the combined CSV, or at a DIRECTORY of
+                                  # the per-attack CSVs (found recursively, concatenated).
+                                  # The dataset is also at IEEE DataPort:
                                   #   https://ieee-dataport.org/documents/5g-nidd-comprehensive-network-intrusion-detection-dataset-generated-over-5g-wireless
-                                  # and point this at the combined CSV, or at a DIRECTORY
-                                  # of the per-attack CSVs (they are concatenated).
   cache_dir: "./data/5gnidd_processed"
                                   # Preprocessed arrays + schema.json land here, keyed by
-                                  # the options below plus the CSV's size/mtime, so the
+                                  # the options below plus the CSV's size/mtime (under
+                                  # `source: kaggle`, the dataset handle instead), so the
                                   # ~1.2M-row parse happens once instead of on every run,
-                                  # benchmark and resume.
+                                  # benchmark and resume. The Kaggle download is likewise
+                                  # only reached on a cache MISS — a warm cache means a run
+                                  # needs no network, and equally means a NEW upstream
+                                  # version is not picked up until the cache is cleared.
   use_cache: true
   label_mode: "multiclass"        # multiclass = predict the ATTACK TYPE (9 classes incl.
                                   #   benign). This is the default because it keeps the

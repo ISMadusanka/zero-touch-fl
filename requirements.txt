@@ -2,6 +2,9 @@
 torch>=2.0
 numpy
 pandas             # 5G-NIDD CSV ingest (~1.2M flows x ~52 columns)
+kagglehub          # downloads 5G-NIDD on first use (data.source: kaggle, the default).
+                   # The mirror is public + CC BY 4.0, so no Kaggle account/API token is
+                   # needed; drop this only if you run with data.source: csv/synthetic.
 pyyaml
 matplotlib
 # NOTE torchvision is deliberately absent: the FL task is 5G-NIDD, a TABULAR

@@ -6,10 +6,17 @@ eight attacks (UDPFlood, HTTPFlood, SlowrateDoS, TCPConnectScan, SYNScan, UDPSca
 SYNFlood, ICMPFlood) described by ~52 Argus flow features. Nine classes counting
 benign.
 
-The dataset is **not redistributable**, so it is not vendored. Download it from
+The dataset is too large to vendor, so it is **downloaded on first use** rather
+than placed by hand. `data.source: kaggle` (the default) fetches the public,
+CC BY 4.0 mirror `humera11/5g-nidd-dataset` with `kagglehub` — no Kaggle account
+or API token required — and caches it under `~/.cache/kagglehub`. The download is
+reached only on a preprocessing cache *miss*, so it costs one transfer per machine.
+
+`data.source: csv` still reads a local copy at `data.csv_path` (a combined CSV, or
+a directory of the per-attack CSVs — found recursively and concatenated), which is
+what an air-gapped box or the
 [IEEE DataPort](https://ieee-dataport.org/documents/5g-nidd-comprehensive-network-intrusion-detection-dataset-generated-over-5g-wireless)
-and point `data.csv_path` at the combined CSV (or at a directory of the per-attack
-CSVs — they are concatenated). To exercise the pipeline without the data, set
+release wants. To exercise the pipeline without the data at all, set
 `data.source: synthetic`; that generates 5G-NIDD-shaped traffic through the same
 preprocessing path and logs a warning on every run, because no number produced
 from it means anything.

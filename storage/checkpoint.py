@@ -68,7 +68,9 @@ def shape_mismatch(global_weights: dict) -> str | None:
     was, now = saved_spec(), active()
     if was is not None and was.source != now.source:
         return (f"was trained on {was.source!r} data but this run loads {now.source!r} "
-                f"— a synthetic-trained baseline would invalidate every number in the run")
+                f"— reusing a baseline across a change of data source would invalidate "
+                f"every number in the run, most dangerously a synthetic-trained one "
+                f"resumed by a real run")
     if was is not None and was.feature_names and now.feature_names \
             and was.feature_names != now.feature_names:
         return (f"was trained on a different feature set "

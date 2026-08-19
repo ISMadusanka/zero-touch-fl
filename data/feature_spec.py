@@ -63,8 +63,11 @@ class FeatureSpec:
     #: audited ("which 32 flow features is this model actually using?") and so a
     #: cache built under a different drop list is recognisably different.
     feature_names: list[str] = field(default_factory=list)
-    #: ``"csv"`` for real 5G-NIDD, ``"synthetic"`` for the generated stand-in.
-    #: Carried through to logs so a synthetic run is never mistaken for a real one.
+    #: Where the rows came from: ``"kaggle"`` (downloaded mirror, the default) or
+    #: ``"csv"`` (a local file) for real 5G-NIDD, ``"synthetic"`` for the generated
+    #: stand-in. Carried through to logs and checkpoints so a synthetic run is
+    #: never mistaken for a real one, and so a checkpoint records which of the two
+    #: real routes produced it.
     source: str = "csv"
     dataset: str = "5gnidd"
 
@@ -83,7 +86,10 @@ class FeatureSpec:
 
     def describe(self) -> str:
         """One-line summary for logs."""
-        tag = "" if self.source == "csv" else f" [{self.source.upper()}]"
+        # Only NON-real sources get a tag. Marking the two real routes as well
+        # would put brackets on every ordinary run and train the eye to skip
+        # them, which is precisely the signal `[SYNTHETIC]` needs to keep.
+        tag = "" if self.source in ("csv", "kaggle") else f" [{self.source.upper()}]"
         return (f"{self.dataset}{tag}: {self.input_dim} flow features -> "
                 f"{self.n_classes} classes ({', '.join(self.class_names) or 'unnamed'})")
 

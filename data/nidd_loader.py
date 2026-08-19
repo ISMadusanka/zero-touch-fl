@@ -14,7 +14,8 @@ Pipeline
 --------
 ``get_data_loaders`` is the only entry point the system calls. It:
 
- 1. reads the CSV (or generates a synthetic stand-in — see ``source``);
+ 1. gets the CSV — downloaded from Kaggle on demand, read from a local path, or
+    generated as a synthetic stand-in (see ``source`` and "Getting the data");
  2. drops identifier / leakage columns (below) and encodes the label;
  3. subsamples to ``max_samples`` so a Phase-2 round costs about what it cost on
     MNIST — 1.2M flows over 20 clients would be ~60k examples per client per
@@ -31,6 +32,24 @@ selector on all rows and splitting afterwards leaks test-set statistics into the
 model, which on an intrusion-detection dataset inflates accuracy enough to matter
 (the reward here IS test accuracy, so a leak would inflate every number the arms
 race produces).
+
+Getting the data
+----------------
+``data.source: kaggle`` is the default and needs no manual download step: the
+dataset is pulled with ``kagglehub`` on first use and cached under
+``~/.cache/kagglehub`` (move it with ``KAGGLEHUB_CACHE``), so a fresh clone can
+train without anyone fetching a CSV by hand. The mirror is
+``humera11/5g-nidd-dataset`` — public and CC BY 4.0, so **no Kaggle account or
+API token is required** — and it ships the full 1,215,890-row ``Combined.csv``.
+
+The download only happens on a preprocessing cache MISS. Once ``cache_dir`` holds
+the processed arrays a run needs no network at all, which also means a new
+upstream version is not picked up on its own; clear the cache (or set
+``data.kaggle_version``) if that matters.
+
+``data.source: csv`` still reads whatever sits at ``data.csv_path``, for an
+air-gapped box or for the IEEE DataPort release, and ``data.source: synthetic``
+generates a stand-in for offline smoke tests.
 
 Leakage columns
 ---------------
@@ -82,6 +101,11 @@ DEFAULT_DROP_COLUMNS = (
     # --- timestamps and row counters ---
     "starttime", "lasttime", "stime", "ltime", "seq", "unnamed: 0", "index",
 )
+
+#: Kaggle mirror used by ``data.source: kaggle``. Public and CC BY 4.0, so the
+#: download needs no Kaggle account or API token; version 1 ships a single
+#: ``Combined.csv`` holding all 1,215,890 flows.
+DEFAULT_KAGGLE_DATASET = "humera11/5g-nidd-dataset"
 
 #: Label column candidates, most specific first. ``multiclass`` wants the attack
 #: type; ``binary`` wants the benign/malicious flag.
@@ -144,21 +168,76 @@ class TabularDataset(Dataset):
 # Ingest
 # ---------------------------------------------------------------------------
 
+def _csv_files(directory: str) -> list[str]:
+    """Every ``*.csv`` under ``directory``, recursively, in a stable order.
+
+    Recursive because a Kaggle download unpacks whatever directory layout the
+    uploader chose, and a top-level-only listing would report a perfectly good
+    nested dataset as empty.
+    """
+    found = []
+    for root, _dirs, files in os.walk(directory):
+        found.extend(os.path.join(root, f)
+                     for f in files if f.lower().endswith(".csv"))
+    return sorted(found)
+
+
+def _download_kaggle(dataset: str, version=None, file: str | None = None) -> str:
+    """Fetch the 5G-NIDD mirror from Kaggle; return the local path it landed at.
+
+    ``kagglehub`` keeps its own download cache (``~/.cache/kagglehub``, or
+    ``KAGGLEHUB_CACHE``), so this is a ~275 MB transfer once per machine and a
+    path lookup every time after. The default mirror is public, which is why the
+    normal path needs no credentials at all; a private or licence-gated mirror
+    would need ``KAGGLE_USERNAME``/``KAGGLE_KEY`` or ``~/.kaggle/kaggle.json``.
+
+    Returns the dataset directory, or that one file when ``file`` names a member
+    (both are fed to :func:`_read_csv`, which handles either).
+    """
+    try:
+        import kagglehub
+    except ImportError as e:
+        raise RuntimeError(
+            "data.source=kaggle needs the `kagglehub` package, which is not installed.\n"
+            "  Install it with `pip install kagglehub` (it is in requirements.txt), or\n"
+            "  set `data.source: csv` and point `data.csv_path` at a local copy."
+        ) from e
+
+    handle = str(dataset).strip()
+    if version not in (None, ""):
+        handle = f"{handle}/versions/{int(version)}"
+    logger.info(f"5G-NIDD: resolving Kaggle dataset {handle!r} via kagglehub "
+                f"(~275 MB on first use, cached afterwards)")
+    try:
+        # kagglehub's second positional arg selects ONE member file; omitting it
+        # downloads the whole dataset and returns the directory.
+        path = (kagglehub.dataset_download(handle, file) if file
+                else kagglehub.dataset_download(handle))
+    except Exception as e:
+        raise RuntimeError(
+            f"could not download Kaggle dataset {handle!r}: {type(e).__name__}: {e}\n"
+            f"  The default mirror is public and needs no Kaggle credentials, so this is\n"
+            f"  usually no network access, or a dataset that was renamed or withdrawn.\n"
+            f"  Offline box? Fetch it once elsewhere, then set `data.source: csv` and\n"
+            f"  point `data.csv_path` at the CSV."
+        ) from e
+    logger.info(f"5G-NIDD: Kaggle dataset ready at {path}")
+    return path
+
+
 def _read_csv(csv_path: str):
-    """Read one CSV, or concatenate every ``*.csv`` in a directory.
+    """Read one CSV, or concatenate every ``*.csv`` under a directory (recursively).
 
     5G-NIDD is distributed both as ``Combined.csv`` and as per-attack files; a
     directory of the latter is concatenated so either layout works. Columns are
     unioned across files, so a per-attack CSV missing a column contributes NaN
-    there rather than dropping the file.
+    there rather than dropping the file. Both the Kaggle download and a local
+    ``data.csv_path`` arrive here, so neither route cares which layout it got.
     """
     import pandas as pd
 
     if os.path.isdir(csv_path):
-        files = sorted(
-            os.path.join(csv_path, f) for f in os.listdir(csv_path)
-            if f.lower().endswith(".csv")
-        )
+        files = _csv_files(csv_path)
         if not files:
             raise FileNotFoundError(f"no .csv files under {csv_path!r}")
         logger.info(f"5G-NIDD: reading {len(files)} CSV file(s) from {csv_path}")
@@ -168,11 +247,14 @@ def _read_csv(csv_path: str):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
             f"5G-NIDD CSV not found at {csv_path!r}.\n"
-            f"  The dataset is not redistributable, so it is not vendored here. Get it from\n"
+            f"  The dataset is too large to vendor, so it is fetched rather than shipped.\n"
+            f"  Easiest fix: set `data.source: kaggle` in configs/base.yaml (the default) —\n"
+            f"  it downloads {DEFAULT_KAGGLE_DATASET} automatically, a public CC BY 4.0\n"
+            f"  mirror that needs no Kaggle account.\n"
+            f"  Or keep `data.source: csv` and point `data.csv_path` at a copy you already\n"
+            f"  have (a CSV, or a directory of per-attack CSVs) — e.g. IEEE DataPort's:\n"
             f"    https://ieee-dataport.org/documents/"
             f"5g-nidd-comprehensive-network-intrusion-detection-dataset-generated-over-5g-wireless\n"
-            f"  and point `data.csv_path` in configs/base.yaml at the CSV (or at a directory\n"
-            f"  of per-attack CSVs).\n"
             f"  To smoke-test the pipeline without the real data, set `data.source: synthetic`\n"
             f"  — that generates 5G-NIDD-shaped traffic and is NOT a substitute for results."
         )
@@ -456,6 +538,11 @@ def _cache_key(options: dict) -> str:
     The CSV is fingerprinted by (path, size, mtime) rather than by hashing its
     contents — a 1 GB hash on every startup would cost more than the parse it is
     meant to skip, and size+mtime catches every realistic edit.
+
+    A Kaggle run is keyed by the dataset handle instead (see :func:`load_nidd`).
+    Its local path is a per-machine download cache, so stat-ing it would both make
+    the processed cache unshareable between machines and force a download before
+    every cache LOOKUP — which is most of what the cache exists to avoid.
     """
     payload = dict(options)
     path = payload.get("csv_path")
@@ -464,9 +551,8 @@ def _cache_key(options: dict) -> str:
         # when a file inside it is rewritten, so fingerprinting the dir alone would
         # keep serving a stale cache after the data was replaced.
         payload["_csv_stat"] = sorted(
-            [f, int(os.stat(os.path.join(path, f)).st_size),
-             int(os.stat(os.path.join(path, f)).st_mtime)]
-            for f in os.listdir(path) if f.lower().endswith(".csv")
+            [os.path.relpath(f, path), int(os.stat(f).st_size), int(os.stat(f).st_mtime)]
+            for f in _csv_files(path)
         )
     elif path and os.path.exists(path):
         st = os.stat(path)
@@ -525,10 +611,15 @@ def load_nidd(data_cfg: dict | None = None, seed: int = 0):
     file for what each one does. Results are cached under ``data.cache_dir``,
     keyed by the options plus the CSV's size/mtime, so the ~1M-row parse happens
     once rather than on every run, benchmark and resume.
+
+    With the default ``data.source: kaggle`` the dataset itself is downloaded on
+    the first cache miss, so a fresh clone trains without anyone placing a CSV by
+    hand. A warm cache short-circuits before that, which is why the download is
+    reached from :func:`_build` rather than from here.
     """
     cfg = dict(data_cfg or {})
     cache_dir = str(cfg.get("cache_dir", "./data/5gnidd_processed"))
-    source = str(cfg.get("source", "csv")).strip().lower()
+    source = str(cfg.get("source", "kaggle")).strip().lower()
     csv_path = str(cfg.get("csv_path", "./data/5gnidd_raw/Combined.csv"))
     label_mode = str(cfg.get("label_mode", "multiclass")).strip().lower()
     n_features = int(cfg.get("n_features", 32))
@@ -538,11 +629,21 @@ def load_nidd(data_cfg: dict | None = None, seed: int = 0):
     balance = str(cfg.get("class_balance", "natural")).strip().lower()
     extra_drop = tuple(str(c).strip().lower() for c in (cfg.get("drop_columns") or ()))
     label_column = cfg.get("label_column")
+    kaggle_dataset = str(cfg.get("kaggle_dataset") or DEFAULT_KAGGLE_DATASET).strip()
+    kaggle_version = cfg.get("kaggle_version")
+    kaggle_file = cfg.get("kaggle_file") or None
 
     options = dict(source=source, csv_path=csv_path, label_mode=label_mode,
                    n_features=n_features, max_samples=max_samples,
                    test_fraction=test_fraction, balance=balance,
                    drop=sorted(extra_drop), label_column=label_column, seed=int(seed))
+    if source == "kaggle":
+        # What identifies the data is the handle, not where kagglehub happened to
+        # put it: keying on the local path would tie the processed cache to one
+        # machine's home directory, and stat-ing it would mean downloading before
+        # every lookup. `csv_path` is unused on this route, so it leaves the key too.
+        options["csv_path"] = None
+        options["kaggle"] = [kaggle_dataset, kaggle_version, kaggle_file]
     key = _cache_key(options)
 
     cached = _MEMO.get(key)
@@ -556,6 +657,8 @@ def load_nidd(data_cfg: dict | None = None, seed: int = 0):
             label_column=label_column, n_features=n_features,
             max_samples=max_samples, test_fraction=test_fraction,
             balance=balance, extra_drop=extra_drop, seed=int(seed),
+            kaggle_dataset=kaggle_dataset, kaggle_version=kaggle_version,
+            kaggle_file=kaggle_file,
         )
         if cfg.get("use_cache", True):
             _save_cache(cache_dir, key, (x_train, y_train, x_test, y_test), spec)
@@ -569,8 +672,14 @@ def load_nidd(data_cfg: dict | None = None, seed: int = 0):
 
 
 def _build(*, source, csv_path, label_mode, label_column, n_features,
-           max_samples, test_fraction, balance, extra_drop, seed):
-    """Do the actual read + fit + transform (cache miss path)."""
+           max_samples, test_fraction, balance, extra_drop, seed,
+           kaggle_dataset=DEFAULT_KAGGLE_DATASET, kaggle_version=None,
+           kaggle_file=None):
+    """Do the actual read + fit + transform (cache miss path).
+
+    This is also where the Kaggle download lives, so it runs only when there is
+    no usable processed cache — a warm cache means no network call at all.
+    """
     rng = np.random.default_rng(seed)
 
     if source == "synthetic":
@@ -580,10 +689,13 @@ def _build(*, source, csv_path, label_mode, label_column, n_features,
             "attack-success or defense number from such a run means anything."
         )
         frame = _synthetic_frame(int(max_samples or 50000), seed)
+    elif source == "kaggle":
+        frame = _read_csv(_download_kaggle(kaggle_dataset, kaggle_version, kaggle_file))
     elif source == "csv":
         frame = _read_csv(csv_path)
     else:
-        raise ValueError(f"unknown data.source {source!r} — expected 'csv' or 'synthetic'")
+        raise ValueError(f"unknown data.source {source!r} — expected "
+                         f"'kaggle', 'csv' or 'synthetic'")
 
     frame.columns = [str(c).strip() for c in frame.columns]
     label_col = _find_label_column(frame.columns, label_mode, label_column)

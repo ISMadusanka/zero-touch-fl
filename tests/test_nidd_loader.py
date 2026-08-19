@@ -318,6 +318,167 @@ def test_missing_csv_names_the_config_key_and_the_synthetic_escape_hatch():
     _reset()
 
 
+# ---------------------------------------------------------------------------
+# Kaggle download (data.source: kaggle) — stubbed, so the suite stays offline
+# ---------------------------------------------------------------------------
+
+class _FakeKagglehub:
+    """Stands in for the real ``kagglehub`` module.
+
+    Records every call so a test can assert not just *what* was read but *how
+    often the network would have been touched* — the whole point of putting the
+    download behind the preprocessing cache.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.calls = []
+
+    def dataset_download(self, handle, file=None):
+        self.calls.append((handle, file))
+        return self.path
+
+
+def _with_fake_kagglehub(path: str) -> _FakeKagglehub:
+    """Install the stub in ``sys.modules`` so ``import kagglehub`` finds it."""
+    fake = _FakeKagglehub(path)
+    sys.modules["kagglehub"] = fake
+    return fake
+
+
+def _fresh_kaggle_run():
+    """Clear the in-process memo so the next load actually re-reads.
+
+    These tests share an option set, and the memo is keyed by options — without
+    this, the second test to run would be served from the first one's memory and
+    would see zero downloads for the wrong reason.
+    """
+    _reset()
+    clear_memo()
+
+
+def _kaggle_dataset_dir(name: str, rows: list[str]) -> str:
+    """A download directory shaped like a real one: the CSV sits in a subfolder."""
+    root = os.path.join(_tmpdir(), name)
+    nested = os.path.join(root, "versions", "1")
+    os.makedirs(nested, exist_ok=True)
+    with open(os.path.join(nested, "Combined.csv"), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(rows) + "\n")
+    return root
+
+
+_KAGGLE_ROWS = (
+    ["a,b,Attack Type"]
+    + [f"{i},{i * 2},Benign" for i in range(30)]
+    + [f"{i + 100},{i},UDPFlood" for i in range(30)]
+)
+
+
+def test_kaggle_source_downloads_and_feeds_the_normal_csv_reader():
+    """`source: kaggle` must land in the same preprocessing path as `source: csv`.
+
+    Also pins the recursive search: the stub buries the CSV under `versions/1/`
+    the way a real kagglehub download does, so a top-level-only listing would
+    report this perfectly good dataset as empty.
+    """
+    _fresh_kaggle_run()
+    saved = sys.modules.get("kagglehub")
+    root = _kaggle_dataset_dir("kaggle_dl", _KAGGLE_ROWS)
+    fake = _with_fake_kagglehub(root)
+    try:
+        _, _, spec = load_nidd(_cfg(source="kaggle", max_samples=None, n_features=2),
+                               seed=0)
+        assert fake.calls == [("humera11/5g-nidd-dataset", None)], fake.calls
+        assert spec.n_classes == 2                       # Benign + UDPFlood
+        assert spec.source == "kaggle"                   # provenance is recorded
+    finally:
+        sys.modules.pop("kagglehub", None)
+        if saved is not None:
+            sys.modules["kagglehub"] = saved
+        _reset()
+
+
+def test_kaggle_version_and_file_reach_kagglehub_as_a_pinned_handle():
+    _fresh_kaggle_run()
+    saved = sys.modules.get("kagglehub")
+    root = _kaggle_dataset_dir("kaggle_pinned", _KAGGLE_ROWS)
+    fake = _with_fake_kagglehub(os.path.join(root, "versions", "1", "Combined.csv"))
+    try:
+        load_nidd(_cfg(source="kaggle", max_samples=None, n_features=2,
+                       kaggle_dataset="someone/mirror", kaggle_version=3,
+                       kaggle_file="Combined.csv"), seed=0)
+        assert fake.calls == [("someone/mirror/versions/3", "Combined.csv")], fake.calls
+    finally:
+        sys.modules.pop("kagglehub", None)
+        if saved is not None:
+            sys.modules["kagglehub"] = saved
+        _reset()
+
+
+def test_kaggle_cache_is_portable_and_spares_the_second_run_a_download():
+    """The processed cache must key on the dataset HANDLE, not the download path.
+
+    kagglehub resolves to a per-machine cache directory, so keying on that path
+    would (a) stop a processed cache being shared between machines and (b) force
+    a download before every cache *lookup*. Simulated by returning a different
+    path on the second run: same handle, so the cache must still hit and
+    kagglehub must not be called at all.
+    """
+    _fresh_kaggle_run()
+    saved = sys.modules.get("kagglehub")
+    cache = os.path.join(_tmpdir(), "kaggle_cache_dir")
+    cfg = _cfg(source="kaggle", max_samples=None, n_features=2,
+               cache_dir=cache, use_cache=True)
+
+    first = _kaggle_dataset_dir("kaggle_box_a", _KAGGLE_ROWS)
+    second = _kaggle_dataset_dir("kaggle_box_b", _KAGGLE_ROWS)
+    try:
+        fake = _with_fake_kagglehub(first)
+        _, _, spec_a = load_nidd(cfg, seed=0)
+        assert len(fake.calls) == 1
+
+        clear_memo()                                     # force the DISK cache path
+        fake = _with_fake_kagglehub(second)              # "another machine"
+        _, _, spec_b = load_nidd(cfg, seed=0)
+        assert fake.calls == [], "a warm cache must not trigger a download"
+        assert spec_b.feature_names == spec_a.feature_names
+    finally:
+        sys.modules.pop("kagglehub", None)
+        if saved is not None:
+            sys.modules["kagglehub"] = saved
+        _reset()
+
+
+def test_kaggle_source_without_kagglehub_says_how_to_install_it():
+    _fresh_kaggle_run()
+    saved = sys.modules.get("kagglehub")
+    sys.modules["kagglehub"] = None                      # makes `import kagglehub` raise
+    try:
+        load_nidd(_cfg(source="kaggle", max_samples=None, n_features=2), seed=0)
+    except RuntimeError as e:
+        msg = str(e)
+        assert "pip install kagglehub" in msg
+        assert "data.source: csv" in msg                 # the offline escape hatch
+    else:
+        raise AssertionError("a missing kagglehub must raise RuntimeError")
+    finally:
+        sys.modules.pop("kagglehub", None)
+        if saved is not None:
+            sys.modules["kagglehub"] = saved
+        _reset()
+
+
+def test_unknown_source_names_all_three_it_accepts():
+    _reset()
+    try:
+        load_nidd(_cfg(source="ftp"), seed=0)
+    except ValueError as e:
+        assert "kaggle" in str(e) and "csv" in str(e) and "synthetic" in str(e)
+    else:
+        raise AssertionError("an unknown data.source must raise ValueError")
+    _reset()
+
+
 # --- cache ------------------------------------------------------------------
 
 def test_cache_round_trips_and_is_invalidated_by_changed_options():

@@ -7,8 +7,8 @@ with verifiable rewards.
 
 The federated task is 9-class attack classification over ~52 Argus flow features,
 learned by a **681-parameter fully-connected network** (`model/nidd_net.py`). The
-dataset is not redistributable — see [Dataset](#dataset) for how to obtain it and
-how to smoke-test without it.
+dataset downloads itself on first run — see [Dataset](#dataset) for the mirror, the
+offline alternatives, and how to smoke-test without it.
 
 ## Overview
 
@@ -274,16 +274,34 @@ flows from the University of Oulu 5G Test Network — benign traffic plus eight
 attacks (UDPFlood, HTTPFlood, SlowrateDoS, TCPConnectScan, SYNScan, UDPScan,
 SYNFlood, ICMPFlood) over ~52 Argus flow features. Nine classes counting benign.
 
-It is **not redistributable**, so it is not vendored here:
+It is too large to vendor, so it is **downloaded on first use** — there is no
+manual setup step. `data.source: kaggle` (the default) pulls
+[`humera11/5g-nidd-dataset`](https://www.kaggle.com/datasets/humera11/5g-nidd-dataset)
+with `kagglehub`: ~275 MB holding the full 1,215,890-flow `Combined.csv`. The
+mirror is public and CC BY 4.0, so **no Kaggle account or API token is needed**.
 
-1. Download it from [IEEE DataPort](https://ieee-dataport.org/documents/5g-nidd-comprehensive-network-intrusion-detection-dataset-generated-over-5g-wireless).
-2. Point `data.csv_path` in `configs/base.yaml` at the combined CSV, or at a
-   directory of the per-attack CSVs (they are concatenated).
+```bash
+pip install kagglehub   # already in requirements.txt
+python main.py --baseline --rounds 3   # downloads the dataset, then trains
+```
+
+`kagglehub` caches the download under `~/.cache/kagglehub` (relocate it with
+`KAGGLEHUB_CACHE`), so the transfer happens once per machine. Set
+`data.kaggle_version` to pin a version, or `data.kaggle_file` to fetch a single
+member file instead of the whole dataset.
+
+Already have the data, or working air-gapped? Set `data.source: csv` and point
+`data.csv_path` at the combined CSV, or at a directory of the per-attack CSVs
+(found recursively and concatenated) — e.g. the
+[IEEE DataPort](https://ieee-dataport.org/documents/5g-nidd-comprehensive-network-intrusion-detection-dataset-generated-over-5g-wireless)
+release.
 
 Nothing hardcodes a column list — the label column is auto-detected and every
 other column is classified numeric or categorical by parsing it — so mirrors that
 spell things differently still load. The ~1.2M-row parse is cached under
-`data.cache_dir`, so it happens once rather than per run.
+`data.cache_dir`, so it happens once rather than per run; the download sits behind
+that cache too, so a warm cache means a run needs no network at all (and equally,
+that a new upstream version is not picked up until the cache is cleared).
 
 To exercise the pipeline **without** the data:
 
