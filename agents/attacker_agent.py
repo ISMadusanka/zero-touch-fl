@@ -83,8 +83,9 @@ Your objective is in `attack_goal`:
 - "slow_degrade": reduce accuracy only slightly (`per_round_drop`) to stay stealthy.
 - "targeted_label": harm a specific class `label` while keeping overall accuracy high.
   If the label is "menu", you will receive `target_neuron_indices` showing the most
-  vulnerable neurons grouped by class. YOU must autonomously decide which class(es) 
-  to sabotage by passing those specific indices into your operators via the `"indices"` parameter.
+  vulnerable neurons grouped by class and layer. YOU must autonomously decide which class(es) 
+  to sabotage by building a distributed subnetwork attack across BOTH convolutional and hidden 
+  layers. Pass those specific indices into your operators via the `"indices"` parameter.
 
 There is a tension: large changes degrade accuracy more but are easier to detect;
 subtle changes evade detection but do less damage. Compose operators to balance

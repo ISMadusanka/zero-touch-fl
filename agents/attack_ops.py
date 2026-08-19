@@ -275,7 +275,7 @@ def _coerce_rows(op, n_rows: int):
     caller must skip it rather than silently fall back to the whole tensor (that
     fallback would turn a mis-specified targeted attack into an untargeted one).
     """
-    raw = op.get("rows", op.get("row"))
+    raw = op.get("rows", op.get("row", op.get("indices")))
     if raw is None:
         return None
     if isinstance(raw, (int, float, str)):

@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 def compute_neuron_importance(model: nn.Module, dataloader, target_class: int, device: str = "cpu", top_k: int = 5):
     """
-    Computes neuron importance across all Linear layers for a target class.
+    Computes neuron importance across both Linear and Conv2d layers for a target class.
     Uses both average activation and gradient magnitude.
     
     Returns:
@@ -42,9 +42,9 @@ def compute_neuron_importance(model: nn.Module, dataloader, target_class: int, d
     handles = []
     layer_names = []
     
-    # Find all linear layers to hook
+    # Find all linear and conv layers to hook
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
             layer_names.append(name)
             handles.append(module.register_forward_hook(get_activation(name)))
             # Use register_full_backward_hook for gradients
@@ -81,13 +81,19 @@ def compute_neuron_importance(model: nn.Module, dataloader, target_class: int, d
         if name not in activations or name not in gradients:
             continue
             
-        # Average activation: (N, out_features) -> mean over N
+        # Average activation: (N, out_features) or (N, C, H, W) -> mean over N (and H, W)
         act = torch.cat(activations[name], dim=0)
-        avg_act = act.abs().mean(dim=0)
+        if act.dim() > 2:
+            avg_act = act.abs().mean(dim=list(range(2, act.dim()))).mean(dim=0)
+        else:
+            avg_act = act.abs().mean(dim=0)
         
-        # Gradient magnitude: (N, out_features) -> mean over batches
+        # Gradient magnitude: (N, out_features) or (N, C, H, W) -> mean over batches
         grad = torch.cat(gradients[name], dim=0)
-        avg_grad = grad.abs().mean(dim=0)
+        if grad.dim() > 2:
+            avg_grad = grad.abs().mean(dim=list(range(2, grad.dim()))).mean(dim=0)
+        else:
+            avg_grad = grad.abs().mean(dim=0)
         
         # Normalize both to [0, 1] so they can be blended equally
         if avg_act.max() > 0:
