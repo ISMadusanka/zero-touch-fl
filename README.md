@@ -324,16 +324,14 @@ dropped and why, the feature selection, and the non-IID partition.
 # Full GRPO training (GPU). Phase 1 runs once, then the RL arms race.
 python main.py --env linux
 
+python main.py --env linux --poisoners 8 --learn attacker
+
 # Quick smoke run: few rounds. --rounds is an ABSOLUTE budget overriding
 # fl.simulation_rounds, so on a resumed run the rounds already done count toward it.
 python main.py --env linux --rounds 8
 
 # Run against a different config file
 python main.py --env linux --config configs/my_experiment.yaml
-
-# Poison exactly 8 clients per round instead of the config's count, and train
-# ONLY the attacker (the defender plays frozen; its checkpoint is untouched).
-python main.py --env linux --poisoners 8 --learn attacker
 
 # Verbose DEBUG run (GPU) — print EVERYTHING for one short run, to the console AND
 # logs/debug.json: the exact attacker/defender LLM prompts + raw outputs, each
@@ -361,41 +359,6 @@ python visualize_rounds.py
 python monitor.py                 # prints a health report + saves logs/monitor/health.png
 python monitor.py --window 50     # smooth over a larger recent window for long runs
 ```
-
-### `--poisoners N` and `--learn` — the two knobs you sweep
-
-Both are the *config* knobs you would otherwise edit between runs, lifted to the
-command line so the YAML stops doubling as the experiment log. Each rewrites the
-whole set of keys that implements it (`core/config_overrides.py`) and logs every
-key it changed at startup, because neither is one setting:
-
-**`--poisoners N`** — exactly N clients are poisoned every Phase-2 round. It sets
-
-| key | why it has to move |
-| --- | --- |
-| `attack.fixed_poison_clients` | the poisoned set itself (clients `0..N-1`) |
-| `fl.n_compromisable` | under a fixed set the controllable pool **is** that set |
-| `attack.max_poison_clients` | `server/algo_defender.py` defaults DnC's and Multi-Krum's assumed `#malicious` to it — leave it at 10 and an 8-poisoner run is defended as if 10 were coming |
-| `attack.eval_poison_clients` | so a later `benchmark/run_benchmark.py` scores the strength that was trained |
-| `curriculum.poisoner_counts` | an exact count leaves no attack-strength axis to sweep |
-
-With `attack.fixed_poison_clients: null` (the attacker picks *which* of its pool
-to hit) the flag pins the per-round **quota** to N out of the unchanged
-`fl.n_compromisable` pool, and turns `attack.sample_budget_in_training` off — a
-per-round draw in `[1, cap]` is the opposite of an exact count. It is rejected up
-front if N exceeds `fl.n_clients` (or the controllable pool, in that second
-regime), and warns when `2N >= fl.n_clients` because the honest majority
-Multi-Krum / DnC / FLTrust are proved under no longer holds.
-
-**`--learn attacker|defender|both`** — which side's LoRA actually trains. The
-other side still **plays**, frozen: `--learn attacker` under `defense.mode: llm`
-means "the attacker best-responds to the current defender", not "no defender",
-and the frozen side's checkpoint on disk is left byte-identical (only trainable
-adapters get an optimizer, a league snapshot, or a save). `defender`/`both`
-require `defense.mode: llm` — under `algorithmic` the defense is FLTrust / DeFL /
-DnC / Multi-Krum, which have no parameters to learn, so asking for it is an error
-rather than a silent downgrade to attacker-only. Omit the flag and the historical
-rule applies: both sides under `defense.mode: llm`, attacker-only otherwise.
 
 ## RUN INFERENCE ON TRAINED LLMS
 ```
@@ -524,6 +487,8 @@ Benchmark a trained attacker against a specific goal (fixed for the whole run):
 python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.1'
 
 python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.1' --max-poison-clients 3
+
+python -m benchmark.run_benchmark --n-clients 25 --max-poison-clients 10 --rounds 20
 # forms: untargeted_degrade=<drop> | slow_degrade=<drop> | targeted_label=<label>
 ```
 

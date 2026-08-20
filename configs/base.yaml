@@ -359,7 +359,7 @@ attack:
 
 # Server-side defense — what the attacker actually faces every Phase-2 round.
 defense:
-  mode: "llm"             # algorithmic | llm
+  mode: "algorithmic"             # algorithmic | llm
                                   # algorithmic = the DEFENDER LLM IS DISABLED. The server
                                   #   defends with the published algorithms below instead;
                                   #   only the attacker trains (rl/schedule.py runs
@@ -580,7 +580,7 @@ rl:
 
   # --- Schedule: success-gated iterated best response (the arms-race ratchet) ---
   switch_mode: "best_response"    # best_response | fixed (legacy K_a/K_d alternation)
-  first_learner: "defender"       # who trains first. defender | attacker
+  first_learner: "attacker"       # who trains first. defender | attacker
                                   # `main.py --learn attacker|defender` pins it to the single
                                   # side that trains (see rl.learners below).
   # learners:                     # WHO TRAINS AT ALL. Normally absent — the rotation is then
