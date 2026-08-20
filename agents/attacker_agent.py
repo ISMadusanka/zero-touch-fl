@@ -310,6 +310,13 @@ class AttackerAgent:
                 n_malformed += 1
                 plan_for_dbg[cid] = []
                 continue
+            import logging
+            log = logging.getLogger("agents.attacker_agent")
+            for op in ops:
+                target_layer = op.get("target")
+                indices = op.get("indices")
+                log.info(f"[Attacker Action] Client {cid} | Layer Targeted: {target_layer} | Neurons: {indices} | Op: {op.get('op')}")
+            
             pw, n_invalid = apply_plan(pool_references[cid], ops, self.max_abs)
             n_invalid_ops += n_invalid
             if _unchanged(cid, pw):

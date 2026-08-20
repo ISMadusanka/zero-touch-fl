@@ -262,6 +262,11 @@ class FLArmsRaceEnv:
             loader = self._clients[self.pool_ids[0]].data_loader
             self.target_neuron_indices = compute_neuron_importance(
                 self.server.model, loader, n_classes=self.n_classes, device=self.device)
+            if self.round_goal.get("type") == "targeted_label" and label is not None:
+                lbl = int(label)
+                if lbl in self.target_neuron_indices:
+                    logger.info(f"[Targeted Poisoning] Target Class: {lbl}")
+                    logger.info(f"[Targeted Poisoning] Discovered Vulnerable Neurons: {self.target_neuron_indices[lbl]}")
 
         logger.info(
             f"Round {round_num}: controllable_pool={self.pool_ids} "
