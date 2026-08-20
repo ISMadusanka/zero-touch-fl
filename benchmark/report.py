@@ -50,7 +50,7 @@ def _goal_str(goal: dict | None) -> str:
 
 def render(summaries: list[dict], n_rounds: int, baseline_accuracy: float,
            out_dir: str | None = None, goal: dict | None = None,
-           n_poisoners: int | None = None) -> str:
+           n_poisoners: int | None = None, n_clients: int | None = None) -> str:
     goal_s = _goal_str(goal)
     # ``n_poisoners`` is the exact per-round poison quota. Pull the realised mean
     # from each summary as an audit check (the held-fixed attack makes them agree).
@@ -59,7 +59,11 @@ def render(summaries: list[dict], n_rounds: int, baseline_accuracy: float,
         used = summaries[0].get("mean_poisoned")
     poisoner_s = ""
     if n_poisoners is not None:
-        poisoner_s = f", Num of poisoners={n_poisoners}"
+        # The DENOMINATOR is what makes two reports comparable: 10 of 20 is a
+        # federation with no honest majority, 10 of 25 is one with it, and the
+        # detection numbers below are not interpretable without knowing which.
+        of_s = f" of {n_clients}" if n_clients is not None else ""
+        poisoner_s = f", Num of poisoners={n_poisoners}{of_s}"
         if used is not None:
             poisoner_s += (" (exact quota)" if abs(used - n_poisoners) < 0.05
                            else f" quota, {used:.1f} effective/round")

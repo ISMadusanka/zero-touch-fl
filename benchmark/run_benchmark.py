@@ -74,6 +74,14 @@ def _parse_args():
     ap.add_argument("--multikrum-m", type=int, default=None,
                     help="Multi-Krum #selected/averaged (default: n - f)")
     ap.add_argument("--device", default=None, help="override fl.device")
+    ap.add_argument("--n-clients", type=int, default=None, metavar="N",
+                    help="override fl.n_clients — the size of the federation to evaluate on. "
+                         "The poison quota does NOT follow it (that is --max-poison-clients), "
+                         "so raising this lowers the adversary's SHARE: 10 of 20 is half the "
+                         "federation, 10 of 25 restores the honest majority DnC/Multi-Krum/"
+                         "FLTrust are proved under. A count that differs from the saved "
+                         "Phase-1 checkpoint re-runs Phase 1 in-process (nothing is written, "
+                         "so training checkpoints are left intact).")
     ap.add_argument("--seed", type=int, default=None, help="override fl.poison_seed")
     ap.add_argument("--out", default="logs/benchmark", help="output dir for json/csv/png (or '' to skip)")
     ap.add_argument("--no-plot", action="store_true", help="skip drawing per-round graphs")
@@ -317,6 +325,13 @@ def main():
     fl = base_cfg["fl"]
     rl_cfg = base_cfg.get("rl", {})
     data_cfg = base_cfg["data"]
+    # Applied here, before anything reads it: `fl` IS base_cfg["fl"], so the shard
+    # partition, the Phase-1 checkpoint check, FLArmsRaceEnv and the DnC/Multi-Krum
+    # honest-majority clamp below all see the overridden count from one assignment.
+    if args.n_clients is not None:
+        if args.n_clients < 1:
+            sys.exit(f"ERROR: --n-clients must be >= 1, got {args.n_clients}")
+        fl["n_clients"] = int(args.n_clients)
     device = args.device or fl["device"]
     seed = args.seed if args.seed is not None else int(fl.get("poison_seed", 0))
 
@@ -529,7 +544,7 @@ def main():
     out_dir = args.out or None
     print("\n" + report.render([summaries[n] for n in defenses], measured_rounds,
                                 baseline_accuracy, out_dir=out_dir, goal=goal,
-                                n_poisoners=eval_budget))
+                                n_poisoners=eval_budget, n_clients=int(fl["n_clients"])))
 
     # Persist per-round history + draw the per-round graphs.
     if out_dir:
