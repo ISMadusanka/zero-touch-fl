@@ -28,6 +28,8 @@ from detector.features import compute_client_features
 from server.aggregation import FedAvgAggregator
 from server.fed_server import FedServer
 
+from attacks.neuron_importance import compute_neuron_importance
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,7 +42,7 @@ class RoundContext:
     """
 
     def __init__(self, round_num, global_accuracy, pool_ids, pool_benign, budget,
-                 goal=None, clean_accuracy=None, clean_eval=None):
+                 goal=None, clean_accuracy=None, clean_eval=None, target_neuron_indices=None):
         self.round_num = round_num
         self.global_accuracy = global_accuracy            # accuracy of the CURRENT global model
         self.pool_ids = pool_ids                          # list[int] controllable pool
@@ -48,6 +50,7 @@ class RoundContext:
         self.budget = budget                              # max clients that may be poisoned
         self.goal = goal                                  # this round's attack goal (maybe sampled)
         self.poisoned_ids = []                            # set at commit (attacker's choice)
+        self.target_neuron_indices = target_neuron_indices or {} # {class_id: {layer: [neurons]}}
         # The clean counterfactual: what this round's aggregate scores with NO
         # poison. This — not ``global_accuracy`` — is what the attacker's damage
         # is measured against (see ``FLArmsRaceEnv.clean_reference_accuracy``).
@@ -136,6 +139,7 @@ class FLArmsRaceEnv:
         self.poisoned_ids: list[int] = []                 # attacker's committed choice
         self._clean_ref_eval: ClassEval | None = None     # cached per-round clean counterfactual
         self.current_eval: ClassEval | None = None        # per-class view of the live global
+        self.target_neuron_indices: dict = {}             # cached neuron importance per class
 
     # ------------------------------------------------------------------
     def reset(self, global_weights, client_weights, baseline_accuracy):
@@ -251,6 +255,14 @@ class FLArmsRaceEnv:
         if self.round_goal.get("type") == "targeted_label" and label is not None:
             extra = (f" clean_recall[{label}]={clean_eval.recall(int(label)):.4f}"
                      f" others={clean_eval.others_mean(int(label)):.4f}")
+                     
+        # Compute neuron importance if we have a client loader for the pool
+        self.target_neuron_indices = {}
+        if self._clients is not None and self.pool_ids:
+            loader = self._clients[self.pool_ids[0]].data_loader
+            self.target_neuron_indices = compute_neuron_importance(
+                self.server.model, loader, n_classes=self.n_classes, device=self.device)
+
         logger.info(
             f"Round {round_num}: controllable_pool={self.pool_ids} "
             f"budget={self.round_budget} goal={self.round_goal} "
@@ -265,6 +277,7 @@ class FLArmsRaceEnv:
             goal=self.round_goal,
             clean_accuracy=clean_eval.overall,
             clean_eval=clean_eval,
+            target_neuron_indices=self.target_neuron_indices,
         )
 
     # ------------------------------------------------------------------

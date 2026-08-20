@@ -76,13 +76,11 @@ You are a partial insider: you control ONLY the clients in `controllable_client_
 
 YOUR OBJECTIVE IS TARGETED. `attack_goal` names ONE class, `label`. You must make the global model FAIL on that class -- its test samples should be classified as anything else -- while EVERY OTHER CLASS KEEPS WORKING AS BEFORE. An attack that wrecks the whole model scores badly even though it also breaks the target class: you are scored on (recall lost on `label`) MINUS (mean recall lost across all other classes). Surgical beats destructive. The target `label` CHANGES between rounds -- read it from `attack_goal` every time and attack that class, not a memorized one.
 
-HOW TO HIT ONE CLASS. `output_layer` tells you the model's final classification layer. Its weight has one ROW PER CLASS: row c together with bias entry c produces class c's score, logit[c] = weight[c] . features + bias[c]. So the ONLY parameters specific to your target are row `label` of `output_layer.weight` and entry `label` of `output_layer.bias`. Everything below that layer is shared by all classes -- editing it damages every class and costs you the collateral penalty. Use the `rows` parameter to confine an operator to that one row:
-  {"op":"scale","target":"<output_layer.weight>","rows":[<label>],"factor":-3.0}
-Make logit[label] small (or negative) relative to the other classes and the model stops predicting that class.
+HOW TO HIT ONE CLASS. You are strictly forbidden from modifying the output layer, as such edits are trivial for defenders to detect. Instead, you must attack the internal representation of the target class in the HIDDEN layers. `target_neuron_indices` gives you the indices of the hidden-layer neurons that respond most strongly to your target class. Your goal is to perturb these specific neurons (e.g., using the `scale` or `add_gaussian_noise` operators restricted by the `indices` parameter) so that the features encoding the target class are corrupted, causing misclassification without touching the output layer.
 
-DILUTION -- THE KEY NUMBER. The server AVERAGES all `federation.n_clients` clients, so if you poison k of them your edit reaches the global model at strength k/n_clients. Scaling the target row by `factor` f on k clients leaves the aggregated row at ((n-k) + k*f)/n of its honest value. Therefore f = 1 - n/k drives the aggregated row to ZERO, and going further past it drives the logit negative. `federation.row_zero_factor` gives that f for each k you might use -- start from it. A timid factor like -1 or 0.5 barely moves the average and does nothing.
+DILUTION -- THE KEY NUMBER. The server AVERAGES all `federation.n_clients` clients, so if you poison k of them your edit reaches the global model at strength k/n_clients. Scaling the target neurons by `factor` f on k clients leaves the aggregated neurons at ((n-k) + k*f)/n of their honest value. `federation.row_zero_factor` gives that f for each k you might use -- start from it. A timid factor like 0.5 barely moves the average and does nothing.
 
-STEALTH. The defender scores each layer separately, so a colossal edit to the output layer shows up in THAT layer's norm and sign statistics even when the whole-model norm still looks normal. Your advantage is that one row is a tiny slice of the model: concentrating the whole perturbation there keeps the whole-model update small. Push the row hard enough to survive dilution, no harder, and consider spreading it over a few clients (smaller f each) when one client's edit would be too loud. `client_update_stats` shows each client's honest `rel_update` -- keep yours in that neighbourhood.
+STEALTH. The defender scores each layer separately. Your advantage is that perturbing a few neurons per layer keeps the whole-layer norm and sign statistics normal. Push the targeted neurons hard enough to survive dilution, no harder, and consider spreading it over a few clients (smaller f each) when one client's edit would be too loud. `client_update_stats` shows each client's honest `rel_update` -- keep yours in that neighbourhood.
 
 `client_update_stats` gives, per controllable client, dimensionless stats of its HONEST update D = local - global (per layer and whole-model), normalized to the global model only:
 - rel_update: norm(D)/norm(global) for the layer -- how large the honest change already is; your poison adds to it, and bigger stands out more.
@@ -91,21 +89,21 @@ STEALTH. The defender scores each layer separately, so a colossal edit to the ou
 - std_ratio, absmean_ratio: spread / typical size of D vs the global's own.
 - whole-model cos_to_global: alignment with the current model.
 
-IMPORTANT -- what your operators act on: every operator transforms the client's FULL weight vector W, NOT the small update D. The server then sees that client's update as D' = op(W) - global. Additive operators are absolute: `add_constant` of size v changes that entry by exactly v, so on a bias row it shifts the aggregated logit by k*v/n_clients -- compare v against `rms_delta`, the honest per-weight step.
+IMPORTANT -- what your operators act on: every operator transforms the client's FULL weight vector W, NOT the small update D. The server then sees that client's update as D' = op(W) - global. Additive operators are absolute: compare their size against `rms_delta`, the honest per-weight step.
 
 %OPERATOR_DOCS%
 
 Each round choose an action with TWO parts:
 1. SELECT which controllable clients to poison, AT MOST `max_poison_clients`. Prefer the FEWEST that can work: every extra client is penalized and easier to catch.
-2. For each selected client, give an ordered ATTACK PLAN. With several clients, give each a DISTINCT, coordinated role (e.g. different factors, or one hitting the weight row while another shifts the bias) so their average moves the target class your way without the clients looking alike.
+2. For each selected client, give an ordered ATTACK PLAN. With several clients, give each a DISTINCT, coordinated role so their average moves the target class your way without the clients looking alike.
 
 Respond with ONLY one JSON object -- no prose, no markdown:
-{"clients":[{"id":<controllable id>,"operations":[{"op":"<name>","target":"<target>","rows":[<label>], ...params}]}]}
+{"clients":[{"id":<controllable id>,"operations":[{"op":"<name>","target":"<target_layer>","indices":[<neuron_idx>], ...params}]}]}
 Rules:
 - Use ids only from `controllable_client_ids`, AT MOST `max_poison_clients`; prefer the fewest.
 - Each client's "operations" is its own ordered list (1-6 ops); order matters.
 - Use only the operators and params listed above.
-- Keep every operator confined to the target class's row unless you have a reason to pay the collateral cost."""
+- NEVER target the output layer. Only target hidden layers using `target_neuron_indices`."""
 
 
 class AttackerAgent:
@@ -184,11 +182,11 @@ class AttackerAgent:
             },
         }
         if self.targeted:
-            payload.update(self._targeted_observation(global_weights, round_goal, int(budget)))
+            payload.update(self._targeted_observation(global_weights, round_goal, int(budget), target_neuron_indices))
         return json.dumps(payload)
 
     # ------------------------------------------------------------------
-    def _targeted_observation(self, global_weights: dict, goal: dict, budget: int) -> dict:
+    def _targeted_observation(self, global_weights: dict, goal: dict, budget: int, target_neuron_indices: dict | None = None) -> dict:
         """Extra observation fields a TARGETED round needs.
 
         Two things the attacker cannot work out from the layer statistics alone:
@@ -208,21 +206,11 @@ class AttackerAgent:
         average by 10%, which does nothing).
         """
         out: dict = {}
-        head = output_layer_keys(global_weights, self.n_classes)
-        if head is not None:
-            entry = {
-                "weight": head["weight_key"],
-                "bias": head["bias_key"],
-                "n_classes": head["n_rows"],
-                "note": "row c of this weight (and bias entry c) IS class c's logit",
-            }
-            label = goal.get("label")
-            if label is not None:
-                try:
-                    entry["row_for_target_label"] = int(label)
-                except (TypeError, ValueError):
-                    pass
-            out["output_layer"] = entry
+        
+        label = goal.get("label")
+        if label is not None and target_neuron_indices is not None and int(label) in target_neuron_indices:
+            out["target_neuron_indices"] = target_neuron_indices[int(label)]
+            out["target_neuron_indices"]["note"] = "These are the indices of the hidden-layer neurons that respond most strongly to your target class. ONLY target these layers using these indices."
         if self.n_clients:
             n = self.n_clients
             out["federation"] = {

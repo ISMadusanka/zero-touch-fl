@@ -266,16 +266,16 @@ def _topk_mask(t, fraction, largest=True):
 
 
 def _coerce_rows(op, n_rows: int):
-    """Parse the optional ``rows`` param of an operator.
+    """Parse the optional ``rows`` or ``indices`` param of an operator.
 
-    Returns ``None`` when the op has no ``rows`` key (apply it to the whole
+    Returns ``None`` when the op has neither key (apply it to the whole
     tensor, the historical behaviour), otherwise the list of valid row indices —
     deduplicated, order-preserving, negatives resolved from the end. An empty
-    list means ``rows`` WAS given but nothing in it addresses this tensor, so the
+    list means ``rows``/``indices`` WAS given but nothing in it addresses this tensor, so the
     caller must skip it rather than silently fall back to the whole tensor (that
     fallback would turn a mis-specified targeted attack into an untargeted one).
     """
-    raw = op.get("rows", op.get("row"))
+    raw = op.get("rows", op.get("row", op.get("indices")))
     if raw is None:
         return None
     if isinstance(raw, (int, float, str)):

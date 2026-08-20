@@ -63,8 +63,9 @@ def run_inference(
         # Attacker SELECTS which of its controllable pool to poison (<= budget) and how.
         a_sys = attacker_agent.system_prompt()
         a_user = attacker_agent.build_user_prompt(
-            ctx.round_num, ctx.global_accuracy, ctx.pool_benign, env.global_weights,
-            ctx.budget, goal=ctx.goal,
+            ctx.round_num, ctx.global_accuracy, ctx.pool_benign,
+            budget=ctx.budget, goal=ctx.goal,
+            target_neuron_indices=ctx.target_neuron_indices,
         )
         a_text = generator.generate(a_sys, a_user, n=1, temperature=temperature)[0]
         poisoned, chosen_ids, n_malformed = attacker_agent.select_and_apply(
