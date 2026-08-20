@@ -35,6 +35,8 @@ Modes:
   python main.py --baseline                  # best-of-N reward-harness sanity (no LLM)
   python main.py --fresh                      # force fresh Phase-1 training
   python main.py --rounds 8                   # override simulation_rounds (quick runs)
+  python main.py --poisoners 8                # poison 8 clients per round, not the config's
+  python main.py --learn attacker             # train ONE side; the other plays frozen
 """
 
 import os
@@ -66,6 +68,7 @@ from storage.checkpoint import (
 )
 from core.types import RoundLog, DetectionVerdict
 from core.debug import dbg
+from core.config_overrides import LEARN_CHOICES, apply_learner_choice, apply_poisoner_count
 from metrics import MetricsTracker
 from rl.curriculum import build_training_curriculum
 from rl.env import FLArmsRaceEnv
@@ -396,6 +399,18 @@ def main():
                         help="Run the best-of-N reward-harness sanity baseline (no LLM)")
     parser.add_argument("--rounds", type=int, default=None,
                         help="Override simulation_rounds (handy for quick smoke runs)")
+    parser.add_argument("--poisoners", type=int, default=None, metavar="N",
+                        help="Poison exactly N clients every Phase-2 round, overriding the "
+                             "config's count (attack.fixed_poison_clients, or the per-round "
+                             "quota when the attacker picks its own set). Also retargets the "
+                             "curriculum's poisoner sweep, the evaluation quota, and the "
+                             "#malicious DnC/Multi-Krum assume. Default: the config's value.")
+    parser.add_argument("--learn", choices=list(LEARN_CHOICES), default=None,
+                        help="Which side TRAINS. 'attacker' / 'defender' train that adapter "
+                             "only, with the other side playing frozen (its checkpoint is "
+                             "left untouched); 'both' is the two-sided arms race. "
+                             "'defender'/'both' need defense.mode: llm. Default: the config "
+                             "(both under defense.mode: llm, attacker-only otherwise).")
     parser.add_argument("--debug", action="store_true",
                         help="Verbose Phase-2 debug run: print every attacker/defender LLM "
                              "prompt+output, poisoning step, FL update and reward to the console "
@@ -410,6 +425,19 @@ def main():
     base_config = load_config(args.config)
     attacker_config = load_config("configs/attacker_agent.yaml")
     defender_config = load_config("configs/defender_agent.yaml")
+
+    # CLI overrides FIRST: everything below — the attacker's system prompt, the
+    # data partition, the curriculum, the algorithmic defender's assumed #malicious
+    # and the env itself — reads these keys, so they have to be settled before the
+    # first reader. Each flag rewrites the whole SET of keys that implements it
+    # (see core/config_overrides.py) and logs what it changed.
+    try:
+        if args.poisoners is not None:
+            apply_poisoner_count(base_config, args.poisoners)
+        if args.learn is not None:
+            apply_learner_choice(base_config, args.learn)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # LLM backend + shared Ollama defaults (used by --dry-run / OpenAI paths).
     llm_backend = "ollama" if args.env == "linux" else "openai"
@@ -482,6 +510,10 @@ def main():
 
     mode = "baseline" if args.baseline else ("dry-run" if args.dry_run else "train")
     n_rounds = args.rounds if args.rounds is not None else int(fl["simulation_rounds"])
+    # --poisoners applies in every mode (the env reads it), but --learn only means
+    # something where there is a GRPO schedule to point at.
+    if args.learn is not None and mode != "train":
+        logger.warning(f"--learn {args.learn} has no effect in --{mode} (nothing trains).")
 
     # ``--debug`` without ``--rounds`` caps how many rounds THIS RUN adds rather
     # than the absolute budget: the training loop resumes from `rounds_done`, so an
@@ -515,6 +547,9 @@ def main():
                 "G": base_config.get("rl", {}).get("G"),
                 "switch_mode": base_config.get("rl", {}).get("switch_mode"),
                 "first_learner": base_config.get("rl", {}).get("first_learner"),
+                "learners": base_config.get("rl", {}).get("learners"),
+                "cli_poisoners": args.poisoners,
+                "cli_learn": args.learn,
                 "success_streak": base_config.get("rl", {}).get("success_streak"),
                 "fl_interlude_between_phases": base_config.get("rl", {}).get("fl_interlude_between_phases"),
                 "baseline_accuracy": round(float(baseline_accuracy), 4),

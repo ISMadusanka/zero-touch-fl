@@ -47,6 +47,7 @@ import logging
 
 from core.types import RoundLog
 from core.debug import dbg
+from core.config_overrides import resolve_trainable
 from rl.grpo import grpo_step
 from rl.policy import PolicyGenerator
 from rl.rewards import (
@@ -280,20 +281,29 @@ def train(
     else:
         logger.info(f"Training budget: rounds {start_round} -> {total_rounds}")
 
-    # With an algorithmic defense there is no defender POLICY: only the attacker
-    # trains, and the defender adapter (on disk and in the league) is left alone.
+    # Who trains this run. With an algorithmic defense there is no defender POLICY,
+    # so it is the attacker alone; ``rl.learners`` (written by ``main.py --learn``)
+    # narrows it further — e.g. attacker-only against a frozen defender LLM. The
+    # untrained side still PLAYS, it just keeps its adapter (on disk and in the
+    # league) untouched.
     algorithmic_defense = getattr(env, "defense", None) is not None
-    trainable = ("attacker",) if algorithmic_defense else ("attacker", "defender")
+    trainable = resolve_trainable(rl, algorithmic_defense)
+    if first_learner not in trainable:
+        logger.warning(
+            f"rl.first_learner={first_learner!r} ignored — this run trains "
+            f"{list(trainable)}, so the first phase is {trainable[0]!r}."
+        )
+        first_learner = trainable[0]
     if algorithmic_defense:
-        if first_learner != "attacker":
-            logger.warning(
-                f"rl.first_learner={first_learner!r} ignored — the defender LLM is "
-                f"disabled (algorithmic defense), so only the attacker trains."
-            )
-            first_learner = "attacker"
         logger.info(
             f"Defender LLM disabled: attacker-only training against "
             f"{env.defense.describe()}"
+        )
+    elif len(trainable) == 1:
+        frozen = "defender" if trainable[0] == "attacker" else "attacker"
+        logger.info(
+            f"Single-learner run: only the {trainable[0]} trains; the {frozen} LLM "
+            f"plays frozen and its checkpoint is left untouched."
         )
 
     import torch

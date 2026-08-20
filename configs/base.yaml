@@ -319,6 +319,13 @@ attack:
                                   # fl.n_compromisable clients, a per-round quota, and the
                                   # attacker LLM choosing which of its pool fills it).
                                   #
+                                  # OVERRIDABLE PER RUN: `python main.py --poisoners 8` sets
+                                  # this AND the four other keys that carry the count
+                                  # (fl.n_compromisable, max_poison_clients,
+                                  # eval_poison_clients, curriculum.poisoner_counts), so a
+                                  # sweep does not need a config edit. See
+                                  # core/config_overrides.py.
+                                  #
                                   # Implemented by making the controllable pool exactly these N
                                   # clients AND the quota exactly N, which is what forces it:
                                   # AttackerAgent.select_and_apply fills unfilled quota slots from
@@ -339,7 +346,9 @@ attack:
                                   # Each override is logged at startup.
   max_poison_clients: 10          # TRAINING quota cap; also the default upper end of the curriculum's
                                   # poisoner sweep (legacy key name; must be <= n_compromisable).
-                                  # Not consulted while fixed_poison_clients is set.
+                                  # Not consulted for the QUOTA while fixed_poison_clients is set,
+                                  # but still read by defense.assumed_byzantine below — which is
+                                  # why `--poisoners N` moves it too.
   sample_budget_in_training: false # randomly draw the exact per-round quota in
                                   # [1..max_poison_clients] for budget-aware generalization.
                                   # IGNORED while `curriculum:` is enabled or fixed_poison_clients
@@ -453,7 +462,8 @@ defense:
 curriculum:
   enabled: true                   # false = go back to the random per-round draws
   rounds_per_block: 10            # consecutive GRPO rounds per (algorithm, #poisoners) pair
-  poisoner_counts: [10]           # the attack strengths swept, in order. null = 1..
+  poisoner_counts: [10]           # the attack strengths swept, in order. Collapsed to [N] by
+                                  # `main.py --poisoners N`. null = 1..
                                   # attack.max_poison_clients. Counts above
                                   # fl.n_compromisable are dropped (with a warning),
                                   # never clamped — clamping would silently give the
@@ -571,6 +581,13 @@ rl:
   # --- Schedule: success-gated iterated best response (the arms-race ratchet) ---
   switch_mode: "best_response"    # best_response | fixed (legacy K_a/K_d alternation)
   first_learner: "defender"       # who trains first. defender | attacker
+                                  # `main.py --learn attacker|defender` pins it to the single
+                                  # side that trains (see rl.learners below).
+  # learners:                     # WHO TRAINS AT ALL. Normally absent — the rotation is then
+                                  # both sides under defense.mode: llm, attacker-only under
+                                  # algorithmic (no defender policy exists there). Written by
+                                  # `main.py --learn`: the side left out still PLAYS, frozen,
+                                  # and its adapter is never optimized, snapshotted or saved.
   min_phase_rounds: 3             # earliest a phase may switch on a sustained win. Set equal to
                                   # success_streak so a phase switches as soon as the learner wins
                                   # success_streak times IN A ROW (no extra minimum-length gate).
