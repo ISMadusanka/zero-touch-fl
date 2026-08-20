@@ -145,6 +145,7 @@ class AttackerAgent:
         global_weights: dict,
         budget: int | None = None,
         goal: dict | None = None,
+        target_neuron_indices: dict | None = None,
     ) -> str:
         """Serialize the attacker's per-round observation into a user message.
 

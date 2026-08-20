@@ -278,7 +278,8 @@ def _run(args, log, events):
     fl = base_cfg["fl"]
     rl_cfg = base_cfg.get("rl", {})
     data_cfg = base_cfg["data"]
-    device = args.device or fl["device"]
+    device = args.device or fl.get("device", "cpu")
+    fl["device"] = device
     seed = args.seed if args.seed is not None else int(fl.get("poison_seed", 0))
 
     names = [n.strip() for n in args.defenses.split(",") if n.strip()]

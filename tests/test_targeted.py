@@ -346,10 +346,11 @@ def test_targeted_agent_uses_the_targeted_prompt_and_observation():
     sd = MnistNet().state_dict()
     benign = {0: {k: v.clone() for k, v in sd.items()}}
     import json
-    payload = json.loads(agent.build_user_prompt(1, 0.78, benign, sd, 2, goal=dict(GOAL)))
-    assert payload["output_layer"]["weight"] == "net.4.weight"
-    assert payload["output_layer"]["bias"] == "net.4.bias"
-    assert payload["output_layer"]["row_for_target_label"] == 2
+    payload = json.loads(agent.build_user_prompt(1, 0.78, benign, sd, budget=2, goal=dict(GOAL), target_neuron_indices={2: {"net.2": [0, 1, 2]}}))
+    assert payload["target_neuron_indices"] == {
+        "net.2": [0, 1, 2],
+        "note": "These are the indices of the hidden-layer neurons that respond most strongly to your target class. ONLY target these layers using these indices."
+    }
     # Dilution hint: poisoning k of 20 clients zeroes the aggregated row at 1 - 20/k.
     assert payload["federation"]["n_clients"] == 20
     assert abs(payload["federation"]["row_zero_factor"]["1"] - (-19.0)) < 1e-9
@@ -366,7 +367,7 @@ def test_untargeted_agent_keeps_the_original_prompt():
     sd = MnistNet().state_dict()
     payload = json.loads(agent.build_user_prompt(
         1, 0.78, {0: {k: v.clone() for k, v in sd.items()}}, sd, 2))
-    assert "output_layer" not in payload and "federation" not in payload
+    assert "target_neuron_indices" not in payload and "federation" not in payload
 
 
 # ---------------------------------------------------------------------------

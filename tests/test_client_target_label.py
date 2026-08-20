@@ -271,7 +271,6 @@ def test_prompt_offers_only_client_zero_and_the_derived_row():
     assert payload["controllable_client_ids"] == [0]
     assert payload["max_poison_clients"] == 1
     assert payload["attack_goal"]["label"] == 7
-    assert payload["output_layer"]["row_for_target_label"] == 7
     # One poisoner out of 20: the dilution table offers k=1 only, and zeroing the
     # aggregated row needs factor 1 - 20/1 = -19.
     assert list(payload["federation"]["row_zero_factor"]) == ["1"]
