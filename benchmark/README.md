@@ -1,9 +1,18 @@
-# Defense Benchmark
+# Attack x Defense Benchmark
 
-Pits the **trained attacker** against a panel of defenses — the **trained
-defender LLM** plus established baselines — for *N* attack rounds, and reports
-**how much of the attack each defense detected** and how well it preserved model
-accuracy.
+Runs a panel of **attacks** against a panel of **defenses** for *N* rounds and
+reports the matrix: how much accuracy each attack cost each defense, and how much
+of each attack each defense detected.
+
+The attack panel puts the **trained attacker** side by side with the published
+state-of-the-art untargeted poisoning attacks — LIE, Min-Max, Min-Sum, Fang,
+Fang-Krum, IPM, Mimic, plus the classic Byzantine baselines — so the question
+"is the learned policy actually better than what is already published?" is one
+table rather than a cross-run comparison. The defense panel is the **trained
+defender LLM** plus established robust aggregators.
+
+Every attack in a round poisons the **same clients**, sees the **same honest
+updates**, and is scored over the **same rounds**. Only the crafted updates differ.
 
 This package is **purely additive**: it reuses the existing FL components
 read-only (`model/`, `data/`, `clients/`, `server/`, `agents/`, `detector/`,
@@ -15,6 +24,20 @@ On the GPU box (needs torch / unsloth / peft + the trained adapters in `checkpoi
 
 ```bash
 python -m benchmark.run_benchmark --rounds 200
+
+# the attack panel (default = llm + every published baseline). Add the no-attack
+# control row to get each defense's clean accuracy as a denominator:
+python -m benchmark.run_benchmark --rounds 200 --attacks clean,llm,lie,min_max,min_sum,fang,ipm,mimic
+
+# just the trained policy, as before (identical output to the old single-attack report):
+python -m benchmark.run_benchmark --rounds 200 --attacks llm
+
+# published baselines only — no adapter, no GPU:
+python -m benchmark.run_benchmark --rounds 20 --attacks lie,min_max,fang --device cpu
+
+# give the baselines the omniscient view their papers assume (a stronger adversary
+# than the trained attacker, which only ever sees its own clients):
+python -m benchmark.run_benchmark --rounds 200 --baseline-knowledge full
 
 # Pick the attack goal the attacker aims for (fixed for the whole run, no per-round
 # sampling). The trained attacker generalizes across targets, so you can evaluate it
@@ -48,6 +71,14 @@ for k in 1 3 5 10 15 20; do
       --out logs/benchmark/poisoners_$k
 done
 ```
+
+> **Note.** Attack rows other than `llm` need no adapter and no GPU, so a
+> baselines-only panel is a fast CPU sanity check of the whole pipeline:
+>
+> ```bash
+> python -m benchmark.run_benchmark --rounds 5 --attacks lie,min_max,fang \
+>     --defenses fedavg,oracle,multikrum --device cpu
+> ```
 
 ### `--max-poison-clients` (the exact eval poison quota)
 
@@ -84,8 +115,10 @@ up to `--attack-retries` times (default **3**; retries are drawn at temperature
 identical text). The run log names the cause — including whether the generation hit
 the token cap — and quotes the offending output.
 
-A round with no usable action after every retry is **skipped**: logged at ERROR,
-excluded from every defense's metrics, and the run continues. It is not scored,
+A round with no usable action after every retry is **skipped for the WHOLE panel**:
+logged at ERROR, excluded from every (attack, defense) cell — including the published
+baselines, which would otherwise be averaged over more rounds than the policy is — and
+the run continues. It is not scored,
 because feeding the panel an all-honest round whose ground truth claims `budget`
 poisoners would depress `detect%` and `acc_drop` for an attack that never happened.
 The report header and each summary's `rounds` therefore count **measured** rounds,
@@ -94,16 +127,24 @@ and `history.json` records `requested_rounds` / `measured_rounds` /
 its budget (raise `rl.max_new_tokens`) or the adapter is degenerate — not a defense
 result.
 
-Output: a console table + `logs/benchmark/benchmark.{json,csv}` + per-round
-`history.json` + a 4-panel graph `benchmark.png` (accuracy per round, rolling
-detection-rate, rolling FPR, and attack-strength per round). Re-plot a saved run
-without re-running (the 200 rounds are slow + need the GPU):
+Output: console tables + `logs/benchmark/benchmark.{json,csv}` (one row per
+(attack, defense) cell) + per-round `history.json` + graphs. With several attacks
+the graphs are `benchmark_attacks.png` (the attack x defense comparison: undefended
+accuracy per round, an acc_drop heatmap, a detection heatmap, and acc_drop grouped
+bars) plus one per-attack `benchmark_<attack>.png` in the original 4-panel layout
+(accuracy per round, rolling detection-rate, rolling FPR, attack strength). A
+single-attack run writes just `benchmark.png`, as before.
+
+Re-plot a saved run without re-running (the 200 rounds are slow + need the GPU) —
+the history is nested by attack for a matrix run and flat for a single-attack one,
+and the plotter detects which it is, so older saved runs still work:
 
 ```bash
-python -m benchmark.plot --history logs/benchmark/history.json   # -> benchmark.png
+python -m benchmark.plot --history logs/benchmark/history.json
 ```
 
-Disable graphing with `--no-plot`. Example table shape:
+Disable graphing with `--no-plot`. Example table shape (one per attack, under the
+matrix grids):
 
 ```
 defense       detect%  FPR    prec  F1    final_acc  mean_acc  acc_drop  atk_thru
@@ -187,37 +228,168 @@ whether it flags or re-weights — and use `detect%` as a secondary, within-styl
 signal. For FLTrust the per-round `info.trust_sum` and the verdict confidences
 also give a softer view than the binary flag.
 
+## The attacks
+
+The second axis. `--attacks` selects the panel; the trained policy (`llm`) is one
+row among the published state-of-the-art untargeted attacks, and every row is run
+over the same rounds, against the same honest updates, poisoning the same clients.
+
+| name | what it is |
+|---|---|
+| `llm` | **The trained attacker adapter — the system under test.** Observes compact per-layer statistics of its clients' benign updates and emits an attack plan in the operator DSL (`agents/attack_ops.py`). The only row needing a GPU + checkpoint; drop it from `--attacks` for a baselines-only run. |
+| `lie` | **LIE / "A Little Is Enough"** (Baruch et al., NeurIPS 2019). The canonical *stealthy* attack: all colluders send `mu + z*sigma`, the coordinate-wise honest mean shifted by a fraction of the population's own standard deviation. `z` is the paper's `z^max`, derived from `n` and the poison count, not a knob. |
+| `min_max` | **AGR-agnostic Min-Max** (Shejwalkar & Houmansadr, NDSS 2021). Solves for the largest perturbation whose distance to the furthest honest update stays inside the honest cloud's own diameter. Needs no knowledge of the server's aggregation rule. |
+| `min_sum` | **AGR-agnostic Min-Sum** (same paper). Same shape, but the constraint bounds the *sum* of squared distances to the honest updates. Neither dominates the other, which is why the paper reports both. |
+| `fang` | **Fang et al.** (USENIX Security 2020), the variant tailored to coordinate-wise **trimmed mean / median**: per coordinate, place the compromised values just outside the honest range on the side that opposes the honest direction. Each compromised client draws its own value, so this row is stochastic across rounds. |
+| `fang_krum` | **Fang et al.**, the variant tailored to **Krum / Multi-Krum** — the rule the `multikrum` column runs. All colluders send `mu - lambda*s`, with `lambda` halved from the paper's derived upper bound until a *simulated* Krum selects one of them. The simulation reuses `benchmark/defenses/multikrum.py`, so the attack is solved against exactly the code it faces. |
+| `ipm` | **Inner Product Manipulation** (Xie et al., UAI 2019). Sends `-epsilon * mu`: perfectly collinear with the honest consensus and therefore invisible to norm/distance filters, while cancelling the honest progress. The default `epsilon=0.1` is the paper's stealthy setting. |
+| `mimic` | **Mimic** (Karimireddy et al., ICLR 2022). Every colluder copies one carefully chosen benign client's update — so the malicious update *is* an honest update and no anomaly detector can flag it — over-weighting that client's data distribution. Designed for heterogeneous data, which is what `data.iid: false` gives this project. |
+| `sign_flip` | Classic sign-flipping Byzantine baseline: `-c *` the client's own honest update. At `c=1` with `m` of `n` poisoners the aggregate keeps only `(n-2m)/n` of the honest progress. |
+| `noise` | Classic Gaussian/random Byzantine baseline (Blanchard et al., NeurIPS 2017). `sigma` is expressed as a multiple of the honest per-coordinate standard deviation so it is scale-free. Note it is **zero-mean, so it averages out under FedAvg** — needing a large `sigma` to do damage while being easy to detect is the classic finding, not a bug. |
+| `scaling` | Boosting / model replacement (Bagdasaryan et al., AISTATS 2020), read untargeted: `gamma *` the client's own honest update. The control for "does the defense do the easy thing?" — norm clipping and distance filters exist specifically for this. Opt-in. |
+| `label_flip` | Untargeted **data** poisoning (Biggio et al., ICML 2012; Fang et al. Sec. 3): the compromised clients train honestly on relabelled data. A different threat model, not a stronger attack — nothing about the resulting update is anomalous, because it is a real gradient of a wrong objective. Opt-in; **forces `--benign-retrain`** so the honest updates come from the same process. |
+| `clean` | **Not an attack — the no-attack control row.** Nothing is poisoned, so each defense's row is its clean accuracy. Opt-in, and worth adding: it is the per-defense denominator for every other row (`clean - attack` for the same defense), and because its ground truth is empty it doubles as a clean-round false-alarm rate. |
+
+Default panel: `llm,lie,min_max,min_sum,fang,fang_krum,ipm,mimic,sign_flip,noise`.
+`scaling`, `label_flip` and `clean` are opt-in via `--attacks`.
+
+### Adversary knowledge (`--baseline-knowledge`)
+
+Every published attack estimates the honest population from the updates it can
+see. Which updates those are is a threat-model choice, so it is one flag for the
+whole panel:
+
+- **`partial`** (default) — only the **compromised** clients' honest updates. This
+  is the like-for-like comparison: it is exactly what the trained attacker
+  observes, so a difference between rows is a difference in what the adversary
+  *did*, not in what it *knew*.
+- **`full`** — every client's honest updates. Omniscient, and the primary setting
+  most of the papers state their attack in, so it is the fairer reading of the
+  *literature*. A strictly stronger adversary than the one `llm` faces.
+
+Under `partial` the baselines still get **more** raw information than the trained
+attacker (full weight vectors versus compacted per-layer statistics), so the
+comparison does not flatter the policy.
+
+A few attacks need at least two visible honest updates to have a population to
+estimate (`lie`, `min_max`, `min_sum`, `mimic`). At `--max-poison-clients 1` with
+`partial` knowledge they degenerate to submitting the honest mean; that is logged
+loudly rather than reported as a weak attack. Use `--baseline-knowledge full` there.
+
+### Attack knobs
+
+`--lie-z` / `--lie-sign` · `--minmax-perturbation {std,unit_vec,sign}` ·
+`--minmax-gamma0` · `--minsum-bound {max,min}` · `--fang-b` · `--fang-krum-f` ·
+`--fang-krum-lambda-mult` · `--ipm-epsilon` · `--mimic-warmup` · `--signflip-c` ·
+`--noise-sigma` · `--scaling-gamma` · `--labelflip-mode {reverse,next,random}`.
+
+Every default is the value its paper states (or, where the paper gives an absolute
+value that only makes sense for its own model, a scale-free equivalent — see the
+module docstring in `benchmark/attacks/`). `fang_krum` is *AGR-tailored*, so it is
+given the same assumed `f` the `multikrum` column is configured with: knowing the
+rule and its parameters is that attack's threat model, not an unfair peek.
+
+## Reading the matrix
+
+```
+ACC_DROP  — mean test accuracy the attack cost this defense
+attack     fedavg   oracle   fltrust  defl     dnc      multikrum
+---------  -------  -------  -------  -------  -------  ---------
+clean      +0.000   +0.000   +0.004   +0.004   -0.000   -0.001
+lie        -0.001   -0.002*  +0.004   +0.001   +0.003   +0.000
+fang       +0.018*  -0.002   +0.004   +0.022   +0.025*  +0.078*
+mimic      +0.004   -0.002   +0.004   +0.029*  +0.021   +0.036
+...
+  (* = strongest attack in that defense's column)
+```
+
+- **`ACC_DROP` is the primary result.** It is well defined for every defense
+  regardless of whether it flags or re-weights, and for every attack regardless of
+  how it crafts. The `*` marks the strongest attack per defense column — the
+  comparison the benchmark exists to make. Control rows (`clean`) are excluded
+  from that mark.
+- **`DETECT%` is the stealth axis.** A strong attack that every defense flags and
+  a weak one that none does are different results, and the two grids together are
+  the honest summary. Read the per-defense caveats in
+  [Reading the detection numbers](#reading-the-detection-numbers-important-caveat)
+  first — they apply per cell.
+- **`ATK_SUCC`** weights each round by `min(1, acc_drop / target)`, so it is
+  `ACC_DROP` rescaled by the goal. Useful for "did it meet the brief", not for
+  ranking attacks that all overshoot or all fall short.
+- `acc_drop` is measured against the **clean Phase-1 baseline**, a fixed number
+  from before the run. That is what makes it comparable ACROSS rows. For "how much
+  did this attack cost *this defense*", add the `clean` row and subtract.
+
+### The single-round caveat (read this before comparing to published numbers)
+
+Phase 2 runs **simulated rounds off a frozen anchor** (`fl.freeze_global_in_phase2`,
+the shipped default): every round sends the clients the same Phase-1 model, and each
+defense's global is that round's aggregate — it does not carry damage into the next
+round. So this benchmark measures **per-round attack strength against a fixed
+reference**, not end-of-training degradation.
+
+That matters for how the rows compare. LIE, Min-Max, Min-Sum and IPM are designed to
+be *individually negligible and cumulatively fatal* — they bound their perturbation
+by the honest population's own spread precisely so it survives many rounds. Measured
+one round at a time against a converged model, they will read as near-zero
+`acc_drop`, while blatant attacks read higher. That is a real property of the
+measurement, not evidence that the stealthy attacks are weak in a real deployment,
+and it is why `DETECT%` is reported beside `ACC_DROP` rather than under it.
+
+The regime is **identical for every row**, including `llm` — which is also the
+regime the policy was trained and rewarded in — so the comparison between rows is
+sound. It is the comparison to a *paper's* end-to-end numbers that does not transfer.
+
+### Per-round variation (`--benign-retrain`)
+
+By default the honest clients **replay** their frozen Phase-1 weights, so the honest
+updates are byte-identical in every round. Within a round that is what guarantees
+every attack and defense sees the same cohort; across rounds it means a
+deterministic attack (`lie`, `min_max`, `min_sum`, `ipm`, `mimic`, `sign_flip`,
+`scaling`, `fang_krum`) reproduces itself exactly and only the stochastic rows
+(`llm`, `fang`, `noise`) vary with `--rounds`. Pass `--benign-retrain` to retrain
+the honest clients each round instead; the within-round guarantee is unaffected,
+since `begin_round()` draws the honest updates once and hands them to everyone.
+
 ## How the comparison is kept fair
 
-- The env (`rl/env.py`) is reused **only as a generator**: each round it samples
-  the poisoned subset and builds the benign + attacker-poisoned client updates.
-- The trained attacker produces **one** attack per round; the **same** set of
-  client updates is fed to **every** defense. We *vary the defense and hold the
-  attack fixed.* The attacker plans against the **frozen Phase-1 benign weights**
-  plus the no-defense **scalar accuracy** (one-round lag) — it does not see each
-  defense's evolving global. (Making the attack adapt per-defense would change the
-  threat model and break the held-fixed comparison.)
-- Each defense evolves its **own** global model, so robustness reflects how that
-  defense's model fares over the run. A round a defense **skips** (produces no new
-  global — e.g. FLTrust with all-zero trust) keeps its previous model; that
-  round's accuracy is its held accuracy and still counts toward `mean_acc`. The
-  count of such rounds is reported as `skipped_rounds` (JSON/CSV). Distinct from
-  that: a round the *attacker* could not produce a usable action for is dropped for
-  **every** defense at once, so the panel is always compared over the same rounds
-  (see [Unusable attacker rounds](#unusable-attacker-rounds---attack-retries)).
-- **Pins frozen benign replay** (`env.benign_retrain = False`) regardless of
-  `fl.benign_retrain_each_round`, so the benign client updates are identical across
-  all defenses each round — the source of the "same attack to everyone" fairness.
-  Training sets that flag to `true` (each defense there evolves one shared global, so
-  honest deltas must track it), but here every `Defense` owns its own global while the
-  env's stays at the Phase-1 state, so retraining would only re-draw the honest updates
-  against a stale reference. The runner logs when it overrides the config; it used to
-  merely warn that the comparison "may be skewed".
-- Runs in the project's native regime (5-of-5 controllable clients poisoned by default per
-  `configs/base.yaml`), which keeps the LLM defender in-distribution. FLTrust
-  still works here: benign client deltas point toward good weights and so align
-  with the server's root update, while poison points away (negative cosine → zero
-  trust).
+- The env (`rl/env.py`) is reused **only as a generator**: each round it builds the
+  controllable pool and the honest client updates.
+- **The same clients are poisoned in every row.** The round's poisoned set is fixed
+  ONCE: when `llm` is in the panel it is the policy's own committed selection and
+  every baseline poisons exactly those clients; otherwise it is the first `budget`
+  of the controllable pool (which is what the shipped `attack.fixed_poison_clients`
+  regime produces anyway). An attack that returns any other client ids is a hard
+  error, not a warning.
+- **The same honest updates.** All attacks craft from one `begin_round()`, so the
+  benign half of the cohort is byte-identical across rows.
+- **The same rounds.** A round the trained attacker cannot produce a usable action
+  for is skipped for the **whole panel**, not just for `llm` — otherwise the
+  baselines would be averaged over more rounds than the policy. `run_info` records
+  `measured_rounds` / `unusable_attack_rounds`.
+- **Vary the defense, hold the attack fixed** (along a row): one attack produces one
+  cohort per round and every defense sees it.
+- **Each attack gets its own defense instances**, because a defense's global model
+  and its cross-round memory (DeFL's Beta trust) are shaped by the attack it faced.
+  One shared panel would let rows contaminate each other.
+- Each attack observes **its own** undefended (`fedavg`) accuracy as the reference
+  the next round's prompt sees — never another row's damage.
+- Detection is scored against the shared ground-truth poisoned set with
+  `metrics.compute.confusion_counts`, exactly as the live system scores it.
+
+## Cost
+
+A matrix run is `n_attacks x n_defenses` test-set passes per round. Two things keep
+that manageable:
+
+- **The accuracy cache** memoises test accuracy by the exact bytes of the global
+  model. Under frozen benign replay a deterministic attack produces a byte-identical
+  global every round, so those repeats collapse to one pass each. It cannot change a
+  number — a hit means the model is bit-for-bit one already measured — and
+  `--no-eval-cache` turns it off. The run logs its hit rate.
+- **`llm_defender` costs one LLM generation per round *per attack*.** Drop it from
+  `--defenses` for a fast algorithmic-only matrix; the run warns when it is in a
+  multi-attack panel.
 
 ## FLTrust knobs
 
@@ -271,13 +443,38 @@ the paper assumes `n ≥ 2f+3` for its guarantee (with `n=5` that caps `f` at 1)
    state_dict + per-client `DetectionVerdict`s).
 2. Register it in `benchmark/defenses/__init__.py` (`build_defenses` + `AVAILABLE`).
 
-Good next candidates: **Krum / Multi-Krum**, **coordinate-wise Median**,
-**Trimmed-Mean** (Yin et al.), **Norm-clipping**, **FLDetector**. Krum/Median/
-Trimmed-Mean are robust aggregators — derive a reject signal the same way FLTrust
-does (a client is "rejected" when it's excluded / trimmed from the aggregate).
+Good next candidates: **coordinate-wise Median**, **Trimmed-Mean** (Yin et al.),
+**Norm-clipping**, **FLDetector**. Median/Trimmed-Mean are robust aggregators —
+derive a reject signal the same way FLTrust does (a client is "rejected" when it's
+excluded / trimmed from the aggregate).
+
+## Adding another attack (later)
+
+1. Create `benchmark/attacks/<name>.py` with a `class <Name>(DeltaAttack)` that
+   implements `craft_deltas(ctx) -> {client_id: flat malicious delta}` for exactly
+   `ctx.poisoned_ids`. Work in flat delta space (`ctx.known_deltas()`,
+   `ctx.deltas_for(...)`); the base class converts back to the absolute weights
+   clients submit. Subclass `Attack` directly instead if the attack produces weights
+   some other way (`label_flip` retrains, so it does).
+2. Register it in `benchmark/attacks/__init__.py` (`build_attacks` + `AVAILABLE`,
+   and `DEFAULT` if it belongs in the standard panel), give it a `citation`, and add
+   a colour in `benchmark/plot.py`.
+3. Read `ctx.known_ids`, never `ctx.honest` directly — that is what makes
+   `--baseline-knowledge` mean something.
+4. Never mutate anything reachable from `ctx`: the honest updates are shared by
+   every attack and every defense in the round.
 
 ## Tests
 
+- `tests/test_benchmark_attacks.py` — every attack against the formula its paper
+  states (LIE's `z^max`, Min-Max/Min-Sum feasibility, Fang's out-of-range placement,
+  Fang-Krum actually landing in Krum's selection, Mimic's chosen client), plus the
+  flat-vector plumbing and the registry. Needs torch:
+  `python tests/test_benchmark_attacks.py`.
+- `tests/test_benchmark_matrix.py` — the matrix invariants: same poisoned clients in
+  every row, same honest updates, per-attack defense instances, a skipped round
+  dropped for the whole panel, and the accuracy cache being a pure memo. Needs torch:
+  `python tests/test_benchmark_matrix.py`.
 - `tests/test_benchmark.py` — torch-free (metrics + report). Runs anywhere:
   `python tests/test_benchmark.py`.
 - `tests/test_benchmark_retry.py` — the harness's unusable-attacker-action path:

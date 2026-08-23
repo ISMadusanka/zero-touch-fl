@@ -41,12 +41,18 @@ def _sd(scale=1.0):
 
 
 class _Ctx:
-    """The three RoundContext fields _sample_attack touches."""
+    """The RoundContext fields the harness touches.
+
+    ``pool_ids`` is read by the round loop (it is what a non-LLM attack poisons and
+    what defines "partial knowledge"); the other three are what _sample_attack needs.
+    """
 
     def __init__(self, budget=2, n_pool=4, round_num=66):
         self.round_num = round_num
         self.budget = budget
         self.pool_benign = {cid: _sd(cid + 1) for cid in range(n_pool)}
+        self.pool_ids = list(range(n_pool))
+        self.goal = {}
 
 
 class _Policy:
@@ -177,10 +183,17 @@ class _Env:
         self.round_num = n_rounds_seen
         self.global_weights = _sd()
         self.committed = []
+        # The real env exposes this round's honest updates; the harness reads them to
+        # build the attack context (and to audit that a crafted cohort actually differs
+        # from the honest one).
+        self.honest_updates = []
 
     def begin_round(self):
         self.round_num += 1
-        return _Ctx(budget=self.budget, n_pool=self.n_clients, round_num=self.round_num)
+        ctx = _Ctx(budget=self.budget, n_pool=self.n_clients, round_num=self.round_num)
+        self.honest_updates = [ModelUpdate(client_id=cid, weights=_sd(cid + 1))
+                               for cid in range(self.n_clients)]
+        return ctx
 
     def set_committed_poison(self, chosen_ids):
         self.committed.append(sorted(chosen_ids))

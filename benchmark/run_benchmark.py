@@ -1,17 +1,31 @@
 #!/usr/bin/env python3
-"""Run the defense benchmark: trained attacker vs a panel of defenses.
+"""Run the benchmark: a panel of ATTACKS vs a panel of DEFENSES.
 
-Pits the trained ATTACKER adapter against {fedavg, oracle, llm_defender, fltrust}
-for N rounds and prints how much of the attack each defense detected + how well it
-preserved accuracy. Must run on the GPU box (needs torch/unsloth/peft + the
-trained adapters in checkpoints/).
+Pits the trained ATTACKER adapter AND the published state-of-the-art untargeted
+poisoning attacks (LIE, Min-Max, Min-Sum, Fang, Fang-Krum, IPM, Mimic, plus the
+classic Byzantine baselines) against {fedavg, oracle, llm_defender, fltrust, defl,
+dnc, multikrum} for N rounds, and prints how much accuracy each attack cost each
+defense and how much of each attack each defense detected.
+
+Every attack in a round poisons the SAME clients, sees the SAME honest updates and
+is measured over the SAME rounds — when the trained attacker is in the panel it
+picks the poisoned set and the baselines follow it — so the matrix isolates the
+attack as the only difference between rows.
+
+Needs torch (+ unsloth/peft and the trained adapter in checkpoints/ only when the
+``llm`` attack or the ``llm_defender`` column is in the panel; a baselines-only run
+is CPU-friendly).
 
 Examples
 --------
 python -m benchmark.run_benchmark --rounds 200
 python -m benchmark.run_benchmark --rounds 200 \
-    --defenses fedavg,oracle,fltrust,llm_defender \
+    --attacks llm,lie,min_max,min_sum,fang,ipm \
+    --defenses fedavg,oracle,fltrust,defl,dnc,multikrum \
     --attack-temperature 0.7 --root-size 100 --out logs/benchmark
+# baselines only (no attacker adapter needed):
+python -m benchmark.run_benchmark --rounds 20 --attacks lie,min_max,fang \
+    --defenses fedavg,fltrust,multikrum
 """
 import argparse
 import copy
@@ -23,6 +37,9 @@ import sys
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import yaml
+
+# Torch-free registries, so --help works without torch installed.
+from benchmark.attacks import AVAILABLE as ATTACKS_AVAILABLE, DEFAULT as ATTACKS_DEFAULT
 
 
 def _parse_args():
@@ -36,6 +53,66 @@ def _parse_args():
                          "(no per-round sampling). Default: attack.goal from --config.")
     ap.add_argument("--defenses", default="fedavg,oracle,llm_defender,fltrust,defl,dnc,multikrum",
                     help="comma-separated; 'fedavg' is always included (attacker reference)")
+    ap.add_argument("--attacks", default=",".join(ATTACKS_DEFAULT),
+                    help="comma-separated attack panel; every attack poisons the SAME "
+                         f"clients each round. Available: {','.join(ATTACKS_AVAILABLE)}. "
+                         "'llm' is the trained adapter (the system under test) and is the "
+                         "only one needing a GPU/checkpoint; omit it for a baselines-only "
+                         "run. Default: " + ",".join(ATTACKS_DEFAULT))
+    ap.add_argument("--baseline-knowledge", choices=("partial", "full"), default="partial",
+                    help="what honest updates the PUBLISHED attacks may look at. "
+                         "'partial' (default) = the compromised clients only, the same "
+                         "information the trained attacker observes — the like-for-like "
+                         "comparison. 'full' = every client's, the omniscient setting most "
+                         "of the papers state their attack in (a strictly stronger adversary)")
+    ap.add_argument("--benign-retrain", action="store_true",
+                    help="re-train the honest clients every round instead of replaying the "
+                         "frozen Phase-1 client weights. Off by default (see "
+                         "benchmark/README.md): with frozen replay the honest updates are "
+                         "identical every round, so a DETERMINISTIC attack produces the same "
+                         "result each round and --rounds only samples the stochastic ones. "
+                         "Turn this on for genuine round-to-round variation in every row. "
+                         "Forced on by the 'label_flip' attack.")
+    ap.add_argument("--no-eval-cache", action="store_true",
+                    help="disable memoising test accuracy by the exact bytes of the global "
+                         "model. The cache never changes a number (a hit means the model is "
+                         "bit-identical to one already evaluated); it only avoids repeating "
+                         "identical test-set passes, which dominate a matrix run")
+    # --- attack knobs ---
+    ap.add_argument("--lie-z", type=float, default=None,
+                    help="LIE perturbation in standard deviations (default: the paper's "
+                         "z^max derived from n and the poison quota)")
+    ap.add_argument("--lie-sign", type=float, default=-1.0,
+                    help="LIE perturbation direction: mu + sign*z*sigma (default -1)")
+    ap.add_argument("--minmax-perturbation", choices=("std", "unit_vec", "sign"),
+                    default="std", help="Min-Max / Min-Sum perturbation direction")
+    ap.add_argument("--minmax-gamma0", type=float, default=10.0,
+                    help="Min-Max / Min-Sum halving-search starting gamma")
+    ap.add_argument("--minsum-bound", choices=("max", "min"), default="max",
+                    help="which honest row Min-Sum's constraint is calibrated to "
+                         "(see benchmark/attacks/agr_agnostic.py)")
+    ap.add_argument("--fang-b", type=float, default=2.0,
+                    help="Fang trimmed-mean/median range multiplier b (paper default 2)")
+    ap.add_argument("--fang-krum-f", type=int, default=None,
+                    help="the f Fang-Krum assumes the server's Krum uses (default: the "
+                         "same assumed-Byzantine count --multikrum-f gets)")
+    ap.add_argument("--fang-krum-lambda-mult", type=float, default=1.0,
+                    help="Fang-Krum starting lambda, as a multiple of the paper's derived "
+                         "upper bound (1.0 = the paper's own starting point; larger trades "
+                         "stealth for damage)")
+    ap.add_argument("--ipm-epsilon", type=float, default=0.1,
+                    help="IPM scale: malicious update is -epsilon*mean(honest). The paper's "
+                         "stealthy setting is 0.1; >= (n-m)/m reverses the aggregate")
+    ap.add_argument("--mimic-warmup", type=int, default=10,
+                    help="Mimic power-iteration steps on the first round")
+    ap.add_argument("--signflip-c", type=float, default=1.0,
+                    help="sign-flip magnitude: malicious update is -c*(own honest update)")
+    ap.add_argument("--noise-sigma", type=float, default=10.0,
+                    help="Gaussian-attack sigma, as a multiple of the honest per-coordinate std")
+    ap.add_argument("--scaling-gamma", type=float, default=10.0,
+                    help="boosting factor for the 'scaling' attack")
+    ap.add_argument("--labelflip-mode", choices=("reverse", "next", "random"),
+                    default="reverse", help="label-flip relabelling rule")
     ap.add_argument("--attacker-adapter", default=None, help="override attacker checkpoint dir")
     ap.add_argument("--defender-adapter", default=None, help="override defender checkpoint dir")
     ap.add_argument("--attack-temperature", type=float, default=0.7,
@@ -301,8 +378,9 @@ def main():
     from agents.defender_agent import DefenderAgent
     from rl.env import FLArmsRaceEnv
     from rl.policy import LLMPolicy
+    from benchmark.attacks import build_attacks
     from benchmark.defenses import AVAILABLE, build_defenses
-    from benchmark.harness import run_benchmark
+    from benchmark.harness import run_attack_benchmark
     from benchmark import report
     from benchmark.phase1 import run_phase1
     from rl.rewards import goal_target
@@ -343,6 +421,29 @@ def main():
     if bad:
         sys.exit(f"ERROR: unknown defense(s) {bad}; available: {AVAILABLE}")
 
+    # The attack panel: the second axis of the report. Order is preserved so the
+    # matrix's rows come out in the order the user asked for.
+    attack_names = []
+    for n in (x.strip() for x in args.attacks.split(",")):
+        if n and n not in attack_names:
+            attack_names.append(n)
+    if not attack_names:
+        sys.exit("ERROR: --attacks is empty; give at least one of "
+                 f"{','.join(ATTACKS_AVAILABLE)}")
+    bad = [n for n in attack_names if n not in ATTACKS_AVAILABLE]
+    if bad:
+        sys.exit(f"ERROR: unknown attack(s) {bad}; available: {ATTACKS_AVAILABLE}")
+    if "llm" not in attack_names:
+        log.warning(
+            "The 'llm' attack is NOT in the panel, so this run measures the published "
+            "baselines against each other and the trained policy appears nowhere. That "
+            "is a valid baselines-only run (and needs no adapter); add 'llm' to "
+            "--attacks to compare against it.")
+    # ``label_flip`` retrains the compromised clients, so the honest updates must be
+    # produced the same way or the comparison would credit the attack with the
+    # difference between "trained this round" and "replayed from Phase 1".
+    force_retrain = args.benign_retrain or "label_flip" in attack_names
+
     random.seed(seed)
     import torch
     torch.manual_seed(seed)
@@ -382,16 +483,29 @@ def main():
     # Env: pure round generator (controllable pool + benign updates + build_updates).
     rng = random.Random(seed)
     env = FLArmsRaceEnv(base_cfg, client_loaders, test_loader, rng)
-    # Frozen benign replay is a BENCHMARK requirement, not a training preference, so it
-    # is pinned here rather than read from fl.benign_retrain_each_round (which training
-    # now sets to true — see configs/base.yaml). Every defense in the panel must see
-    # byte-identical benign updates in a round for "same attack to everyone" to hold,
-    # and each Defense owns its own global while the env's stays at the Phase-1 state,
-    # so retraining here would re-draw the honest updates against a stale reference for
-    # no benefit. This used to be a warning that the comparison "may be skewed".
-    if env.benign_retrain:
+    # Frozen benign replay is the BENCHMARK default, not a training preference, so it is
+    # pinned here rather than read from fl.benign_retrain_each_round (which training now
+    # sets to true — see configs/base.yaml). Every attack and defense in the panel must
+    # see byte-identical benign updates in a round for "same round to everyone" to hold,
+    # and each Defense owns its own global while the env's stays at the Phase-1 state, so
+    # retraining would re-draw the honest updates against a stale reference.
+    #
+    # What frozen replay ALSO does is make the honest updates identical ACROSS rounds, so
+    # a deterministic attack repeats itself every round and only the stochastic ones
+    # (llm, fang, noise) actually vary. --benign-retrain trades that determinism for
+    # genuine round-to-round variation; the within-round guarantee is unaffected either
+    # way, since begin_round() draws the honest updates ONCE and every attack in that
+    # round starts from them.
+    if force_retrain:
+        why = ("--benign-retrain" if args.benign_retrain
+               else "the 'label_flip' attack, whose poisoned clients train locally")
+        log.info(f"benchmark: honest clients RE-TRAIN each round ({why}). Within a round "
+                 f"every attack and defense still sees the same honest updates.")
+        env.benign_retrain = True
+    elif env.benign_retrain:
         log.info("benchmark: pinning frozen benign replay (fl.benign_retrain_each_round "
-                 "is true for training, but the panel needs identical benign updates)")
+                 "is true for training, but the panel needs identical benign updates). "
+                 "Pass --benign-retrain for round-to-round variation.")
         env.benign_retrain = False
     env.reset(copy.deepcopy(global_weights), client_weights, baseline_accuracy)
 
@@ -403,8 +517,10 @@ def main():
     )
     eval_budget = _resolve_eval_budget(env, requested_budget)
 
-    # Load the trained policy: the attacker adapter is always needed; the defender
-    # adapter only if the LLM defender is in the panel.
+    # Load the trained policy: the attacker adapter only when the `llm` ATTACK is in
+    # the panel, the defender adapter only when the `llm_defender` DEFENSE is. A
+    # baselines-only panel with algorithmic defenses needs neither, so it must not pay
+    # for (or fail on) a 3B base model — that is what makes a CPU smoke-test possible.
     adapter_paths = dict(rl_cfg.get("adapter_paths", {
         "attacker": "checkpoints/attacker_adapter",
         "defender": "checkpoints/defender_adapter",
@@ -414,10 +530,13 @@ def main():
     if args.defender_adapter:
         adapter_paths["defender"] = args.defender_adapter
 
-    # The ATTACKER adapter is what is under evaluation — without it there is nothing
-    # to benchmark, so this one really is fatal.
-    if not adapter_exists(adapter_paths["attacker"]):
-        sys.exit(f"ERROR: no trained attacker adapter at {adapter_paths['attacker']}")
+    needs_attacker = "llm" in attack_names
+    # The ATTACKER adapter is what is under evaluation — when the `llm` row was asked
+    # for and it is missing there is nothing to evaluate, so that really is fatal.
+    if needs_attacker and not adapter_exists(adapter_paths["attacker"]):
+        sys.exit(f"ERROR: no trained attacker adapter at {adapter_paths['attacker']}\n"
+                 f"       (drop 'llm' from --attacks to run the published baselines "
+                 f"only, or pass --attacker-adapter <dir>)")
 
     # The DEFENDER adapter is needed ONLY by the `llm_defender` column, and a missing
     # one is the NORMAL case rather than an error: with `defense.mode: algorithmic`
@@ -428,34 +547,39 @@ def main():
     # also materialise an unused defender LoRA (~115 MB of VRAM at lora_r=16).
     names, skipped_llm_defender = _resolve_llm_defender(names, adapter_paths, base_cfg)
 
-    adapter_names = (("attacker", "defender") if "llm_defender" in names
-                     else ("attacker",))
-    policy = LLMPolicy(
-        base_model=rl_cfg.get("model", "unsloth/Qwen2.5-3B-Instruct"),
-        max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
-        lora_r=int(rl_cfg.get("lora_r", 16)),
-        lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
-        load_in_4bit=bool(rl_cfg.get("load_in_4bit", True)),
-        seed=seed,
-        adapters=adapter_names,
-        attn_implementation=rl_cfg.get("attn_implementation", "eager"),
-        use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
-    )
-    policy.load_adapter("attacker", adapter_paths["attacker"])
-    if "llm_defender" in names:
-        policy.load_adapter("defender", adapter_paths["defender"])
+    policy = attacker_agent = None
+    defender_agent = DefenderAgent(defender_cfg)   # only used by the llm_defender column
+    adapter_names = tuple(n for n, needed in (("attacker", needs_attacker),
+                                              ("defender", "llm_defender" in names))
+                          if needed)
+    if adapter_names:
+        policy = LLMPolicy(
+            base_model=rl_cfg.get("model", "unsloth/Qwen2.5-3B-Instruct"),
+            max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
+            lora_r=int(rl_cfg.get("lora_r", 16)),
+            lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
+            load_in_4bit=bool(rl_cfg.get("load_in_4bit", True)),
+            seed=seed,
+            adapters=adapter_names,
+            attn_implementation=rl_cfg.get("attn_implementation", "eager"),
+            use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
+        )
+        for adapter in adapter_names:
+            policy.load_adapter(adapter, adapter_paths[adapter])
+    else:
+        log.info("No LLM adapter needed for this panel (no 'llm' attack, no "
+                 "'llm_defender' defense) — skipping the base-model load.")
 
-    # The prompt must describe the same regime training used: a fixed poisoned set
-    # changes the system prompt from "select k of n" to "plan for all of these",
-    # and the rl: block carries the context-fill budget the observation is
-    # compacted to fit. Bind the real tokenizer so that budget is exact.
-    attacker_cfg["fixed_poison_set"] = (
-        attack_cfg.get("fixed_poison_clients") not in (None, False, 0, ""))
-    attacker_cfg["rl"] = rl_cfg
-    attacker_agent = AttackerAgent(attacker_cfg)
-    attacker_agent.bind_tokenizer(policy.count_prompt_tokens)
-    # Only meaningful for the llm_defender column; harmless to build either way.
-    defender_agent = DefenderAgent(defender_cfg)
+    if needs_attacker:
+        # The prompt must describe the same regime training used: a fixed poisoned set
+        # changes the system prompt from "select k of n" to "plan for all of these",
+        # and the rl: block carries the context-fill budget the observation is
+        # compacted to fit. Bind the real tokenizer so that budget is exact.
+        attacker_cfg["fixed_poison_set"] = (
+            attack_cfg.get("fixed_poison_clients") not in (None, False, 0, ""))
+        attacker_cfg["rl"] = rl_cfg
+        attacker_agent = AttackerAgent(attacker_cfg)
+        attacker_agent.bind_tokenizer(policy.count_prompt_tokens)
 
     root_loader = None
     root_epochs = 1
@@ -506,53 +630,102 @@ def main():
     dnc_m = args.dnc_num_byzantine if args.dnc_num_byzantine is not None else assumed_byz
     mk_f = args.multikrum_f if args.multikrum_f is not None else assumed_byz
 
-    defenses = build_defenses(
-        names, device=device, policy=policy, defender_agent=defender_agent,
-        root_loader=root_loader, root_lr=args.root_lr or float(fl["lr"]),
-        root_epochs=root_epochs, eta=args.eta,
-        defender_temperature=args.defender_temperature,
+    # The attack panel. Fang-Krum is AGR-TAILORED, so it is told the same assumed
+    # #Byzantine the multikrum column is configured with — knowing the rule and its
+    # parameters is that attack's threat model, not an unfair peek.
+    attacks = build_attacks(
+        attack_names, policy=policy, attacker_agent=attacker_agent,
+        attacker_adapter="attacker", attack_temperature=args.attack_temperature,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)),
-        defl_delta=args.defl_delta, defl_tau=args.defl_tau,
-        dnc_num_byzantine=dnc_m, dnc_c=args.dnc_c, dnc_niters=args.dnc_niters,
-        dnc_sub_dim=args.dnc_sub_dim, dnc_seed=seed,
-        multikrum_num_byzantine=mk_f, multikrum_m=args.multikrum_m,
+        attack_retries=max(0, args.attack_retries), seed=seed,
+        lie_z=args.lie_z, lie_sign=args.lie_sign,
+        minmax_perturbation=args.minmax_perturbation, minmax_gamma0=args.minmax_gamma0,
+        minsum_bound=args.minsum_bound, fang_b=args.fang_b,
+        fang_krum_f=(args.fang_krum_f if args.fang_krum_f is not None else mk_f),
+        fang_krum_lambda_mult=args.fang_krum_lambda_mult,
+        ipm_epsilon=args.ipm_epsilon, mimic_warmup=args.mimic_warmup,
+        signflip_c=args.signflip_c, noise_sigma=args.noise_sigma,
+        scaling_gamma=args.scaling_gamma, labelflip_mode=args.labelflip_mode,
+        client_loaders=client_loaders, lr=float(fl["lr"]),
+        local_epochs=int(fl["local_epochs"]), device=device,
     )
 
-    log.info(f"Benchmark: {args.rounds} rounds | defenses={list(defenses)} | "
-             f"baseline_acc={baseline_accuracy:.4f} | attack_temp={args.attack_temperature}"
+    # Every attack needs its OWN defense instances: a defense's global model — and any
+    # cross-round memory it keeps (DeFL's Beta trust) — is shaped by the attack it
+    # faced, so one shared panel would let the rows contaminate each other.
+    def _panel():
+        return build_defenses(
+            names, device=device, policy=policy, defender_agent=defender_agent,
+            root_loader=root_loader, root_lr=args.root_lr or float(fl["lr"]),
+            root_epochs=root_epochs, eta=args.eta,
+            defender_temperature=args.defender_temperature,
+            max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)),
+            defl_delta=args.defl_delta, defl_tau=args.defl_tau,
+            dnc_num_byzantine=dnc_m, dnc_c=args.dnc_c, dnc_niters=args.dnc_niters,
+            dnc_sub_dim=args.dnc_sub_dim, dnc_seed=seed,
+            multikrum_num_byzantine=mk_f, multikrum_m=args.multikrum_m,
+        )
+
+    panels = {name: _panel() for name in attacks}
+    defenses = list(next(iter(panels.values())))
+
+    log.info(f"Benchmark: {args.rounds} rounds | attacks={list(attacks)} | "
+             f"defenses={defenses} | baseline_acc={baseline_accuracy:.4f} | "
+             f"attack_temp={args.attack_temperature} | "
+             f"baseline_knowledge={args.baseline_knowledge}"
              + (" | llm_defender SKIPPED (no defender adapter)"
                 if skipped_llm_defender else ""))
-    summaries, _metrics = run_benchmark(
-        env, policy, attacker_agent, defenses, test_loader,
+    if "llm_defender" in defenses and len(attacks) > 1:
+        log.warning(
+            f"The 'llm_defender' column runs one LLM generation per round PER ATTACK, "
+            f"so this panel costs {len(attacks)}x its usual generations "
+            f"({len(attacks) * args.rounds} defender calls). Drop it from --defenses for "
+            f"a faster algorithmic-only matrix.")
+    summaries, _metrics, run_info = run_attack_benchmark(
+        env, attacks, panels, test_loader,
         init_global=copy.deepcopy(global_weights), baseline_accuracy=baseline_accuracy,
-        n_rounds=args.rounds, attack_temperature=args.attack_temperature,
-        max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)), device=device,
-        log_every=args.log_every, target_drop=target_drop,
-        attack_retries=max(0, args.attack_retries),
+        n_rounds=args.rounds, device=device, log_every=args.log_every,
+        target_drop=target_drop, knowledge=args.baseline_knowledge,
+        max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)),
+        eval_cache=not args.no_eval_cache,
     )
 
-    # Rounds the harness could not get a usable attacker action for are skipped, so
-    # report the MEASURED count rather than the requested one — the table's header
-    # and its per-defense columns then describe the same set of rounds.
-    measured_rounds = max((s.get("rounds", 0) for s in summaries.values()),
-                          default=args.rounds)
-    skipped_rounds = args.rounds - measured_rounds
+    # Rounds the harness could not get a usable attacker action for are skipped for the
+    # WHOLE panel, so report the MEASURED count rather than the requested one — the
+    # header and every cell then describe the same set of rounds.
+    measured_rounds = run_info["measured_rounds"]
+    skipped_rounds = run_info["unusable_attack_rounds"]
     if skipped_rounds > 0:
         log.warning(f"{skipped_rounds} of {args.rounds} round(s) had no usable attacker "
                     f"action and are excluded; the report covers {measured_rounds} round(s)")
 
     out_dir = args.out or None
-    print("\n" + report.render([summaries[n] for n in defenses], measured_rounds,
-                                baseline_accuracy, out_dir=out_dir, goal=goal,
-                                n_poisoners=eval_budget, n_clients=int(fl["n_clients"])))
+    single = list(attacks)[0] if len(attacks) == 1 else None
+    if single is not None:
+        # One attack: keep the original per-defense report verbatim, so a
+        # `--attacks llm` run produces exactly the output it always has.
+        text = report.render([summaries[single][d] for d in defenses], measured_rounds,
+                             baseline_accuracy, out_dir=out_dir, goal=goal,
+                             n_poisoners=eval_budget, n_clients=int(fl["n_clients"]))
+    else:
+        text = report.render_matrix(
+            summaries, measured_rounds, baseline_accuracy, out_dir=out_dir, goal=goal,
+            n_poisoners=eval_budget, n_clients=int(fl["n_clients"]),
+            citations={n: a.citation for n, a in attacks.items()}, run_info=run_info)
+    print("\n" + text)
 
-    # Persist per-round history + draw the per-round graphs.
+    # Persist per-round history + draw the per-round graphs. The history is nested by
+    # attack for a matrix run and flat for a single-attack one; benchmark.plot detects
+    # which it is, so an old saved run still re-plots.
     if out_dir:
         import json as _json
-        history = {name: m.history for name, m in _metrics.items()}
+        history = ({d: m.history for d, m in _metrics[single].items()} if single
+                   else {a: {d: m.history for d, m in panel.items()}
+                         for a, panel in _metrics.items()})
         with open(os.path.join(out_dir, "history.json"), "w") as f:
             _json.dump({"baseline_accuracy": baseline_accuracy,
-                        "defenses": list(defenses),
+                        "attacks": list(attacks),
+                        "defenses": defenses,
                         # Recorded so a saved result is self-describing: a missing
                         # llm_defender column is a deliberate skip, not a lost run,
                         # and a measured count below --rounds is skipped attack
@@ -561,13 +734,23 @@ def main():
                         "requested_rounds": args.rounds,
                         "measured_rounds": measured_rounds,
                         "unusable_attack_rounds": skipped_rounds,
+                        "run_info": run_info,
                         "history": history}, f, indent=2)
         log.info(f"[saved] {os.path.join(out_dir, 'history.json')}")
         if not args.no_plot:
-            from benchmark.plot import plot_history
-            png = plot_history(history, baseline_accuracy, os.path.join(out_dir, "benchmark.png"))
-            if png:
-                log.info(f"[saved] {png}")
+            from benchmark.plot import plot_attack_comparison, plot_history
+            base = os.path.join(out_dir, "benchmark.png")
+            if single:
+                made = [plot_history(history, baseline_accuracy, base)]
+            else:
+                stem, ext = os.path.splitext(base)
+                made = [plot_attack_comparison(history, baseline_accuracy,
+                                               f"{stem}_attacks{ext}")]
+                made += [plot_history(panel, baseline_accuracy, f"{stem}_{a}{ext}")
+                         for a, panel in history.items()]
+            for png in made:
+                if png:
+                    log.info(f"[saved] {png}")
 
 
 if __name__ == "__main__":

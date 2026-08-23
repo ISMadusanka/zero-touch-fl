@@ -492,6 +492,31 @@ python -m benchmark.run_benchmark --n-clients 25 --max-poison-clients 10 --round
 # forms: untargeted_degrade=<drop> | slow_degrade=<drop> | targeted_label=<label>
 ```
 
+The benchmark is an **attack × defense matrix**: the trained attacker runs beside
+the published state-of-the-art untargeted poisoning attacks (LIE, Min-Max, Min-Sum,
+Fang, Fang-Krum, IPM, Mimic, plus the classic Byzantine baselines) against the same
+defense panel. Every attack in a round poisons the **same clients**, sees the **same
+honest updates** and is scored over the **same rounds**, so the only difference
+between rows is the attack itself.
+
+```bash
+# the default panel: the trained policy + every published baseline
+python -m benchmark.run_benchmark --rounds 200
+
+# add the no-attack control row (each defense's clean accuracy, the denominator
+# for reading every other row)
+python -m benchmark.run_benchmark --rounds 200 --attacks clean,llm,lie,min_max,fang,mimic
+
+python -m benchmark.run_benchmark --rounds 200 --attacks clean,llm,lie,min_max,min_sum,fang,fang_krum,ipm,mimic,sign_flip,noise --out logs/benchmark
+
+# published baselines only — needs no adapter and no GPU
+python -m benchmark.run_benchmark --rounds 20 --attacks lie,min_max,fang --device cpu
+```
+
+See [`benchmark/README.md`](benchmark/README.md) for the attack panel, the
+adversary-knowledge setting (`--baseline-knowledge`), how to read the matrix, and
+the single-round caveat that applies when comparing to published end-to-end numbers.
+
 ## Project structure
 
 ```
@@ -506,6 +531,9 @@ server/       Central server + FedAvg aggregation + algo_defender.py (the round-
 detector/     features.py — per-client per-layer statistical feature extractor
 agents/       attacker_agent.py / defender_agent.py (pure prompt+parse), attack_ops.py (operator DSL), llm_client.py
 rl/           env, rewards, turns, inference (dry-run), policy (Unsloth+LoRA), grpo, schedule, baseline
+benchmark/    attack x defense matrix: attacks/ (the trained policy + the published
+              SOTA untargeted attacks), defenses/ (FedAvg, oracle, LLM defender,
+              FLTrust, DeFL, DnC, Multi-Krum), harness, metrics, report, plot
 metrics/      Ground-truth confusion/TPR/FPR/ASR/APR (research evaluation + reward source)
 storage/      Phase-1 checkpoint + RL progress
 configs/      YAML configuration

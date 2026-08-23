@@ -35,8 +35,13 @@ def _clip(x: float, lo: float, hi: float) -> float:
 class DefenseMetrics:
     """Accumulates one defense's per-round results into a summary."""
 
-    def __init__(self, name: str, baseline_accuracy: float, target_drop: float | None = None):
+    def __init__(self, name: str, baseline_accuracy: float, target_drop: float | None = None,
+                 attack: str = "llm"):
         self.name = name
+        # Which attack produced the updates this defense was scored against. The
+        # benchmark is an attack x defense matrix, so a summary that names only the
+        # defense is ambiguous the moment more than one attack is in the panel.
+        self.attack = attack
         self.baseline = float(baseline_accuracy)
         # The attack's accuracy-degradation GOAL asks for ``target_drop`` of accuracy,
         # i.e. it is met IN FULL in a round when the defended model's accuracy falls
@@ -113,6 +118,7 @@ class DefenseMetrics:
         f1 = _safe_div(2 * precision * recall, precision + recall)
         mean_acc = _safe_div(self.acc_sum, self.rounds)
         return {
+            "attack": self.attack,
             "defense": self.name,
             "rounds": self.rounds,
             "malicious_total": self.tp + self.fn,     # poisoned-client instances seen
