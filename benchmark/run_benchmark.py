@@ -164,6 +164,11 @@ def _parse_args():
     ap.add_argument("--no-plot", action="store_true", help="skip drawing per-round graphs")
     ap.add_argument("--fresh", action="store_true", help="force fresh Phase-1 instead of loading checkpoint")
     ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--events", default=None, metavar="DEST",
+                    help="emit a JSONL event stream describing the run as it happens: "
+                         "'-' (or 'stdout') interleaves it into stdout behind a sentinel "
+                         "prefix, any other value is a file path. Off by default, so plain "
+                         "CLI output is unchanged. This is what `python -m webui` watches.")
     return ap.parse_args()
 
 
@@ -368,6 +373,15 @@ def main():
                         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
     log = logging.getLogger("benchmark")
 
+    # The watcher's channel. Opened FIRST so a UI sees "started" before the torch /
+    # Unsloth imports below (which can take a minute on a cold GPU box) rather than
+    # staring at a blank panel. NULL emitter unless --events was passed.
+    from benchmark.events import EventEmitter
+    em = EventEmitter(args.events)
+    em.emit("started", argv=sys.argv[1:], rounds=int(args.rounds),
+            attacks=args.attacks, defenses=args.defenses, goal=args.goal,
+            config=args.config, out=args.out)
+
     # Heavy / FL imports are deferred so --help works without torch.
     from data.nidd_loader import get_data_loaders
     from model import set_default_hidden
@@ -410,7 +424,14 @@ def main():
         if args.n_clients < 1:
             sys.exit(f"ERROR: --n-clients must be >= 1, got {args.n_clients}")
         fl["n_clients"] = int(args.n_clients)
-    device = args.device or fl["device"]
+    # Same reason as --n-clients above: write it BACK into the config, not just into
+    # a local. FLArmsRaceEnv (and the FedServer it builds) reads fl["device"]
+    # directly, so a --device that only lived in this local left the env on the
+    # config's "cuda" and a `--device cpu` run died in torch with "Torch not
+    # compiled with CUDA enabled" -- on the exact machine the flag exists for.
+    if args.device:
+        fl["device"] = args.device
+    device = fl["device"]
     seed = args.seed if args.seed is not None else int(fl.get("poison_seed", 0))
 
     # Always include the no-defense baseline (it is also the attacker's reference).
@@ -681,13 +702,21 @@ def main():
             f"so this panel costs {len(attacks)}x its usual generations "
             f"({len(attacks) * args.rounds} defender calls). Drop it from --defenses for "
             f"a faster algorithmic-only matrix.")
+    em.emit("config", attacks=list(attacks), defenses=defenses,
+            baseline_accuracy=float(baseline_accuracy), rounds=int(args.rounds),
+            n_clients=int(fl["n_clients"]), n_poisoners=int(eval_budget),
+            target_drop=(float(target_drop) if target_drop is not None else None),
+            goal=goal, knowledge=args.baseline_knowledge, device=str(device),
+            attacker_adapter=adapter_paths["attacker"],
+            llm_defender_skipped=bool(skipped_llm_defender),
+            citations={n: a.citation for n, a in attacks.items()})
     summaries, _metrics, run_info = run_attack_benchmark(
         env, attacks, panels, test_loader,
         init_global=copy.deepcopy(global_weights), baseline_accuracy=baseline_accuracy,
         n_rounds=args.rounds, device=device, log_every=args.log_every,
         target_drop=target_drop, knowledge=args.baseline_knowledge,
         max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)),
-        eval_cache=not args.no_eval_cache,
+        eval_cache=not args.no_eval_cache, emitter=em,
     )
 
     # Rounds the harness could not get a usable attacker action for are skipped for the
@@ -713,6 +742,12 @@ def main():
             n_poisoners=eval_budget, n_clients=int(fl["n_clients"]),
             citations={n: a.citation for n, a in attacks.items()}, run_info=run_info)
     print("\n" + text)
+    em.emit("summary", summaries=summaries, defenses=defenses,
+            attacks=list(attacks), measured_rounds=int(measured_rounds),
+            requested_rounds=int(args.rounds), skipped_rounds=int(skipped_rounds),
+            baseline_accuracy=float(baseline_accuracy), run_info=run_info,
+            n_poisoners=int(eval_budget), n_clients=int(fl["n_clients"]),
+            goal=goal, report=text)
 
     # Persist per-round history + draw the per-round graphs. The history is nested by
     # attack for a matrix run and flat for a single-attack one; benchmark.plot detects
@@ -751,6 +786,10 @@ def main():
             for png in made:
                 if png:
                     log.info(f"[saved] {png}")
+        em.emit("saved", out_dir=out_dir,
+                history=os.path.join(out_dir, "history.json"))
+    em.emit("finished", measured_rounds=int(measured_rounds))
+    em.close()
 
 
 if __name__ == "__main__":

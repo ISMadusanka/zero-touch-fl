@@ -27,6 +27,7 @@ import logging
 from server.fed_server import FedServer
 
 from benchmark.attacks.base import AttackContext, float_keys
+from benchmark.events import NULL as NULL_EMITTER
 # Re-exported: these are the LLM sampling helpers, which live with the LLM attack
 # but are part of the harness's tested surface (tests/test_benchmark_retry.py).
 from benchmark.attacks.llm_attack import (  # noqa: F401
@@ -215,6 +216,37 @@ def _audit_cohort(name: str, poisoned: dict, honest: dict, expected_ids, round_n
     return unchanged
 
 
+def _cohort_shift(poisoned: dict, honest: dict, keys) -> dict:
+    """How far an attack moved the clients it poisoned, as plain floats.
+
+    ``||w_poisoned - w_honest||`` per client, plus the mean over the cohort and the
+    ratio of that to the mean honest update size. Purely descriptive — nothing in
+    the benchmark reads it — but it is the one number that makes a round's picture
+    legible in the UI: a defense that let an attack through matters very differently
+    depending on whether the attack pushed by 0.01 or by 40.
+
+    Costs one subtraction over a 681-parameter model per poisoned client, so it is
+    computed unconditionally-cheap but only CALLED when a watcher is attached.
+    """
+    import torch
+
+    per_client, mags = {}, []
+    for cid, w in poisoned.items():
+        ref = honest.get(int(cid))
+        if ref is None:
+            continue
+        sq = 0.0
+        for k in keys:
+            if k in w and k in ref:
+                sq += float(torch.sum((w[k] - ref[k]).double() ** 2))
+        mag = sq ** 0.5
+        per_client[int(cid)] = round(mag, 6)
+        mags.append(mag)
+    return {"per_client": per_client,
+            "mean": round(sum(mags) / len(mags), 6) if mags else 0.0,
+            "max": round(max(mags), 6) if mags else 0.0}
+
+
 # ---------------------------------------------------------------------------
 # The round loop
 # ---------------------------------------------------------------------------
@@ -223,7 +255,7 @@ def run_attack_benchmark(env, attacks, panels, test_loader, init_global,
                          baseline_accuracy, n_rounds, *, device: str = "cpu",
                          log_every: int = 10, target_drop: float | None = None,
                          knowledge: str = "partial", max_new_tokens: int = 512,
-                         eval_cache: bool = True):
+                         eval_cache: bool = True, emitter=None):
     """Run ``n_rounds`` of every attack vs every defense.
 
     Args:
@@ -237,6 +269,11 @@ def run_attack_benchmark(env, attacks, panels, test_loader, init_global,
             attack in.
         target_drop: the goal's requested accuracy drop, enabling the per-round
             goal-success weighting.
+        emitter: optional :class:`benchmark.events.EventEmitter`. When enabled the
+            harness publishes one ``round`` event per measured round carrying the
+            full (attack, defense) cell for that round — what the web UI renders
+            live. ``None`` (the default) is the no-op emitter, so a plain CLI run
+            is byte-identical to before.
 
     Returns ``(summaries, metrics, run_info)`` where ``summaries`` and ``metrics``
     are ``{attack: {defense: ...}}`` and ``run_info`` carries the round bookkeeping
@@ -244,6 +281,7 @@ def run_attack_benchmark(env, attacks, panels, test_loader, init_global,
     """
     if knowledge not in ("partial", "full"):
         raise ValueError(f"unknown knowledge {knowledge!r}; use 'partial' or 'full'")
+    em = emitter if emitter is not None else NULL_EMITTER
     llm_names = [n for n, a in attacks.items() if a.is_llm]
     if len(llm_names) > 1:
         raise ValueError(f"at most one LLM attack per panel, got {llm_names}")
@@ -292,6 +330,9 @@ def run_attack_benchmark(env, attacks, panels, test_loader, init_global,
                 f"attacker action after every retry. Excluded from every "
                 f"(attack, defense) cell; {n_unusable} round(s) skipped so far. If "
                 f"this recurs, raise rl.max_new_tokens or inspect the adapter.")
+            em.emit("round_skipped", index=r, round_num=int(ctx.round_num),
+                    reason="no usable attacker action after every retry",
+                    unusable_total=n_unusable)
             continue
 
         poisoned_ids = set(ids)
@@ -306,6 +347,7 @@ def run_attack_benchmark(env, attacks, panels, test_loader, init_global,
             pool_ids=[int(c) for c in ctx.pool_ids], n_clients=env.n_clients,
             goal=getattr(ctx, "goal", None) or {}, keys=float_keys(g))
 
+        cells, shifts = [], {}
         for name, attack in attacks.items():
             base_ctx.reference_accuracy = reference[name]
             poisoned = attack.craft(base_ctx)
@@ -330,8 +372,19 @@ def run_attack_benchmark(env, attacks, panels, test_loader, init_global,
                     acc = metrics[name][dname].last_acc   # no model yet (post-reset)
                 metrics[name][dname].record(ctx.round_num, res.verdicts, truth,
                                             acc, skipped=(res.new_global is None))
+                if em.enabled:
+                    h = metrics[name][dname].history[-1]
+                    cells.append({"attack": name, "defense": dname, **h})
+            if em.enabled and attack.poisons:
+                shifts[name] = _cohort_shift(poisoned, honest, base_ctx.keys)
             if "fedavg" in metrics[name]:
                 reference[name] = metrics[name]["fedavg"].last_acc
+
+        em.emit("round", index=r, of=n_rounds, round_num=int(ctx.round_num),
+                poisoned=sorted(int(c) for c in poisoned_ids),
+                pool=[int(c) for c in ctx.pool_ids], n_clients=int(env.n_clients),
+                goal=getattr(ctx, "goal", None) or {}, cells=cells, shifts=shifts,
+                reference={a: round(float(v), 6) for a, v in reference.items()})
 
         if r == 1 or r % log_every == 0 or r == n_rounds:
             logger.info(f"[round {r}/{n_rounds}] poisoned={sorted(poisoned_ids)}")

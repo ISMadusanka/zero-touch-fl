@@ -3,7 +3,7 @@
 llm:
   model: "gpt-4o-mini"            # OpenAI — inference/baseline only, NOT trainable
   temperature: 0.7
-  ollama_model: "qwen2.5:3b"      # Ollama — inference (--dry-run)
+  ollama_model: "ilsp/meltemi-instruct-v1.5:latest"      # Ollama — inference (--dry-run)
 
 # Attack goal is injected from configs/base.yaml (attack.goal) at runtime; this
 # block is the fallback used if base.yaml has no attack.goal.

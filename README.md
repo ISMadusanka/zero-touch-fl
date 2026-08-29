@@ -318,6 +318,50 @@ means anything.
 See `DATA_PARTION.md` for the preprocessing order, the leakage columns that are
 dropped and why, the feature selection, and the non-IID partition.
 
+## Web control panel
+
+```bash
+python -m webui          # http://localhost:8090
+```
+
+Drives training and the benchmark from a browser, and streams what they are doing
+back live. It is a **watcher, not a second implementation**: every run it starts is
+the same subprocess you would launch from a shell, with the exact argv shown on the
+page so it can be copy-pasted, and nothing about a run's behaviour lives in it.
+
+- **Training** — every flag (`--rounds`, `--poisoners`, `--learn`, `--fresh`,
+  `--debug`, mode) plus every knob in `configs/base.yaml`, with that file's own
+  inline comments as the help text. Live: accuracy vs the clean counterfactual,
+  induced drop vs the target and the win gate, the attacker reward split by term,
+  GRPO step health, detection TPR/FPR, attack potency, and a per-client
+  TP/FN/FP/TN grid. It needed **no change to the training code** — the panel tails
+  the round records `main.py` already writes to `logs/round_data/rounds.jsonl`.
+- **Model versions** — training overwrites `checkpoints/attacker_adapter` in place,
+  so the policy a benchmark loads has already moved on by the time it finishes. A
+  *version* is a snapshot of the adapters, taken when you choose, under
+  `checkpoints/versions/<id>/`, recorded with the round count and reward profile it
+  was training at. Snapshots only read `checkpoints/`; a run in flight is untouched.
+- **Benchmark** — the full attack × defense panel and every hyperparameter, run
+  against one saved version or **swept across several** (one ordinary
+  `benchmark.run_benchmark` per version, back to back). Live: which clients were
+  poisoned, which the defense flagged, how far the attack moved each one, and the
+  matrix filling in round by round. At the end: a verdict, the sortable matrix, and
+  a version comparison.
+- **Run history** — each run's resolved config, console log and per-round history
+  under `logs/webui/runs/<run_id>/`, reopenable.
+
+The panel starts processes and has no authentication, so it binds to `127.0.0.1`.
+On a remote GPU box, tunnel to it:
+
+```bash
+ssh -i <key> -L 8090:localhost:8090 <user>@<server>
+```
+
+The one change it needed outside itself is `--events` on
+`benchmark.run_benchmark`, which emits a JSONL description of each round
+(`benchmark/events.py`). Without the flag, CLI output is unchanged. See
+[`webui/README.md`](webui/README.md).
+
 ## Usage
 
 ```bash
@@ -513,6 +557,12 @@ python -m benchmark.run_benchmark --rounds 200 --attacks clean,llm,lie,min_max,m
 python -m benchmark.run_benchmark --rounds 20 --attacks lie,min_max,fang --device cpu
 ```
 
+```bash
+# emit a JSONL description of every round (what `python -m webui` watches).
+# '-' interleaves it into stdout behind a sentinel; any other value is a file path.
+python -m benchmark.run_benchmark --rounds 200 --events logs/bench_events.jsonl
+```
+
 See [`benchmark/README.md`](benchmark/README.md) for the attack panel, the
 adversary-knowledge setting (`--baseline-knowledge`), how to read the matrix, and
 the single-round caveat that applies when comparing to published end-to-end numbers.
@@ -536,9 +586,14 @@ benchmark/    attack x defense matrix: attacks/ (the trained policy + the publis
               FLTrust, DeFL, DnC, Multi-Krum), harness, metrics, report, plot
 metrics/      Ground-truth confusion/TPR/FPR/ASR/APR (research evaluation + reward source)
 storage/      Phase-1 checkpoint + RL progress
+webui/        `python -m webui` -- the browser control panel: run training and the
+              benchmark, watch live metrics, snapshot fine-tuned versions
 configs/      YAML configuration
 logs/         system.log, debug.json (--debug), round_data/rounds.jsonl,
-              metrics/rounds.jsonl + summary.json, visualizations/
+              metrics/rounds.jsonl + summary.json, visualizations/,
+              webui/runs/<run_id>/ (config + console + results per panel run)
+checkpoints/  global_model.pt, client_updates.pt, baseline.json, the live LoRA
+              adapters, and versions/<id>/ -- the snapshots a benchmark can target
 ```
 
 See [`SYSTEM.md`](SYSTEM.md) for the full architecture (round loop, reward
