@@ -7,8 +7,13 @@ Generates charts from the Phase-2 ``round_data`` JSON logs + the aggregate
 
 Round JSON schema (see core.types.RoundLog):
     round_num, attack_goal, poisoned_client_ids, predicted_labels[],
-    test_accuracy, baseline_accuracy, attacker_reward, defender_reward,
+    test_accuracy, baseline_accuracy, attack_effectiveness, defender_reward,
     learning_agent, attack_metadata
+
+``attack_effectiveness`` is a MEASUREMENT, not a reward: the attack is a
+deterministic label-flip schedule with no policy, so only the defender is trained.
+Logs written before that change carry the field as ``attacker_reward`` and are
+still read.
 
 Usage:
     python visualize_rounds.py
@@ -129,18 +134,32 @@ def plot_accuracy(rounds, out_dir):
     plt.close(fig)
 
 
+def _effectiveness(r):
+    """Attack effectiveness for one round, falling back to the pre-label-flip
+    field name so older logs still plot."""
+    return r.get("attack_effectiveness", r.get("attacker_reward", 0.0))
+
+
 def plot_rewards(rounds, out_dir):
-    """Attacker & defender verifiable reward per round (+ rolling mean)."""
+    """The defender's reward and the attack's effectiveness, per round.
+
+    Only one of these is a reward. Plotting them together is still the right call:
+    a defender reward climbing while effectiveness sits at zero is a defender
+    getting good at spotting an attack that does no damage.
+    """
     rns = [r["round_num"] for r in rounds]
-    a = [r.get("attacker_reward", 0.0) for r in rounds]
+    a = [_effectiveness(r) for r in rounds]
     d = [r.get("defender_reward", 0.0) for r in rounds]
     win = max(2, len(rns) // 20)
     fig, ax = plt.subplots(figsize=(12, 5))
-    apply_dark_style(ax, "Verifiable RL Reward Over Rounds", "Round", "Reward")
+    apply_dark_style(ax, "Defender Reward & Attack Effectiveness Over Rounds",
+                     "Round", "Reward / effectiveness")
     ax.plot(rns, a, color=COLORS["accent2"], linewidth=0.8, alpha=0.35)
     ax.plot(rns, d, color=COLORS["accent3"], linewidth=0.8, alpha=0.35)
-    ax.plot(rns, _rolling(a, win), color=COLORS["accent2"], linewidth=2.2, label="Attacker (rolling)")
-    ax.plot(rns, _rolling(d, win), color=COLORS["accent3"], linewidth=2.2, label="Defender (rolling)")
+    ax.plot(rns, _rolling(a, win), color=COLORS["accent2"], linewidth=2.2,
+            label="Attack effectiveness (rolling)")
+    ax.plot(rns, _rolling(d, win), color=COLORS["accent3"], linewidth=2.2,
+            label="Defender reward (rolling)")
     ax.legend(facecolor=COLORS["card"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"])
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "02_rewards.png"), dpi=150)
@@ -290,7 +309,7 @@ def plot_accuracy_preservation(rounds, out_dir):
 def generate_html_report(rounds, out_dir, summary=None):
     charts = sorted(f for f in os.listdir(out_dir) if f.endswith(".png"))
     rns = [r["round_num"] for r in rounds]
-    mean_a = np.mean([r.get("attacker_reward", 0.0) for r in rounds])
+    mean_a = np.mean([_effectiveness(r) for r in rounds])
     mean_d = np.mean([r.get("defender_reward", 0.0) for r in rounds])
     final_acc = rounds[-1]["test_accuracy"]
 
@@ -332,7 +351,7 @@ def generate_html_report(rounds, out_dir, summary=None):
 <div class="stats">
   <div class="stat"><div class="val">{len(rounds)}</div><div class="lbl">Rounds</div></div>
   <div class="stat"><div class="val">{final_acc:.4f}</div><div class="lbl">Final Accuracy</div></div>
-  <div class="stat"><div class="val">{mean_a:.3f}</div><div class="lbl">Mean Attacker Reward</div></div>
+  <div class="stat"><div class="val">{mean_a:.3f}</div><div class="lbl">Mean Attack Effectiveness</div></div>
   <div class="stat"><div class="val">{mean_d:.3f}</div><div class="lbl">Mean Defender Reward</div></div>
 </div>
 {metrics_html}

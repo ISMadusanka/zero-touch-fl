@@ -11,7 +11,7 @@ from core.types import DetectionVerdict          # noqa: E402
 from benchmark.metrics import DefenseMetrics      # noqa: E402
 from benchmark import report                      # noqa: E402
 from benchmark.run_benchmark import (                       # noqa: E402
-    _resolve_eval_budget, _resolve_llm_defender,
+    _resolve_llm_defender, resolve_poison_clients,
 )
 
 
@@ -159,17 +159,16 @@ def test_plot_skips_gracefully_without_matplotlib():
 
 # --- panel resolution: a missing defender adapter must not kill the run ------
 
-_PATHS = {"attacker": "checkpoints/attacker_adapter",
-          "defender": "checkpoints/defender_adapter"}
+_PATHS = {"defender": "checkpoints/defender_adapter"}
 _ALGORITHMIC = {"defense": {"mode": "algorithmic"}}
 _FULL_PANEL = ["fedavg", "oracle", "llm_defender", "fltrust", "defl", "dnc", "multikrum"]
 
 
 def test_missing_defender_adapter_skips_only_that_column():
-    """The reported bug. `llm_defender` is in the DEFAULT --defenses list, and with
-    `defense.mode: algorithmic` (the shipped config) the defender adapter is never
-    trained — so a plain `run_benchmark` used to sys.exit before measuring anything,
-    discarding all six other defenses because one optional column was unavailable."""
+    """`llm_defender` is in the DEFAULT --defenses list and needs a trained defender
+    adapter, which a box that has never run training does not have. A hard exit there
+    used to discard all six other defenses because one optional column was
+    unavailable."""
     names, skipped = _resolve_llm_defender(
         _FULL_PANEL, _PATHS, _ALGORITHMIC, exists=lambda p: False)
     assert skipped is True
@@ -206,14 +205,14 @@ def test_llm_defender_alone_is_a_clear_error_not_a_silent_fedavg_run():
     except SystemExit as e:
         msg = str(e)
         assert "--defenses" in msg and "--defender-adapter" in msg
-        assert "defense.mode: algorithmic" in msg
+        assert "no defender adapter has been trained yet" in msg
     else:
         raise AssertionError("expected SystemExit when no comparable defense remains")
 
 
-def test_skip_reason_distinguishes_disabled_from_untrained():
-    """`defense.mode: llm` means a defender WAS supposed to be trained, so the message
-    should not blame the config."""
+def test_skip_warning_names_the_path_and_the_fix():
+    """The warning has to be actionable: which checkpoint was missing, and how to
+    get the column back."""
     import io
     import logging
 
@@ -224,134 +223,52 @@ def test_skip_reason_distinguishes_disabled_from_untrained():
     try:
         _resolve_llm_defender(_FULL_PANEL, _PATHS, {"defense": {"mode": "llm"}},
                              exists=lambda p: False)
-        assert "no defender adapter has been trained yet" in buf.getvalue()
-        buf.truncate(0), buf.seek(0)
-        _resolve_llm_defender(_FULL_PANEL, _PATHS, _ALGORITHMIC, exists=lambda p: False)
-        assert "defender LLM is disabled" in buf.getvalue()
+        out = buf.getvalue()
+        assert _PATHS["defender"] in out
+        assert "python main.py" in out and "--defender-adapter" in out
     finally:
         logger.removeHandler(handler)
 
 
-def test_missing_defense_config_defaults_to_algorithmic():
-    """An older config with no `defense:` block must still resolve, not KeyError."""
+def test_missing_defense_config_still_resolves():
+    """A config with no `defense:` block must still resolve, not KeyError."""
     names, skipped = _resolve_llm_defender(_FULL_PANEL, _PATHS, {}, exists=lambda p: False)
     assert skipped is True and "llm_defender" not in names
 
 
-# --- eval poison budget: settable up to n_clients, pool widened to match -----
-
-class _FakeEnv:
-    """Just the attributes the benchmark's budget/pool resolution touches."""
-
-    def __init__(self, n_clients=20, n_compromisable=5):
-        self.n_clients = n_clients
-        self.n_compromisable = n_compromisable
-        self.budget_cap = 1
-        self.sample_budget = True
-        self.sample_target = True
-
-    def pool_ids(self):
-        return list(range(self.n_compromisable))
-
-
+# --- which clients flip labels in an evaluation ------------------------------
 # The real resolution used by the benchmark — not a re-implementation, so these
 # tests cannot drift away from what actually runs.
-_resolve_budget = _resolve_eval_budget
+
+def test_poison_clients_default_to_the_attack_config():
+    assert resolve_poison_clients({"poison_client_ids": [0, 3]}, None, 20) == [0, 3]
+    assert resolve_poison_clients({}, None, 20) == [0]
+    # A bare int is accepted as a one-element set.
+    assert resolve_poison_clients({"poison_client_ids": 2}, None, 20) == [2]
 
 
-def test_eval_budget_can_exceed_the_trained_pool_up_to_n_clients():
-    """The reported bug: --max-poison-clients was clamped to fl.n_compromisable (5),
-    so asking for 10 silently behaved exactly like 5."""
-    env = _FakeEnv(n_clients=20, n_compromisable=5)
-    assert _resolve_budget(env, 10) == 10
-    assert env.budget_cap == 10
-    # Raising the cap is useless unless the POOL grows too: the attacker may only
-    # choose from range(n_compromisable), and select_and_apply clamps to the pool size.
-    assert env.n_compromisable == 10
-    assert env.pool_ids() == list(range(10))
-    assert env.sample_budget is False       # eval never randomises the budget
+def test_cli_overrides_the_configured_poison_set():
+    assert resolve_poison_clients({"poison_client_ids": [0]}, "0,1,2", 20) == [0, 1, 2]
+    assert resolve_poison_clients({"poison_client_ids": [0]}, " 4 , 2 ", 20) == [2, 4]
 
 
-def test_eval_budget_reaches_every_client():
-    env = _FakeEnv(n_clients=20, n_compromisable=5)
-    assert _resolve_budget(env, 20) == 20
-    assert env.n_compromisable == 20 and env.pool_ids() == list(range(20))
+def test_evaluation_can_poison_every_client():
+    """The benchmark's ceiling is fl.n_clients, so the standard 'attack success vs
+    fraction malicious' sweep is expressible — that is what evaluation is for."""
+    ids = resolve_poison_clients({}, ",".join(str(i) for i in range(20)), 20)
+    assert ids == list(range(20))
 
 
-def test_eval_budget_is_capped_at_n_clients():
-    env = _FakeEnv(n_clients=20, n_compromisable=5)
-    assert _resolve_budget(env, 999) == 20     # cannot poison more clients than exist
-    assert _resolve_budget(_FakeEnv(), 0) == 1  # ...and at least one
-    assert _resolve_budget(_FakeEnv(), -5) == 1
-
-
-def test_small_eval_budget_leaves_the_pool_alone():
-    """Asking for fewer than the trained pool must NOT shrink it — the attacker still
-    chooses which of its 5 insiders to use."""
-    env = _FakeEnv(n_clients=20, n_compromisable=5)
-    assert _resolve_budget(env, 2) == 2
-    assert env.n_compromisable == 5 and env.budget_cap == 2
-
-
-def test_attacker_can_actually_select_ten_of_twenty():
-    """End-to-end on the parsing path: with a widened pool the agent really does return
-    10 poisoned clients, rather than being truncated to the old pool of 5."""
-    import torch
-    from agents.attacker_agent import AttackerAgent
-
-    env = _FakeEnv(n_clients=20, n_compromisable=5)
-    budget = _resolve_budget(env, 10)
-    pool = {cid: {"w": torch.ones(4)} for cid in env.pool_ids()}
-    assert len(pool) == 10
-
-    plan = {"clients": [{"id": cid, "operations": [{"op": "scale", "target": "all",
-                                                    "factor": 1.5 + 0.1 * cid}]}
-                        for cid in range(10)]}
-    poisoned, chosen, n_malformed = AttackerAgent().select_and_apply(
-        __import__("json").dumps(plan), pool, budget)
-    assert chosen == list(range(10)), chosen
-    assert len(poisoned) == 10 and n_malformed == 0
-    # Every chosen client's weights really changed (not silently a no-op).
-    assert all(not torch.equal(poisoned[c]["w"], pool[c]["w"]) for c in chosen)
-
-
-def test_selection_is_still_truncated_to_the_budget():
-    """Widening the pool must not let the attacker exceed the budget it was given."""
-    import json
-
-    import torch
-    from agents.attacker_agent import AttackerAgent
-
-    env = _FakeEnv(n_clients=20, n_compromisable=5)
-    budget = _resolve_budget(env, 10)
-    pool = {cid: {"w": torch.ones(3)} for cid in env.pool_ids()}
-    plan = {"clients": [{"id": cid, "operations": [{"op": "scale", "target": "all",
-                                                    "factor": 2.0}]}
-                        for cid in range(10)]}
-    plan["clients"] += [{"id": 0, "operations": [{"op": "scale", "target": "all",
-                                                  "factor": 3.0}]}]      # duplicate
-    _p, chosen, _m = AttackerAgent().select_and_apply(json.dumps(plan), pool, budget)
-    assert len(chosen) == budget == 10
-    assert len(set(chosen)) == len(chosen)          # deduped
-
-
-def test_benchmark_sized_pool_underselection_is_filled_to_exact_budget():
-    """The benchmark must not silently turn a quota of 10 into one poisoner."""
-    import json
-
-    import torch
-    from agents.attacker_agent import AttackerAgent
-
-    env = _FakeEnv(n_clients=20, n_compromisable=5)
-    budget = _resolve_budget(env, 10)
-    pool = {cid: {"w": torch.ones(3)} for cid in env.pool_ids()}
-    one_client_plan = {"clients": [{"id": 7, "operations": [
-        {"op": "scale", "target": "all", "factor": 2.0}]}]}
-    poisoned, chosen, malformed = AttackerAgent().select_and_apply(
-        json.dumps(one_client_plan), pool, budget)
-    assert len(chosen) == len(poisoned) == budget == 10
-    assert chosen[0] == 7 and len(set(chosen)) == budget
-    assert malformed == 0
+def test_out_of_range_ids_are_dropped_not_clamped():
+    """Clamping [0, 25] would silently produce two attacks on whichever id the clamp
+    landed on, which is not what the config asked for."""
+    assert resolve_poison_clients({}, "0,25,1,1,-3", 20) == [0, 1]
+    try:
+        resolve_poison_clients({}, "99", 20)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("an entirely invalid poison set must abort")
 
 
 def test_honest_majority_warnings_fire_at_the_right_thresholds():
@@ -375,7 +292,7 @@ def test_honest_majority_warnings_fire_at_the_right_thresholds():
     assert _capture(5, 20) == ""                          # 25%: nothing to say
     assert "1/3 point" in _capture(8, 20)                 # 40%: informational
     assert "NO honest majority" in _capture(10, 20)       # 50%: guarantees void
-    assert "EVERY client is a poisoner" in _capture(20, 20)
+    assert "EVERY client flips labels" in _capture(20, 20)
     assert _capture(1, 0) == ""                           # degenerate, no crash
 
 

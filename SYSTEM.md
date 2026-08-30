@@ -1,389 +1,356 @@
-# System Architecture — LLM-Direct Adversarial FL with GRPO
+# System Architecture — Label-Flip Poisoning vs a GRPO-Trained Defender LLM
 
-This document describes the redesigned system: the round loop, the attacker /
-defender contracts, the verifiable rewards, the GRPO training schedule, and the
-checkpoint layout. It supersedes the old feedback/episodic-memory design.
+This document describes the round loop, the attack, the defender contract, the
+verifiable reward, the GRPO training schedule, and the checkpoint layout.
+
+**The attack is not a policy.** It is a deterministic, detection-adaptive
+label-flipping schedule that the environment runs directly
+(`agents/label_flip_attacker.py`). The defender LLM is the only trainable agent.
+An earlier design had an attacker LLM emitting weight-space operator plans; that
+is gone — see [Why the poison is in the data](#why-the-poison-is-in-the-data).
 
 ## Components
 
 | Layer | Module | Role |
 |-------|--------|------|
-| Model | `model/mnist_net.py` | `MnistNet`, ~970 params. State_dict keys: `net.2.weight [16,49]`, `net.2.bias [16]`, `net.4.weight [10,16]`, `net.4.bias [10]`. The schema both LLMs operate over. |
+| Model | `model/mnist_net.py` | `MnistNet`, ~970 params. State_dict keys: `net.2.weight [16,49]`, `net.2.bias [16]`, `net.4.weight [10,16]`, `net.4.bias [10]`. The schema the defender operates over. |
 | Data | `data/mnist_loader.py` | MNIST load + per-client partition: IID, or the FLTrust non-IID bias-`q` scheme (`partition_noniid_fltrust`). |
+| Data | `data/round_sampler.py` | A fresh slice of each client's own shard per round. |
+| Attack | `data/label_flip.py` | The symmetric flip `y → 9−y`, the flipped-dataset wrapper, and the seeded choice of which examples to flip. |
+| Attack | `agents/label_flip_attacker.py` | The detection-adaptive ladder: which clients flip, how much, and how it reacts to the verdicts. |
 | Clients | `clients/benign_client.py` | Honest local SGD → `ModelUpdate`. |
+| Clients | `clients/malicious_client.py` | The same local SGD, on flipped labels. |
 | Server | `server/fed_server.py`, `server/aggregation.py` | Global model + eval; FedAvg over non-flagged clients. |
 | Features | `detector/features.py` | Per-client, per-layer statistical feature vectors (no decisions). |
-| Attacker | `agents/attacker_agent.py` + `agents/attack_ops.py` | Prompt (layer stats) + parse/apply of an attack plan (operator DSL). |
-| Defender (default) | `server/algo_defender.py` | **Active defense.** Rotating pool of published algorithms (FLTrust / DeFL / DnC / Multi-Krum from `benchmark/defenses/`); one drawn per round, producing both the verdicts and the aggregate. |
-| Defender (LLM) | `agents/defender_agent.py` | Prompt + parse of per-client benign/malicious labels. **Disabled** unless `defense.mode: llm`. |
-| RL | `rl/*` | Environment, rewards, turns, GRPO, schedule, policy, baseline, inference. |
-| Metrics | `metrics/*` | Ground-truth confusion/TPR/FPR/ASR/APR (research + reward source). |
+| Defender (default) | `agents/defender_agent.py` | Prompt + parse of per-client benign/malicious labels. The trainable policy. |
+| Defender (alt) | `server/algo_defender.py` | Published algorithms (FLTrust / DeFL / DnC / Multi-Krum from `benchmark/defenses/`); one per round, producing both the verdicts and the aggregate. Active under `defense.mode: algorithmic`. |
+| RL | `rl/*` | Environment, reward, turn, GRPO, schedule, policy, baseline, inference. |
+| Metrics | `metrics/*` | Ground-truth confusion/TPR/FPR/ASR/APR (research evaluation). |
 
 ## Round loop (Phase 2)
-
-Leader–follower (Stackelberg): the attacker moves, the defender best-responds to
-the realized updates.
 
 ```
 reset env from Phase-1 checkpoint (per-client benign weights, global, baseline acc)
 for each round:
-  0. FIX this round's defense algorithm + poison quota b from the training CURRICULUM
-     (algorithmic mode; both held for the whole 10-round block — see below.
-      No curriculum: the algorithm is drawn per defense.selection and
-      b = randint(1, max_poison_clients).
-      attack.fixed_poison_clients (SHIPPED DEFAULT, 10) overrides all of that:
-      b = 10 every round, so only the algorithm axis is swept)
-  1. honest updates for all N clients               # retrain from global, or replay Phase-1 weights
-  2. expose the attacker's controllable pool [0..n_compromisable) + exact poison quota b
-     (fixed set: the pool IS the poisoned set, b = its size. Otherwise the
-      curriculum block's count in training, the eval budget at eval time)
-  3. ATTACKER LLM → a per-client attack plan for each of the b clients
-     (fixed set: those clients are given as poison_client_ids; otherwise the LLM
-      also SELECTS exactly b of controllable_client_ids)
-     (input: round, the client ids, per-client LAYER STATS, acc, goal — packed
-      positionally and held under rl.max_context_fill of the context window)
-     → apply_plan(benign_i, plan_i) → poisoned weights for the CHOSEN clients
-  4. build full update list (poisoned ∪ honest)
-  5. DEFEND:
-     algorithmic (default) — env.defend(): the round's algorithm emits per-client
-       verdicts AND its own aggregate (FLTrust trust-weighting, DeFL Beta+CLP,
-       DnC/Multi-Krum filtered mean) → new global (None → keep prev)
-     llm — detector/features → per-client stat vectors → DEFENDER LLM emits a
-       benign/malicious label + confidence per client (input: features ONLY),
-       then FedAvg over the clients labelled benign
-  6. evaluate global accuracy
-  7. attacker_reward + defender_reward (ground truth = the CHOSEN poisoned set)  ← train-time only
-  8. GRPO update for the learning agent; write round log + metrics
+  1. every client gets a fresh slice of its OWN shard        # data/round_sampler.py
+  2. every client trains HONESTLY from the current global    # -> honest_updates
+  3. THE ATTACK: the ladder's current fraction f is applied to each poisoned
+     client's own per-round sample count -> n_flip labels. Each poisoned client
+     RE-TRAINS the same data with n_flip labels flipped (y -> 9-y).
+     Ground truth = the clients that ended up with >= 1 flipped label.
+  4. build the full update list (poisoned clients swapped into the honest cohort)
+  5. CLEAN COUNTERFACTUAL: aggregate the all-honest cohort and evaluate it
+  6. DEFEND:
+     llm (default) — detector/features -> per-client stat vectors -> DEFENDER LLM
+       emits a benign/malicious label + confidence per client (input: features
+       ONLY), then FedAvg over the clients labelled benign
+     algorithmic — env.defend(): the round's algorithm emits per-client verdicts
+       AND its own aggregate (FLTrust trust-weighting, DeFL Beta+CLP,
+       DnC/Multi-Krum filtered mean) -> new global (None -> keep prev)
+  7. evaluate the defended aggregate
+  8. defender_reward (ground truth = the poisoned set)       <- train-time only
+  9. GRPO update for the defender; write round log + metrics
+ 10. FEED THE LADDER the committed round's verdicts: caught -> step down,
+     missed -> hold, caught at the floor -> reset to the top
 ```
 
-The attacker must poison exactly the round's quota `b` (always clamped to the
-controllable pool) — normally a strict minority of the `N` clients — so the defender's robust
-feature references (coordinate-wise median, MAD) always see an honest majority.
-Different GRPO rollouts may pick different subsets, so each rollout is rewarded
-against its OWN chosen set; the committed rollout's set becomes the round's ground
-truth.
+Steps 2 and 3 produce **two updates for each poisoned client** — one honest, one
+poisoned — from the same starting model and the same examples. That is what makes
+the counterfactual in step 5 exact: the two branches differ by nothing but the
+labels.
 
-**Arms-race handoff.** The attacker trains (defender frozen) until it wins 3
-committed rounds in a row, then a single **benign FL round** runs (step 1 above
-for all clients, no attacker/detector — the refreshed client weights + global are
-kept), and the defender trains (attacker frozen) until it wins 3 in a row, then
-another benign FL round runs, and so on. Every GRPO phase after the first starts
-from a freshly advanced client state (see "Between-phase benign FL round" below).
-With the defender LLM disabled there is no defender phase: every phase is an
-attacker phase, still bounded by the same win-streak / cap gate, so the benign FL
-interlude keeps firing between them.
+**Frozen anchor (`fl.freeze_global_in_phase2`, default true).** Phase 2 does not
+continue the federation. Each round is an independent episode branching off the
+same Phase-1 final model: the aggregate in step 7 is measured and then *discarded*,
+so round *n+1* sends the clients exactly the model round *n* did. Without it the
+attack's own damage becomes the next round's starting point, and a round's numbers
+depend on the wreckage left by every round before it. Set it to `false` to restore
+a continuing federation.
 
-## Defense (`defense.mode`, `server/algo_defender.py`)
+**Local training is mandatory.** `fl.benign_retrain_each_round` is forced on: the
+poison IS the poisoned clients' local training on mislabelled data, so there is no
+frozen state_dict to replay and no weight edit to apply. Replaying frozen honest
+weights while the poisoned clients trained fresh would also be a giveaway for
+entirely the wrong reason (staleness, not the labels).
 
-The shipped config is **`defense.mode: algorithmic`** — the defender LLM is off.
-`AlgorithmicDefender` holds the pool named by `defense.algorithms` (default
-`fltrust, defl, dnc, multikrum`, the same classes the benchmark panel uses). The
-training curriculum `select()`s one per round; without a curriculum it
-`choose()`s one from a dedicated RNG, so the draw never shifts the env's poison /
-budget / target sampling.
+## The attack (`agents/label_flip_attacker.py`, `data/label_flip.py`)
 
-- **Fixed for the round.** Set in `env.begin_round()`, so the clean
-  counterfactual, all `G` scored rollouts and the commit face the same defense —
-  GRPO advantages stay meaningful.
+### Why the poison is in the data
+
+A weight-space edit (scale ×2, flip the signs, add noise) is a post-hoc transform
+of a vector the client already computed. Its magnitude is a free parameter, so an
+attacker can dial it to whatever a detector tolerates, and the resulting update
+need not resemble anything a real client would ever send — which makes "did the
+detector catch it" a question about outlier arithmetic rather than about
+poisoning.
+
+A label flip has exactly **one** knob: how many of the client's own examples carry
+a wrong label. Everything downstream is honest — same examples, same batch size,
+same epochs, same learning rate — so the update is a real SGD trajectory of a real
+(if wrong) objective and lands inside the honest update distribution by
+construction.
+
+### The flip
+
+`symmetric`: `y → (n_classes − 1) − y`. On MNIST that is `0↔9, 1↔8, … 4↔5`. The
+standard label-flipping attack in the FL-poisoning literature (Fang et al., USENIX
+Security 2020; Tolpegin et al., ESORICS 2020): deterministic, maximally wrong
+under an ordinal reading of the label space, and it perturbs every class rather
+than one pair, so no class is left as a clean anchor.
+
+`flip_label` mirrors the **type** of the input (a Python `int` for torchvision's
+MNIST, a 0-dim tensor for a `TensorDataset`) because `default_collate` refuses to
+stack a batch mixing the two — which is every partially-poisoned batch.
+
+**Which** examples are flipped is a seeded, deterministic function of
+`(run seed, client id, round index)`, and the flipped loader's shuffle uses a
+generator seeded the same way. So a poisoned client's whole local training — the
+mislabelled examples *and* the order SGD visits them in — is reproducible, and a
+resumed run reproduces the interrupted one's poison exactly.
+
+### The ladder
+
+```
+start:  flip start_fraction (1.0) of the poisoned client's round data
+CAUGHT      -> step down step_fraction (0.1):  100% -> 90% -> 80% -> ...
+NOT CAUGHT  -> HOLD. Send the same level again, unchanged.
+CAUGHT at floor_fraction (0.5) -> RESET to start_fraction and descend again.
+```
+
+On a 1000-example round that is exactly 1000, 900, 800, 700, 600, 500, then back
+to 1000.
+
+- **Levels are an integer index**, not a running float subtraction: `fraction =
+  start − level × step`. Repeatedly doing `f -= 0.1` from 1.0 lands on
+  `0.7999999999999999` and `0.5000000000000001`, so "am I at the floor?" — the test
+  that decides when the cycle resets — would be at the mercy of binary rounding.
+- **A floor off the step grid is snapped up** to the nearest reachable level (with
+  a log line), so the ladder can never descend past what was configured.
+- **The fraction is applied per client**, to that client's own per-round sample
+  count, so a non-IID partition (which gives clients unequal shards) still flips
+  the same *proportion* everywhere.
+- **The ladder advances exactly once per committed round** — `env.record_detection`
+  is guarded against a second call. The GRPO loop scores `G` rollouts against the
+  same cohort, and letting each advance the ladder would make the attack schedule
+  depend on `rl.G`, a sampling hyperparameter, rather than on whether the defense
+  caught anything.
+
+**Why a floor.** Below about half the client's data the honest gradient dominates
+its own update: the round stops being an attack and becomes noise, and neither
+"caught" nor "missed" carries information.
+
+**Why a reset.** Parked at the floor, the defender would spend the rest of the run
+being trained on one static, barely-detectable setting. The reset forces it to
+keep re-proving itself across the whole range.
+
+### What "caught" means
+
+`attack.schedule.caught_rule` — `all` (default, every poisoned client flagged),
+`majority`, or `any`. Ground truth is what **actually shipped** flipped labels,
+not the configured set: a client whose level rounded to zero flips sent an honest
+update, and holding the defense responsible for not flagging it would step the
+ladder on a detection that could not have happened.
+
+### Effective poison only
+
+A configured client counts as poisoned **only if at least one of its labels was
+flipped**. A ladder level that rounds to zero on a small shard leaves the client
+genuinely honest, so it is excluded from `poisoned_ids`, from the defender's
+reward, and from the ladder's feedback. `poisoned_ids` may therefore be empty — a
+clean round, on which the defender wins by staying quiet.
+
+## Defense (`defense.mode`)
+
+The shipped config is **`defense.mode: llm`** — the trainable defender.
+`algorithmic` swaps in `AlgorithmicDefender` over the pool named by
+`defense.algorithms` (default `fltrust, defl, dnc, multikrum`, the same classes the
+benchmark panel uses). The curriculum `select()`s one per round; without one it
+`choose()`s from a dedicated RNG.
+
+- **`python main.py` refuses to train under `algorithmic`**, with a message saying
+  why: the attack is a fixed schedule and the algorithms are not policies, so there
+  is no gradient to compute. It is for `--dry-run`, `--baseline` and the benchmark.
+- **Fixed for the round.** Set in `env.begin_round()`, so the clean counterfactual
+  and the commit face the same defense.
 - **Verdicts + aggregate together.** `env.defend(updates, commit=)` returns both;
-  `env.evaluate_state` / `env.commit_state` consume the state. The verdicts are
-  what `defender_reward`, the metrics tracker and the attacker's evasion term see.
-  For the derived-flag defenses (FLTrust trust ≤ 0, DnC/Multi-Krum "dropped",
-  DeFL MOUD-Vote) read `induced_drop` as the primary signal and TPR/FPR loosely —
-  same caveat as `benchmark/README.md`.
+  `env.evaluate_state` / `env.commit_state` consume the state. For the derived-flag
+  defenses (FLTrust trust ≤ 0, DnC/Multi-Krum "dropped", DeFL MOUD-Vote) read
+  `induced_drop` as the primary signal and TPR/FPR loosely — same caveat as
+  `benchmark/README.md`.
 - **Scoring is side-effect free.** `commit=False` snapshots and restores the
-  algorithm's cross-round state (`Defense.state_snapshot` / `state_restore`:
-  DeFL's Beta counts + `S(t-1)`, DnC's subsampling RNG).
-- **Attacker-only training.** `rl/schedule.py` builds one optimizer, keeps the
-  `PhaseController` on `learners=("attacker",)`, skips league/curriculum opponent
-  swaps, and never writes `checkpoints/defender_adapter/`. `main.py` doesn't even
-  create the defender LoRA adapter. Set `defense.mode: llm` to restore the
-  two-sided race — the defender adapter resumes untouched.
+  algorithm's cross-round state (`Defense.state_snapshot` / `state_restore`: DeFL's
+  Beta counts + `S(t-1)`, DnC's subsampling RNG).
 - Each round log carries `attack_metadata.defense` (the algorithm name, or
   `"llm"`); rounds are only comparable within one defense.
 
 ## Training curriculum (`curriculum:`, `rl/curriculum.py`)
 
-Which (defense, #poisoners) pair each Phase-2 round faces. Enabled by default; it
-replaces `defense.selection` **and** `attack.sample_budget_in_training`, whose two
-independent uniform draws split the rounds evenly only in expectation (per-cell
-counts are `Binomial(rounds, 1/20)`, sd ≈ 3.1 per 200 rounds) and re-rolled the
-pair every round, so the policy never trained contiguously in any one regime.
+Which **defense algorithm** each Phase-2 round faces, under `defense.mode:
+algorithmic`. It replaces `defense.selection`'s uniform draw, whose per-algorithm
+counts are even only in expectation and which re-rolled every round — so a
+stateful algorithm's memory advanced on ~1 round in 4, scattered.
 
 ```
 for algorithm in defense.algorithms:            # fltrust, defl, dnc, multikrum
-    for k in curriculum.poisoner_counts:        # e.g. 1, 2, 3, 4, 5
-        curriculum.rounds_per_block (10) consecutive GRPO rounds at (algorithm, k)
-# 4 x 5 x 10 = 200 rounds per cycle; every algorithm gets exactly 50, 10 per k.
-#
-# AS SHIPPED the poisoner axis is collapsed: attack.fixed_poison_clients: 10
-# poisons the same 10 clients every round, so poisoner_counts becomes [10] and a
-# cycle is 4 x 1 x 10 = 40 rounds, 10 per algorithm. Set it to null to sweep k.
+    curriculum.rounds_per_block (10) consecutive rounds defended by it
+# ...then the cycle repeats.
 ```
 
-- **One slot per round, consumed in `env.begin_round()`.** The between-phase
-  benign FL round does not go through it, so a block always gets its full 10
-  attacker rounds; the phase machinery runs on top of the sweep unchanged.
+- **INACTIVE under `defense.mode: llm`.** There is no algorithm axis, and the
+  attack strength is the ladder's, not a schedule's. `build_training_curriculum`
+  returns `None` and logs why.
+- **`n_poisoners` survives on `CurriculumSlot` as a constant** —
+  `len(attack.poison_client_ids)` — so a round log names the attack size without
+  re-deriving it from the config. It is not an axis the curriculum varies. (The
+  two-axis machinery is kept so a future experiment can sweep something else
+  without rewriting the sweep.)
+- **One slot per round, consumed in `env.begin_round()`.** The between-phase benign
+  FL round does not go through it, so a block always gets its full 10 rounds.
 - **Position is one integer**, saved in `checkpoints/rl_progress.json` next to
-  `rounds_done` / `controller`, so a resume continues mid-block. Older progress
-  files fall back to `rounds_done`, which counts exactly the same rounds.
-- **The attack target is pinned** (`attack.goal.target_accuracy_drop: 0.10`,
-  `sample_target_in_training: false`) so a block's rounds — and one block against
-  the next — are comparable: the win gate is `win_fraction x the round's target`
-  (0.06 here) and the reward is normalized by it, so a moving target would change
-  what "success" means inside a block. The target is **two things at once**: the
-  ambition placed in the attacker's prompt *and* where `drop_term`'s linear region
-  ends, and simultaneously the **divisor** of the damage term. So it must be moved
-  together with `rl.reward.attacker.alpha` — the shipped pair is `alpha 5.0 /
-  target 0.10`, keeping `alpha/target = 50` so a point of accuracy is worth what it
-  was at the old `0.02`, including against the absolute `min_reward_spread` /
-  `advantage_std_floor` noise floors. What actually changes at 0.10 is the
-  ceiling on ambition: at 0.02 a 2pp cut already collected nearly all the damage
-  reward available and a 10pp cut was worth only ~1.4x as much, so the reward was
-  telling the attacker to stop at two points.
-- Each round log carries `attack_metadata.curriculum`
-  (`algorithm`, `n_poisoners`, `cycle`, `block`, `position`, `block_round`).
-- `curriculum.enabled: false` (or no `curriculum:` block) restores the random draws.
+  `rounds_done` / `controller` / `attacker`, so a resume continues mid-block. Older
+  progress files fall back to `rounds_done`, which counts exactly the same rounds.
+- `curriculum.enabled: false` (or no `curriculum:` block) restores the random draw.
 
-## Attacker contract (client selection + attack-plan DSL)
+## Defender-LLM contract (classification)
 
-- **Input** (`agents/attacker_agent.build_user_prompt`): `round`,
-  `current_global_accuracy`, `attack_goal`, the client ids — `poison_client_ids` +
-  `n_poison_clients` under a fixed set, otherwise `controllable_client_ids` (the
-  pool it may touch) + `max_poison_clients` (this round's exact quota; legacy key
-  name) — a `layers` shape table, the `stats_key` / `whole_key` legends, and
-  `client_update_stats`
-  — per-layer + whole-model **statistics of each pool client's HONEST UPDATE**
-  `Δ = local − global` (`agents/attack_ops.delta_stats`), one positional array per
-  layer in `stats_key` order: `rel_update`
-  (‖Δ‖/‖G‖), `rms_delta`, `energy_frac`, `sign_flip_frac`, `std_ratio`,
-  `absmean_ratio`, and whole-model `cos_to_global`. Every value is normalized
-  against the **global model only** — never a median/mean/pairwise reference over
-  other clients (those are defender-only; a partial-insider attacker cannot
-  observe the honest majority) and never a pool baseline (the budget makes the
-  pool unstable and it is the poison target). This keeps the observation
-  dimensionless, architecture-independent, and budget-invariant. No raw weights.
-- **Output**: a single JSON object
-  `{"clients": [ {"id": <pool id>, "operations": [ {op, target, ...params}, ... ]}, ... ]}`.
-  The attacker **selects exactly the quota** of pool clients to poison and gives **each
-  its own plan**. Operators (`agents/attack_ops.py`, 10): `scale`, `sign_flip`,
-  `add_gaussian_noise`, `mask`, `clip`, `add_constant`, `permute`,
-  `scale_neurons`, `blend_random`, `quantize`. `target` is `"all"`, a layer name,
-  or a full parameter key — the exact names come from `client_update_stats` (for
-  MnistNet e.g. `"net.2"` / `"net.4.weight"`). Operations apply in order.
-- **Selection + application** (`agents/attacker_agent.select_and_apply` →
-  `attack_ops.apply_plan`): filters ids to the pool, dedups, truncates excess ids,
-  and fills an under-sized usable selection to the **exact quota** with remaining
-  pool ids and an emitted plan; per chosen client deep-copies its benign weights, applies its plan,
-  skips unknown ops / bad params / bad targets (counted, not fatal), then scrubs
-  NaN/Inf and clamps to `±max_weight_abs`. PyTorch does all arithmetic — the LLM
-  only emits the selection + plans. Shorthand inputs (`{"operations": [...]}`
-  shared plan, `{"clients":[ids], "operations":[...]}`) are accepted for
-  robustness, and parsing never raises.
-- **Effective poison only.** A selected client counts as poisoned **only if its
-  weights actually changed**. Unparseable output, an empty plan, ops that were all
-  skipped as invalid, and arithmetic no-ops (`scale factor=1.0`) all leave the
-  client's weights byte-identical to its honest update — the server receives an
-  honest update, so there is nothing to detect. Those clients are excluded from
-  the returned `poisoned_ids` and charged to `n_malformed` (a wasted client, a
-  reward penalty) instead. `poisoned_ids` may therefore be **empty**: a clean
-  round where the attacker selected clients and achieved nothing. Counting them as
-  poisoned made the ASR metric report 100% success for an attack that did nothing
-  and trained the defender to flag undetectable clients.
-
-## Defender-LLM contract (classification) — only under `defense.mode: llm`
-
-- **Input** (`agents/defender_agent.build_user_prompt`): per-client features
-  from `detector/features.compute_client_features` — **only** features, never the
-  ground truth.
+- **Input** (`agents/defender_agent.build_user_prompt`): per-client features from
+  `detector/features.compute_client_features` — **only** features, never the ground
+  truth, and never the ladder's current level.
   - Per layer (one per model layer; e.g. `net.2`, `net.4` for MnistNet): `l2_norm`,
     `rel_norm` (vs the median over all clients), `cos_to_median` (vs the
     coordinate-wise median over all clients — references include the scored client
     itself, not leave-one-out; with a benign majority the median is honest either
-    way), `sign_agreement` (fraction of coords matching the median sign — catches
-    sign-flip/targeted attacks that preserve norm).
+    way), `sign_agreement` (fraction of coords matching the median sign).
   - Whole model: `l2_norm`, `rel_norm`, `cos_to_mean`, `max_pairwise_cos`
     (FoolsGold), `dnc_score` (SVD spectral outlier).
-- **Output**: `{"clients": [{client_id, is_suspicious, confidence}, ...]}`
-  → one `DetectionVerdict` per client (missing/garbled entries default benign). A
-  short free-text `reason` per client is **off by default** to save generation
-  tokens (informational only — never used by the reward/metrics); re-enable it
-  with `emit_reason: true` in `configs/defender_agent.yaml`.
+- **Output**: `{"clients": [{client_id, is_suspicious, confidence}, ...]}` → one
+  `DetectionVerdict` per client (missing/garbled entries default benign). A short
+  free-text `reason` per client is **off by default** to save generation tokens
+  (informational only — never used by the reward/metrics); re-enable it with
+  `emit_reason: true` in `configs/defender_agent.yaml`.
+- **`confidence` is certainty in THIS verdict**, not a suspicion score: 1.0 = "I am
+  sure of the label I just gave". `DetectionVerdict.p_malicious` is the optional,
+  explicitly calibrated P(malicious), which the algorithmic defenses supply and
+  which carries a hard contract — `p ≥ 0.5` **iff** `is_suspicious`. See
+  `core/types.py` and `tests/test_p_malicious_calibration.py`.
 
-## Verifiable rewards (`rl/rewards.py`)
+## Verifiable reward (`rl/rewards.py`)
 
-Both continuous, so GRPO group advantages don't collapse.
+### The defender's reward — the only trained signal
 
-- **Attacker**: `α·drop_term(drop, target) + β·stealth·potency − γ·malformed_frac
-  + ζ·diversity·stealth·potency`.
+Confidence-weighted **soft-F1** vs the poisoned set (or `clip(TPR − λ·FPR)` with
+`mode: tpr_minus_fpr`). Continuous by design: GRPO's advantage *is* the
+within-group reward spread, and a hard hit/miss score would tie whenever several
+rollouts agree on the flags.
 
-  **Damage is the objective; stealth and collaboration are shaping.** They exist
-  only to keep the gradient dense while damage is near zero, and neither is worth
-  anything on its own, so the shaping budget is held below what a real attack earns:
+On a **clean round** (empty poisoned set — a ladder level that rounded to zero
+flips) F1 is undefined and would score a flawless defender 0, training it to
+invent detections. There the reward is `1 − mean soft P(malicious)` instead: it is
+rewarded for staying quiet.
 
-  > `β + ζ  <  α · (smallest drop worth calling an attack) / target`
-  > shipped: `0.10 + 0.05 = 0.15  <  5.0 · 0.01 / 0.10 = 0.5` (a 1pp drop)
+`_soft_malicious_prob` prefers a producer's calibrated `p_malicious` over the
+`(is_suspicious, confidence)` reconstruction. The reconstruction is correct for the
+LLM defender (which is asked for exactly that certainty) and **wrong** for a
+threshold filter, whose decision boundary is not at 0.5 — under it the soft signal
+ran backwards over the entire accepted half of the cohort.
 
-  Any genuine damage therefore outbids everything a non-damaging rollout can
-  collect, by >3× — measured against the best damage-free strategy available
-  (5 clients, maximal diversity, maximal potency, fully evading: 0.147, vs 0.549 for
-  a single 1pp drop).
+### The attack measurement — reported, never trained on
 
-  The invariant has now been lost three times, each time by changing one value in
-  isolation, so it is checked in three places rather than documented in one:
+`attack_effectiveness(clean, post, goal) = drop_term(clean − post, target)`.
 
-  - `rl.rewards.check_reward_balance` runs at the start of **every** run mode
-    (train / `--baseline` / `--dry-run`), logging the weights and WARNING (not
-    failing — an unbalanced reward is a legitimate experiment) when it breaks.
-  - `tests/test_attack_potency.py` asserts it directly against `configs/base.yaml`,
-    so drift fails the tests rather than a training run.
-  - Every round log carries a `reward_terms` block and every `system.log` round line
-    carries `att_reward=…(dmg=… stl=… mal=… col=… pot=…)`, so "which term is paying"
-    is readable during a run instead of back-solved afterwards.
+- **`drop = clean_reference_accuracy − post_accuracy`** — measured against **this
+  round's clean counterfactual**: the accuracy the aggregate reaches with the same
+  clients trained on the same data with their real labels
+  (`FLArmsRaceEnv.clean_reference_accuracy`, one extra test-set evaluation per
+  round, cached). It is *not* the previous round's post-attack accuracy: in a
+  continuing federation the attack's own damage becomes the next round's starting
+  point, so a previous-round reference measures the round-over-round *change* and a
+  repeated, equally damaging attack reads as ≈0 from the second round on.
 
-  The three failures, for the record: (1) moving `target` — which *divides* damage —
-  without moving `α`; (2) assuming the `potency` gate alone was enough, when a large,
-  evading, completely harmless perturbation passes that gate honestly and at `β=0.5`
-  still collected 0.245 against the 0.5 a 1pp drop paid; (3) `--baseline` and
-  `--dry-run` never reading `rl.reward.attacker` at all, so they scored on the bare
-  function defaults (`α=1.0, β=0.5`) — an inverted balance on the very paths used to
-  evaluate. All three run modes now take the weights from the config.
+  **When there is no counterfactual to measure** — the round's defense refused to
+  aggregate even the unpoisoned updates (FLTrust zeroing every trust score, DeFL
+  removing everyone in a CLP) — `clean_reference_accuracy` returns
+  `current_accuracy` as a placeholder and sets `clean_reference_measured = False`.
+  `RoundContext.clean_measured` carries it into the round log as
+  `clean_measured: false`. **Slice those rounds out before reporting damage.**
 
-  With `target` from the goal, `stealth` =
-  calibrated evasion over the chosen clients (`1 − p_malicious`, 0 when nothing was
-  poisoned), `malformed_frac = n_malformed / n_selected` (the waste penalty,
-  normalized over the clients the attacker *selected*), and
-  `diversity = 1 − mean pairwise cosine` of
-  the chosen clients' perturbations (the **collaboration** bonus, 0 for a single
-  client) — rewarding coordinated, distinct multi-client attacks over identical
-  Sybil-like clones. See `rl/rewards.py` (`attacker_reward`, `drop_term`,
-  `attack_potency`, `perturbation_diversity`).
+  **When the defense aggregated, but only after rejecting the honest majority** —
+  the counterfactual exists and looks perfectly ordinary, but it is a reading of the
+  defense's own false-positive rate. This is tested on the **unpoisoned** cohort,
+  where every flag is by definition a false positive, which is what keeps a
+  genuinely strong attack (which legitimately provokes flags) from being mistaken
+  for a broken defense. Exposed as `clean_defense_sane` → `RoundContext.defense_sane`
+  → `defense_sane: false` in the round log.
+- **`drop_term(drop, target)`** is `x = drop/target`: linear on `−0.5 ≤ x ≤ 1`
+  (hitting the goal scores exactly 1.0), then `1 + 0.5·(x−1)/(x−1+1)` above —
+  strictly increasing, asymptotic to 1.5 — and `−0.5 − 0.25·u/(u+1)` with
+  `u = −0.5 − x` below, strictly *decreasing*, asymptotic to −0.75. **No flat region
+  at either end**, so two rounds whose damage differs always differ here too. Both
+  saturations are fast (4× the target buys < 0.4 extra), so 1.0 keeps meaning "hit
+  the requested drop".
+- **`attack_was_damaging`** (`rl/switch.py`) is the reported pass/fail:
+  `drop ≥ win_fraction × target` (0.06 at the shipped 0.6 × 0.10). Shared with the
+  metrics tracker's `attack_success` so the two cannot drift apart.
 
-  - **`potency`** (`attack_potency`) is `mean_i s_i/(s_i+1)` over the poisoned
-    clients, with `s_i = ‖poisoned_i − benign_i‖ / ‖benign_i − global‖` — the poison
-    measured against the honest update it hides inside, in the same units the
-    defenses score (`Δ = w_i − global`), so it is dimensionless and
-    architecture-independent like everything else the attacker sees. It **gates the
-    stealth payment**, and that gate is load-bearing. Un-gated, `β·stealth` pays for
-    not being caught, and the cheapest way not to be caught is not to attack: a
-    poison one part in a thousand of the honest update is byte-different (so it
-    clears the `n_malformed` no-op check) and collects full stealth for zero damage.
-    In a recorded 262-round run the damage term supplied ~11% of the attacker's
-    reward and stealth the rest (mean 0.83 under FLTrust, 0.91 under Multi-Krum) at
-    a **median induced drop of 0.0000**, and the global model gained 0.097 accuracy
-    over the run it was being "attacked" through. The gate introduces no new
-    degenerate optimum in its place: a huge perturbation drives potency to 1 but is
-    flagged, so stealth — and with it the whole term — collapses, and a flagged
-    client is dropped from the aggregate so it earns no damage either. Both extremes
-    score ~0; only "big enough to hurt, subtle enough to pass" pays. Same argument
-    as the collaboration bonus's own gate: a term you can max out without attacking
-    is a term the policy farms instead of attacking.
-
-  - **`drop = clean_reference_accuracy − post_accuracy`** — the damage measured
-    against **this round's clean counterfactual**: the accuracy the aggregate
-    reaches with no poison (`FLArmsRaceEnv.clean_reference_accuracy`, one extra
-    test-set evaluation per round, cached). It is *not* the previous round's
-    post-attack accuracy. With `benign_retrain_each_round: false` the environment
-    is memoryless — every round's global is rebuilt from frozen benign weights
-    plus that round's poison — so a previous-round reference measured the
-    round-over-round *change*: an identical devastating attack scored high once
-    and ≈0 forever after, which put the schedule's `success_streak` gate
-    permanently out of reach. Against the clean counterfactual an attack that hits
-    its target scores the same every time, in either retrain mode.
-
-    **When there is no counterfactual to measure** — the round's defense refused to
-    aggregate even the unpoisoned updates (FLTrust zeroing every trust score, DeFL
-    removing everyone in a CLP) — `clean_reference_accuracy` returns
-    `current_accuracy` as a placeholder and sets `clean_reference_measured = False`.
-    Callers must check it: `RoundContext.clean_measured` carries it to the schedule,
-    which passes `skip_update=True` to `grpo_step` so the round still advances the
-    environment but applies **no gradient**, and the round log records
-    `clean_measured: false`. Returning the fallback silently was a real training bug:
-    it is the previous round's post-attack accuracy, and when the poisoned round also
-    failed to aggregate the post accuracy was that same number, so `drop` was
-    identically `+0.0000` by construction. About a quarter of the rounds in a
-    recorded run looked like a measured "the attack achieved nothing".
-
-    **When the defense aggregated, but only after rejecting the honest majority** —
-    the counterfactual exists and looks perfectly ordinary, but it is a reading of
-    the defense's own false-positive rate, and the drop between two such readings is
-    noise wearing the costume of an attack result. `clean_reference_accuracy` tests
-    this on the **unpoisoned** cohort, where every flag is by definition a false
-    positive, and exposes `FLArmsRaceEnv.clean_defense_sane` →
-    `RoundContext.defense_sane` → the same `skip_update=True` path as above, plus
-    `defense_sane: false` in the round log and a `SKIP-defense-broken` tag in
-    `system.log`. Testing it on the clean cohort rather than the poisoned one is
-    what keeps a genuinely strong attack (which legitimately provokes flags) from
-    being mistaken for a broken defense. This was silent for a whole recorded run:
-    45 of 262 rounds (17%) rejected the honest majority under FLTrust — mean FPR
-    0.43, peak 0.81 — `_warn_defense_malfunction` logged a warning after the fact,
-    and the policy was trained on every one of them anyway.
-  - **`drop_term(drop, target)`** is `x = drop/target`: linear on `−0.5 ≤ x ≤ 1`
-    (hitting the goal scores exactly 1.0), then `1 + 0.5·(x−1)/(x−1+1)` above —
-    strictly increasing, asymptotic to 1.5 — and `−0.5 − 0.25·u/(u+1)` with
-    `u = −0.5 − x` below, strictly *decreasing*, asymptotic to −0.75. Same value at
-    the goal and the same linear region as the old hard `clip(x, −0.5, 1.5)`; the
-    difference is that there is **no flat region at either end**.
-
-    Flat regions are a specific training failure, because GRPO's advantage *is* the
-    within-group reward spread: once every rollout lands in the same flat region they
-    tie, the spread collapses, and `grpo_step` skips the update. The overshoot flat
-    came first — the attacker stopped learning exactly when it got good at overshooting
-    `1.5·target`. The **backfire** flat matters once `target` is small: at a target of
-    `0.02`, `x < −0.5` means "the attack made the model more than 1pp *better* than the
-    clean counterfactual", which several rounds in a recorded run were well past, and
-    every such rollout used to score exactly `−0.5`. At the configured `0.10` the knee
-    sits at a 5pp improvement instead, so the backfire side is far less crowded — but
-    the term stays monotone either way, which is the point.
-
-    Both saturations are fast (4× the target buys < 0.4 extra), so the objective stays
-    "hit the requested drop", not "destroy the model", and a catastrophic backfire
-    stays bounded-bad instead of dominating.
-- **Defender** (train-time ground truth): confidence-weighted **soft-F1** vs the
-  poisoned set (or `clip(TPR − λ·FPR)`). On a **clean round** (empty poisoned set
-  — the attacker's plans were all no-ops) F1 is undefined and would score a
-  flawless defender 0, training it to invent detections; there the reward is
-  `1 − mean soft P(malicious)` instead, i.e. it is rewarded for staying quiet.
+These exist to answer a question the defender's own reward cannot: *was the thing
+it got good at catching actually an attack?* A run where the defender wins every
+round but `induced_drop` sits at zero is a defender that learned to detect a
+formality.
 
 ## GRPO + schedule
 
 - **`rl/grpo.py`**: sample `G` completions; reward each; advantage
-  `A_i = (r_i − mean)/(std + ε)`; loss
-  `mean_i[ −A_i·mean_t logπ(o_i,t) + β·mean_t KL_t ]` with the k3 KL estimator
+  `A_i = (r_i − mean)/max(std, std_floor)`; loss
+  `(1/Σ_i L_i)·Σ_i Σ_t [ −A_i·logπ(o_i,t) + β·KL_t ]` with the k3 KL estimator
   against the **frozen base model** (adapters disabled). Single-iteration ⇒ no
-  clipping needed. Reports the zero-advantage-group fraction (stall signal).
-- **`rl/policy.py`**: one Unsloth `Qwen2.5-3B-Instruct` base (bf16 LoRA by
-  default; 4-bit QLoRA optional via `rl.load_in_4bit`) + two PEFT LoRA
-  adapters (`attacker`, `defender`). `set_adapter` selects the active policy;
-  `disable_adapter` exposes the base as the KL reference.
-- **`rl/schedule.py`**: freeze-and-alternate — train attacker `K_a` rounds
-  (defender frozen, greedy), then defender `K_d` rounds (attacker frozen,
-  greedy), repeat. **With the algorithmic defense the rotation is attacker-only**
-  (`learners=("attacker",)`): one optimizer, no opponent generator, no league
-  swaps, and the defender adapter is neither loaded nor saved.
-  The best-scoring sampled action is committed to advance the
-  env. An **opponent league** snapshots adapters periodically and, with
-  probability `league_prob`, makes a phase face a random past snapshot. The league
-  is a **bounded ring buffer** (`league_max_snapshots`, default 10, oldest
-  evicted): each snapshot is a full CPU copy of one adapter's LoRA tensors
-  (~115 MB for Qwen2.5-3B at `lora_r: 16`), so an unbounded pool grew past 20 GB
-  of host RAM within ~10k rounds and eventually OOM'd the box.
-- **Switch trigger** (`best_response` mode): a phase freezes-and-switches as soon
-  as the learner wins `success_streak` (default **3**) committed rounds **in a
-  row**. `min_phase_rounds` is set equal to `success_streak`, so there is no
-  extra minimum-length gate — 3 consecutive wins is the whole condition (a
-  `max_phase_rounds` cap still forces a switch if the win never comes).
+  clipping needed. **Token-level normalization**, not sequence-mean: the defender
+  emits one verdict object per client, so output length scales with `fl.n_clients`
+  and a rollout that omits clients is shorter — the old per-rollout mean rewarded
+  terser (more incomplete) verdicts.
+  - **Degeneracy is decided by absolute reward SPREAD** (`min_reward_spread`,
+    0.02), not by `std < 1e-6`. The reward is a soft F1 over per-client
+    confidences, so two behaviourally identical verdict-sets routinely differ by a
+    hair; treating that as signal meant z-scoring sampling noise up to
+    full-magnitude advantages.
+  - **`resample_on_zero_advantage`** re-draws the group once at a higher
+    temperature; **`skip_zero_advantage`** then skips the optimizer step entirely
+    rather than stepping on a pure KL-to-base signal (which is active un-learning).
+  - **Where the spread comes from:** all `G` rollouts classify the *same* cohort, so
+    the only source of variation is `rl.temperature` (default 1.0). At 0 every
+    rollout is identical and no step is ever taken.
+- **`rl/policy.py`**: one Unsloth `Qwen2.5-3B-Instruct` base (bf16 LoRA by default;
+  4-bit QLoRA optional via `rl.load_in_4bit`) + one PEFT LoRA adapter (`defender`).
+  `set_adapter` selects the active policy; `disable_adapter` exposes the base as the
+  KL reference. The multi-adapter machinery is kept — it costs nothing with one
+  adapter and is what would let a second trainable agent be added back.
+- **`rl/turns.py`**: `DefenderTurn` binds one round to the defender policy. It does
+  not sample an attack — the env has already produced the round's poisoned updates
+  by the time `begin_round` returns, which is exactly the property the old design
+  needed a frozen-attacker sample to obtain. Its `commit()` is where
+  `env.record_detection` fires.
+- **`rl/schedule.py`**: defender phases. A phase runs until the defender sustains a
+  win (`success_streak` consecutive rounds catching every poisoned client without
+  over-flagging) or hits `max_phase_rounds`; the adapter is then snapshotted into
+  the league and persisted. This still earns its place because the opponent is not
+  static: winning a phase means the ladder has been driven down, so the phase
+  boundary checkpoints the defender at each rung it has actually mastered.
+  - **The committed rollout is an on-policy draw** (`rl.commit_selection: sample`),
+    not the argmax. Committing the best-of-G would corrupt the attack schedule as
+    well as the metrics: the ladder reacts to the committed verdicts, so it would be
+    calibrated to the policy's luckiest sample rather than its actual behaviour. The
+    argmax is still logged as `best_index` next to `committed_index`.
+  - The **league** is a bounded ring buffer (`league_max_snapshots`, default 10,
+    oldest evicted) of past defender checkpoints; each is a full CPU copy of the
+    adapter's LoRA tensors (~115 MB at `lora_r: 16`), so an unbounded pool OOMs a
+    long run. With no opponent policy left there is nothing to swap them into — they
+    are retained for inspection, not played against.
 - **Between-phase benign FL round** (`fl_interlude_between_phases`, default on):
-  before EVERY phase after the first — i.e. right before the incoming learner
-  starts GRPO — the schedule runs ONE honest FL round exactly like Phase 1
-  (`FLArmsRaceEnv.run_benign_fl_round`): all benign clients retrain from the
-  current global, FedAvg into a new global, and the freshly trained per-client
-  weights REPLACE the frozen benign references. So each new attacker/defender
-  phase (and the frozen opponent + aggregator) trains against an advanced client
-  state rather than the same frozen Phase-1 weights. The interlude gets its own
-  sequential round number and is logged to `logs/system.log`,
-  `logs/round_data/rounds.jsonl` (`attack_metadata.event="benign_fl_round"`)
-  and `logs/debug.json`.
+  before every phase after the first, one honest FL round runs exactly like Phase 1
+  (`FLArmsRaceEnv.run_benign_fl_round`) — all clients retrain from the current
+  global with real labels, FedAvg into a new global, and the freshly trained
+  per-client weights replace the stored references. **No effect while
+  `fl.freeze_global_in_phase2` is true**: advancing the shared global is precisely
+  what a simulated round must not do, so it skips and logs.
 
 ## Modes (`main.py`)
 
@@ -391,13 +358,16 @@ Both continuous, so GRPO group advantages don't collapse.
 |------|------|------|-----|
 | Train | *(default)* | `rl/policy.py` + `rl/schedule.py` (GRPO) | yes |
 | Dry-run | `--dry-run` | `rl/inference.py` (frozen Ollama/OpenAI), full loop, no updates | no |
-| Baseline | `--baseline` | `rl/baseline.py` best-of-N fixed actions, no LLM | no |
+| Baseline | `--baseline` | `rl/baseline.py` — no LLM at all | no |
 
-All three run against whichever defense `defense.mode` selects. Under
-`algorithmic` the defender LLM is never called, so `--dry-run` makes one LLM call
-per round (the attacker) instead of two, and `--baseline` scores its fixed
-actions against the round's real algorithm rather than the built-in norm
-heuristic (which is only used under `defense.mode: llm`).
+The attack needs no model in any mode. Under `defense.mode: llm`, `--dry-run`
+makes one LLM call per round (the defender) and `--baseline` uses a fixed
+norm/sign heuristic in its place; under `algorithmic` neither calls a model at all.
+Training requires `llm`.
+
+The ladder adapts in every mode — `--dry-run` and `--baseline` call
+`env.record_detection` exactly as training does, so their logs show the same
+saw-tooth a training run would produce.
 
 All three honour `--rounds N` (an absolute budget overriding `fl.simulation_rounds`)
 and `--config <path>`. `--debug` without `--rounds` caps how many rounds **this
@@ -407,50 +377,65 @@ rounds instead of exiting immediately.
 ## Checkpoints & resume
 
 - `checkpoints/global_model.pt`, `client_updates.pt`, `baseline.json` — Phase 1.
-- `checkpoints/attacker_adapter/`, `checkpoints/defender_adapter/` — LoRA adapters
+- `checkpoints/defender_adapter/` — the LoRA adapter
   (`adapter_model.safetensors` + `adapter_config.json`).
+- `checkpoints/fl_state.pt` — the live Phase-2 FL state (evolving global + per-client
+  weights + accuracy + round index).
 - `checkpoints/rl_progress.json` — resume state:
-  `{"rounds_done", "round_index", "controller"}`. `rounds_done` is the GRPO-step
-  counter; `round_index` is the FL round-number counter (so round labels and
-  `logs/round_data/rounds.jsonl` continue instead of restarting from the first
-  Phase-2 round); `controller` is the `PhaseController` snapshot
-  (`learner`, `phase_index`, `phase_round`, `streak`, `capped`) so the arms-race
-  schedule continues where it left off. Written together with the adapters on the
-  `rl.save_every` cadence and on exit. Older files with only `rounds_done` still
-  load (the missing fields fall back: `round_index`→`rounds_done`, `controller`→a
-  fresh schedule).
-- Rerunning resumes: adapters + `rounds_done` + `round_index` + `controller` are all
-  reloaded. The env still re-derives its weights from the Phase-1 baseline (the model
-  state lives in the adapters), but the round counter and schedule pick up in place.
-  **Not** persisted: the in-memory opponent **league** (snapshots restart empty).
+  `{"rounds_done", "round_index", "controller", "curriculum", "attacker"}`.
+  - `rounds_done` — the GRPO-step counter.
+  - `round_index` — the FL round-number counter, so round labels and
+    `logs/round_data/rounds.jsonl` continue instead of restarting.
+  - `controller` — the `PhaseController` snapshot (`learner`, `phase_index`,
+    `phase_round`, `streak`, `capped`).
+  - `curriculum` — the defense sweep's position.
+  - **`attacker` — the label-flip ladder's `level` and `cycle`.** Without it a
+    restart rewinds the attack to full poison and replays strengths the defender is
+    already past, making the schedule depend on how often the run happened to crash.
+    Saved with the grid (`start`/`step`/`n_levels`) so a config edit between runs is
+    detectable rather than silently re-interpreting a saved level as a different
+    fraction.
+
+  Written together with the adapter on the `rl.save_every` cadence and on exit.
+  Older files with any field missing still load (each falls back safely; a
+  controller that says `learner: "attacker"` — from before the attacker LLM was
+  removed — continues as the defender with a warning).
+- **Not** persisted: the in-memory checkpoint league (it restarts empty).
 
 ## Logs
 
 Per-round records are **appended to a JSONL stream** (one JSON object per line)
-rather than written one file per round. At the configured `fl.simulation_rounds`
-a file-per-round sink produced millions of tiny files across two directories,
-exhausting inodes and making the directories unusable; appending is O(1) per round
-and stays greppable. `monitor.py` and `visualize_rounds.py` read the JSONL **and**
-legacy `round_NNN.json` files, so logs from older runs still load.
+rather than written one file per round. At the configured `fl.simulation_rounds` a
+file-per-round sink produced millions of tiny files across two directories,
+exhausting inodes; appending is O(1) per round and stays greppable. `monitor.py`
+and `visualize_rounds.py` read the JSONL **and** legacy `round_NNN.json` files, so
+logs from older runs still load.
 
 - `logs/system.log` — run log.
-- `logs/round_data/rounds.jsonl` — per round: `attack_goal`,
-  `poisoned_client_ids`, `predicted_labels`, accuracies, `attacker_reward`,
-  `defender_reward`, `learning_agent`, and an `attack_metadata` block with
-  `clean_accuracy` / `induced_drop` (the counterfactual and the damage the reward
-  actually uses), `clean_measured` / `defense_sane` (**slice both `false` cases out
-  before reporting damage** — no gradient was applied on them either),
-  `attack_potency` (how hard the committed attack actually pushed; near 0 next to a
-  high reward means the policy is farming stealth rather than attacking),
-  `attack_diversity`, `n_malformed`, `budget`, `n_used`, `defense` (which algorithm
-  faced the round, or `"llm"` — rounds are only comparable within one defense),
-  plus a `train` sub-block (loss, mean reward, zero-advantage fraction).
+- `logs/round_data/rounds.jsonl` — per round: `attack_goal`, `poisoned_client_ids`,
+  `predicted_labels`, accuracies, `attack_effectiveness`, `defender_reward`,
+  `learning_agent`, and an `attack_metadata` block with:
+  - `flip_fraction` / `flip_plan` / `n_flipped` — **the attack**: the ladder level
+    the round was sent at, and how many labels that meant per client.
+  - `ladder` — where it moved after seeing the verdicts (`caught`, `caught_rule`,
+    `event` ∈ `hold`/`step_down`/`reset`, `next_flip_fraction`, `level`, `cycle`).
+    The run's whole attack schedule is recoverable from its own logs.
+  - `clean_accuracy` / `induced_drop` — the counterfactual and the damage.
+  - `clean_measured` / `defense_sane` — **slice both `false` cases out before
+    reporting damage**; they measure the defense, not the attack.
+  - `attack_effectiveness` / `attack_damaging` — the normalized damage and whether
+    it cleared the reporting bar.
+  - `defense` — which algorithm faced the round, or `"llm"`. Rounds are only
+    comparable within one defense.
+  - `curriculum`, `phase_index`, `phase_round`, `learner_success`, and a `train`
+    sub-block (loss, mean reward, reward spread, zero-advantage fraction,
+    `committed_index` vs `best_index`, `stepped`, `resampled`).
 - `logs/metrics/rounds.jsonl` + `summary.json` — ground-truth confusion / TPR /
-  FPR / ASR / APR. `summary.json`'s `aggregate` covers every round; its
-  `per_round` block is the retained tail (`MetricsTracker.keep_rounds`, default
-  2000) — the full history is in `rounds.jsonl`.
-- `logs/debug.json` (`--debug`) — structured event stream, capped at the most
-  recent `DebugLogger.MAX_EVENTS` events (the file is rewritten in full each
-  round, so an unbounded buffer made long debug runs O(n²)). `events_dropped`
-  records how many were evicted.
+  FPR / ASR / APR. `summary.json`'s `aggregate` covers every round; its `per_round`
+  block is the retained tail (`MetricsTracker.keep_rounds`, default 2000) — the full
+  history is in `rounds.jsonl`.
+- `logs/debug.json` (`--debug`) — structured event stream, capped at the most recent
+  `DebugLogger.MAX_EVENTS` events (the file is rewritten in full each round, so an
+  unbounded buffer made long debug runs O(n²)). `events_dropped` records how many
+  were evicted.
 - `logs/visualizations/report.html` — `python visualize_rounds.py`.

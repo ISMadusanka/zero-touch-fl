@@ -75,17 +75,19 @@ _PROGRESS_FILE = "rl_progress.json"
 
 
 def save_progress(rounds_done: int, round_index: int | None = None,
-                  controller: dict | None = None, curriculum: dict | None = None):
+                  controller: dict | None = None, curriculum: dict | None = None,
+                  attacker: dict | None = None):
     """Persist Phase-2 resume state.
 
     Backward compatible: ``rounds_done`` is always written. For a FULL resume we also
     persist ``round_index`` (the FL round-number counter, so round labels and
     ``logs/round_data`` continue across restarts instead of overwriting from the first
-    Phase-2 round), ``controller`` (the arms-race ``PhaseController`` snapshot, so
-    the learner/phase/streak resume instead of restarting at the first attacker phase),
-    and ``curriculum`` (the :class:`rl.curriculum.TrainingCurriculum` position, so the
-    (defense, #poisoners) sweep continues mid-block instead of restarting at the first
-    algorithm with one poisoner on every restart).
+    Phase-2 round), ``controller`` (the ``PhaseController`` snapshot, so the
+    phase/streak resume instead of restarting at phase 0), ``curriculum`` (the
+    :class:`rl.curriculum.TrainingCurriculum` position, so the defense sweep continues
+    mid-block), and ``attacker`` (the label-flip ladder's level and cycle, so the
+    attack resumes at the strength it had reached instead of restarting at full poison
+    and replaying levels the defender has already been trained past).
     """
     _ensure_dir()
     payload = {"rounds_done": int(rounds_done)}
@@ -95,13 +97,16 @@ def save_progress(rounds_done: int, round_index: int | None = None,
         payload["controller"] = controller
     if curriculum is not None:
         payload["curriculum"] = curriculum
+    if attacker is not None:
+        payload["attacker"] = attacker
     with open(os.path.join(CHECKPOINT_DIR, _PROGRESS_FILE), "w") as f:
         json.dump(payload, f)
 
 
 def load_progress() -> dict:
     """Return the Phase-2 resume state as a dict: ``{"rounds_done": int,
-    "round_index": int|None, "controller": dict|None, "curriculum": dict|None}``.
+    "round_index": int|None, "controller": dict|None, "curriculum": dict|None,
+    "attacker": dict|None}``.
 
     Old progress files that only hold ``rounds_done`` load fine (the new keys come
     back ``None`` → the caller falls back gracefully); a missing or corrupt file
@@ -115,10 +120,11 @@ def load_progress() -> dict:
             "round_index": data.get("round_index"),
             "controller": data.get("controller"),
             "curriculum": data.get("curriculum"),
+            "attacker": data.get("attacker"),
         }
     except (FileNotFoundError, ValueError, TypeError):
         return {"rounds_done": 0, "round_index": None, "controller": None,
-                "curriculum": None}
+                "curriculum": None, "attacker": None}
 
 
 def adapter_exists(path: str) -> bool:

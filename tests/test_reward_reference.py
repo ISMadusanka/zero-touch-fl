@@ -1,21 +1,20 @@
-"""Regression tests for the attacker/defender reward semantics (rl/rewards.py).
+"""Regression tests for the reward semantics (rl/rewards.py).
 
-Locks in three fixes:
+The defender's reward is the only trained signal; ``attack_effectiveness`` is a
+reported measurement of how much the round's flipped labels cost the model.
+Locked in here:
 
-1. Damage is measured against the round's CLEAN counterfactual, so an attack that
-   hits its target scores the same every time it hits it — the previous
-   "prev round's post-attack accuracy" reference made a repeated, equally
-   devastating attack score ~0 from the second round on, which put the
-   schedule's ``success_streak`` gate permanently out of reach.
-2. The damage term is strictly monotonic above the goal instead of flat, so a
-   group of competent rollouts no longer collapses to zero advantage (which made
-   ``grpo_step`` skip the update exactly when the attacker got good).
-3. A round with no effective poison is scored sanely for BOTH agents: the
-   defender is rewarded for staying quiet instead of being handed an undefined
-   F1 of 0, and the attacker is charged the full waste penalty.
+1. Damage is measured against the round's CLEAN counterfactual, so an attack of a
+   given strength scores the same every time it is sent — a "previous round's
+   accuracy" reference would make a repeated, equally damaging attack read as ~0
+   from the second round on.
+2. The damage term is strictly monotonic at BOTH ends instead of flat, so it
+   still separates rounds that all overshoot (or all backfire).
+3. A round with no effective poison — a ladder level that rounded to zero flips —
+   is scored sanely: the defender is rewarded for staying quiet instead of being
+   handed an undefined F1 of 0.
 
-Torch-free except for ``perturbation_diversity`` (not used here):
-    python tests/test_reward_reference.py
+Torch-free:  python tests/test_reward_reference.py
 """
 import os
 import sys
@@ -24,35 +23,38 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.types import DetectionVerdict  # noqa: E402
 from rl.rewards import (  # noqa: E402
-    attacker_reward, defender_reward, drop_term, group_advantages,
+    attack_effectiveness, defender_reward, drop_term, goal_target, group_advantages,
 )
 
 GOAL = {"type": "untargeted_degrade", "target_accuracy_drop": 0.20}
 
 
-def _evaded(ids, n_clients=20):
-    """Every client passes as benign (confidently) -> full stealth for poisoners."""
-    return [DetectionVerdict(cid, False, 1.0, "") for cid in range(n_clients)]
-
-
 # --- 1. clean-reference semantics -------------------------------------------
 
 def test_identical_attack_scores_identically_every_round():
-    """The memoryless env rebuilds the same aggregate each round, so the same
-    attack must earn the same reward each round."""
+    """Each round rebuilds its own counterfactual from the same anchor, so the
+    same attack strength must measure the same every round."""
     clean, post = 0.90, 0.60          # this round's unpoisoned acc vs achieved acc
-    r = [attacker_reward(clean, post, GOAL, [0], _evaded([0]), 0)
-         for _ in range(3)]
+    r = [attack_effectiveness(clean, post, GOAL) for _ in range(3)]
     assert r[0] == r[1] == r[2]
     assert r[0] > 1.0                 # a 0.30 drop against a 0.20 target
 
 
-def test_reward_tracks_goal_attainment_not_round_over_round_change():
-    half = attacker_reward(0.90, 0.80, GOAL, [0], _evaded([0]), 0)
-    full = attacker_reward(0.90, 0.70, GOAL, [0], _evaded([0]), 0)
+def test_effectiveness_tracks_goal_attainment():
+    half = attack_effectiveness(0.90, 0.80, GOAL)
+    full = attack_effectiveness(0.90, 0.70, GOAL)
     assert full > half
-    # drop == target -> damage term is exactly 1.0 (plus the 0.5 stealth bonus).
-    assert abs(full - (1.0 + 0.5)) < 1e-9
+    # drop == target -> exactly 1.0, by construction.
+    assert abs(full - 1.0) < 1e-9
+    # No damage -> 0.0; a backfire (the model got BETTER) -> negative.
+    assert abs(attack_effectiveness(0.90, 0.90, GOAL)) < 1e-9
+    assert attack_effectiveness(0.90, 0.95, GOAL) < 0.0
+
+
+def test_goal_target_reads_both_goal_shapes():
+    assert abs(goal_target(GOAL) - 0.20) < 1e-9
+    assert abs(goal_target({"type": "slow_degrade", "per_round_drop": 0.02}) - 0.02) < 1e-9
+    assert goal_target({}) > 0.0      # never zero, so the division is always safe
 
 
 # --- 2. no flat region at EITHER end ----------------------------------------
@@ -71,14 +73,10 @@ def test_drop_term_is_bounded_and_strictly_increasing_past_the_goal():
 
 
 def test_drop_term_is_bounded_and_strictly_decreasing_past_a_backfire():
-    """The mirror of the overshoot fix, and it matters at the configured target.
-
-    ``x < -0.5`` means "the attack made the model more than 0.5*target BETTER than the
-    clean counterfactual". With target 0.02 that is a 1pp improvement — several rounds
-    in a recorded run were well past it, and the old hard floor scored every one of
-    them at exactly -0.5, so a whole group of backfiring rollouts tied and GRPO skipped
-    the update.
-    """
+    """The mirror of the overshoot property. ``x < -0.5`` means "the round made the
+    model more than 0.5*target BETTER than the clean counterfactual", which a weak
+    ladder level on a small target reaches routinely — a hard floor there would
+    make every such round report exactly -0.5 and hide the differences."""
     xs = [-0.5, -0.75, -1.0, -2.0, -5.0, -20.0]
     vals = [drop_term(x * 0.02, 0.02) for x in xs]
     assert all(b < a for a, b in zip(vals, vals[1:])), vals
@@ -86,83 +84,20 @@ def test_drop_term_is_bounded_and_strictly_decreasing_past_a_backfire():
     assert min(vals) > -0.75                   # still bounded-bad, not unbounded
 
 
-def test_backfiring_group_keeps_a_learning_signal():
-    """The concrete failure the smooth floor prevents: four rollouts that all improve
-    the model must still be ORDERED, so the least-bad one is reinforced."""
-    small_goal = {"type": "untargeted_degrade", "target_accuracy_drop": 0.02}
-    posts = [0.81, 0.83, 0.86, 0.90]           # drops -0.01 / -0.03 / -0.06 / -0.10
-    rs = [attacker_reward(0.80, p, small_goal, [0], _evaded([0]), 0) for p in posts]
-    assert len(set(rs)) == len(rs), rs
-    assert all(b < a for a, b in zip(rs, rs[1:])), rs   # worse backfire -> less reward
-    _adv, zero_frac = group_advantages(rs)
-    assert zero_frac == 0.0
-
-
-# --- 2b. the collaboration bonus is not free money --------------------------
-
-def test_collaboration_bonus_requires_evading_detection():
-    """Diversity is almost free to maximize (emit distinct per-client plans and it goes
-    to ~1.0 regardless of whether the attack works), so paying for it unconditionally
-    was a reward-hacking channel: one recorded round collected 0.197 of collaboration
-    bonus while every poisoned client was detected and the model got *better*."""
-    caught = [DetectionVerdict(i, True, 1.0, "", p_malicious=1.0) for i in range(4)] + [
-        DetectionVerdict(i, False, 1.0, "", p_malicious=0.0) for i in range(4, 20)]
-    evaded = [DetectionVerdict(i, False, 1.0, "", p_malicious=0.0) for i in range(20)]
-    ids = [0, 1, 2, 3]
-
-    # Caught: the bonus is gated to zero, so diversity changes nothing.
-    r_caught_diverse = attacker_reward(0.80, 0.80, GOAL, ids, caught, 0,
-                                       zeta=0.2, diversity=1.0)
-    r_caught_clones = attacker_reward(0.80, 0.80, GOAL, ids, caught, 0,
-                                      zeta=0.2, diversity=0.0)
-    assert abs(r_caught_diverse - r_caught_clones) < 1e-9
-
-    # Evaded: coordination is worth its full weight.
-    r_evaded_diverse = attacker_reward(0.80, 0.80, GOAL, ids, evaded, 0,
-                                       zeta=0.2, diversity=1.0)
-    r_evaded_clones = attacker_reward(0.80, 0.80, GOAL, ids, evaded, 0,
-                                      zeta=0.2, diversity=0.0)
-    assert abs((r_evaded_diverse - r_evaded_clones) - 0.2) < 1e-9
-
-
-def test_collaboration_bonus_stays_the_smallest_term():
-    """It must never out-earn damage, or it becomes the policy's shortcut."""
-    goal = {"type": "untargeted_degrade", "target_accuracy_drop": 0.02}
-    evaded = [DetectionVerdict(i, False, 1.0, "", p_malicious=0.0) for i in range(20)]
-    ids = [0, 1]
-    # A realistically achievable 1pp drop...
-    damage_gain = (attacker_reward(0.80, 0.79, goal, ids, evaded, 0, zeta=0.2, diversity=0.0)
-                   - attacker_reward(0.80, 0.80, goal, ids, evaded, 0, zeta=0.2, diversity=0.0))
-    # ...versus perfect coordination on a round that did nothing.
-    collab_gain = (attacker_reward(0.80, 0.80, goal, ids, evaded, 0, zeta=0.2, diversity=1.0)
-                   - attacker_reward(0.80, 0.80, goal, ids, evaded, 0, zeta=0.2, diversity=0.0))
-    assert damage_gain > collab_gain, (damage_gain, collab_gain)
-
-
-def test_competent_group_keeps_a_learning_signal():
-    """Four rollouts that all overshoot the target used to tie at the 1.5 clip →
-    zero advantage → grpo_step skipped the step. They must now separate."""
-    posts = [0.45, 0.30, 0.18, 0.09]          # drops 0.45 / 0.60 / 0.72 / 0.81
-    rs = [attacker_reward(0.90, p, GOAL, [0], _evaded([0]), 0)
-          for p in posts]
-    assert len(set(rs)) == len(rs), rs
-    _adv, zero_frac = group_advantages(rs)
-    assert zero_frac == 0.0
-    assert all(b > a for a, b in zip(rs, rs[1:]))     # more damage -> more reward
-
-
 def test_overshoot_is_worth_much_less_than_reaching_the_goal():
-    """Saturation must stay fast: the objective is 'hit the target', not
-    'destroy the model'."""
+    """Saturation stays fast, so 1.0 keeps meaning 'hit the target'."""
     at_goal = drop_term(0.20, 0.20)
     quadruple = drop_term(0.80, 0.20)
     assert at_goal == 1.0
     assert quadruple - at_goal < 0.4          # 4x the target buys < 0.4 extra
 
 
-# --- 3. clean rounds (no effective poison) ----------------------------------
+# --- 3. the defender's reward -----------------------------------------------
 
 def test_defender_rewarded_for_silence_on_a_clean_round():
+    """A ladder level that rounds to zero flips leaves every update honest. F1 is
+    undefined there and scoring a flawless defender 0 would train it to invent
+    detections; staying quiet is the win condition instead."""
     quiet = defender_reward([DetectionVerdict(i, False, 1.0, "") for i in range(20)], [])
     unsure = defender_reward([DetectionVerdict(i, False, 0.0, "") for i in range(20)], [])
     noisy = defender_reward([DetectionVerdict(i, True, 1.0, "") for i in range(20)], [])
@@ -171,7 +106,7 @@ def test_defender_rewarded_for_silence_on_a_clean_round():
     assert abs(noisy - 0.0) < 1e-9
 
 
-def test_defender_still_scored_on_f1_when_poison_exists():
+def test_defender_scored_on_soft_f1_when_poison_exists():
     verdicts = [DetectionVerdict(0, True, 1.0, "")] + [
         DetectionVerdict(i, False, 1.0, "") for i in range(1, 20)]
     assert abs(defender_reward(verdicts, [0]) - 1.0) < 1e-6      # perfect catch
@@ -179,22 +114,51 @@ def test_defender_still_scored_on_f1_when_poison_exists():
     assert defender_reward(missed, [0]) < 0.01                   # missed it entirely
 
 
-def test_attacker_punished_for_a_wasted_round():
-    """No effective poison: no damage, no stealth, full waste penalty."""
-    r = attacker_reward(0.90, 0.90, GOAL, [], _evaded([]), 1)
-    assert abs(r - (-1.0)) < 1e-9
-    # Selecting three clients and wasting all three is no worse per-client...
-    assert abs(attacker_reward(0.90, 0.90, GOAL, [], _evaded([]), 3)
-               - (-1.0)) < 1e-9
-    # ...but wasting 1 of 2 selected is only half the penalty.
-    half = attacker_reward(0.90, 0.90, GOAL, [1], _evaded([1]), 1)
-    assert abs(half - (0.0 + 0.5 * 1.0 - 1.0 * 0.5)) < 1e-9
+def test_defender_reward_is_continuous_in_confidence():
+    """The soft F1 is what gives GRPO a gradient when several rollouts agree on the
+    hard flags but differ in how sure they are."""
+    def r(conf):
+        return defender_reward(
+            [DetectionVerdict(0, True, conf, "")]
+            + [DetectionVerdict(i, False, 1.0, "") for i in range(1, 20)], [0])
+    vals = [r(c) for c in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    assert all(b > a for a, b in zip(vals, vals[1:])), vals
 
 
-def test_doing_nothing_scores_worse_than_a_real_attack():
-    nothing = attacker_reward(0.90, 0.90, GOAL, [], _evaded([]), 1)
-    real = attacker_reward(0.90, 0.75, GOAL, [0], _evaded([0]), 0)
-    assert real > nothing + 1.0
+def test_defender_group_keeps_a_learning_signal():
+    """Four verdict sets of differing quality must separate, or the advantages
+    collapse and grpo_step skips the update."""
+    def r(n_caught):
+        poisoned = [0, 1, 2, 3]
+        v = [DetectionVerdict(i, i < n_caught, 1.0, "") for i in range(4)]
+        v += [DetectionVerdict(i, False, 1.0, "") for i in range(4, 20)]
+        return defender_reward(v, poisoned)
+    rs = [r(n) for n in (0, 1, 2, 4)]
+    assert all(b > a for a, b in zip(rs, rs[1:])), rs
+    _adv, zero_frac = group_advantages(rs)
+    assert zero_frac == 0.0
+
+
+def test_tpr_minus_fpr_mode_penalises_false_positives():
+    poisoned = [0]
+    perfect = [DetectionVerdict(0, True, 1.0, "")] + [
+        DetectionVerdict(i, False, 1.0, "") for i in range(1, 11)]
+    over = [DetectionVerdict(i, True, 1.0, "") for i in range(6)] + [
+        DetectionVerdict(i, False, 1.0, "") for i in range(6, 11)]
+    assert defender_reward(perfect, poisoned, mode="tpr_minus_fpr") == 1.0
+    assert defender_reward(over, poisoned, mode="tpr_minus_fpr") < 1.0
+
+
+def test_calibrated_p_malicious_is_preferred_over_confidence():
+    """Algorithmic defenses report a boundary-calibrated p_malicious; the
+    (is_suspicious, confidence) reconstruction is only the fallback."""
+    poisoned = [0]
+    others = [DetectionVerdict(i, False, 1.0, "", p_malicious=0.0) for i in range(1, 11)]
+    strong = defender_reward(
+        [DetectionVerdict(0, True, 0.0, "", p_malicious=1.0)] + others, poisoned)
+    weak = defender_reward(
+        [DetectionVerdict(0, True, 0.0, "", p_malicious=0.55)] + others, poisoned)
+    assert strong > weak, "p_malicious must drive the reward, not `confidence`"
 
 
 def _run():

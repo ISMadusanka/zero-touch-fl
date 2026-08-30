@@ -22,31 +22,31 @@ N_CLIENTS = 6
 TRAINING_ROUNDS = 10
 
 
-def _loader(seed: int, n: int = 64):
+def _loader(seed: int, n: int = 64, shuffle: bool = True):
     g = torch.Generator().manual_seed(seed)
     return DataLoader(
         TensorDataset(torch.randn(n, 1, 28, 28, generator=g),
                       torch.randint(0, 10, (n,), generator=g)),
-        batch_size=32, shuffle=True)
+        batch_size=32, shuffle=shuffle)
 
 
-def _env(benign_retrain=False):
+def _env(freeze: bool = False, shuffle: bool = True):
     cfg = {
-        # freeze_global_in_phase2: False — the counterfactual's interaction with a
-        # MOVING global (it must be invalidated when the shared model advances) is
-        # what several of these tests are about. Its behaviour on frozen simulated
-        # rounds is covered by tests/test_frozen_rounds.py.
+        # freeze_global_in_phase2 defaults to False here — the counterfactual's
+        # interaction with a MOVING global (it must be invalidated when the shared
+        # model advances) is what several of these tests are about. Its behaviour on
+        # frozen simulated rounds is covered by tests/test_frozen_rounds.py.
         "fl": {"n_clients": N_CLIENTS, "device": "cpu",
-               "benign_retrain_each_round": benign_retrain,
-               "freeze_global_in_phase2": False,
-               "training_rounds": TRAINING_ROUNDS, "n_compromisable": 2,
-               "lr": 0.05, "local_epochs": 1},
-        "attack": {"goal": {"type": "untargeted_degrade", "target_accuracy_drop": 0.20},
-                   "max_poison_clients": 2, "sample_budget_in_training": False},
+               "freeze_global_in_phase2": freeze,
+               "training_rounds": TRAINING_ROUNDS,
+               "lr": 0.05, "local_epochs": 1, "poison_seed": 0},
+        "attack": {"type": "label_flip", "poison_client_ids": [0],
+                   "goal": {"type": "untargeted_degrade", "target_accuracy_drop": 0.20}},
     }
-    loaders = [_loader(i) for i in range(N_CLIENTS)]
+    loaders = [_loader(i, shuffle=shuffle) for i in range(N_CLIENTS)]
     env = FLArmsRaceEnv(cfg, loaders, _loader(99, n=128), random.Random(0))
     from model.mnist_net import MnistNet
+    torch.manual_seed(1234)
     gw = {k: v.clone() for k, v in MnistNet().state_dict().items()}
     cw = [{k: v + torch.randn_like(v) * 0.01 for k, v in gw.items()}
           for _ in range(N_CLIENTS)]
@@ -56,6 +56,23 @@ def _env(benign_retrain=False):
 
 def _wreck(sd):
     return {k: v * -50.0 for k, v in sd.items()}
+
+
+def _wrecked_updates(env, ids=(0,)):
+    """This round's cohort with ``ids`` replaced by a blatantly poisoned update.
+
+    Built here rather than through the env because the real attack is a LABEL FLIP
+    — a genuine SGD trajectory that deliberately sits inside the honest update
+    distribution, and on these synthetic random-label loaders it barely moves the
+    aggregate. These tests are about the env's REFERENCE BOOKKEEPING, so they need
+    an update whose effect on the aggregate is unmistakable.
+    """
+    from core.types import ModelUpdate
+    out = []
+    for u in env.build_updates(include_poison=False):
+        w = _wreck(u.weights) if u.client_id in set(ids) else u.weights
+        out.append(ModelUpdate(u.client_id, w, dict(u.metadata or {})))
+    return out
 
 
 def _use_deterministic_eval(env):
@@ -79,7 +96,7 @@ def test_context_exposes_the_clean_counterfactual():
     ctx = env.begin_round()
     assert ctx.clean_accuracy is not None
     # It equals the accuracy of the all-honest aggregate.
-    updates = env.build_updates({})
+    updates = env.build_updates(include_poison=False)
     clean = [DetectionVerdict(u.client_id, False, 0.0, "") for u in updates]
     assert abs(ctx.clean_accuracy - env.evaluate_updates(updates, clean)) < 1e-12
 
@@ -91,26 +108,50 @@ def test_clean_reference_is_cached_within_a_round():
 
 
 def test_repeated_identical_attack_gives_a_stable_drop():
-    """The regression that motivated the change: with frozen benign replay the
-    env is memoryless, so an identical attack must yield an identical drop every
-    round. Measured against current_accuracy it collapsed to 0 after round 1."""
-    env = _env(benign_retrain=False)
+    """THE invariant the frozen anchor exists to provide: every round branches off
+    the same model with the same data, so an identical attack must yield a bit-for-bit
+    identical drop, however many times it is repeated.
+
+    ``shuffle=False`` makes local training deterministic, so any drift would be the
+    env's bookkeeping rather than SGD order.
+    """
+    env = _env(freeze=True, shuffle=False)
+    _use_deterministic_eval(env)
+    env.current_accuracy = env.server.evaluate(None)
+    drops = []
+    for _ in range(3):
+        ctx = env.begin_round()
+        updates = _wrecked_updates(env)
+        verdicts = [DetectionVerdict(u.client_id, False, 0.9, "") for u in updates]
+        post = env.commit(updates, verdicts)
+        drops.append(round(ctx.clean_accuracy - post, 10))
+    assert len(set(drops)) == 1, f"clean-reference drop drifted: {drops}"
+    assert drops[0] > 0.0, "the wrecking attack should register damage"
+
+
+def test_the_previous_rounds_accuracy_is_not_a_usable_reference():
+    """Why the counterfactual exists at all. In a CONTINUING federation the attack's
+    own damage becomes the next round's starting point, so measuring against the
+    round's starting accuracy makes a repeated, equally devastating attack look like
+    it stopped working — the failure that put the phase gate out of reach. The clean
+    counterfactual keeps measuring the attack."""
+    env = _env(freeze=False, shuffle=False)
     _use_deterministic_eval(env)
     env.current_accuracy = env.server.evaluate(None)
     drops, legacy_drops = [], []
     for _ in range(3):
         ctx = env.begin_round()
-        poisoned = {0: _wreck(ctx.pool_benign[0])}
-        updates = env.build_updates(poisoned)
+        updates = _wrecked_updates(env)
         verdicts = [DetectionVerdict(u.client_id, False, 0.9, "") for u in updates]
-        env.set_committed_poison([0])
         post = env.commit(updates, verdicts)
-        drops.append(round(ctx.clean_accuracy - post, 10))
-        legacy_drops.append(round(ctx.global_accuracy - post, 10))
-    assert len(set(drops)) == 1, f"clean-reference drop drifted: {drops}"
-    assert drops[0] > 0.0, "the wrecking attack should register damage"
-    # The old reference decayed to ~0 once the model was already wrecked.
-    assert legacy_drops[-1] < drops[-1]
+        drops.append(ctx.clean_accuracy - post)
+        legacy_drops.append(ctx.global_accuracy - post)
+    # The "since last round" reference decays toward 0 as the model is wrecked...
+    assert legacy_drops[-1] < legacy_drops[0]
+    assert abs(legacy_drops[-1]) < 0.01
+    # ...while the counterfactual still reports real damage on the final round.
+    assert drops[-1] > legacy_drops[-1]
+    assert all(d > 0.0 for d in drops), drops
 
 
 def test_clean_reference_refreshes_after_a_benign_fl_round():
@@ -169,7 +210,7 @@ def test_unmeasurable_clean_reference_is_flagged_not_silently_faked():
 
     # And the pathology it produced is reproducible: a round that also fails to
     # aggregate reports a drop of exactly zero.
-    updates = env.build_updates({})
+    updates = env.build_updates(include_poison=False)
     assert env.commit_state(None) == env.current_accuracy
     assert ctx.clean_accuracy - env.current_accuracy == 0.0
     assert len(updates) == N_CLIENTS
@@ -183,23 +224,25 @@ def test_a_measurable_round_reports_measured():
     assert ctx.clean_measured is True
 
 
-def test_unmeasured_rounds_skip_the_policy_update():
-    """``grpo_step(skip_update=True)`` still scores the group (the environment needs a
-    rollout to advance) but applies no gradient, so a structurally-zero damage term
-    cannot move the policy."""
+def test_degenerate_group_skips_the_policy_update():
+    """A group whose rewards do not separate carries no learning signal: the
+    policy-gradient term is 0 and the loss reduces to the KL penalty, i.e. a pull
+    back toward the base model. The step is skipped rather than applied.
+
+    The rollouts are still produced and returned, because the driver needs one of
+    them to advance the environment (and its verdicts to drive the attack ladder).
+    """
     from rl.grpo import grpo_step
 
     class _Policy:
         def generate(self, adapter, system, user, n, temperature, max_new_tokens):
-            # Deliberately DIFFERENT lengths so the rewards below separate: the point
-            # of this test is that only the caller's veto stops the step, not degeneracy.
-            return ["plan" + "!" * i for i in range(n)]
+            return ["verdicts"] * n            # identical -> identical rewards
 
         def policy_token_logprobs(self, *a, **k):
-            raise AssertionError("skip_update must not run the log-prob pass")
+            raise AssertionError("a skipped step must not run the log-prob pass")
 
         def adapter_parameters(self, adapter):
-            raise AssertionError("skip_update must not touch the optimizer")
+            raise AssertionError("a skipped step must not touch the optimizer")
 
     class _Turn:
         def messages(self):
@@ -210,18 +253,17 @@ def test_unmeasured_rounds_skip_the_policy_update():
 
     class _Optimizer:
         def zero_grad(self):
-            raise AssertionError("skip_update must not touch the optimizer")
+            raise AssertionError("a skipped step must not touch the optimizer")
 
         def step(self):
-            raise AssertionError("skip_update must not touch the optimizer")
+            raise AssertionError("a skipped step must not touch the optimizer")
 
-    stats = grpo_step(_Policy(), "attacker", _Optimizer(), _Turn(), G=4,
-                      skip_update=True, skip_reason="test")
+    stats = grpo_step(_Policy(), "defender", _Optimizer(), _Turn(), G=4,
+                      resample_on_zero_advantage=False)
     assert stats["stepped"] is False
-    assert stats["skipped_by_caller"] is True
-    assert stats["reward_spread"] > 0.0        # the group WAS separated...
-    assert stats["zero_advantage_fraction"] == 0.0   # ...and not degenerate...
-    assert len(stats["completions"]) == 4      # ...and the rollouts are available
+    assert stats["reward_spread"] == 0.0
+    assert stats["zero_advantage_fraction"] == 1.0
+    assert len(stats["completions"]) == 4      # the rollouts are still available
     assert stats["loss"] == 0.0                # ...but nothing was optimized
 
 

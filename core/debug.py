@@ -11,10 +11,10 @@ calling it from the hot path costs nothing in normal runs. When enabled (via
     valid, complete-up-to-the-last-round file).
 
 It captures the full Phase-2 picture *in the order the code executes it*: the
-federated fine-tuning of each round, the exact attacker-LLM prompt and its G
-rollouts, each rollout's attack plan + resulting poisoned-weight deltas, the
-exact defender-LLM prompt + raw output + parsed verdicts, the per-rollout
-rewards, the GRPO group advantages / loss / step, and the committed outcome.
+federated fine-tuning of each round, the label-flip ladder level and how many
+labels it flipped on each poisoned client, the exact defender-LLM prompt + its G
+rollouts' raw outputs + parsed verdicts, the per-rollout rewards, the GRPO group
+advantages / loss / step, the committed outcome, and where the ladder moved next.
 
 This module only *observes and formats* — it never changes training behaviour.
 Every method is wrapped so a formatting bug can never crash a run: on error it
@@ -189,7 +189,7 @@ class DebugLogger:
         return lines
 
     # ------------------------------------------------------------------
-    # Weight-stat helpers (torch imported lazily, only when enabled)
+    # Weight-stat helper
     # ------------------------------------------------------------------
     @staticmethod
     def _sd_l2(sd) -> float:
@@ -199,37 +199,6 @@ class DebugLogger:
         for v in sd.values():
             sq += float(v.detach().float().pow(2).sum())
         return sq ** 0.5
-
-    @staticmethod
-    def _delta_stats(benign: dict, poisoned: dict, precision: int = 4):
-        layers = {}
-        tot_d = tot_b = tot_p = 0.0
-        gmax = 0.0
-        for k in benign:
-            b = benign[k].detach().float()
-            p = poisoned[k].detach().float()
-            d = p - b
-            dn = float(d.pow(2).sum())
-            bn = float(b.pow(2).sum())
-            pn = float(p.pow(2).sum())
-            mx = float(d.abs().max()) if d.numel() else 0.0
-            layers[k] = {
-                "delta_l2": round(dn ** 0.5, precision),
-                "benign_l2": round(bn ** 0.5, precision),
-                "poisoned_l2": round(pn ** 0.5, precision),
-                "max_abs_delta": round(mx, precision),
-            }
-            tot_d += dn
-            tot_b += bn
-            tot_p += pn
-            gmax = max(gmax, mx)
-        total = {
-            "delta_l2": round(tot_d ** 0.5, precision),
-            "benign_l2": round(tot_b ** 0.5, precision),
-            "poisoned_l2": round(tot_p ** 0.5, precision),
-            "max_abs_delta": round(gmax, precision),
-        }
-        return total, layers
 
     def _guard(fn):
         """Decorator: no-op when disabled, and never raise out of a log call."""
@@ -256,134 +225,91 @@ class DebugLogger:
         self._record("phase", title, data)
 
     @_guard
-    def round_header(self, round_num, learner, opponent, phase_index, phase_round,
-                     pool_ids, budget, global_accuracy, G, scoring_opp_temp, opp_temp,
+    def round_header(self, round_num, learner, phase_index, phase_round,
+                     poisoned_ids, flip_fraction, flip_plan, global_accuracy, G,
                      curriculum=None):
         self._round = round_num
         self._learner = learner
         self._stage = "setup"
         self._rollout = -1
         self._banner(
-            f"ROUND {round_num}  |  learner={str(learner).upper()} "
-            f"(frozen opponent={opponent})  |  phase {phase_index}.{phase_round}"
+            f"ROUND {round_num}  |  learner={str(learner).upper()}  "
+            f"|  phase {phase_index}.{phase_round}"
         )
+        flips = "  ".join(f"c{cid}:{n}" for cid, n in sorted((flip_plan or {}).items()))
         self._line(
-            f"controllable_pool={list(pool_ids)}  budget={budget}   "
-            f"global_accuracy={_short(global_accuracy)}   "
-            f"G={G}  scoring_opp_temp={scoring_opp_temp}  commit_opp_temp={opp_temp}"
+            f"attack=label_flip  flip_fraction={_short(flip_fraction)}  "
+            f"poisoned={list(poisoned_ids)}  flips[{flips}]   "
+            f"global_accuracy={_short(global_accuracy)}   G={G}"
         )
         if curriculum:
-            # Which (defense, #poisoners) block this round belongs to — the schedule
-            # holds both fixed for the whole block, so this is the round's real setting.
             self._line(
                 f"curriculum: block={curriculum.get('block')} "
                 f"round={curriculum.get('block_round')}  cycle={curriculum.get('cycle')}  "
-                f"defense={curriculum.get('algorithm') or 'llm'}  "
-                f"n_poisoners={curriculum.get('n_poisoners')}"
+                f"defense={curriculum.get('algorithm') or 'llm'}"
             )
         self._record("round_header", "round_start", {
-            "round": round_num, "learner": learner, "opponent": opponent,
+            "round": round_num, "learner": learner,
             "phase_index": phase_index, "phase_round": phase_round,
-            "controllable_pool": list(pool_ids), "budget": budget,
-            "global_accuracy": _short(global_accuracy),
-            "G": G, "scoring_opp_temp": scoring_opp_temp, "commit_opp_temp": opp_temp,
+            "poisoned_client_ids": list(poisoned_ids),
+            "flip_fraction": _short(flip_fraction),
+            "flip_plan": {str(k): v for k, v in (flip_plan or {}).items()},
+            "global_accuracy": _short(global_accuracy), "G": G,
             "curriculum": curriculum,
         })
 
     @_guard
-    def fl_round(self, round_num, poisoned_ids, honest_updates, current_accuracy, benign_retrain):
-        mode = ("benign clients re-trained locally" if benign_retrain
-                else "replaying frozen Phase-1 local weights")
+    def fl_round(self, round_num, poisoned_ids, updates, current_accuracy):
+        """Every client's local training for this round.
+
+        For a poisoned client ``train_acc`` is measured against its FLIPPED labels,
+        so a high value means it fit the poisoned objective well — not that it
+        learned the real task. The row shows the flip count so the two readings
+        cannot be confused.
+        """
         self._line()
-        self._line(f"[FL] federated fine-tuning this round ({mode})")
+        self._line("[FL] federated fine-tuning this round (every client trains locally)")
         pois = set(poisoned_ids or [])
         rows = []
-        for u in honest_updates:
+        for u in updates:
             cid = getattr(u, "client_id", None)
             meta = getattr(u, "metadata", {}) or {}
             l2 = self._sd_l2(u.weights)
-            tag = "POISONED*" if cid in pois else "benign   "
-            if meta:
-                extra = (f"train_acc={_short(meta.get('train_accuracy'))} "
-                         f"train_loss={_short(meta.get('train_loss'))} "
-                         f"samples={meta.get('train_samples')}")
-            else:
-                extra = "(frozen replay — no local training this round)"
+            tag = "POISONED" if cid in pois else "benign  "
+            extra = (f"train_acc={_short(meta.get('train_accuracy'))} "
+                     f"train_loss={_short(meta.get('train_loss'))} "
+                     f"samples={meta.get('train_samples')}")
+            if cid in pois:
+                extra += (f"  flipped={meta.get('n_flipped')}"
+                          f"/{meta.get('n_local_samples')} "
+                          f"({_short(meta.get('flip_fraction'))})")
             self._line(f"    client {cid}  {tag}  weight_l2={round(l2, 4)}   {extra}")
             rows.append({"client_id": cid, "poisoned": cid in pois,
                          "weight_l2": round(l2, 4), "train": meta})
         if pois:
-            self._line("    (* poisoned clients start from these benign weights; "
-                       "the attack plan is applied per-rollout below)")
+            self._line("    (poisoned clients ran the SAME local training on the SAME "
+                       "examples — only their labels differ)")
         self._record("fl_round", "federated_finetune", {
-            "round": round_num, "benign_retrain": benign_retrain,
-            "current_accuracy": _short(current_accuracy), "clients": rows,
+            "round": round_num, "current_accuracy": _short(current_accuracy),
+            "clients": rows,
         })
 
     @_guard
-    def attacker_prompt(self, system, user, who="learner"):
+    def attack_plan(self, flip_fraction, flip_plan, poisoned_ids):
+        """This round's attack: the ladder level and the labels it flipped."""
         self._line()
-        self._line(f"[ATTACKER PROMPT]  exact input to attacker LLM ({who})")
-        if self._sys_seen.get("attacker") == system:
-            self._line(_DOT[:88] + " [system]")
-            self._line("(system prompt unchanged — see first round / debug.json)")
-        else:
-            self._sys_seen["attacker"] = system
-            self._block("system", system)
-        self._block("user", user)
-        self._record("attacker_prompt", f"attacker_prompt_{who}",
-                     {"who": who, "system": system, "user": user})
-
-    @_guard
-    def attacker_output(self, text, who="frozen-opponent"):
-        self._line()
-        self._line(f"[ATTACKER OUTPUT]  raw completion from attacker LLM ({who})")
-        self._line(text if isinstance(text, str) else json.dumps(text, default=str))
-        self._record("attacker_output", f"attacker_output_{who}", {"who": who, "text": text})
-
-    @_guard
-    def poison(self, plan, references, poisoned, n_malformed, n_invalid_ops=0):
-        """``plan`` is either a per-client mapping ``{cid: [ops]}`` (the selection
-        path) or one shared op list; ``None`` means nothing parsed. ``poisoned``
-        holds only the clients whose weights actually changed, so a selected
-        client missing from it was wasted and is counted in ``n_malformed``."""
-        self._line()
-        if plan is None:
-            self._line(f"[POISON] attack plan UNPARSEABLE -> no client poisoned "
-                       f"(n_malformed={n_malformed})")
-        elif isinstance(plan, dict):
-            n_ops = sum(len(ops or []) for ops in plan.values())
-            self._line(f"[POISON] per-client attack plan: {len(plan)} client(s), "
-                       f"{n_ops} op(s) total, invalid/skipped ops={n_invalid_ops}, "
-                       f"effectively poisoned={sorted(poisoned)}, wasted={n_malformed}")
-            for cid, ops in plan.items():
-                landed = "poisoned" if cid in poisoned else "NO-OP (wasted)"
-                self._line(f"    client {cid} [{landed}]: " + json.dumps(ops, default=str))
-        else:
-            self._line(f"[POISON] shared attack plan ({len(plan)} op(s), "
-                       f"invalid/skipped ops={n_invalid_ops}):")
-            self._line("    " + json.dumps(plan, default=str))
-        if not poisoned:
+        self._line(f"[ATTACK] label_flip (symmetric y -> 9-y) at "
+                   f"{float(flip_fraction):.0%} of each poisoned client's round data")
+        for cid, n in sorted((flip_plan or {}).items()):
+            landed = "poisoned" if cid in set(poisoned_ids or []) else "no flips (honest)"
+            self._line(f"    client {cid}: {n} label(s) flipped [{landed}]")
+        if not poisoned_ids:
             self._line("    -> NO client was effectively poisoned this round "
                        "(the server receives only honest updates)")
-        per_client = {}
-        for cid in poisoned:
-            if cid not in references:
-                continue
-            total, layers = self._delta_stats(references[cid], poisoned[cid])
-            self._line(
-                f"    client {cid}: delta_l2={total['delta_l2']} "
-                f"(benign_l2={total['benign_l2']} -> poisoned_l2={total['poisoned_l2']}), "
-                f"max|delta|={total['max_abs_delta']}"
-            )
-            for k, lv in layers.items():
-                mark = "   <- changed" if lv["delta_l2"] > 0 else ""
-                self._line(f"        {k}: delta_l2={lv['delta_l2']}{mark}")
-            per_client[cid] = {"total": total, "layers": layers}
-        self._record("poison", "attack_plan_applied", {
-            "plan": plan, "n_malformed": n_malformed, "n_invalid_ops": n_invalid_ops,
-            "effective_poisoned_ids": sorted(poisoned),
-            "poison_deltas": per_client,
+        self._record("attack", "label_flip_plan", {
+            "flip_fraction": _short(flip_fraction),
+            "flip_plan": {str(k): v for k, v in (flip_plan or {}).items()},
+            "poisoned_client_ids": list(poisoned_ids or []),
         })
 
     @_guard
@@ -441,13 +367,6 @@ class DebugLogger:
                           "confidence": _short(v.confidence), "reason": v.reason}
                          for v in verdicts],
         })
-
-    @_guard
-    def opponent_move(self, temperature):
-        self._stage = "opponent-move"
-        self._line()
-        self._line(f"[OPPONENT MOVE] frozen attacker plays one greedy/scoring move "
-                   f"(T={temperature}) — its poisoned updates are fixed for all defender rollouts")
 
     @_guard
     def scoring_rollout(self, text):
@@ -525,22 +444,26 @@ class DebugLogger:
     def committing(self):
         self._stage = "commit"
         self._line()
-        self._line("[COMMIT] applying the best-scoring rollout against the REAL "
-                   "(greedy) opponent:")
+        self._line("[COMMIT] applying the committed rollout — its verdicts decide "
+                   "the aggregate AND drive the attack ladder:")
 
     @_guard
     def commit_summary(self, learner, committed_index, info, reference_acc, post_acc, drop,
-                       success, attacker_reward, defender_reward, poisoned_ids,
-                       global_acc=None, best_index=None):
-        """``reference_acc`` is the round's CLEAN counterfactual (the accuracy the
-        aggregate reaches unpoisoned) — the baseline ``drop`` is measured from.
-        ``global_acc`` is the accuracy of the global model the round started on,
-        shown for context only.
+                       success, attack_effectiveness, defender_reward, poisoned_ids,
+                       global_acc=None, best_index=None, ladder=None):
+        """``reference_acc`` is the round's CLEAN counterfactual (the same clients
+        trained on the same data with their REAL labels) — the baseline ``drop`` is
+        measured from. ``global_acc`` is the accuracy of the global model the round
+        started on, shown for context only.
 
         ``committed_index`` is the rollout that ADVANCED the environment — an
         on-policy draw from the group, not necessarily the best-scoring one
         (``best_index``, shown alongside when it differs). See
-        ``rl.schedule._committed_index``."""
+        ``rl.schedule._committed_index``.
+
+        ``ladder`` is where the attack moved AFTER seeing these verdicts, which is
+        the feedback edge of the whole design — print it last, because it is the
+        consequence of everything above it."""
         verdicts = info.get("verdicts", [])
         flagged = sorted({v.client_id for v in verdicts if v.is_suspicious})
         averaged = sorted({v.client_id for v in verdicts if not v.is_suspicious})
@@ -558,25 +481,34 @@ class DebugLogger:
                        "clean round, nothing to detect)")
         self._line(
             f"    clean_reference {_short(reference_acc)} -> post {_short(post_acc)}  "
-            f"(drop={_short(drop)})   learner_success={success}"
+            f"(drop={_short(drop)})   defender_success={success}"
         )
         if global_acc is not None:
             self._line(f"    (global model accuracy at round start: {_short(global_acc)})")
         self._line(
-            f"    attacker_reward={_short(attacker_reward)}  "
+            f"    attack_effectiveness={_short(attack_effectiveness)}  "
             f"defender_reward={_short(defender_reward)}"
         )
+        if ladder:
+            self._line(
+                f"    [LADDER] sent {float(ladder.get('flip_fraction', 0)):.0%} -> "
+                f"{'CAUGHT' if ladder.get('caught') else 'missed'}"
+                f" ({ladder.get('caught_rule')}) -> {ladder.get('event')} -> next round "
+                f"{float(ladder.get('next_flip_fraction', 0)):.0%} "
+                f"(level {ladder.get('level')}, cycle {ladder.get('cycle')})"
+            )
         self._record("commit", "round_committed", {
             "learner": learner, "best_index": best_index,
             "flagged": flagged, "averaged": averaged,
             "clean_reference_accuracy": _short(reference_acc),
             "global_accuracy_at_round_start": _short(global_acc),
             "post_accuracy": _short(post_acc),
-            "drop": _short(drop), "learner_success": success,
-            "n_malformed": info.get("n_malformed"),
-            "attacker_reward": _short(attacker_reward),
+            "drop": _short(drop), "defender_success": success,
+            "attack_effectiveness": _short(attack_effectiveness),
             "defender_reward": _short(defender_reward),
             "poisoned_client_ids": list(poisoned_ids),
+            "flip_plan": {str(k): v for k, v in (info.get("flip_plan") or {}).items()},
+            "ladder": ladder,
             "verdicts": [{"client_id": v.client_id, "is_suspicious": v.is_suspicious,
                           "confidence": _short(v.confidence), "reason": v.reason}
                          for v in verdicts],

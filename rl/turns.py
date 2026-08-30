@@ -1,217 +1,62 @@
-"""AttackerTurn / DefenderTurn — bind one FL round to one *learning* agent.
+"""DefenderTurn — bind one FL round to the defender policy.
 
 A "turn" fixes everything about a round except the learning agent's action, so
-the GRPO sampler can score G candidate actions against an identical state and a
-frozen opponent (the Stackelberg structure: the leader/attacker moves, the
-follower/defender best-responds).
+the GRPO sampler can score G candidate actions against an identical state.
 
-The attacker's action now includes CLIENT SELECTION: from its controllable pool
-(``env.pool_benign``) it picks exactly ``env.round_budget`` clients and poisons
-each (see ``AttackerAgent.select_and_apply``). Different rollouts may pick
-different exact-size subsets, so each reward uses ITS OWN chosen set.
+There is only one turn now. The attack is not a policy: it is the deterministic,
+detection-adaptive label-flip ladder run by the env (see
+:mod:`agents.label_flip_attacker`), which has already produced this round's
+poisoned updates by the time ``begin_round`` returns. So the defender's G
+rollouts all classify the SAME cohort of updates — exactly the property the old
+``DefenderTurn`` had to sample a frozen attacker once to obtain, and which is now
+free.
 
 Generators are duck-typed: any object with
 ``generate(system, user, n, temperature) -> list[str]`` works — a
 ``PolicyGenerator`` (trainable LoRA adapter) during RL, or an
 ``InferenceGenerator`` (frozen Ollama/OpenAI) during --dry-run.
-
-The attacker's opponent is whatever defends the round. With the defender LLM
-disabled (``defense.mode: algorithmic``) that is ``env.defense`` — one published
-algorithm per round — and ``DefenderTurn`` is never constructed because there is
-no defender policy left to train. ``AttackerTurn`` handles both cases: the
-algorithmic defense also produces the round's aggregate, so its post-round
-accuracy comes from ``env.evaluate_state`` / ``env.commit_state`` rather than
-from FedAvg over the un-flagged clients.
 """
 
 import logging
 
 from core.debug import dbg
-from rl.rewards import (
-    attack_potency, attacker_reward, defender_reward, perturbation_diversity,
-)
+from rl.rewards import defender_reward
 
 logger = logging.getLogger(__name__)
 
 
-class AttackerTurn:
-    """Learning agent = attacker. Opponent = the server-side defense.
-
-    The defense is either the frozen defender LLM (``defender_gen``) or, when the
-    defender LLM is disabled, ``env.defense`` — the round's algorithm. The two
-    opponent-temperature knobs apply only to the LLM path; an algorithm is
-    deterministic given the updates, so scoring and committing see the same
-    defense either way.
-    """
-
-    def __init__(self, env, attacker_agent, defender_agent, defender_gen=None,
-                 reward_cfg: dict | None = None, opponent_temperature: float = 0.0,
-                 scoring_opponent_temperature: float | None = None):
-        self.env = env
-        self.attacker_agent = attacker_agent
-        self.defender_agent = defender_agent
-        self.defender_gen = defender_gen
-        self.reward_cfg = reward_cfg or {}
-        self.opp_temp = opponent_temperature
-        # Who defends: the round's algorithm, or the frozen defender LLM.
-        self.algorithmic = getattr(env, "defense", None) is not None
-        if not self.algorithmic and defender_gen is None:
-            raise ValueError(
-                "AttackerTurn needs a defender generator when the defender LLM "
-                "defends (defense.mode: llm) — none was supplied"
-            )
-        # When SCORING the G candidate plans we sample the frozen defender at a
-        # (usually nonzero) temperature so different plans see different verdicts
-        # — this restores within-group reward spread and is the key fix for the
-        # attacker's zero-advantage collapse. The COMMITTED round still uses the
-        # greedy ``opp_temp`` so success is measured against the real defender.
-        self.scoring_opp_temp = (
-            opponent_temperature if scoring_opponent_temperature is None
-            else scoring_opponent_temperature
-        )
-
-        # The controllable pool + this round's exact quota (the attacker chooses
-        # which clients fill it, and how to poison each).
-        self.pool_references = env.pool_benign            # {cid: benign state_dict}
-        self.budget = env.round_budget
-        # Damage is scored against THIS round's clean counterfactual (the accuracy
-        # the aggregate reaches with no poison), not against the current global's
-        # accuracy — see FLArmsRaceEnv.clean_reference_accuracy. All G rollouts
-        # share it, so the within-group ordering is still purely "which plan hurt
-        # more", while the absolute scale now means "how much of the goal did this
-        # attack achieve" in every round, not "how much worse than last round".
-        self.reference_accuracy = env.clean_reference_accuracy()
-        self.goal = env.round_goal                        # this round's (maybe sampled) goal
-
-        self.system = attacker_agent.system_prompt()
-        self.user = attacker_agent.build_user_prompt(
-            env.round_index + env.training_rounds, env.current_accuracy,
-            self.pool_references, env.global_weights, self.budget, goal=self.goal,
-        )
-        dbg.attacker_prompt(self.system, self.user, who="learner")
-
-    # The learning agent's prompt (consumed by the GRPO sampler / policy).
-    def messages(self) -> tuple[str, str]:
-        return self.system, self.user
-
-    def _defender_verdicts(self, updates, temperature):
-        feats = self.env.features(updates)
-        client_ids = [u.client_id for u in updates]
-        d_sys = self.defender_agent.system_prompt()
-        d_user = self.defender_agent.build_user_prompt(feats)
-        text = self.defender_gen.generate(d_sys, d_user, n=1, temperature=temperature)[0]
-        verdicts = self.defender_agent.parse(text, client_ids)
-        dbg.defender_io(d_sys, d_user, text, verdicts, who="opponent",
-                        temperature=temperature)
-        return verdicts
-
-    def _defend(self, updates, temperature, commit):
-        """Run the round's defense. Returns ``(verdicts, state)`` where ``state``
-        is the defense's own aggregate (algorithmic path) or ``None`` — meaning
-        "aggregate with FedAvg over the un-flagged clients" (LLM path)."""
-        if self.algorithmic:
-            verdicts, state = self.env.defend(updates, commit=commit)
-            dbg.algo_defense(self.env.round_defense, verdicts, commit=commit)
-            return verdicts, state
-        return self._defender_verdicts(updates, temperature), None
-
-    def _apply(self, attacker_text, temperature, commit=False):
-        poisoned, chosen_ids, n_malformed = self.attacker_agent.select_and_apply(
-            attacker_text, self.pool_references, self.budget
-        )
-        updates = self.env.build_updates(poisoned)
-        verdicts, state = self._defend(updates, temperature, commit)
-        return updates, verdicts, state, n_malformed, chosen_ids, poisoned
-
-    def reward(self, attacker_text) -> float:
-        dbg.scoring_rollout(attacker_text)
-        updates, verdicts, state, n_malformed, chosen_ids, poisoned = self._apply(
-            attacker_text, self.scoring_opp_temp, commit=False)
-        post_acc = (self.env.evaluate_state(state) if self.algorithmic
-                    else self.env.evaluate_updates(updates, verdicts))
-        refs = {cid: self.pool_references[cid] for cid in chosen_ids}
-        diversity = perturbation_diversity(poisoned, refs)
-        # How much poison this rollout actually shipped, relative to the honest
-        # update it hides in — gates the stealth term so "don't attack" stops
-        # being the highest-scoring way to evade detection (see attack_potency).
-        potency = attack_potency(poisoned, refs, self.env.global_weights)
-        r = attacker_reward(
-            self.reference_accuracy, post_acc, self.goal, chosen_ids,
-            verdicts, n_malformed,
-            alpha=self.reward_cfg.get("alpha", 1.0),
-            beta=self.reward_cfg.get("beta", 0.5),
-            gamma=self.reward_cfg.get("gamma", 1.0),
-            zeta=self.reward_cfg.get("zeta", 0.0),
-            diversity=diversity,
-            potency=potency,
-        )
-        dbg.rollout_outcome(reward=r, post_acc=post_acc, n_malformed=n_malformed,
-                            verdicts=verdicts, poisoned_ids=chosen_ids)
-        return r
-
-    def commit(self, attacker_text) -> dict:
-        dbg.committing()
-        updates, verdicts, state, n_malformed, chosen_ids, poisoned = self._apply(
-            attacker_text, self.opp_temp, commit=True)
-        self.env.set_committed_poison(chosen_ids)
-        new_acc = (self.env.commit_state(state) if self.algorithmic
-                   else self.env.commit(updates, verdicts))
-        return {
-            "updates": updates,
-            "verdicts": verdicts,
-            "n_malformed": n_malformed,
-            "post_accuracy": new_acc,
-            "poisoned_ids": chosen_ids,
-            "poisoned_by_client": poisoned,
-            "defense_algorithm": self.env.round_defense,
-        }
-
-
 class DefenderTurn:
-    """Learning agent = defender. Opponent = frozen attacker (greedy).
+    """Learning agent = defender. Opponent = the round's label-flip ladder level.
 
-    The frozen attacker's client selection + poisoned weights are sampled ONCE
-    here so all G defender candidates classify the same set of updates.
+    The poisoned updates come from the env, so nothing here samples or generates
+    an attack; the turn's whole job is to build the defender's prompt from the
+    round's per-client features and to score its verdicts against ground truth.
     """
 
-    def __init__(self, env, attacker_agent, defender_agent, attacker_gen,
-                 reward_cfg: dict | None = None, opponent_temperature: float = 0.0):
+    def __init__(self, env, defender_agent, reward_cfg: dict | None = None):
         if getattr(env, "defense", None) is not None:
             raise RuntimeError(
                 "DefenderTurn requires the defender LLM, but this run defends with "
-                "algorithms (defense.mode: algorithmic) — there is no defender "
-                "policy to train. Set defense.mode: llm to re-enable it."
+                "algorithms (defense.mode: algorithmic) — there is no policy to "
+                "train. Set defense.mode: llm, or run --dry-run / --baseline."
             )
         self.env = env
-        self.attacker_agent = attacker_agent
         self.defender_agent = defender_agent
         self.reward_cfg = reward_cfg or {}
 
-        # Frozen attacker plays its move for this round: it selects exactly the
-        # budgeted number from its pool and decides how to poison each.
-        dbg.opponent_move(opponent_temperature)
-        a_sys = attacker_agent.system_prompt()
-        a_user = attacker_agent.build_user_prompt(
-            env.round_index + env.training_rounds, env.current_accuracy,
-            env.pool_benign, env.global_weights, env.round_budget, goal=env.round_goal,
-        )
-        dbg.attacker_prompt(a_sys, a_user, who="frozen-opponent")
-        a_text = attacker_gen.generate(a_sys, a_user, n=1, temperature=opponent_temperature)[0]
-        dbg.attacker_output(a_text, who="frozen-opponent")
-        poisoned, chosen_ids, self.n_malformed = attacker_agent.select_and_apply(
-            a_text, env.pool_benign, env.round_budget)
-        self.poisoned_ids = chosen_ids
-        self.poisoned_by_client = poisoned
-        env.set_committed_poison(chosen_ids)
-
-        self.updates = env.build_updates(poisoned)
+        # This round's cohort: honest updates with the label-flipped insiders
+        # swapped in. Ground truth is whatever actually shipped flipped labels.
+        self.updates = env.build_updates()
+        self.poisoned_ids = list(env.poisoned_ids)
         self.client_ids = [u.client_id for u in self.updates]
         self.features = env.features(self.updates)
 
+        dbg.attack_plan(env.flip_fraction, env.flip_plan, self.poisoned_ids)
         self.system = defender_agent.system_prompt()
         self.user = defender_agent.build_user_prompt(self.features)
         dbg.defender_prompt(self.system, self.user, who="learner")
 
+    # The learning agent's prompt (consumed by the GRPO sampler / policy).
     def messages(self) -> tuple[str, str]:
         return self.system, self.user
 
@@ -227,14 +72,23 @@ class DefenderTurn:
         return r
 
     def commit(self, defender_text) -> dict:
+        """Commit one rollout's verdicts: aggregate the un-flagged clients, measure
+        the result, and feed the outcome back into the attack ladder.
+
+        The ladder advances HERE and nowhere else. Scoring a rollout must never
+        move it, or the attack schedule would depend on ``rl.G`` instead of on
+        whether the defense actually caught the round.
+        """
         dbg.committing()
         verdicts = self.defender_agent.parse(defender_text, self.client_ids)
         new_acc = self.env.commit(self.updates, verdicts)
+        ladder = self.env.record_detection(verdicts)
         return {
             "updates": self.updates,
             "verdicts": verdicts,
-            "n_malformed": self.n_malformed,
             "post_accuracy": new_acc,
             "poisoned_ids": self.poisoned_ids,
-            "poisoned_by_client": self.poisoned_by_client,
+            "flip_plan": dict(self.env.flip_plan),
+            "flip_fraction": self.env.flip_fraction,
+            "ladder": ladder,
         }

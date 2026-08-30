@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Run the defense benchmark: trained attacker vs a panel of defenses.
+"""Run the defense benchmark: the label-flip attack vs a panel of defenses.
 
-Pits the trained ATTACKER adapter against {fedavg, oracle, llm_defender, fltrust}
-for N rounds and prints how much of the attack each defense detected + how well it
-preserved accuracy. Must run on the GPU box (needs torch/unsloth/peft + the
-trained adapters in checkpoints/).
+Pits the detection-adaptive label-flip attack against {fedavg, oracle,
+llm_defender, fltrust, defl, dnc, multikrum} for N rounds and prints how much of
+the attack each defense detected + how well it preserved accuracy.
+
+Needs no attacker model — the attack is a deterministic schedule. It needs a GPU
+box only for the ``llm_defender`` column (torch/unsloth/peft + the trained
+defender adapter in checkpoints/); every other column runs on CPU.
 
 Examples
 --------
 python -m benchmark.run_benchmark --rounds 200
 python -m benchmark.run_benchmark --rounds 200 \
     --defenses fedavg,oracle,fltrust,llm_defender \
-    --attack-temperature 0.7 --root-size 100 --out logs/benchmark
+    --poison-clients 0,1 --root-size 100 --out logs/benchmark
 """
 import argparse
 import copy
@@ -31,28 +34,28 @@ def _parse_args():
     ap.add_argument("--rounds", type=int, default=200, help="number of attack rounds")
     ap.add_argument("--config", default="configs/base.yaml")
     ap.add_argument("--goal", default=None,
-                    help="attack goal the attacker aims for, e.g. 'untargeted_degrade=0.1', "
-                         "'slow_degrade=0.02', or 'targeted_label=7'. Fixed for the whole run "
-                         "(no per-round sampling). Default: attack.goal from --config.")
+                    help="the DAMAGE BAR the attack is reported against, e.g. "
+                         "'untargeted_degrade=0.1'. Does not change what the attack does. "
+                         "Default: attack.goal from --config.")
     ap.add_argument("--defenses", default="fedavg,oracle,llm_defender,fltrust,defl,dnc,multikrum",
-                    help="comma-separated; 'fedavg' is always included (attacker reference)")
-    ap.add_argument("--attacker-adapter", default=None, help="override attacker checkpoint dir")
+                    help="comma-separated; 'fedavg' is always included (no-defense reference)")
     ap.add_argument("--defender-adapter", default=None, help="override defender checkpoint dir")
-    ap.add_argument("--attack-temperature", type=float, default=0.7,
-                    help="attacker sampling temperature (0 = greedy/deterministic)")
-    ap.add_argument("--attack-retries", type=int, default=3, metavar="N",
-                    help="extra attacker samples to draw when a round's action does not "
-                         "fill the exact poison quota (truncated or no-op plan). A round "
-                         "with no usable action after these is skipped and excluded from "
-                         "the metrics, not fatal. 0 = one attempt per round")
     ap.add_argument("--defender-temperature", type=float, default=0.0,
                     help="LLM-defender sampling temperature")
-    ap.add_argument("--max-poison-clients", type=int, default=None, metavar="N",
-                    help="exact eval poison quota per round (the attacker chooses WHICH "
-                         "clients fill it). Anything from 1 up to "
-                         "fl.n_clients (20) is allowed here — the controllable pool is widened "
-                         "to match, so this is NOT limited to fl.n_compromisable the way "
-                         "training is. Default: attack.eval_poison_clients")
+    ap.add_argument("--poison-clients", default=None, metavar="IDS",
+                    help="comma-separated client ids that flip labels, e.g. '0' or '0,1,2'. "
+                         "Default: attack.poison_client_ids. Anything from a single client "
+                         "up to every client is allowed here, so this is the knob for the "
+                         "standard 'attack success vs fraction malicious' sweep.")
+    ap.add_argument("--flip-fraction", type=float, default=None, metavar="F",
+                    help="HOLD the attack at this flip fraction for the whole run instead of "
+                         "letting the ladder adapt (e.g. 1.0 = always flip every label). "
+                         "Sets start=floor=F, so no step is possible. Use this for a clean "
+                         "per-defense comparison at one attack strength.")
+    ap.add_argument("--ladder-feedback", default=None, metavar="DEFENSE",
+                    help="which defense's verdicts drive the attack ladder (default: the "
+                         "first non-fedavg defense in the panel). 'none' holds the attack "
+                         "at its starting level for the whole run.")
     ap.add_argument("--root-size", type=int, default=100, help="FLTrust clean root-set size")
     ap.add_argument("--root-epochs", type=int, default=None,
                     help="FLTrust server local epochs R_l (default: defense.fltrust.root_epochs, "
@@ -64,13 +67,13 @@ def _parse_args():
     ap.add_argument("--defl-tau", type=float, default=2.5,
                     help="DeFL MOUD per-layer outlier z-threshold")
     ap.add_argument("--dnc-num-byzantine", type=int, default=None,
-                    help="DnC assumed #malicious m (default: configured poison count)")
+                    help="DnC assumed #malicious m (default: the poisoned-client count)")
     ap.add_argument("--dnc-c", type=float, default=1.0, help="DnC filtering fraction c")
     ap.add_argument("--dnc-niters", type=int, default=1, help="DnC subsampling iterations")
     ap.add_argument("--dnc-sub-dim", type=int, default=10000,
                     help="DnC subsample dimension b (clamped to the model's dim)")
     ap.add_argument("--multikrum-f", type=int, default=None,
-                    help="Multi-Krum assumed #Byzantine f (default: configured poison count)")
+                    help="Multi-Krum assumed #Byzantine f (default: the poisoned-client count)")
     ap.add_argument("--multikrum-m", type=int, default=None,
                     help="Multi-Krum #selected/averaged (default: n - f)")
     ap.add_argument("--device", default=None, help="override fl.device")
@@ -110,80 +113,41 @@ def _build_root_loader(data_cfg, root_size, batch_size, seed):
                              seed=seed)
 
 
-def _resolve_eval_budget(env, requested, log=None):
-    """Pin ``env`` to a fixed evaluation poison budget and return it.
+def resolve_poison_clients(attack_cfg: dict, requested: str | None, n_clients: int,
+                           log=None) -> list[int]:
+    """The client ids that flip labels for this evaluation.
 
-    The benchmark's ceiling is ``fl.n_clients``, **not** ``fl.n_compromisable``.
-    Training pins the attacker to a fixed insider pool (5 of 20 by default) because
-    that is the threat model it learns under. Evaluation is where you ask "how do these
-    defenses hold up as the adversary controls more of the federation?", which has to
-    go past that pool and up to every client. Clamping the eval budget to
-    ``n_compromisable`` made ``--max-poison-clients 10`` silently behave exactly like 5.
-
-    Raising the cap alone is not enough. The attacker may only pick from
-    ``env.pool_ids == range(n_compromisable)``, and ``AttackerAgent.select_and_apply``
-    clamps the budget to the pool size — so the pool is widened to match. That widening
-    mutates only THIS env instance, after ``reset()``: training reads
-    ``fl.n_compromisable`` from the config and is untouched.
-
-    Also switches off the per-round budget/target randomisation that training can use,
-    so every evaluated round must poison exactly the requested count and faces the
-    same goal. The attacker chooses WHICH clients fill the quota, never how many.
+    ``--poison-clients`` overrides ``attack.poison_client_ids``. The ceiling here is
+    ``fl.n_clients``, so the benchmark can sweep the adversary's share all the way up
+    — the standard "attack success vs fraction malicious" experiment — which is the
+    point of evaluation as opposed to training. Ids outside the federation are
+    dropped with a warning rather than clamped.
     """
     log = log or logging.getLogger("benchmark")
-    n_all = int(env.n_clients)
-    budget = max(1, min(int(requested), n_all))
-    if budget != int(requested):
-        log.warning(f"--max-poison-clients {requested} clamped to {budget} "
-                    f"(1..fl.n_clients={n_all} is the valid range)")
-
-    trained_pool = int(env.n_compromisable)
-    if budget > trained_pool:
-        env.n_compromisable = budget
-        log.warning(
-            f"Widening the attacker's controllable pool from {trained_pool} to {budget} "
-            f"client(s) for this evaluation (clients 0..{budget - 1}). The policy was "
-            f"TRAINED against a pool of {trained_pool}, so this measures "
-            f"out-of-distribution generalization to a larger insider foothold — "
-            f"informative, but not the setting it was fitted to. Raise "
-            f"fl.n_compromisable and retrain to make it in-distribution."
-        )
-
-    env.sample_budget = False       # eval never randomises the budget
-    env.budget_cap = budget
-    env.sample_target = False       # ...nor the goal
-    # ...nor sweeps it. The training curriculum walks the poison quota through
-    # its configured counts in blocks; evaluation must hold it at exactly `budget`
-    # for every round so the panel's columns are comparable. (The benchmark builds
-    # its env without a curriculum, so this is belt-and-braces against that changing.)
-    env.curriculum = None
-    fixed = getattr(env, "fixed_poison_clients", None)
-    if fixed is not None:
-        # Trained with a FIXED poisoned set. Keep that regime — the eval budget just
-        # says how large the fixed set is — rather than letting env._round_budget's
-        # min(fixed, pool) silently cap a widened --max-poison-clients back down to
-        # the trained count, which would report a larger attack than actually ran.
-        if int(fixed) != budget:
-            log.warning(
-                f"Fixed poisoned set resized from {fixed} to {budget} client(s) for this "
-                f"evaluation (clients 0..{budget - 1}); training pinned it at {fixed}."
-            )
-        env.fixed_poison_clients = budget
-        # In this mode the pool IS the poisoned set, so it must shrink as well as
-        # grow with the budget — otherwise a --max-poison-clients BELOW the trained
-        # count would leave a wider pool than quota, which is the one combination
-        # the fixed-set prompt cannot describe.
-        env.n_compromisable = budget
-    log.info(f"Eval poison quota = exactly {budget} of pool {env.n_compromisable} "
-             f"(clients {list(range(env.n_compromisable))}); "
-             + ("the SAME clients every round (fixed set); the attacker chooses only "
-                "how to poison them" if fixed is not None
-                else "attacker selects which to poison"))
-    _warn_about_adversary_share(budget, n_all, log)
-    return budget
+    if requested is None:
+        raw = attack_cfg.get("poison_client_ids", [0])
+        if isinstance(raw, int):
+            raw = [raw]
+    else:
+        raw = [part for part in str(requested).replace(" ", "").split(",") if part]
+    ids, seen = [], set()
+    for item in raw:
+        cid = int(item)
+        if not 0 <= cid < n_clients:
+            log.warning(f"--poison-clients: dropping {cid} — outside 0..{n_clients - 1}")
+            continue
+        if cid in seen:
+            log.warning(f"--poison-clients: dropping duplicate {cid}")
+            continue
+        ids.append(cid)
+        seen.add(cid)
+    if not ids:
+        raise SystemExit("ERROR: no valid poisoned client ids — pass --poison-clients "
+                         f"with ids in 0..{n_clients - 1}")
+    return sorted(ids)
 
 
-def _warn_about_adversary_share(budget, n_clients, log):
+def _warn_about_adversary_share(n_poisoners, n_clients, log):
     """Flag the thresholds where the benchmark's numbers change meaning.
 
     Every robust aggregator in the panel assumes the adversary is a MINORITY:
@@ -195,24 +159,22 @@ def _warn_about_adversary_share(budget, n_clients, log):
     the exception by design: its trust comes from a server-held clean root set rather
     than from the client population, so it degrades gracefully instead of inverting.
 
-    Raising the budget that far is a legitimate experiment (it is the standard
-    "attack success vs fraction malicious" sweep) — it just has to be read with this
-    caveat, so we say it plainly rather than letting the table look like a defense
-    collapse at ordinary settings.
+    Raising the count that far is a legitimate experiment (it is the standard "attack
+    success vs fraction malicious" sweep) — it just has to be read with this caveat.
     """
     if n_clients <= 0:
         return
-    share = budget / n_clients
-    if budget >= n_clients:
+    share = n_poisoners / n_clients
+    if n_poisoners >= n_clients:
         log.warning(
-            f"EVERY client is a poisoner ({budget}/{n_clients}). There are no honest "
+            f"EVERY client flips labels ({n_poisoners}/{n_clients}). There are no honest "
             f"updates and no true negatives, so FPR/precision are degenerate and "
             f"detection numbers are not interpretable. Accuracy drop is the only "
             f"meaningful column in this configuration."
         )
     elif share >= 0.5:
         log.warning(
-            f"Poisoners are {budget}/{n_clients} ({share:.0%}) — NO honest majority. "
+            f"Poisoners are {n_poisoners}/{n_clients} ({share:.0%}) — NO honest majority. "
             f"Multi-Krum/DnC/DeFL assume the adversary is a minority (Multi-Krum's "
             f"bound needs n >= 2f+3), so their guarantees do not hold here and weak "
             f"detection is the expected outcome rather than a defect. FLTrust is the "
@@ -220,7 +182,7 @@ def _warn_about_adversary_share(budget, n_clients, log):
         )
     elif share > 1.0 / 3.0:
         log.info(
-            f"Poisoners are {budget}/{n_clients} ({share:.0%}) — past the ~1/3 point "
+            f"Poisoners are {n_poisoners}/{n_clients} ({share:.0%}) — past the ~1/3 point "
             f"where Byzantine-robust aggregators typically start to degrade. Expected, "
             f"but worth noting when reading the table."
         )
@@ -231,18 +193,12 @@ def _resolve_llm_defender(names, adapter_paths, base_cfg, exists=None):
 
     Returns ``(names, skipped)``.
 
-    ``llm_defender`` is the only column that needs a trained DEFENDER adapter, and
-    with ``defense.mode: algorithmic`` — the shipped default — that adapter is never
-    written: the defender LLM is disabled and ``rl/schedule.py`` trains the attacker
-    only, deliberately leaving the defender checkpoint untouched. Since
-    ``llm_defender`` is also in the default ``--defenses`` list, the old hard
-    ``sys.exit`` meant a plain ``run_benchmark`` on a normally-trained run aborted
-    before measuring ANY defense — throwing away FLTrust, DeFL, DnC, Multi-Krum,
-    Oracle and FedAvg because one optional column was unavailable.
-
-    A missing defender adapter is therefore expected, not exceptional: warn, drop the
-    column, keep going. Only a panel with nothing comparable left is fatal — and that
-    is reported with the flag needed to fix it rather than as a stack trace.
+    ``llm_defender`` is the only column that needs a trained DEFENDER adapter, so on a
+    box that has never run training it is simply unavailable. Since it is also in the
+    default ``--defenses`` list, a hard exit would abort the run before measuring ANY
+    defense — throwing away FLTrust, DeFL, DnC, Multi-Krum, Oracle and FedAvg because
+    one optional column was missing. Warn, drop the column, keep going. Only a panel
+    with nothing comparable left is fatal.
 
     ``exists`` is injectable so this is testable without ``storage.checkpoint``.
     """
@@ -255,25 +211,21 @@ def _resolve_llm_defender(names, adapter_paths, base_cfg, exists=None):
         return list(names), False
 
     remaining = [n for n in names if n != "llm_defender"]
-    mode = str(((base_cfg.get("defense") or {}).get("mode") or "algorithmic")).lower()
-    why = ("the defender LLM is disabled in this config (defense.mode: algorithmic), "
-           "so no defender adapter is ever trained"
-           if mode == "algorithmic" else "no defender adapter has been trained yet")
     log = logging.getLogger("benchmark")
     # `fedavg` is force-added as the no-defense reference, so it does not count as a
     # defense the user asked to compare against.
     if not [n for n in remaining if n != "fedavg"]:
         raise SystemExit(
             f"ERROR: nothing left to benchmark — 'llm_defender' was the only requested "
-            f"defense and {why} (looked in {path}).\n"
+            f"defense and no defender adapter has been trained yet (looked in {path}).\n"
             f"       Request algorithmic defenses instead, e.g.\n"
             f"       --defenses fltrust,defl,dnc,multikrum\n"
             f"       or pass --defender-adapter <dir> to point at a checkpoint."
         )
     log.warning(
-        f"Skipping the 'llm_defender' column: {why} (looked in {path}). "
-        f"Continuing with {remaining}. To include it, pass --defender-adapter <dir>, "
-        f"or set defense.mode: llm and train a defender."
+        f"Skipping the 'llm_defender' column: no defender adapter at {path}. "
+        f"Continuing with {remaining}. To include it, train one (python main.py) or "
+        f"pass --defender-adapter <dir>."
     )
     return remaining, True
 
@@ -286,11 +238,9 @@ def main():
 
     # Heavy / FL imports are deferred so --help works without torch.
     from data.mnist_loader import get_data_loaders
-    from storage.checkpoint import state_exists, load_state, adapter_exists
-    from agents.attacker_agent import AttackerAgent
+    from storage.checkpoint import state_exists, load_state
     from agents.defender_agent import DefenderAgent
     from rl.env import FLArmsRaceEnv
-    from rl.policy import LLMPolicy
     from benchmark.defenses import AVAILABLE, build_defenses
     from benchmark.harness import run_benchmark
     from benchmark import report
@@ -298,18 +248,12 @@ def main():
     from rl.rewards import goal_target
 
     base_cfg = yaml.safe_load(open(args.config))
-    attacker_cfg = yaml.safe_load(open("configs/attacker_agent.yaml"))
     defender_cfg = yaml.safe_load(open("configs/defender_agent.yaml"))
-    # Attack goal: --goal overrides the config. Set it on BOTH the base config (so the
-    # env's goal/logging match) and the attacker agent (whose self.goal drives the
-    # benchmark prompt). Evaluation always uses a FIXED goal — never per-round sampling.
+    # The DAMAGE BAR the run is reported against. --goal overrides the config.
     goal = _parse_goal(args.goal) if args.goal else base_cfg.get("attack", {}).get("goal")
     if goal:
         base_cfg.setdefault("attack", {})["goal"] = goal
-        attacker_cfg["attack_goal"] = goal
-    log.info(f"Attack goal (fixed for the run): {goal}")
-    # Requested accuracy drop for the goal-success metric (attack "succeeds" a round
-    # when a defense's accuracy falls to/below baseline - target_drop).
+    log.info(f"Damage bar (fixed for the run): {goal}")
     target_drop = goal_target(goal) if goal else None
 
     fl = base_cfg["fl"]
@@ -318,7 +262,7 @@ def main():
     device = args.device or fl["device"]
     seed = args.seed if args.seed is not None else int(fl.get("poison_seed", 0))
 
-    # Always include the no-defense baseline (it is also the attacker's reference).
+    # Always include the no-defense baseline.
     names = [n.strip() for n in args.defenses.split(",") if n.strip()]
     if "fedavg" not in names:
         names = ["fedavg"] + names
@@ -326,22 +270,43 @@ def main():
     if bad:
         sys.exit(f"ERROR: unknown defense(s) {bad}; available: {AVAILABLE}")
 
+    # --- The attack under evaluation --------------------------------------
+    attack_cfg = dict(base_cfg.get("attack", {}) or {})
+    n_clients = int(fl["n_clients"])
+    poison_ids = resolve_poison_clients(attack_cfg, args.poison_clients, n_clients, log)
+    attack_cfg["poison_client_ids"] = poison_ids
+    if args.flip_fraction is not None:
+        f = max(1e-6, min(1.0, float(args.flip_fraction)))
+        # start == floor makes the ladder a single level, so `advance` can only ever
+        # hold: the attack is pinned at f whatever any defense detects.
+        attack_cfg["schedule"] = dict(attack_cfg.get("schedule") or {},
+                                      start_fraction=f, floor_fraction=f)
+        log.info(f"Attack PINNED at {f:.0%} flipped labels for every round "
+                 f"(--flip-fraction) — the ladder cannot adapt")
+    base_cfg["attack"] = attack_cfg
+    _warn_about_adversary_share(len(poison_ids), n_clients, log)
+
+    ladder_feedback = args.ladder_feedback
+    if ladder_feedback is None:
+        ladder_feedback = next((n for n in names if n != "fedavg"), None)
+    elif ladder_feedback.strip().lower() == "none":
+        ladder_feedback = None
+
     random.seed(seed)
     import torch
     torch.manual_seed(seed)
 
     client_loaders, test_loader = get_data_loaders(
-        n_clients=fl["n_clients"], batch_size=fl["batch_size"],
+        n_clients=n_clients, batch_size=fl["batch_size"],
         data_dir=data_cfg.get("data_dir", "./data/mnist_raw"), iid=data_cfg.get("iid", True),
         bias_q=float(data_cfg.get("noniid_bias", 0.5)), seed=seed,
     )
 
-
     # Phase-1 start state (reuse the saved honest-FedAvg checkpoint, or train fresh).
     # load_state() returns None on a partial/corrupt checkpoint, so guard the unpack.
     state = load_state() if (state_exists() and not args.fresh) else None
-    if state is not None and len(state[1]) != fl["n_clients"]:
-        log.warning(f"Checkpoint has {len(state[1])} client(s) but config n_clients={fl['n_clients']} "
+    if state is not None and len(state[1]) != n_clients:
+        log.warning(f"Checkpoint has {len(state[1])} client(s) but config n_clients={n_clients} "
                     f"— ignoring the stale checkpoint and re-running Phase-1.")
         state = None
     if state is not None:
@@ -352,94 +317,52 @@ def main():
         global_weights, client_weights, baseline_accuracy = run_phase1(
             base_cfg, client_loaders, test_loader)
 
-    # Env: pure round generator (controllable pool + benign updates + build_updates).
+    # Env: pure round generator (local training + label flipping + build_updates).
+    # Every client trains each round, which is not optional — the poison IS the
+    # poisoned clients' local training on flipped labels. Every defense in the panel
+    # still sees byte-identical updates within a round, because the env builds them
+    # once and hands the same list to each.
     rng = random.Random(seed)
     env = FLArmsRaceEnv(base_cfg, client_loaders, test_loader, rng)
-    # Frozen benign replay is a BENCHMARK requirement, not a training preference, so it
-    # is pinned here rather than read from fl.benign_retrain_each_round (which training
-    # now sets to true — see configs/base.yaml). Every defense in the panel must see
-    # byte-identical benign updates in a round for "same attack to everyone" to hold,
-    # and each Defense owns its own global while the env's stays at the Phase-1 state,
-    # so retraining here would re-draw the honest updates against a stale reference for
-    # no benefit. This used to be a warning that the comparison "may be skewed".
-    if env.benign_retrain:
-        log.info("benchmark: pinning frozen benign replay (fl.benign_retrain_each_round "
-                 "is true for training, but the panel needs identical benign updates)")
-        env.benign_retrain = False
     env.reset(copy.deepcopy(global_weights), client_weights, baseline_accuracy)
 
-    attack_cfg = base_cfg.get("attack", {})
-    requested_budget = (
-        args.max_poison_clients if args.max_poison_clients is not None
-        else int(attack_cfg.get(
-            "eval_poison_clients", attack_cfg.get("max_poison_clients", 1)))
-    )
-    eval_budget = _resolve_eval_budget(env, requested_budget)
-
-    # Load the trained policy: the attacker adapter is always needed; the defender
-    # adapter only if the LLM defender is in the panel.
+    # The defender adapter is needed ONLY by the `llm_defender` column, and a missing
+    # one is the normal case on a box that has not trained. Resolved BEFORE the model
+    # is built so a skipped column does not also materialise an unused LoRA.
     adapter_paths = dict(rl_cfg.get("adapter_paths", {
-        "attacker": "checkpoints/attacker_adapter",
         "defender": "checkpoints/defender_adapter",
     }))
-    if args.attacker_adapter:
-        adapter_paths["attacker"] = args.attacker_adapter
     if args.defender_adapter:
         adapter_paths["defender"] = args.defender_adapter
-
-    # The ATTACKER adapter is what is under evaluation — without it there is nothing
-    # to benchmark, so this one really is fatal.
-    if not adapter_exists(adapter_paths["attacker"]):
-        sys.exit(f"ERROR: no trained attacker adapter at {adapter_paths['attacker']}")
-
-    # The DEFENDER adapter is needed ONLY by the `llm_defender` column, and a missing
-    # one is the NORMAL case rather than an error: with `defense.mode: algorithmic`
-    # (the shipped default) the defender LLM is disabled and rl/schedule.py
-    # deliberately never writes that checkpoint. Aborting the run therefore threw away
-    # every algorithmic-defense result the benchmark exists to produce. Drop the column
-    # and carry on. Resolved BEFORE the model is built so a skipped column does not
-    # also materialise an unused defender LoRA (~115 MB of VRAM at lora_r=16).
     names, skipped_llm_defender = _resolve_llm_defender(names, adapter_paths, base_cfg)
 
-    adapter_names = (("attacker", "defender") if "llm_defender" in names
-                     else ("attacker",))
-    policy = LLMPolicy(
-        base_model=rl_cfg.get("model", "unsloth/Qwen2.5-3B-Instruct"),
-        max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
-        lora_r=int(rl_cfg.get("lora_r", 16)),
-        lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
-        load_in_4bit=bool(rl_cfg.get("load_in_4bit", True)),
-        seed=seed,
-        adapters=adapter_names,
-        attn_implementation=rl_cfg.get("attn_implementation", "eager"),
-        use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
-    )
-    policy.load_adapter("attacker", adapter_paths["attacker"])
+    policy = None
     if "llm_defender" in names:
+        from rl.policy import LLMPolicy
+        policy = LLMPolicy(
+            base_model=rl_cfg.get("model", "unsloth/Qwen2.5-3B-Instruct"),
+            max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
+            lora_r=int(rl_cfg.get("lora_r", 16)),
+            lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
+            load_in_4bit=bool(rl_cfg.get("load_in_4bit", True)),
+            seed=seed,
+            adapters=("defender",),
+            attn_implementation=rl_cfg.get("attn_implementation", "eager"),
+            use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
+        )
         policy.load_adapter("defender", adapter_paths["defender"])
-
-    # The prompt must describe the same regime training used: a fixed poisoned set
-    # changes the system prompt from "select k of n" to "plan for all of these",
-    # and the rl: block carries the context-fill budget the observation is
-    # compacted to fit. Bind the real tokenizer so that budget is exact.
-    attacker_cfg["fixed_poison_set"] = (
-        attack_cfg.get("fixed_poison_clients") not in (None, False, 0, ""))
-    attacker_cfg["rl"] = rl_cfg
-    attacker_agent = AttackerAgent(attacker_cfg)
-    attacker_agent.bind_tokenizer(policy.count_prompt_tokens)
-    # Only meaningful for the llm_defender column; harmless to build either way.
     defender_agent = DefenderAgent(defender_cfg)
 
     root_loader = None
     root_epochs = 1
     if "fltrust" in names:
         root_loader = _build_root_loader(data_cfg, args.root_size, fl["batch_size"], seed)
-        # R_l must match what the attacker TRAINED against, or the FLTrust column
-        # measures a different defense than the one the policy learned to beat.
-        # --root-epochs wins; otherwise fall back to the config, whose default (null)
-        # sizes the root update to an honest client's iteration count. FLTrust rescales
-        # every accepted delta to ||g0||, so R_l alone decides how far the global can
-        # move per round — see server.algo_defender.resolve_root_epochs.
+        # R_l must match what training used, or the FLTrust column measures a
+        # different defense than the defender learned against. --root-epochs wins;
+        # otherwise fall back to the config, whose default (null) sizes the root
+        # update to an honest client's iteration count. FLTrust rescales every
+        # accepted delta to ||g0||, so R_l alone decides how far the global can move
+        # per round — see server.algo_defender.resolve_root_epochs.
         from server.algo_defender import DEFAULT_MAX_ROOT_EPOCHS, resolve_root_epochs
         ft_cfg = ((base_cfg.get("defense") or {}).get("fltrust") or {})
         configured = args.root_epochs
@@ -448,8 +371,6 @@ def main():
         root_epochs = resolve_root_epochs(
             configured, root_batches=len(root_loader),
             client_iterations=int(fl["local_epochs"]) * len(client_loaders[0]),
-            # Same cap as training, or the FLTrust column faces a different (and
-            # in the un-capped case malfunctioning) defense than the policy trained on.
             max_epochs=int(ft_cfg.get("max_root_epochs") or DEFAULT_MAX_ROOT_EPOCHS),
         )
         log.info(f"FLTrust root fine-tuning: root_epochs={root_epochs} over "
@@ -458,21 +379,18 @@ def main():
                  f"~{int(fl['local_epochs']) * len(client_loaders[0])})")
 
     # DnC / Multi-Krum assume a known upper bound on #malicious; default it to the
-    # eval poison quota (the exact number of clients the attacker must poison), clamped
-    # to a benign majority. This is an assumed adversary budget, NOT per-round truth.
+    # number of clients actually flipping labels, clamped to a benign majority.
     #
-    # The clamp stays even when --max-poison-clients exceeds it: both algorithms are
-    # only defined for a minority adversary (Multi-Krum keeps m = n - f updates, so
-    # f >= n/2 would leave it averaging half the federation or fewer), so feeding them
-    # f = 12 of 20 does not make them stronger, it makes them ill-posed. They are
-    # deliberately given the strongest well-formed assumption instead, and the
-    # honest-majority warning above explains why detection falls off past that point.
-    n_cl = int(fl["n_clients"])
-    assumed_byz = max(1, min(eval_budget, (n_cl - 1) // 2))
-    if eval_budget > assumed_byz:
+    # The clamp stays even when more clients are poisoned than that: both algorithms
+    # are only defined for a minority adversary (Multi-Krum keeps m = n - f updates,
+    # so f >= n/2 leaves it averaging half the federation or fewer), so feeding them
+    # f = 12 of 20 does not make them stronger, it makes them ill-posed.
+    n_poisoners = len(poison_ids)
+    assumed_byz = max(1, min(n_poisoners, (n_clients - 1) // 2))
+    if n_poisoners > assumed_byz:
         log.info(
-            f"DnC/Multi-Krum assumed_byzantine capped at {assumed_byz} (of {n_cl}) while "
-            f"{eval_budget} clients are actually poisoned — those algorithms are only "
+            f"DnC/Multi-Krum assumed_byzantine capped at {assumed_byz} (of {n_clients}) while "
+            f"{n_poisoners} clients are actually poisoned — those algorithms are only "
             f"defined for a minority adversary. Override with --dnc-num-byzantine / "
             f"--multikrum-f."
         )
@@ -490,34 +408,24 @@ def main():
         dnc_sub_dim=args.dnc_sub_dim, dnc_seed=seed,
         multikrum_num_byzantine=mk_f, multikrum_m=args.multikrum_m,
     )
+    if ladder_feedback is not None and ladder_feedback not in defenses:
+        ladder_feedback = next((n for n in defenses if n != "fedavg"), None)
 
     log.info(f"Benchmark: {args.rounds} rounds | defenses={list(defenses)} | "
-             f"baseline_acc={baseline_accuracy:.4f} | attack_temp={args.attack_temperature}"
+             f"poisoned={poison_ids} | baseline_acc={baseline_accuracy:.4f}"
              + (" | llm_defender SKIPPED (no defender adapter)"
                 if skipped_llm_defender else ""))
     summaries, _metrics = run_benchmark(
-        env, policy, attacker_agent, defenses, test_loader,
+        env, defenses, test_loader,
         init_global=copy.deepcopy(global_weights), baseline_accuracy=baseline_accuracy,
-        n_rounds=args.rounds, attack_temperature=args.attack_temperature,
-        max_new_tokens=int(rl_cfg.get("max_new_tokens", 512)), device=device,
-        log_every=args.log_every, target_drop=target_drop,
-        attack_retries=max(0, args.attack_retries),
+        n_rounds=args.rounds, device=device, log_every=args.log_every,
+        target_drop=target_drop, ladder_feedback=ladder_feedback,
     )
 
-    # Rounds the harness could not get a usable attacker action for are skipped, so
-    # report the MEASURED count rather than the requested one — the table's header
-    # and its per-defense columns then describe the same set of rounds.
-    measured_rounds = max((s.get("rounds", 0) for s in summaries.values()),
-                          default=args.rounds)
-    skipped_rounds = args.rounds - measured_rounds
-    if skipped_rounds > 0:
-        log.warning(f"{skipped_rounds} of {args.rounds} round(s) had no usable attacker "
-                    f"action and are excluded; the report covers {measured_rounds} round(s)")
-
     out_dir = args.out or None
-    print("\n" + report.render([summaries[n] for n in defenses], measured_rounds,
+    print("\n" + report.render([summaries[n] for n in defenses], args.rounds,
                                 baseline_accuracy, out_dir=out_dir, goal=goal,
-                                n_poisoners=eval_budget))
+                                n_poisoners=n_poisoners))
 
     # Persist per-round history + draw the per-round graphs.
     if out_dir:
@@ -526,14 +434,12 @@ def main():
         with open(os.path.join(out_dir, "history.json"), "w") as f:
             _json.dump({"baseline_accuracy": baseline_accuracy,
                         "defenses": list(defenses),
-                        # Recorded so a saved result is self-describing: a missing
-                        # llm_defender column is a deliberate skip, not a lost run,
-                        # and a measured count below --rounds is skipped attack
-                        # rounds rather than a truncated run.
+                        # Recorded so a saved result is self-describing.
                         "llm_defender_skipped": skipped_llm_defender,
-                        "requested_rounds": args.rounds,
-                        "measured_rounds": measured_rounds,
-                        "unusable_attack_rounds": skipped_rounds,
+                        "poison_client_ids": poison_ids,
+                        "flip_fraction_pinned": args.flip_fraction,
+                        "ladder_feedback": ladder_feedback,
+                        "rounds": args.rounds,
                         "history": history}, f, indent=2)
         log.info(f"[saved] {os.path.join(out_dir, 'history.json')}")
         if not args.no_plot:

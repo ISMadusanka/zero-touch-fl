@@ -1,7 +1,7 @@
 """Tests for Phase 2's SIMULATED rounds on the frozen Phase-1 global.
 
 The contract under test (rl.env.FLArmsRaceEnv with fl.freeze_global_in_phase2):
-every attacker-learning round starts from the SAME Phase-1 anchor, the clients
+every defender-learning round starts from the SAME Phase-1 anchor, the clients
 train on NEW local data, the round's aggregate is SCORED and then discarded, and
 nothing the round produces leaks into the next one.
 
@@ -43,10 +43,13 @@ def _cfg(frozen=True, benign_retrain=True):
         "fl": {"n_clients": N_CLIENTS, "device": "cpu",
                "benign_retrain_each_round": benign_retrain,
                "freeze_global_in_phase2": frozen,
-               "training_rounds": TRAINING_ROUNDS, "n_compromisable": 2,
+               "training_rounds": TRAINING_ROUNDS, "poison_seed": 0,
                "lr": 0.05, "local_epochs": 1, "batch_size": 32},
-        "attack": {"goal": {"type": "untargeted_degrade", "target_accuracy_drop": 0.10},
-                   "max_poison_clients": 2, "sample_budget_in_training": False},
+        # One insider, so the 4-client federation keeps an honest majority. The
+        # tests that need a blatantly poisoned cohort build it themselves — see
+        # _wrecked_updates — rather than relying on the (deliberately subtle) flip.
+        "attack": {"type": "label_flip", "poison_client_ids": [0],
+                   "goal": {"type": "untargeted_degrade", "target_accuracy_drop": 0.10}},
     }
 
 
@@ -54,6 +57,7 @@ def _env(frozen=True, benign_retrain=True, round_data=None):
     loaders = [_loader(i) for i in range(N_CLIENTS)]
     env = FLArmsRaceEnv(_cfg(frozen, benign_retrain), loaders, _loader(99, n=256),
                         random.Random(0), round_data=round_data)
+    torch.manual_seed(1234)
     gw = {k: v.clone() for k, v in MnistNet().state_dict().items()}
     cw = [{k: v + torch.randn_like(v) * 0.01 for k, v in gw.items()}
           for _ in range(N_CLIENTS)]
@@ -69,6 +73,22 @@ def _wreck(sd):
     return {k: v * -50.0 for k, v in sd.items()}
 
 
+def _wrecked_updates(env, ids=(0, 1)):
+    """This round's cohort with ``ids`` replaced by a blatantly poisoned update.
+
+    Built here rather than through the env because the real attack is a LABEL FLIP,
+    a genuine SGD trajectory that barely moves the aggregate on these synthetic
+    random-label loaders. These tests are about the ANCHOR's bookkeeping, so they
+    need a round whose damage is unmistakable.
+    """
+    from core.types import ModelUpdate
+    out = []
+    for u in env.build_updates(include_poison=False):
+        w = _wreck(u.weights) if u.client_id in set(ids) else u.weights
+        out.append(ModelUpdate(u.client_id, w, dict(u.metadata or {})))
+    return out
+
+
 def _clean_verdicts(updates):
     return [DetectionVerdict(u.client_id, False, 0.0, "test") for u in updates]
 
@@ -82,7 +102,7 @@ def test_committing_a_round_leaves_the_global_at_the_phase1_anchor():
     anchor = env.global_weights
     for _ in range(3):
         env.begin_round()
-        updates = env.build_updates({0: _wreck(env.pool_benign[0])})
+        updates = _wrecked_updates(env, ids=(0,))
         env.commit(updates, _clean_verdicts(updates))
         assert _same(env.global_weights, anchor), \
             "a committed simulated round moved the global off the Phase-1 anchor"
@@ -93,7 +113,7 @@ def test_commit_returns_the_rounds_post_attack_accuracy():
     number is the attacker's reward signal."""
     env = _env()
     env.begin_round()
-    updates = env.build_updates({0: _wreck(env.pool_benign[0])})
+    updates = _wrecked_updates(env, ids=(0,))
     verdicts = _clean_verdicts(updates)
     expected = env.evaluate_updates(updates, verdicts)
     assert abs(env.commit(updates, verdicts) - expected) < 1e-12
@@ -106,8 +126,7 @@ def test_current_accuracy_stays_the_anchors_accuracy():
     anchor, however much damage a round did."""
     env = _env()
     env.begin_round()
-    updates = env.build_updates({0: _wreck(env.pool_benign[0]),
-                                 1: _wreck(env.pool_benign[1])})
+    updates = _wrecked_updates(env)
     post = env.commit(updates, _clean_verdicts(updates))
     assert env.current_accuracy == env.baseline_accuracy
     assert post != env.current_accuracy or post == env.baseline_accuracy
@@ -119,8 +138,7 @@ def test_damage_does_not_carry_into_the_next_round():
     env = _env(round_data=None)
     env.begin_round()
     clean_first = env.clean_reference_accuracy()
-    updates = env.build_updates({0: _wreck(env.pool_benign[0]),
-                                 1: _wreck(env.pool_benign[1])})
+    updates = _wrecked_updates(env)
     env.commit(updates, _clean_verdicts(updates))
 
     env.begin_round()
@@ -134,7 +152,7 @@ def test_unfrozen_mode_still_advances_the_global():
     env = _env(frozen=False)
     anchor = env.global_weights
     env.begin_round()
-    updates = env.build_updates({})
+    updates = env.build_updates(include_poison=False)
     env.commit(updates, _clean_verdicts(updates))
     assert not _same(env.global_weights, anchor), \
         "freeze_global_in_phase2: false must keep the continuing-federation behaviour"
@@ -149,10 +167,11 @@ def test_benign_fl_interlude_is_skipped_when_frozen():
     assert _same(env.global_weights, anchor)
 
 
-def test_benign_retrain_is_forced_on_when_frozen():
-    env = _env(benign_retrain=False)
-    assert env.benign_retrain, \
-        "frozen rounds with frozen client weights would be byte-identical"
+def test_benign_retrain_is_forced_on():
+    """The label-flip poison IS local training on mislabelled data, so there is no
+    frozen-replay mode to fall back to."""
+    assert _env(benign_retrain=False).benign_retrain
+    assert _env(frozen=False, benign_retrain=False).benign_retrain
 
 
 def test_restore_reanchors_a_drifted_checkpoint():

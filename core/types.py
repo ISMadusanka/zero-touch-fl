@@ -8,9 +8,11 @@ from typing import Any
 class ModelUpdate:
     """A single client's model weights submission.
 
-    For benign clients ``weights`` is the locally trained state_dict. For
-    poisoned clients it is produced by applying the attacker LLM's attack plan
-    to the benign weights (see ``agents.attack_ops.apply_plan``).
+    ``weights`` is ALWAYS a locally trained state_dict — poisoned clients included.
+    The attack is label flipping (see ``data.label_flip``), so a poisoned update is
+    the honest output of honest SGD over corrupted labels; nothing edits the
+    weights after training. ``metadata['poisoned']`` marks which is which, and for
+    a poisoned client ``metadata`` also carries ``n_flipped`` / ``flip_fraction``.
     """
     client_id: int
     weights: dict  # state_dict tensors
@@ -68,11 +70,13 @@ class DetectionVerdict:
 class RoundLog:
     """Complete record of a single simulation/training round.
 
-    The old adaptation/skip bookkeeping (attacker_adapted, defender_adapted,
-    all_clients_flagged, round_skipped) is gone — adaptation is now RL, not a
-    hand-rolled feedback loop. The new fields capture the per-round ground
-    truth (``poisoned_client_ids``), the defender's predictions, and the
-    verifiable rewards used for the GRPO updates.
+    ``poisoned_client_ids`` is the round's ground truth — the clients that shipped
+    flipped labels. ``defender_reward`` is the verifiable signal the GRPO update
+    used. ``attack_effectiveness`` is NOT a reward: the attack is a fixed adaptive
+    schedule with no policy, so this is a pure measurement of how much accuracy
+    the round's flipped labels cost, normalized by ``attack_goal``'s target drop
+    (see ``rl.rewards.attack_effectiveness``). ``attack_metadata`` carries the
+    ladder's level and transition for the round.
     """
     round_num: int
     attack_goal: dict
@@ -80,7 +84,7 @@ class RoundLog:
     predicted_labels: list[dict]          # [{client_id, is_suspicious, confidence, reason}]
     test_accuracy: float
     baseline_accuracy: float
-    attacker_reward: float
+    attack_effectiveness: float
     defender_reward: float
-    learning_agent: str                   # "attacker" | "defender" | "none"
+    learning_agent: str                   # "defender" | "none"
     attack_metadata: dict = field(default_factory=dict)

@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""Run inference with a fine-tuned attacker / defender LoRA adapter.
+"""Run inference with the fine-tuned defender LoRA adapter.
 
-Loads the QLoRA base model + one trained adapter (from ``checkpoints/``) and
+Loads the QLoRA base model + the trained adapter (from ``checkpoints/``) and
 prints the model's raw text output. This uses the SAME policy class as training
 (`rl/policy.py`), so you get the actual fine-tuned behaviour — not the Ollama
 dry-run path.
+
+The defender is the only trained agent: the attack is a deterministic
+label-flipping schedule with no model behind it (see
+``agents/label_flip_attacker.py``).
 
 Must run on a GPU box (needs torch / unsloth / peft), same as training.
 
 Examples
 --------
-# One-shot, free-form prompt:
-python infer.py --adapter attacker --prompt "Describe a stealthy MNIST model-poisoning attack."
+# Use the REAL system prompt the defender was trained with, with a feature payload:
+python infer.py --role --prompt '{"client_ids":[0,1,2],"features":{}}'
 
-# Use the REAL system prompt the agent was trained with; read the user message from stdin:
-echo '{"round": 5, "current_global_accuracy": 0.8, "attack_goal": {"type":"untargeted_degrade","target_accuracy_drop":0.2}, "controllable_client_ids":[0,1,2,3,4], "max_poison_clients":1, "client_update_stats": {}}' \
-  | python infer.py --adapter attacker --role
+# Read the user message from stdin:
+cat features.json | python infer.py --role
 
 # Sample 4 completions at temperature 1.0:
-python infer.py --adapter defender --role --prompt '{"client_ids":[0,1,2,3,4],"features":{}}' --n 4 --temperature 1.0
+python infer.py --role --prompt '{"client_ids":[0,1,2],"features":{}}' --n 4 --temperature 1.0
 
 # Interactive: load the model ONCE, then prompt repeatedly:
-python infer.py --adapter attacker --role --interactive
+python infer.py --role --interactive
 """
 import argparse
 import os
@@ -45,37 +48,34 @@ def _load_policy(cfg):
     )
 
 
-def _role_system(adapter: str, cfg: dict | None = None) -> str:
-    """The exact system prompt the given agent was trained with.
+def _role_system(cfg: dict | None = None) -> str:
+    """The exact system prompt the defender was trained with.
 
-    The attacker has two variants and the config picks between them: with
-    ``attack.fixed_poison_clients`` set it was trained to plan for a FIXED client
-    set, without it to select clients itself. Reading the config here is what
-    keeps "exact" true — the two prompts differ in their rules, so serving the
-    wrong one to a trained adapter is off-distribution.
+    Built from ``configs/defender_agent.yaml`` when it is readable, because
+    ``emit_reason`` changes the required output schema — serving the wrong variant
+    to a trained adapter is off-distribution.
     """
-    if adapter == "attacker":
-        from agents.attacker_agent import AttackerAgent
-        attack = ((cfg or {}).get("attack") or {})
-        fixed = attack.get("fixed_poison_clients") not in (None, False, 0, "")
-        return AttackerAgent({"fixed_poison_set": fixed}).system_prompt()
     from agents.defender_agent import DefenderAgent
-    return DefenderAgent().system_prompt()
+    try:
+        defender_cfg = yaml.safe_load(open("configs/defender_agent.yaml")) or {}
+    except OSError:
+        defender_cfg = {}
+    return DefenderAgent(defender_cfg).system_prompt()
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Inference on a fine-tuned attacker/defender adapter",
+        description="Inference on the fine-tuned defender adapter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--adapter", choices=["attacker", "defender"], required=True,
-                    help="which trained adapter to load")
+    ap.add_argument("--adapter", choices=["defender"], default="defender",
+                    help="which trained adapter to load (only the defender is trained)")
     ap.add_argument("--prompt", default=None,
                     help="user prompt (omit to read stdin, or use --interactive)")
     ap.add_argument("--system", default=None,
                     help="system prompt text (default: empty, or the role prompt with --role)")
     ap.add_argument("--role", action="store_true",
-                    help="use the agent's REAL trained system prompt for this role")
+                    help="use the defender's REAL trained system prompt")
     ap.add_argument("--config", default="configs/base.yaml")
     ap.add_argument("--adapter-path", default=None,
                     help="override the checkpoint dir (default: rl.adapter_paths from config)")
@@ -99,7 +99,7 @@ def main():
     if args.system is not None:
         system = args.system
     elif args.role:
-        system = _role_system(args.adapter, cfg)
+        system = _role_system(cfg)
     else:
         system = ""
 

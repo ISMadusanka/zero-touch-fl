@@ -286,10 +286,14 @@ def build_algorithmic_defender(cfg: dict, *, root_loader=None,
         root_loader = root_loader_factory()
 
     # DnC / Multi-Krum need an ASSUMED upper bound on the number of malicious
-    # clients (a hyperparameter, never per-round truth). Default it to the attack
-    # budget the config actually grants, clamped to keep an honest majority.
+    # clients (a hyperparameter, never per-round truth). Default it to how many
+    # clients the config actually has flipping labels, clamped to keep an honest
+    # majority — both algorithms are only defined for a minority adversary.
     n_clients = int(fl.get("n_clients", 1))
-    default_byz = max(1, min(int(attack.get("max_poison_clients", 1)),
+    poison_ids = attack.get("poison_client_ids", [0])
+    if isinstance(poison_ids, int):
+        poison_ids = [poison_ids]
+    default_byz = max(1, min(len(list(poison_ids or [0])),
                              max(1, (n_clients - 1) // 2)))
     assumed_byz = dcfg.get("assumed_byzantine")
     assumed_byz = default_byz if assumed_byz is None else max(1, int(assumed_byz))

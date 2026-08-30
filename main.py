@@ -2,37 +2,49 @@
 
 Two phases:
   Phase 1 (training_rounds): honest FedAvg training, then checkpoint.
-  Phase 2 (simulation_rounds): attacker-learning rounds SIMULATED on the frozen
+  Phase 2 (simulation_rounds): defender-learning rounds SIMULATED on the frozen
     Phase-1 global.
+
+THE ATTACK IS LABEL FLIPPING, and it is not learned. A fixed, configurable set of
+insider clients (``attack.poison_client_ids``, default ``[0]``) trains each round
+on its own data with some fraction of the labels flipped symmetrically
+(``y -> 9-y``). That fraction follows a detection-adaptive ladder:
+
+  * start at 100% of the client's round data,
+  * every round the defense CATCHES it, back off one step (10% by default),
+  * every round the defense MISSES it, hold the level and send it again,
+  * once it is caught at the floor (50%), RESET to 100% and descend again.
+
+So the attack strength is a saw-tooth driven by the defender's own competence,
+and it keeps re-testing the whole range instead of parking at one setting. See
+``agents/label_flip_attacker.py``.
 
 Phase 2 does not run a continuing federation. Each round is an independent episode
 branching off the SAME Phase-1 final model:
 
   1. that frozen global is sent to every client;
   2. every client trains on NEW local data (a fresh slice of its own shard);
-  3. the attacker LLM picks an exact-budget subset of its controllable pool and
-     poisons those clients (primitive weight operators over the benign weights);
+  3. the poisoned clients re-train that same data with the ladder's share of the
+     labels flipped;
   4. poisoned + honest updates go to the server, which defends and aggregates;
-  5. the aggregate is evaluated on the test set — that accuracy is the attacker's
-     reward — and then DISCARDED. The attacker improves on it with GRPO;
-  6. the next round starts again from the Phase-1 global.
+  5. the aggregate is evaluated on the test set, the defender is rewarded on how
+     well its verdicts matched ground truth, and GRPO updates it;
+  6. those verdicts feed the ladder, and the next round starts from the anchor.
 
-Set ``fl.freeze_global_in_phase2: false`` to restore the original continuing
-federation, where each committed aggregate becomes the next round's global.
+Set ``fl.freeze_global_in_phase2: false`` to restore the continuing federation,
+where each committed aggregate becomes the next round's global.
 
-The DEFENDER LLM IS CURRENTLY DISABLED (``defense.mode: algorithmic`` in
-configs/base.yaml). The server instead defends with the published algorithms —
-FLTrust, DeFL, DnC and Multi-Krum — using ONE of them, drawn at random, per
-round (see ``server/algo_defender.py``). Only the attacker is trained with GRPO.
-Setting ``defense.mode: llm`` restores the original two-sided arms race, where a
-defender LLM classifies each client benign/malicious from per-client per-layer
-statistics and both sides get a verifiable per-round reward and train with GRPO
-(separate LoRA adapters over one frozen Qwen2.5-3B-Instruct base).
+The DEFENDER LLM is the only learner (``defense.mode: llm``). It classifies each
+client benign/malicious from per-client per-layer weight statistics and trains with
+GRPO over a LoRA adapter on a frozen Qwen2.5-3B-Instruct base. Setting
+``defense.mode: algorithmic`` swaps it for the published algorithms — FLTrust,
+DeFL, DnC, Multi-Krum — which is useful for ``--dry-run`` / ``--baseline`` and the
+benchmark, but leaves nothing to train.
 
 Modes:
   python main.py --env linux                 # full GRPO training (needs a GPU)
   python main.py --env linux --dry-run       # frozen-LLM round loop, no training
-  python main.py --baseline                  # best-of-N reward-harness sanity (no LLM)
+  python main.py --baseline                  # no-LLM round loop + fixed heuristic defense
   python main.py --fresh                      # force fresh Phase-1 training
   python main.py --rounds 8                   # override simulation_rounds (quick runs)
 """
@@ -56,8 +68,8 @@ from clients.benign_client import BenignClient
 from server.fed_server import FedServer
 from server.aggregation import FedAvgAggregator
 from server.algo_defender import build_algorithmic_defender
-from agents.attacker_agent import AttackerAgent
 from agents.defender_agent import DefenderAgent
+from agents.label_flip_attacker import build_attacker
 from agents.llm_client import create_llm_client
 from storage.checkpoint import (
     save_state, load_state, state_exists, save_progress, load_progress, adapter_exists,
@@ -112,9 +124,7 @@ def quiet_noisy_warnings():
     imported lazily in ``rl/policy.py`` on the training path) — tripping Unsloth's
     "import unsloth before transformers" warning and potentially skipping some of
     its optimizations. Transformers' own log verbosity is lowered in
-    ``LLMPolicy.__init__`` instead, right after Unsloth is imported. The
-    ``warnings.filterwarnings`` calls below are pure ``warnings``-module filters
-    and do not import ``transformers``.
+    ``LLMPolicy.__init__`` instead, right after Unsloth is imported.
     """
     import warnings
     warnings.filterwarnings("ignore", message=r".*max_new_tokens.*max_length.*")
@@ -173,7 +183,7 @@ def run_training_phase(config: dict, client_loaders, test_loader):
     for round_num in range(1, fl["training_rounds"] + 1):
         logger.info(f"--- Training Round {round_num}/{fl['training_rounds']} ---")
         updates = [client.train(server.model) for client in clients]
-        # No detection in Phase 1 — everyone is honest.
+        # No detection in Phase 1 — everyone is honest, no labels are flipped.
         clean = [DetectionVerdict(u.client_id, False, 0.0, "phase1") for u in updates]
         new_weights = aggregator.aggregate(updates, clean)
         server.set_global_weights(new_weights)
@@ -190,61 +200,54 @@ def run_training_phase(config: dict, client_loaders, test_loader):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: LLM-direct adversarial arms race
+# Phase 2: label-flip attack vs the learning defender
 # ---------------------------------------------------------------------------
 
 def run_phase2(
     global_weights, client_weights, baseline_accuracy,
-    client_loaders, test_loader, config, attacker_config, defender_config,
+    client_loaders, test_loader, config, defender_config,
     mode: str, n_rounds: int, llm_backend: str,
     max_new_rounds: int | None = None,
 ):
     fl = config["fl"]
-    logger.info("=" * 60)
-    attack_cfg = config.get("attack", {})
+    attack_cfg = config.get("attack", {}) or {}
     frozen = bool(fl.get("freeze_global_in_phase2", True))
-    logger.info(f"PHASE 2: attacker-learning rounds  (mode={mode}, "
+    seed = int(fl.get("poison_seed", 0))
+
+    logger.info("=" * 60)
+    logger.info(f"PHASE 2: defender-learning rounds  (mode={mode}, "
                 f"{'SIMULATED on the frozen Phase-1 global' if frozen else 'continuing federation'})")
     logger.info(f"  client_data_refresh={fl.get('client_data_refresh', 'rotate')} "
                 f"fraction={fl.get('client_round_fraction', 0.25)}")
-    _fixed_poison = attack_cfg.get("fixed_poison_clients")
-    if _fixed_poison not in (None, False, 0, ""):
-        logger.info(f"  simulation_rounds={n_rounds}, FIXED poison set = clients "
-                    f"0..{int(_fixed_poison) - 1} ({_fixed_poison} of "
-                    f"{fl.get('n_clients')}), poisoned every round; the attacker LLM "
-                    f"chooses HOW to poison them, not which")
-    else:
-        logger.info(f"  simulation_rounds={n_rounds}, n_compromisable={fl.get('n_compromisable')}, "
-                    f"max_poison_clients={attack_cfg.get('max_poison_clients')}, "
-                    f"sample_budget={attack_cfg.get('sample_budget_in_training')}")
-    goal_cfg = attack_cfg.get("goal", {}) or {}
-    logger.info(f"  attack_goal={goal_cfg.get('type')} "
-                f"target_accuracy_drop={goal_cfg.get('target_accuracy_drop')} "
-                f"sample_target={attack_cfg.get('sample_target_in_training')}")
-    logger.info(f"  baseline_accuracy={baseline_accuracy:.4f}")
+
+    # The attack is built here (not inside the env) so its ladder state can be
+    # restored from the progress file before the first round runs.
+    attacker = build_attacker(config, n_clients=int(fl["n_clients"]), seed=seed)
+    logger.info(f"  simulation_rounds={n_rounds}, baseline_accuracy={baseline_accuracy:.4f}")
+    logger.info(f"  attack_goal={(attack_cfg.get('goal') or {}).get('type')} "
+                f"target_accuracy_drop="
+                f"{(attack_cfg.get('goal') or {}).get('target_accuracy_drop')} "
+                f"(the DAMAGE BAR the round is reported against — it does not change "
+                f"what the attack does)")
     logger.info("=" * 60)
 
-    seed = int(fl.get("poison_seed", 0))
     rng = random.Random(seed)
     # Step 2 of a simulated round: every client gets NEW local data each round (a
     # fresh slice of its own shard). Without this the frozen global would hand the
     # clients an identical starting point AND identical data, so every round would
-    # reproduce the same honest updates and there would be nothing for the attacker
-    # to generalize over. ``fl.client_data_refresh: none`` turns it off.
+    # reproduce the same honest updates and the defender would face one static
+    # problem restated N times. ``fl.client_data_refresh: none`` turns it off.
     round_data = build_round_data_sampler(config, client_loaders, seed=seed)
-    # Server-side defense. With ``defense.mode: algorithmic`` (the default) the
-    # defender LLM is disabled and one published algorithm — FLTrust / DeFL / DnC /
-    # Multi-Krum — defends each round, drawn at random; only the attacker trains.
-    # ``defense.mode: llm`` restores the trainable defender LLM.
+    # Server-side defense. ``defense.mode: llm`` (the default) trains the defender
+    # LLM; ``algorithmic`` swaps in one published algorithm per round, which leaves
+    # nothing to train and is only useful for --dry-run / --baseline.
+    #
     # An honest client's per-round SGD iteration count. FLTrust's root fine-tuning is
     # sized to match it (defense.fltrust.root_epochs: null), because FLTrust rescales
     # every accepted update to ||g0|| — so the server's reference update, not the
-    # clients', sets how far the global model can move per round. See
-    # server.algo_defender.resolve_root_epochs. It must be counted over the data a
-    # client actually trains on THIS round, which with the per-round refresh on is a
-    # slice of the shard, not the whole thing — sizing g0 off the full shard would
-    # make it several times too large and FLTrust would rescale every honest update
-    # to match.
+    # clients', sets how far the global model can move per round. It must be counted
+    # over the data a client actually trains on THIS round, which with the per-round
+    # refresh on is a slice of the shard, not the whole thing.
     batches_per_client = (
         round_data.batches_per_round if round_data is not None
         else (len(client_loaders[0]) if client_loaders else 0)
@@ -262,33 +265,26 @@ def run_phase2(
             seed=seed,
         ),
     )
-    # Training curriculum: instead of drawing the defense algorithm and the poison
-    # quota at random every round, sweep them — one algorithm held for
-    # `rounds_per_block` rounds at 1 poisoner, then at 2, ... then the next
-    # algorithm, then the cycle repeats. Every (defense, #poisoners) pair therefore
-    # gets an equal, contiguous share of the attacker's training. None = the old
-    # random draws (no `curriculum:` block, or `enabled: false`).
+    # With an algorithmic defense the curriculum sweeps WHICH algorithm defends each
+    # block; under the defender LLM there is no algorithm axis and the attack
+    # strength is the ladder's, so there is nothing to sweep and it returns None.
     curriculum = build_training_curriculum(
         config, algorithms=(defense.names if defense is not None else None))
     env = FLArmsRaceEnv(config, client_loaders, test_loader, rng,
-                        defense=defense, curriculum=curriculum, round_data=round_data)
+                        defense=defense, curriculum=curriculum, round_data=round_data,
+                        attacker=attacker)
     env.reset(global_weights, client_weights, baseline_accuracy)
 
     metrics_tracker = MetricsTracker(baseline_accuracy=baseline_accuracy, output_dir="logs/metrics")
-    attacker_agent = AttackerAgent(attacker_config)
     defender_agent = DefenderAgent(defender_config)
 
     if mode == "baseline":
         from rl.baseline import run_baseline
-        # Same attacker reward weights training uses — the baseline COMMITS the
-        # highest-scoring action, so different weights would report a different
-        # attack (see rl.rewards.check_reward_balance).
-        run_baseline(env, n_rounds, metrics_tracker, _save_round_log,
-                     reward_cfg=config.get("rl", {}).get("reward", {}).get("attacker", {}))
+        run_baseline(env, n_rounds, metrics_tracker, _save_round_log)
 
     elif mode == "dry-run":
         from rl.inference import InferenceGenerator, run_inference
-        llm_cfg = attacker_config.get("llm", {})
+        llm_cfg = defender_config.get("llm", {})
         model = llm_cfg.get("ollama_model" if llm_backend == "ollama" else "model")
         backend = create_llm_client(
             backend=llm_backend, model=model,
@@ -296,51 +292,40 @@ def run_phase2(
             ollama_base_url=llm_cfg.get("ollama_base_url", "http://localhost:11434"),
         )
         gen = InferenceGenerator(backend, max_new_tokens=int(config.get("rl", {}).get("max_new_tokens", 2048)))
-        run_inference(env, attacker_agent, defender_agent, gen, n_rounds,
-                      metrics_tracker, _save_round_log,
-                      temperature=float(llm_cfg.get("temperature", 0.7)),
-                      reward_cfg=config.get("rl", {}).get("reward", {}).get("attacker", {}))
+        run_inference(env, defender_agent, gen, n_rounds, metrics_tracker,
+                      _save_round_log,
+                      temperature=float(llm_cfg.get("temperature", 0.7)))
 
     else:  # full GRPO training
         from rl.policy import LLMPolicy
         from rl.schedule import train
         rl_cfg = config.get("rl", {})
         adapter_paths = rl_cfg.get("adapter_paths", {
-            "attacker": "checkpoints/attacker_adapter",
             "defender": "checkpoints/defender_adapter",
         })
-        # With the defender LLM disabled there is no defender policy to train, so
-        # we don't even materialise its LoRA adapter (one fewer ~115 MB copy of
-        # LoRA tensors on the GPU). Its checkpoint on disk is left untouched, so
-        # flipping ``defense.mode`` back to ``llm`` resumes it unchanged.
-        adapter_names = ("attacker",) if defense is not None else ("attacker", "defender")
+        # Only the defender has a policy now, so only its LoRA adapter is
+        # materialised (one fewer ~115 MB copy of LoRA tensors on the GPU).
         policy = LLMPolicy(
             base_model=rl_cfg.get("model", "unsloth/Qwen2.5-3B-Instruct"),
             max_seq_len=int(rl_cfg.get("max_seq_len", 8192)),
             lora_r=int(rl_cfg.get("lora_r", 16)),
             lora_alpha=int(rl_cfg.get("lora_alpha", 32)),
             load_in_4bit=bool(rl_cfg.get("load_in_4bit", True)),
-            seed=int(fl.get("poison_seed", 0)),
-            adapters=adapter_names,
+            seed=seed,
+            adapters=("defender",),
             attn_implementation=rl_cfg.get("attn_implementation", "eager"),
             use_fast_generate=bool(rl_cfg.get("use_fast_generate", True)),
         )
-        # Measure the attacker's context fill with the REAL tokenizer from here on
-        # (until now the agent used the character heuristic). This is what makes
-        # rl.max_context_fill an exact cap rather than an approximate one.
-        attacker_agent.bind_tokenizer(policy.count_prompt_tokens)
-        # Resume adapters if present.
-        for name, path in adapter_paths.items():
-            if name in adapter_names and adapter_exists(path):
-                policy.load_adapter(name, path)
+        if adapter_exists(adapter_paths["defender"]):
+            policy.load_adapter("defender", adapter_paths["defender"])
         progress = load_progress()
         start_round = progress["rounds_done"]
         if start_round:
             logger.info(f"Resuming Phase-2 training from round {start_round}")
             # Restore the LIVE shared FL state (the evolving global model + per-client
-            # weights) so the arms race continues from where it stopped instead of
-            # rewinding to the Phase-1 baseline. env.reset() above already loaded the
-            # Phase-1 baseline; this overrides it with the saved Phase-2 state.
+            # weights) so the run continues from where it stopped instead of rewinding
+            # to the Phase-1 baseline. env.reset() above already loaded the Phase-1
+            # baseline; this overrides it with the saved Phase-2 state.
             saved_fl = load_fl_state()
             if saved_fl is not None:
                 env.restore_fl_state(saved_fl)
@@ -350,14 +335,15 @@ def run_phase2(
                     "Phase-1 baseline (older checkpoint predating fl_state.pt)."
                 )
 
-        def progress_cb(done, round_index=None, controller=None, curriculum=None):
+        def progress_cb(done, round_index=None, controller=None, curriculum=None,
+                        attacker_state=None):
             save_progress(done, round_index=round_index, controller=controller,
-                          curriculum=curriculum)
+                          curriculum=curriculum, attacker=attacker_state)
 
         def fl_state_cb(fl_state):
             save_fl_state(fl_state)
 
-        train(env, policy, attacker_agent, defender_agent, config,
+        train(env, policy, defender_agent, config,
               metrics_tracker, _save_round_log, rng,
               progress_cb=progress_cb, fl_state_cb=fl_state_cb,
               start_round=start_round, resume=progress,
@@ -368,12 +354,14 @@ def run_phase2(
     if frozen:
         # The global never moved (that is the point), so the informative number is
         # the LAST round's post-attack accuracy — what the anchor degrades to under
-        # the attacker's committed plan — not the anchor's own unchanged accuracy.
+        # the committed round — not the anchor's own unchanged accuracy.
         logger.info(f"Frozen anchor accuracy: {env.current_accuracy:.4f} "
                     f"(baseline: {baseline_accuracy:.4f}) — last simulated round scored "
                     f"{env.last_round_accuracy:.4f}")
     else:
         logger.info(f"Final accuracy: {env.current_accuracy:.4f} (baseline: {baseline_accuracy:.4f})")
+    logger.info(f"Label-flip ladder ended at {env.attacker.fraction:.0%} "
+                f"(cycle {env.attacker.ladder.cycle})")
     logger.info("=" * 60)
     metrics_tracker.save_summary()
 
@@ -392,14 +380,15 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Run the Phase-2 loop with a frozen LLM (no training, no GPU needed)")
     parser.add_argument("--baseline", action="store_true",
-                        help="Run the best-of-N reward-harness sanity baseline (no LLM)")
+                        help="Run the Phase-2 loop with no LLM at all (fixed heuristic defense)")
     parser.add_argument("--rounds", type=int, default=None,
                         help="Override simulation_rounds (handy for quick smoke runs)")
     parser.add_argument("--debug", action="store_true",
-                        help="Verbose Phase-2 debug run: print every attacker/defender LLM "
-                             "prompt+output, poisoning step, FL update and reward to the console "
-                             "AND to logs/debug.json. Library noise is silenced. If --rounds is "
-                             f"not given, Phase 2 is capped at {DEBUG_DEFAULT_ROUNDS} rounds.")
+                        help="Verbose Phase-2 debug run: print the label-flip plan, every "
+                             "defender LLM prompt+output, every FL update and reward to the "
+                             "console AND to logs/debug.json. Library noise is silenced. If "
+                             "--rounds is not given, Phase 2 is capped at "
+                             f"{DEBUG_DEFAULT_ROUNDS} rounds.")
     args = parser.parse_args()
 
     setup_logging(debug=args.debug)
@@ -407,31 +396,17 @@ def main():
     logger.info("Starting Zero-Touch Federated Learning System")
 
     base_config = load_config(args.config)
-    attacker_config = load_config("configs/attacker_agent.yaml")
     defender_config = load_config("configs/defender_agent.yaml")
 
     # LLM backend + shared Ollama defaults (used by --dry-run / OpenAI paths).
     llm_backend = "ollama" if args.env == "linux" else "openai"
     llm_defaults = base_config.get("llm", {})
-    for agent_cfg in (attacker_config, defender_config):
-        agent_cfg.setdefault("llm", {})
-        agent_cfg["llm"]["backend"] = llm_backend
-        agent_cfg["llm"].setdefault("ollama_base_url", llm_defaults.get("ollama_base_url", "http://localhost:11434"))
-        agent_cfg["llm"].setdefault("ollama_model", llm_defaults.get("ollama_model", "qwen2.5:3b"))
-
-    # Single source of truth for the attack goal: base config -> attacker agent.
-    goal = base_config.get("attack", {}).get("goal")
-    if goal:
-        attacker_config["attack_goal"] = goal
-
-    # ...and for the two things the attacker's PROMPT depends on but that live in
-    # the base config: whether the poisoned set is fixed (which changes the system
-    # prompt from "select k of n" to "plan for all of these"), and the context-fill
-    # budget the observation is compacted to fit.
-    _attack_cfg = base_config.get("attack", {}) or {}
-    attacker_config["fixed_poison_set"] = (
-        _attack_cfg.get("fixed_poison_clients") not in (None, False, 0, ""))
-    attacker_config["rl"] = base_config.get("rl", {})
+    defender_config.setdefault("llm", {})
+    defender_config["llm"]["backend"] = llm_backend
+    defender_config["llm"].setdefault(
+        "ollama_base_url", llm_defaults.get("ollama_base_url", "http://localhost:11434"))
+    defender_config["llm"].setdefault(
+        "ollama_model", llm_defaults.get("ollama_model", "qwen2.5:3b"))
 
     # Reproducibility.
     seed = int(base_config["fl"].get("poison_seed", 0))
@@ -481,28 +456,30 @@ def main():
         logger.info(f"[debug] no --rounds given -> capping this run at "
                     f"{DEBUG_DEFAULT_ROUNDS} Phase-2 round(s)")
     if args.debug:
+        attack_cfg = base_config.get("attack", {}) or {}
+        schedule = attack_cfg.get("schedule") or {}
         dbg.enable(
             output_dir="logs", filename="debug.json", mode=mode,
             config_summary={
                 "model": base_config.get("rl", {}).get("model"),
-                "defense_mode": (base_config.get("defense", {}) or {}).get("mode", "algorithmic"),
+                "defense_mode": (base_config.get("defense", {}) or {}).get("mode", "llm"),
                 "defense_algorithms": (base_config.get("defense", {}) or {}).get("algorithms"),
-                "defense_selection": (base_config.get("defense", {}) or {}).get("selection", "random"),
                 "curriculum": (base_config.get("curriculum") or None),
                 "freeze_global_in_phase2": fl.get("freeze_global_in_phase2", True),
                 "client_data_refresh": fl.get("client_data_refresh", "rotate"),
                 "client_round_fraction": fl.get("client_round_fraction", 0.25),
                 "n_clients": fl.get("n_clients"),
-                "n_compromisable": fl.get("n_compromisable"),
-                "fixed_poison_clients": base_config.get("attack", {}).get("fixed_poison_clients"),
-                "max_poison_clients": base_config.get("attack", {}).get("max_poison_clients"),
-                "sample_budget": base_config.get("attack", {}).get("sample_budget_in_training"),
+                "attack_type": attack_cfg.get("type", "label_flip"),
+                "poison_client_ids": attack_cfg.get("poison_client_ids"),
+                "flip_ladder": {
+                    "start_fraction": schedule.get("start_fraction"),
+                    "step_fraction": schedule.get("step_fraction"),
+                    "floor_fraction": schedule.get("floor_fraction"),
+                    "caught_rule": schedule.get("caught_rule"),
+                },
                 "noniid_bias": base_config.get("data", {}).get("noniid_bias"),
                 "G": base_config.get("rl", {}).get("G"),
-                "switch_mode": base_config.get("rl", {}).get("switch_mode"),
-                "first_learner": base_config.get("rl", {}).get("first_learner"),
                 "success_streak": base_config.get("rl", {}).get("success_streak"),
-                "fl_interlude_between_phases": base_config.get("rl", {}).get("fl_interlude_between_phases"),
                 "baseline_accuracy": round(float(baseline_accuracy), 4),
                 "n_rounds": n_rounds,
                 "max_new_rounds": max_new_rounds,
@@ -517,7 +494,6 @@ def main():
             client_loaders=client_loaders,
             test_loader=test_loader,
             config=base_config,
-            attacker_config=attacker_config,
             defender_config=defender_config,
             mode=mode,
             n_rounds=n_rounds,

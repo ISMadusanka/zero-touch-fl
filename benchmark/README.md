@@ -1,103 +1,98 @@
 # Defense Benchmark
 
-Pits the **trained attacker** against a panel of defenses — the **trained
-defender LLM** plus established baselines — for *N* attack rounds, and reports
-**how much of the attack each defense detected** and how well it preserved model
-accuracy.
+Pits the **label-flip attack** against a panel of defenses — the **trained defender
+LLM** plus established baselines — for *N* rounds, and reports **how much of the
+attack each defense detected** and how well it preserved model accuracy.
 
-This package is **purely additive**: it reuses the existing FL components
-read-only (`model/`, `data/`, `clients/`, `server/`, `agents/`, `detector/`,
-`rl/policy.py`, `rl/env.py`, `metrics/`) and modifies **none** of them.
+This package is **purely additive**: it reuses the existing FL components read-only
+(`model/`, `data/`, `clients/`, `server/`, `agents/`, `detector/`, `rl/policy.py`,
+`rl/env.py`, `metrics/`) and modifies **none** of them.
+
+**No attacker model is needed.** The attack is a deterministic, detection-adaptive
+label-flipping schedule (`agents/label_flip_attacker.py`), so every column except
+`llm_defender` runs on CPU.
 
 ## Run it
-
-On the GPU box (needs torch / unsloth / peft + the trained adapters in `checkpoints/`):
 
 ```bash
 python -m benchmark.run_benchmark --rounds 200
 
-# Pick the attack goal the attacker aims for (fixed for the whole run, no per-round
-# sampling). The trained attacker generalizes across targets, so you can evaluate it
-# at any requested drop and read each defense's acc_drop against that target:
+# Pin the attack at ONE strength for the whole run. This is usually what you want
+# for a clean per-defense comparison: with the ladder free to adapt, each defense
+# would otherwise be measured partly on how hard the FEEDBACK defense was pushing.
+python -m benchmark.run_benchmark --rounds 200 --flip-fraction 1.0
+python -m benchmark.run_benchmark --rounds 200 --flip-fraction 0.6
+
+# Choose which defense's verdicts drive the ladder (default: the first non-fedavg
+# column). 'none' holds the attack at its starting level for the whole run.
+python -m benchmark.run_benchmark --rounds 200 --ladder-feedback fltrust
+python -m benchmark.run_benchmark --rounds 200 --ladder-feedback none
+
+# The DAMAGE BAR the run is reported against (does not change what the attack does):
 python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.1'
-python -m benchmark.run_benchmark --rounds 200 --goal 'untargeted_degrade=0.3'
 #   forms: untargeted_degrade=<drop> | slow_degrade=<drop> | targeted_label=<label>
 #   default (no --goal): attack.goal from configs/base.yaml
 # The chosen goal is printed in the report header and saved to benchmark.json.
 
-# to chnage outcomes
+# vary the seed to change the partition / which examples get flipped
 python -m benchmark.run_benchmark --rounds 10 --seed 1
 python -m benchmark.run_benchmark --rounds 10 --seed 2
-python -m benchmark.run_benchmark --rounds 10 --seed 3
 
 # choose defenses / tune FLTrust + DeFL + DnC + Multi-Krum / save outputs:
 python -m benchmark.run_benchmark --rounds 200 \
     --defenses fedavg,oracle,fltrust,llm_defender,defl,dnc,multikrum \
-    --attack-temperature 0.7 --root-size 100 --eta 1.0 \
+    --root-size 100 --eta 1.0 \
     --defl-delta 0.05 --defl-tau 2.5 --dnc-c 1.0 --dnc-sub-dim 10000 \
     --multikrum-m 4 --out logs/benchmark
 
-# sweep the adversary's size: 1 .. fl.n_clients (20) poisoners per round.
-# Evaluation is NOT limited to fl.n_compromisable (10) the way training is — the
-# controllable pool is resized to match the quota, so `15` really does poison
-# exactly 15 clients (clients 0..14 in that widened case).
-# Under a fixed poisoned set (attack.fixed_poison_clients, the shipped default)
-# --max-poison-clients resizes that set: the first k clients, the same every round.
+# sweep the adversary's size: the standard "attack success vs fraction malicious"
+# experiment. Evaluation has no training-time pool limit — name any client ids.
 for k in 1 3 5 10 15 20; do
-  python -m benchmark.run_benchmark --rounds 50 --max-poison-clients $k \
-      --out logs/benchmark/poisoners_$k
+  ids=$(seq -s, 0 $((k-1)))
+  python -m benchmark.run_benchmark --rounds 50 --poison-clients "$ids" \
+      --flip-fraction 1.0 --out logs/benchmark/poisoners_$k
 done
 ```
 
-### `--max-poison-clients` (the exact eval poison quota)
+### `--poison-clients` (who flips labels)
 
-Valid range is **1 .. `fl.n_clients`** (20 by default). Two things to keep in mind:
+A comma-separated list of client ids, e.g. `0` or `0,1,2`. Defaults to
+`attack.poison_client_ids` from the config. Valid range is `0 .. fl.n_clients-1`;
+ids outside it are **dropped with a warning, not clamped** — clamping `0,25` would
+silently produce two attacks on whichever id the clamp landed on.
 
-- It is an **exact quota, not a ceiling.** The attacker chooses which clients and
-  their plans, but not how many: `--max-poison-clients 10` means exactly 10
-  effective poisoned updates each completed round. The report labels this as an
-  exact quota and each summary retains `mean_poisoned` as an audit field.
-- **Past ~50% the defenses have no guarantee left.** Multi-Krum (needs `n ≥ 2f+3`),
-  DnC and DeFL all assume the adversary is a minority; at or above half the
-  federation, weak detection is the expected result rather than a defect. FLTrust is
-  the exception — its trust comes from the server's clean root set, not from the
-  client population. At `--max-poison-clients 20` there are no honest updates at all,
-  so FPR/precision are degenerate and only the accuracy columns mean anything. The
-  run warns about each of these thresholds as it starts.
+**Past ~50% the defenses have no guarantee left.** Multi-Krum (needs `n ≥ 2f+3`),
+DnC and DeFL all assume the adversary is a minority; at or above half the
+federation, weak detection is the expected result rather than a defect. FLTrust is
+the exception — its trust comes from the server's clean root set, not from the
+client population. With every client poisoned there are no honest updates at all,
+so FPR/precision are degenerate and only the accuracy columns mean anything. The
+run warns at each of these thresholds as it starts.
 
-Going above `fl.n_compromisable` also means the policy is being evaluated outside the
-threat model it was fitted to (it trained against a 10-client foothold). That is a
-legitimate generalization test, and the run says so — raise `fl.n_compromisable` and
-retrain if you want it in-distribution.
+### `--flip-fraction` and `--ladder-feedback` (how the attack behaves)
 
-### Unusable attacker rounds (`--attack-retries`)
+By default the attack **adapts**: it starts at `attack.schedule.start_fraction`
+(100%), backs off a notch each time it is caught, and resets at the floor. In a
+benchmark that raises a question the single-defense case does not have — *caught by
+whom?* The panel has N defenses with N different verdicts.
 
-A single attacker generation can come back unusable: truncated mid-JSON at
-`rl.max_new_tokens`, or a plan that parses fine but changes no weight (`scale`
-with `factor: 1.0`, an unknown operator, a target no layer matches).
-`select_and_apply` will not label byte-identical benign weights as poison, so such
-a round produces fewer effective plans than the quota and cannot be measured.
+- `--ladder-feedback <defense>` names the one whose verdicts close the loop
+  (default: the first non-`fedavg` column). Every defense still faces the identical
+  attack each round; one of them additionally decides how strong the next round is.
+- `--ladder-feedback none` never advances the ladder, so the attack stays at its
+  starting level for the whole run.
+- `--flip-fraction F` pins it harder still: it sets `start = floor = F`, so the
+  ladder has a single level and **no** step is possible whatever any defense
+  detects.
 
-That is sampling noise, not a broken run, so the round's action is **resampled**
-up to `--attack-retries` times (default **3**; retries are drawn at temperature
-≥ 0.7 even under `--attack-temperature 0`, since a greedy redraw would return the
-identical text). The run log names the cause — including whether the generation hit
-the token cap — and quotes the offending output.
-
-A round with no usable action after every retry is **skipped**: logged at ERROR,
-excluded from every defense's metrics, and the run continues. It is not scored,
-because feeding the panel an all-honest round whose ground truth claims `budget`
-poisoners would depress `detect%` and `acc_drop` for an attack that never happened.
-The report header and each summary's `rounds` therefore count **measured** rounds,
-and `history.json` records `requested_rounds` / `measured_rounds` /
-`unusable_attack_rounds`. Persistent skips mean the attacker output is too long for
-its budget (raise `rl.max_new_tokens`) or the adapter is degenerate — not a defense
-result.
+For a straight "how do these defenses handle a 100% label flip" table, use
+`--flip-fraction 1.0`. Let the ladder adapt when you want to see *how far down* a
+particular defense can push the attack.
 
 Output: a console table + `logs/benchmark/benchmark.{json,csv}` + per-round
 `history.json` + a 4-panel graph `benchmark.png` (accuracy per round, rolling
 detection-rate, rolling FPR, and attack-strength per round). Re-plot a saved run
-without re-running (the 200 rounds are slow + need the GPU):
+without re-running:
 
 ```bash
 python -m benchmark.plot --history logs/benchmark/history.json   # -> benchmark.png
@@ -121,9 +116,9 @@ multikrum     ...      ...    ...   ...   ...        ...       ...       ...
 
 | name | what it is |
 |---|---|
-| `fedavg` | **No defense** — plain FedAvg over all clients (flags nobody). Lower bound + the state the attacker observes each round. Always included. |
+| `fedavg` | **No defense** — plain FedAvg over all clients (flags nobody). The lower bound: what the attack costs when nothing stops it. Always included. |
 | `oracle` | Cheats by flagging exactly the ground-truth poisoned clients. **Upper bound** on detection + robustness. |
-| `llm_defender` | Your **trained defender adapter** — the model under test. The only column needing a *defender* checkpoint: it is **skipped with a warning** (not an error) when none exists, which is the normal case under `defense.mode: algorithmic`, where the defender LLM is disabled and only the attacker trains. Point at one with `--defender-adapter <dir>`, or set `defense.mode: llm` and train one. |
+| `llm_defender` | Your **trained defender adapter** — the model under test, and the only column needing a checkpoint (or a GPU). It is **skipped with a warning**, not an error, when none exists, so a box that has never run training still gets the whole rest of the panel. Point at one with `--defender-adapter <dir>`, or train one with `python main.py`. |
 | `fltrust` | **FLTrust** (Cao et al., NDSS 2021): trust-bootstrapped robust aggregation using a small clean root dataset. |
 | `defl` | **DeFL** (Yan et al., AAAI 2023): CLP-aware defense. Inspects the DNN layer-by-layer via a Federated Gradient Norm Vector (FGNV) to (a) detect the *critical learning period*, (b) flag malicious clients by per-layer outlier voting (MOUD-Vote), then hard-remove them during the CLP and soft-down-weight them after via a per-client Bayesian (Beta) trust. **Needs no clean root set and no LLM.** |
 | `dnc` | **DnC** (Shejwalkar & Houmansadr, NDSS 2021): Divide-and-Conquer spectral aggregator. Subsamples dimensions, centers the updates, projects them onto their top singular vector, and filters out the `c·m` clients that project furthest (the spectral outliers), then averages the rest. **Needs no clean root set and no LLM** (assumes a known #malicious `m`). |
@@ -189,35 +184,32 @@ also give a softer view than the binary flag.
 
 ## How the comparison is kept fair
 
-- The env (`rl/env.py`) is reused **only as a generator**: each round it samples
-  the poisoned subset and builds the benign + attacker-poisoned client updates.
-- The trained attacker produces **one** attack per round; the **same** set of
-  client updates is fed to **every** defense. We *vary the defense and hold the
-  attack fixed.* The attacker plans against the **frozen Phase-1 benign weights**
-  plus the no-defense **scalar accuracy** (one-round lag) — it does not see each
-  defense's evolving global. (Making the attack adapt per-defense would change the
-  threat model and break the held-fixed comparison.)
+- The env (`rl/env.py`) is reused **only as a generator**: each round it trains
+  every client honestly, re-trains the poisoned ones on flipped labels, and builds
+  the cohort.
+- The cohort is built **once per round** and the same `ModelUpdate` list is handed
+  to **every** defense. We *vary the defense and hold the attack fixed.* Making the
+  attack adapt per-defense would break that (and change the threat model), which is
+  why the ladder reads exactly one defense's verdicts — see
+  [`--ladder-feedback`](#--flip-fraction-and---ladder-feedback-how-the-attack-behaves).
 - Each defense evolves its **own** global model, so robustness reflects how that
   defense's model fares over the run. A round a defense **skips** (produces no new
   global — e.g. FLTrust with all-zero trust) keeps its previous model; that
   round's accuracy is its held accuracy and still counts toward `mean_acc`. The
-  count of such rounds is reported as `skipped_rounds` (JSON/CSV). Distinct from
-  that: a round the *attacker* could not produce a usable action for is dropped for
-  **every** defense at once, so the panel is always compared over the same rounds
-  (see [Unusable attacker rounds](#unusable-attacker-rounds---attack-retries)).
-- **Pins frozen benign replay** (`env.benign_retrain = False`) regardless of
-  `fl.benign_retrain_each_round`, so the benign client updates are identical across
-  all defenses each round — the source of the "same attack to everyone" fairness.
-  Training sets that flag to `true` (each defense there evolves one shared global, so
-  honest deltas must track it), but here every `Defense` owns its own global while the
-  env's stays at the Phase-1 state, so retraining would only re-draw the honest updates
-  against a stale reference. The runner logs when it overrides the config; it used to
-  merely warn that the comparison "may be skewed".
-- Runs in the project's native regime (5-of-5 controllable clients poisoned by default per
-  `configs/base.yaml`), which keeps the LLM defender in-distribution. FLTrust
-  still works here: benign client deltas point toward good weights and so align
-  with the server's root update, while poison points away (negative cosine → zero
-  trust).
+  count of such rounds is reported as `skipped_rounds` (JSON/CSV). Every requested round is
+  measured: the attack is a deterministic schedule, so there is no unusable-action
+  case to resample or skip.
+- **Every client trains locally each round**, which is not optional here: the
+  label-flip poison IS the poisoned clients' local training on mislabelled data, so
+  there is no frozen state_dict to replay. Fairness is unaffected — the env builds
+  the cohort once and every defense sees the identical list. (The env's own global
+  stays at the Phase-1 anchor while each `Defense` evolves its own, so the clients
+  train from a fixed reference throughout.)
+- Runs in the project's native regime (`attack.poison_client_ids` from
+  `configs/base.yaml`, default a single insider), which keeps the LLM defender
+  in-distribution. FLTrust still works here: benign client deltas point toward good
+  weights and so align with the server's root update, while a label-flipped update
+  points away (negative cosine → zero trust).
 
 ## FLTrust knobs
 
@@ -238,9 +230,9 @@ robust to the occasional false positive.
 
 ## DnC knobs
 
-`--dnc-num-byzantine` (assumed #malicious `m`; default = the eval poison budget
-`--max-poison-clients` clamped to a benign majority — a hyperparameter / assumed
-adversary budget, **not** per-round ground truth) ·
+`--dnc-num-byzantine` (assumed #malicious `m`; default = the number of poisoned
+clients, clamped to a benign majority — a hyperparameter / assumed adversary budget,
+**not** per-round ground truth) ·
 `--dnc-c` (filtering fraction `c`, paper iid default **1** → drop `c·m` clients each
 round) · `--dnc-niters` (subsampling iterations, default **1**) · `--dnc-sub-dim`
 (subsample dimension `b`, default **10000**, the paper's value — clamped to the
@@ -251,8 +243,8 @@ over the surviving clients.
 
 ## Multi-Krum knobs
 
-`--multikrum-f` (assumed #Byzantine `f`; default = the eval poison budget, same
-assumed-budget hyperparameter as DnC — **not** ground truth) · `--multikrum-m`
+`--multikrum-f` (assumed #Byzantine `f`; default = the number of poisoned clients,
+same assumed-budget hyperparameter as DnC — **not** ground truth) · `--multikrum-m`
 (#updates selected and averaged; default `n−f`, i.e. drop the `f` worst — set `1` for
 plain Krum, or `n−f−2` for the paper's strong-resilience bound). The score always
 sums each client's `n−f−2` closest squared distances (paper Eq. 5); for `n=5, f=1`
@@ -274,11 +266,10 @@ does (a client is "rejected" when it's excluded / trimmed from the aggregate).
 
 ## Tests
 
-- `tests/test_benchmark.py` — torch-free (metrics + report). Runs anywhere:
-  `python tests/test_benchmark.py`.
-- `tests/test_benchmark_retry.py` — the harness's unusable-attacker-action path:
-  resample, then skip the round instead of aborting the run (needs torch):
-  `python tests/test_benchmark_retry.py`.
+- `tests/test_benchmark.py` — torch-free (metrics, report, panel resolution and
+  `--poison-clients` parsing). Runs anywhere: `python tests/test_benchmark.py`.
+- `tests/test_label_flip.py` / `tests/test_label_flip_env.py` — the attack itself:
+  the flip, the ladder's saw-tooth, and its wiring into the env.
 - `tests/test_fltrust.py` — the FLTrust trust/aggregation math (needs torch; run
   on the GPU box): `python tests/test_fltrust.py`.
 - `tests/test_defl_logic.py` — DeFL's layer grouping, CLP rule, MOUD-Vote and Beta

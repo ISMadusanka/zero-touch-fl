@@ -17,11 +17,12 @@ batch for multiple gradient steps.
 ``Σ_i L_i``, so every sampled token carries the same weight. The earlier form —
 ``mean_i [ -A_i * mean_t logπ ]`` — divided each rollout by its OWN length, which
 weights a short rollout's tokens more heavily than a long one's (the length bias
-DAPO / Dr. GRPO identify). That is not a cosmetic concern here: output length is
-tied to the configured action size: larger poison quotas require longer plans.
-The old bias therefore changed optimization behavior across budget settings.
-When all rollouts happen to be the same length the two forms are identical, so this does not change the
-effective learning rate — only the relative weighting across unequal lengths.
+DAPO / Dr. GRPO identify). That is not a cosmetic concern here: the defender emits
+one verdict object per client, so output length scales with ``fl.n_clients``, and
+a rollout that omits clients is shorter than one that labels them all. The old
+bias therefore rewarded terser (more incomplete) verdicts. When all rollouts
+happen to be the same length the two forms are identical, so this does not change
+the effective learning rate — only the relative weighting across unequal lengths.
 """
 
 import logging
@@ -83,23 +84,13 @@ def grpo_step(
     resample_temperature: float = 1.3,
     min_reward_spread: float = DEFAULT_MIN_REWARD_SPREAD,
     advantage_std_floor: float = DEFAULT_ADVANTAGE_STD_FLOOR,
-    skip_update: bool = False,
-    skip_reason: str = "",
 ) -> dict:
     """Run one GRPO update for ``adapter`` against ``turn``. Returns metrics.
 
     ``turn`` must expose ``messages() -> (system, user)`` and
     ``reward(completion_text) -> float`` (see ``rl/turns.py``).
 
-    ``skip_update`` samples and scores the group as usual but applies NO gradient.
-    The caller uses it when the round's reward is known in advance to be
-    uninformative — currently when the environment could not measure the clean
-    counterfactual, which makes the attacker's damage term structurally zero (see
-    ``rl.env.FLArmsRaceEnv.clean_reference_measured``). The rollouts are still
-    produced and scored because the caller needs one of them to advance the
-    environment, and the recorded rewards stay comparable with trainable rounds.
-
-    Zero-advantage handling (the attacker-collapse guard): when every sampled
+    Zero-advantage handling (the policy-collapse guard): when every sampled
     rollout earns the same reward the within-group spread is ~0, so the
     policy-gradient term is 0 and the loss reduces to ``kl_beta * KL`` — a pull
     *back toward the base model*, i.e. active un-learning. To avoid that:
@@ -111,9 +102,9 @@ def grpo_step(
       KL-to-base signal.
 
     "Degenerate" is decided by ``min_reward_spread``, not by exact equality: the
-    rewards derive from an accuracy measured on a finite test set, so two
-    behaviourally identical rollouts routinely differ by a hair. Treating that as
-    signal meant z-scoring measurement noise up to full-magnitude advantages — see
+    reward is a soft F1 over per-client confidences, so two behaviourally identical
+    verdict sets routinely differ by a hair. Treating that as signal meant z-scoring
+    sampling noise up to full-magnitude advantages — see
     ``rl.rewards.group_advantages``.
     """
     system, user = turn.messages()
@@ -123,10 +114,10 @@ def grpo_step(
     completions = policy.generate(
         adapter, system, user, n=G, temperature=temperature, max_new_tokens=max_new_tokens,
     )
-    # Capture BEFORE scoring: turn.reward() runs the opponent's generate(), which
-    # overwrites both of these. `completion_ids` are the exact sampled tokens (what
-    # the log-prob pass must score); `completed` marks which rollouts ended with EOS
-    # instead of being cut off at max_new_tokens.
+    # Capture immediately: any later generate() overwrites both. `completion_ids`
+    # are the exact sampled tokens (what the log-prob pass must score); `completed`
+    # marks which rollouts ended with EOS instead of being cut off at
+    # max_new_tokens.
     completion_ids = _generation_ids(policy, len(completions))
     completed = _completed_flags(policy, len(completions))
 
@@ -166,15 +157,7 @@ def grpo_step(
     mean_r = sum(rewards) / len(rewards) if rewards else 0.0
 
     # 3c. Still degenerate → do NOT step (would only pull the adapter to base).
-    #     ``skip_update`` is the caller's own veto (an uninformative round).
-    stepped = not (zero_frac >= 1.0 and skip_zero_advantage) and not skip_update
-    if skip_update:
-        logger.warning(
-            f"GRPO[{adapter}]: update SKIPPED by the caller"
-            + (f" ({skip_reason})" if skip_reason else "")
-            + f"; {G} rollouts scored around {mean_r:.3f} for the environment only, "
-            "no gradient applied"
-        )
+    stepped = not (zero_frac >= 1.0 and skip_zero_advantage)
 
     # 4. Accumulate the GRPO loss; backward per-sample to bound memory.
     #
@@ -246,7 +229,6 @@ def grpo_step(
         "completions": completions,
         "advantages": advantages,
         "stepped": stepped,
-        "skipped_by_caller": bool(skip_update),
         "resampled": resampled,
         "temperature": eff_temperature,
         # Tokens the update was normalized over, and the per-rollout lengths behind
@@ -255,7 +237,7 @@ def grpo_step(
         "total_tokens": total_tokens,
         "completion_tokens": token_lengths,
     }
-    if zero_frac >= 1.0 and not stepped and not skip_update:
+    if zero_frac >= 1.0 and not stepped:
         logger.warning(
             f"GRPO[{adapter}]: degenerate group - {G} rewards span only "
             f"{spread:.4g} (< min_reward_spread={min_reward_spread:g}) around "

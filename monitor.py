@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""RL health monitor — is each LLM actually learning, or collapsing?
+"""RL health monitor — is the defender actually learning, or collapsing?
 
-Reads logs/round_data/round_*.json (written every round, so this works WHILE
-training runs) and reports per-agent learning trends + collapse flags, plus a
-health.png. Run it any time:  python monitor.py
+Reads logs/round_data/rounds.jsonl (appended every round, so this works WHILE
+training runs) and reports learning trends + collapse flags, plus a health.png.
+Run it any time:  python monitor.py
+
+The defender is the only learner; the attack is the deterministic label-flip
+ladder, so its side of the report is a DESCRIPTION of what the defender has been
+facing, not a training diagnostic.
 
 Signals it tracks
 -----------------
 Learning (good):
-  * the LEARNING agent's GRPO group-mean reward (train.mean_reward) trends UP
-    during its own phases;
-  * attacker: induced accuracy drop trends up and/or stealth trends up;
-  * defender: FPR trends DOWN while TPR stays high.
+  * the defender's GRPO group-mean reward (train.mean_reward) trends UP;
+  * FPR trends DOWN while TPR stays high;
+  * the flip fraction walks DOWN and resets — the ladder saw-tooth. A ladder
+    parked at 100% for the whole run means the defender is catching nothing.
 Collapse (bad):
   * zero_advantage_fraction ~1  -> all G samples tie -> NO gradient;
-  * attacker reward flat AND induced drop ~0 -> "do-nothing" collapse;
-  * attacker malformed rate climbing -> output degeneration;
-  * defender flag-rate ~1 (flag everything) or ~0 (flag nothing) -> degenerate classifier;
-  * reward variance ~0 -> stuck.
+  * flag-rate ~1 (flag everything) or ~0 (flag nothing) -> degenerate classifier;
+  * reward variance ~0 -> stuck;
+  * induced drop ~0 at every ladder level -> the attack is not doing damage, so a
+    high TPR means the defender learned to detect a formality.
 """
 
 import argparse
@@ -96,16 +100,20 @@ def load_rounds(log_dir: str) -> list[dict]:
         stealth = float(np.mean([1.0 - _soft_mal(v) for v in pois_v])) if pois_v else 0.0
         meta = r.get("attack_metadata") or {}
         train = meta.get("train", {})
-        # The damage the attacker is actually rewarded for: post-attack accuracy vs
-        # THIS round's clean counterfactual. Older logs predate the field, so fall
-        # back to the (baseline-relative) approximation they allow.
+        ladder = meta.get("ladder") or {}
+        # The damage the round's flipped labels actually did: post-attack accuracy
+        # vs THIS round's clean counterfactual. Older logs predate the field, so
+        # fall back to the (baseline-relative) approximation they allow.
         drop = meta.get("induced_drop")
         if drop is None:
             drop = r.get("baseline_accuracy", 0.0) - r.get("test_accuracy", 0.0)
         rows.append({
             "round": r["round_num"],
             "learner": r.get("learning_agent", "none"),
-            "att_reward": r.get("attacker_reward", 0.0),
+            # Reported damage on the goal's scale. `attacker_reward` is the legacy
+            # field name from before the attack stopped being a trained policy.
+            "attack_eff": r.get("attack_effectiveness",
+                                r.get("attacker_reward", float("nan"))),
             "def_reward": r.get("defender_reward", 0.0),
             "drop": drop,
             "stealth": stealth,
@@ -114,7 +122,12 @@ def load_rounds(log_dir: str) -> list[dict]:
             "fpr": fp / (fp + tn) if (fp + tn) else float("nan"),
             "zero_adv": train.get("zero_advantage_fraction", float("nan")),
             "train_mean_r": train.get("mean_reward", float("nan")),
-            "n_malformed": (r.get("attack_metadata") or {}).get("n_malformed", 0),
+            # The attack schedule: the ladder level this round was sent at, and
+            # whether the defense caught it.
+            "flip_fraction": meta.get("flip_fraction", float("nan")),
+            "n_flipped": meta.get("n_flipped", 0),
+            "caught": bool(ladder.get("caught", False)),
+            "ladder_event": ladder.get("event", ""),
         })
     return rows
 
@@ -154,9 +167,9 @@ def _segments(rounds, vals, max_gap=1):
 
 
 def _shade_phases(ax, rows):
-    """Shade the background by which agent was training, so the per-phase regions
-    are visible (pink = attacker-learning, green = defender-learning)."""
-    colors = {"attacker": "#FF6584", "defender": "#43E97B"}
+    """Shade the background over rounds where the defender was training, so the
+    honest FL interludes between phases stand out as gaps."""
+    colors = {"defender": "#43E97B"}
     if not rows:
         return
     start = rows[0]["round"]
@@ -177,65 +190,74 @@ def _flag(cond, bad_msg, ok_msg):
 
 
 def analyze(rows, window: int):
+    n_train = sum(r["learner"] == "defender" for r in rows)
     print("=" * 70)
-    print(f"RL HEALTH REPORT — {len(rows)} rounds "
-          f"(attacker-learning: {sum(r['learner']=='attacker' for r in rows)}, "
-          f"defender-learning: {sum(r['learner']=='defender' for r in rows)})")
+    print(f"RL HEALTH REPORT — {len(rows)} rounds ({n_train} defender-training, "
+          f"{len(rows) - n_train} other)")
     print("=" * 70)
 
     def recent(rows_a, key):
         _, v = _series(rows_a, key)
         return float(np.mean(v[-window:])) if len(v) else float("nan")
 
-    att = [r for r in rows if r["learner"] == "attacker"]
     de = [r for r in rows if r["learner"] == "defender"]
 
-    # ---- Attacker ----
-    print("\n[ATTACKER]  (its own training rounds)")
-    if att:
-        e, l, s = _trend(_series(att, "train_mean_r")[1])
-        de_, dl, ds = _trend(_series(att, "drop")[1])
-        se, sl, ss = _trend(_series(att, "stealth")[1])
-        zadv = recent(att, "zero_adv")
-        malf = recent(att, "n_malformed")
-        rew_var = float(np.var(_series(att, "train_mean_r")[1][-window:])) if att else 0.0
-        print(f"  GRPO mean-reward:  early={e:+.3f}  late={l:+.3f}  slope={s:+.4f}")
+    # ---- The attack it faced (a description, not a training diagnostic) ----
+    print("\n[ATTACK]  label-flip ladder — what the defender was up against")
+    if rows:
+        _, ff = _series(rows, "flip_fraction")
+        de_, dl, ds = _trend(_series(rows, "drop")[1])
+        caught_rate = float(np.mean([r["caught"] for r in rows]))
+        resets = sum(1 for r in rows if r["ladder_event"] == "reset")
+        steps = sum(1 for r in rows if r["ladder_event"] == "step_down")
+        holds = sum(1 for r in rows if r["ladder_event"] == "hold")
+        if len(ff):
+            print(f"  flip fraction:     min={np.nanmin(ff):.0%}  max={np.nanmax(ff):.0%}  "
+                  f"recent={float(np.nanmean(ff[-window:])):.0%}")
+        print(f"  ladder:            {steps} step-down, {holds} hold, {resets} reset "
+              f"(caught {caught_rate:.0%} of rounds)")
         print(f"  induced acc-drop:  early={de_:+.3f}  late={dl:+.3f}  slope={ds:+.4f}")
-        print(f"  stealth:           early={se:.3f}  late={sl:.3f}  slope={ss:+.4f}")
-        print(f"  recent zero_adv={zadv:.2f}  malformed={malf:.2f}  reward_var={rew_var:.4f}")
-        print(_flag(l <= e, "reward NOT improving (frozen/over the opponent)", "reward improving"))
-        print(_flag(zadv > 0.7, "high zero-advantage -> little/no gradient", "advantage signal present"))
-        print(_flag(dl < 0.01 and l <= e, "≈no damage + no reward gain -> DO-NOTHING collapse?", "causing damage"))
-        print(_flag(malf > 0.3, "high malformed-plan rate -> output degenerating", "plans parse cleanly"))
-        print(_flag(rew_var < 1e-4, "reward variance ≈0 -> stuck", "reward varies (exploring)"))
+        # A ladder that never moves is the single most important thing to notice:
+        # the defender is then being trained on one static attack level forever.
+        print(_flag(steps + resets == 0,
+                    "ladder NEVER stepped -> defender caught (almost) nothing; it is "
+                    "training against one static attack level",
+                    "ladder is adapting (the defender is landing detections)"))
+        print(_flag(abs(dl) < 0.005,
+                    "induced drop ~0 -> the flipped labels are not damaging the model, "
+                    "so a high TPR means detecting a formality",
+                    "the attack is doing measurable damage"))
     else:
-        print("  (no attacker-learning rounds yet)")
+        print("  (no rounds yet)")
 
     # ---- Defender ----
     print("\n[DEFENDER]  (its own training rounds)")
     if de:
-        e, l, s = _trend(_series(de, "train_mean_r")[1])
+        e, l, s_ = _trend(_series(de, "train_mean_r")[1])
         fe, fl_, fs = _trend(_series(de, "fpr")[1])
         te, tl, ts = _trend(_series(de, "tpr")[1])
         fr = recent(de, "flag_rate")
         zadv = recent(de, "zero_adv")
         rew_var = float(np.var(_series(de, "train_mean_r")[1][-window:])) if de else 0.0
-        print(f"  GRPO mean-reward:  early={e:+.3f}  late={l:+.3f}  slope={s:+.4f}")
+        print(f"  GRPO mean-reward:  early={e:+.3f}  late={l:+.3f}  slope={s_:+.4f}")
         print(f"  TPR (recall):      early={te:.3f}  late={tl:.3f}")
         print(f"  FPR (false-alarm): early={fe:.3f}  late={fl_:.3f}  slope={fs:+.4f}")
         print(f"  recent flag_rate={fr:.2f}  zero_adv={zadv:.2f}  reward_var={rew_var:.4f}")
         print(_flag(l <= e, "reward NOT improving", "reward improving"))
-        print(_flag(fl_ >= fe and fl_ > 0.4, "FPR not falling -> over-flagging benign clients", "FPR controlled / falling"))
+        print(_flag(fl_ >= fe and fl_ > 0.4, "FPR not falling -> over-flagging benign clients",
+                    "FPR controlled / falling"))
         print(_flag(fr > 0.95, "flagging ~ALL clients -> flag-all collapse", "not flag-all"))
         print(_flag(fr < 0.05, "flagging ~NO clients -> flag-none collapse", "not flag-none"))
-        print(_flag(zadv > 0.7, "high zero-advantage -> little/no gradient", "advantage signal present"))
-        print(_flag(rew_var < 1e-4, "reward variance ≈0 -> stuck", "reward varies (exploring)"))
+        print(_flag(zadv > 0.7, "high zero-advantage -> little/no gradient",
+                    "advantage signal present"))
+        print(_flag(rew_var < 1e-4, "reward variance ~0 -> stuck", "reward varies (exploring)"))
     else:
         print("  (no defender-learning rounds yet)")
 
-    print("\nArms-race note: healthy training OSCILLATES — when one agent trains, its")
-    print("reward rises while the opponent's falls, then they swap. Flatlining of BOTH")
-    print("rewards (with low variance) is the real 'stuck' signal.")
+    print("\nReading the two together: the defender's reward should rise WHILE the flip")
+    print("fraction walks down. A rising reward at a pinned 100% flip means it is winning")
+    print("the easiest version of the problem; a falling reward after a reset is expected,")
+    print("because the ladder just handed it full-strength poison again.")
     print("=" * 70)
 
 
@@ -249,15 +271,11 @@ def plot(rows, out: str, window: int):
         w = min(window, len(v))
         return np.convolve(v, np.ones(w) / w, mode="same")
 
-    # 1: GRPO mean-reward per agent. CONNECTED lines that BREAK across rounds
-    #    where the agent wasn't training (no bridging across frozen phases), over
-    #    a background shaded by who was training (pink=attacker, green=defender).
+    # 1: the defender's GRPO mean-reward. CONNECTED lines that BREAK across rounds
+    #    where it wasn't training (no bridging across the FL interludes).
     _shade_phases(ax[0, 0], rows)
-    ra, va = _series([r for r in rows if r["learner"] == "attacker"], "train_mean_r")
     rd, vd = _series([r for r in rows if r["learner"] == "defender"], "train_mean_r")
-    ax[0, 0].set_title("GRPO mean reward — want UP (shaded band = agent training)")
-    for i, (sr, sv) in enumerate(_segments(ra, va)):
-        ax[0, 0].plot(sr, roll(sv), color="#FF6584", label="attacker" if i == 0 else None)
+    ax[0, 0].set_title("Defender GRPO mean reward — want UP (shaded = training)")
     for i, (sr, sv) in enumerate(_segments(rd, vd)):
         ax[0, 0].plot(sr, roll(sv), color="#43E97B", label="defender" if i == 0 else None)
     ax[0, 0].axhline(0.0, color="#999999", lw=0.6, ls="--")
@@ -278,12 +296,16 @@ def plot(rows, out: str, window: int):
     if len(vz): ax[1, 0].plot(rz, roll(vz), color="#F7971E")
     ax[1, 0].set_ylim(-0.05, 1.05); ax[1, 0].set_xlabel("round")
 
-    # 4: attacker induced drop + stealth
-    _shade_phases(ax[1, 1], rows)
-    rdp, vdp = _series(rows, "drop"); rs, vs = _series(rows, "stealth")
-    ax[1, 1].set_title("Attacker: induced acc-drop & stealth — want UP")
-    if len(vdp): ax[1, 1].plot(rdp, roll(vdp), color="#6C63FF", label="acc drop")
-    if len(vs): ax[1, 1].plot(rs, roll(vs), color="#00C9FF", label="stealth")
+    # 4: THE LADDER. Plotted RAW (no rolling mean) — the saw-tooth is the signal,
+    #    and smoothing it away is exactly what would hide a defender that stopped
+    #    catching anything. The induced drop shares the axis so the two can be read
+    #    against each other: damage should track the flip fraction.
+    rl_, vl = _series(rows, "flip_fraction")
+    rdp, vdp = _series(rows, "drop")
+    ax[1, 1].set_title("Attack ladder: flip fraction (raw) vs induced acc-drop")
+    if len(vl): ax[1, 1].plot(rl_, vl, color="#FF6584", lw=1.0, label="flip fraction")
+    if len(vdp): ax[1, 1].plot(rdp, roll(vdp), color="#6C63FF", label="induced acc-drop")
+    ax[1, 1].axhline(0.0, color="#999999", lw=0.6, ls="--")
     ax[1, 1].legend(); ax[1, 1].set_xlabel("round")
 
     fig.tight_layout()

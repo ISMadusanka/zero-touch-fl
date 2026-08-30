@@ -2,45 +2,37 @@
 
 fl:
   training_rounds: 45             # Phase 1: honest training rounds
-  simulation_rounds: 2000000         # Phase 2: adversarial RL rounds
+  simulation_rounds: 2000000         # Phase 2: defender-learning rounds
   n_clients: 20                   # total federated clients (honest majority)
-  n_compromisable: 10             # the attacker can ONLY access clients [0 .. n_compromisable-1];
-                                  # the remaining clients are always honest & out of reach.
-                                  # OVERRIDDEN by attack.fixed_poison_clients when that is set
-                                  # (the pool is then exactly the fixed poisoned set) — keep the
-                                  # two equal so the config reads the way the run behaves.
-                                  # NOTE at 10 of 20 the federation no longer has a strictly
-                                  # honest majority, which is outside the regime Multi-Krum / DnC /
-                                  # FLTrust are proved under. Raise n_clients to restore it.
-  poison_fraction: 0.2            # DEPRECATED for selection: the attacker now CHOOSES which of
-                                  # its pool to poison (see attack.max_poison_clients). Kept only
-                                  # as a legacy fallback for defenses that assume a #malicious.
-  poison_seed: 0                  # RNG seed: non-IID partition + per-round budget sampling + repro
+                                  # WHICH of them flip labels is attack.poison_client_ids.
+  poison_fraction: 0.2            # legacy fallback for defenses that need an assumed
+                                  # #malicious when none is configured (see
+                                  # defense.assumed_byzantine).
+  poison_seed: 0                  # RNG seed: non-IID partition, per-round data slices, WHICH
+                                  # examples each poisoned client flips, and general repro
   # --- Phase 2 = SIMULATED rounds on the frozen Phase-1 model ---
   freeze_global_in_phase2: true   # true = Phase 2 does NOT continue the federation. Every
-                                  # attacker-learning round is an independent episode off the
+                                  # defender-learning round is an independent episode off the
                                   # SAME Phase-1 final model: the anchor is sent to the clients,
-                                  # they train on new local data, the attacker poisons its chosen
-                                  # clients, the server aggregates, the aggregate is SCORED on the
-                                  # test set (that score is the reward GRPO trains on) and then
-                                  # DISCARDED — the next round starts from the anchor again.
+                                  # they train on new local data, the insiders re-train it with
+                                  # flipped labels, the server defends and aggregates, the
+                                  # aggregate is SCORED on the test set and then DISCARDED — the
+                                  # next round starts from the anchor again.
                                   #
                                   # Why not let it accumulate: in a continuing federation the
-                                  # attacker's own damage becomes the next round's starting point,
-                                  # so what a plan is worth depends on the wreckage left by every
-                                  # plan before it. The same attack scores differently depending on
-                                  # run history, and a run that has already collapsed the model
-                                  # scores every subsequent plan against rubble. The reward then
-                                  # tracks environment drift rather than the action — and the
-                                  # damage term (clean_reference_accuracy - post_accuracy) is only
-                                  # a controlled comparison when both branches start from the same
-                                  # model, which is exactly what the frozen anchor guarantees.
+                                  # attack's own damage becomes the next round's starting point,
+                                  # so a round's numbers depend on the wreckage left by every
+                                  # round before it, and a run that has already collapsed the
+                                  # model measures every subsequent round against rubble. The
+                                  # damage term (clean_reference_accuracy - post_accuracy) is
+                                  # only a controlled comparison when both branches start from
+                                  # the same model, which is what the frozen anchor guarantees.
                                   #
-                                  # false = the original continuing federation (each committed
-                                  # aggregate becomes the next round's global). Note that
-                                  # rl.fl_interlude_between_phases only does anything when this is
-                                  # false — with a frozen anchor there is no shared FL state to
-                                  # advance, so the interlude is skipped.
+                                  # false = a continuing federation (each committed aggregate
+                                  # becomes the next round's global). Note that
+                                  # rl.fl_interlude_between_phases only does anything when this
+                                  # is false — with a frozen anchor there is no shared FL state
+                                  # to advance, so the interlude is skipped.
   client_data_refresh: "rotate"   # step 2 of a simulated round: what data the clients train on.
                                   # rotate   = the client's shard is shuffled and cut into disjoint
                                   #            per-round slices; round r trains on slice r, and the
@@ -69,20 +61,16 @@ fl:
                                   # over the ROUND's data, not the full shard. Lowering this
                                   # therefore shrinks ||g0|| in step with the honest clients — do
                                   # not "fix" one without the other.
-  benign_retrain_each_round: true  # true = every benign client retrains from the CURRENT global each
-                                  # round. false replays frozen Phase-1 local weights forever, which
-                                  # broke FLTrust: trust is ReLU(cos(delta_i, g0)) and a frozen
-                                  # delta points back at a stale weight vector, so as the global
-                                  # moved the honest deltas went anti-correlated with the fresh root
-                                  # direction and FLTrust DROPPED the honest majority (measured FPR
-                                  # 0.9-1.0 for whole curriculum blocks; on some rounds the only
-                                  # clients it accepted were the poisoned ones). Retraining keeps the
-                                  # honest deltas on the same descent direction the server sees. It
-                                  # costs one local-training pass per client per round, which on this
-                                  # 970-parameter model is negligible next to LLM generation.
-                                  # FORCED ON when freeze_global_in_phase2 is true: a frozen global
-                                  # plus frozen client weights makes every round byte-identical, so
-                                  # the retrain IS the "clients train with new data" step there.
+  benign_retrain_each_round: true  # FORCED ON, and kept only so an old config still parses.
+                                  # A label-flipping client's poison IS its local training on
+                                  # mislabelled data — there is no frozen state_dict to replay
+                                  # and no weight edit to apply — so the round cannot happen
+                                  # without training. Replaying frozen honest weights while the
+                                  # poisoned clients trained fresh would also be a giveaway for
+                                  # entirely the wrong reason (staleness, not the flipped
+                                  # labels). Setting this false logs a warning and is ignored.
+                                  # Cost is one local-training pass per client per round, which
+                                  # on this 970-parameter model is negligible.
   local_epochs: 3
   batch_size: 64
   lr: 0.002
@@ -95,107 +83,94 @@ data:
                                   # is IID; larger = more non-IID; paper default 0.5.
   data_dir: "./data/mnist_raw"
 
-# Attack goal (configurable). First experiment = untargeted accuracy reduction.
+# ---------------------------------------------------------------------------
+# THE ATTACK — label flipping, on a detection-adaptive ladder.
+#
+# This is the ONLY attack the system implements. A fixed set of insider clients
+# trains each round on its own data with a share of the labels flipped
+# symmetrically (y -> 9-y), and how large that share is follows a ladder that
+# reacts to the defense:
+#
+#   start at 100% of the client's per-round data
+#   caught            -> step down one step_fraction  (100% -> 90% -> 80% -> ...)
+#   NOT caught        -> hold this level and send it again
+#   caught at the floor -> reset to 100% and descend again
+#
+# On a client holding 1000 examples per round that is exactly 1000, 900, 800, ...
+# down to 500, then back to 1000. The descent rate is set by the DEFENDER's own
+# competence, so the curriculum it faces is generated by its own failures.
+#
+# Why the poison is in the DATA and not in the weights: a weight-space edit is a
+# post-hoc transform whose magnitude is a free parameter, so an attacker can dial
+# it to whatever a detector tolerates and the resulting update need not resemble
+# anything a real client would send. A label flip has exactly one knob — how many
+# of the client's own examples are mislabelled — and the update it produces is a
+# genuine SGD trajectory, so it sits inside the honest update distribution by
+# construction. See data/label_flip.py and agents/label_flip_attacker.py.
+# ---------------------------------------------------------------------------
 attack:
+  type: "label_flip"              # the only implemented attack; validated, not dispatched on
+  poison_client_ids: [0]          # WHICH clients flip labels, every round. Default: just
+                                  # client 0, the single insider. Add ids for a larger
+                                  # foothold, e.g. [0, 1, 2]. Ids outside 0..n_clients-1
+                                  # are dropped with a warning rather than clamped.
+                                  # NOTE once this reaches half of fl.n_clients the
+                                  # federation has no honest majority and the robust
+                                  # aggregators are outside the regime they are proved in
+                                  # (logged at startup).
+  n_classes: 10                   # MNIST label count; sets the symmetric flip y -> 9-y
+  schedule:
+    start_fraction: 1.0           # the TOP of the ladder: flip every label the client
+                                  # trains on this round. Where each cycle begins.
+    step_fraction: 0.1            # how far one detection backs the attack off. 0.1 of a
+                                  # 1000-example round is the 1000 -> 900 -> 800 walk.
+    floor_fraction: 0.5           # the BOTTOM. Below about half the client's data the
+                                  # honest gradient dominates its own update, so neither
+                                  # "caught" nor "missed" carries information any more —
+                                  # the round stops being an attack and starts being
+                                  # noise. Caught AT the floor resets to start_fraction
+                                  # instead of descending further, so the run keeps
+                                  # re-testing the whole range rather than parking at the
+                                  # weakest setting for the rest of training.
+                                  # Snapped onto the step grid; an unreachable value is
+                                  # moved to the nearest reachable level, with a log line.
+    caught_rule: "all"            # with several poisoned clients, how many must be flagged
+                                  # for the round to count as CAUGHT (and step down):
+                                  #   all      = every poisoned client (default) — one
+                                  #              surviving insider is a successful round
+                                  #   majority = more than half of them
+                                  #   any      = at least one; the harshest, fastest descent
+  # --- The DAMAGE BAR (reporting only) ---
+  # None of this changes what the attack does — the ladder decides that. It sets the
+  # scale the round's measured accuracy drop is REPORTED against, so `attack_effectiveness`
+  # in the round logs means "1.0 = cost the model target_accuracy_drop".
   goal:
     type: "untargeted_degrade"    # untargeted_degrade | slow_degrade | targeted_label
-    target_accuracy_drop: 0.10    # THE training target (sample_target_in_training is off, so every
-                                  # round asks for this exact drop) and the fallback used at EVAL.
-                                  # The attacker is asked to cut global accuracy by 10 points.
-                                  #
-                                  # This value does TWO things, and they pull in opposite
-                                  # directions — read both before changing it.
-                                  #
-                                  # 1. IT IS THE AMBITION. It goes into the attacker's prompt, and
-                                  #    it is where drop_term's linear region ENDS: drop == target
-                                  #    scores exactly 1.0 and everything past it saturates fast
-                                  #    (asymptote 1.5). So the target is the point where the reward
-                                  #    stops asking for more damage. At 0.02 that ceiling was the
-                                  #    binding constraint on ambition: a 2pp cut already collected
-                                  #    ~all the damage reward available, and a 10pp cut was worth
-                                  #    only ~1.4x a 2pp one. The reward was telling the attacker to
-                                  #    stop at 2 points. At 0.10 damage pays linearly all the way
-                                  #    out to a 10pp cut.
-                                  #
-                                  # 2. IT IS THE REWARD'S SCALE. The damage term is drop/target, so
-                                  #    raising the target DIVIDES the authority of damage in the
-                                  #    reward — 5x less here. That is the regression that sent this
-                                  #    knob to 0.02 in the first place: at 0.10 with alpha 1.0 the
-                                  #    observed ~0.01 drops mapped to ~0.1 of reward, less than the
-                                  #    collaboration bonus and only ~3x the stealth term, so the
-                                  #    policy farmed formatting instead of attacking.
-                                  #
-                                  # (2) is CANCELLED by rl.reward.attacker.alpha: 5.0 below —
-                                  # 5 * drop/0.10 is identically 1 * drop/0.02, so a point of
-                                  # accuracy is worth exactly what it was worth at the old target,
-                                  # including against the min_reward_spread / advantage_std_floor
-                                  # noise floors, which are absolute. Only (1) changes.
-                                  # KEEP alpha * (1/target) CONSTANT whenever you move this.
+    target_accuracy_drop: 0.10    # a round that costs 10 accuracy points scores 1.0
     # per_round_drop: 0.02        # slow_degrade
-    # label: 7                    # targeted_label (per-class eval is a TODO; falls back to overall)
-  # --- Attack-goal target sampling (generalize instead of overfitting a single target) ---
-  sample_target_in_training: false # OFF. true = randomize untargeted_degrade's target_accuracy_drop
-                                  # each round from `target_choices`. That was on, and it fought the
-                                  # curriculum below: a block holds the defense and the poisoner count
-                                  # fixed for 10 rounds precisely so those 10 rounds are comparable,
-                                  # but a target re-drawn every round changes what "success" means
-                                  # inside the block (the win gate is win_fraction * the round's
-                                  # target, and the reward is normalized by it), so block-to-block
-                                  # differences were partly just which targets got drawn. Training
-                                  # now asks for goal.target_accuracy_drop every round.
-  target_choices: [0.05, 0.10, 0.15, 0.20]  # per-round target pool — only read when
-                                  # sample_target_in_training is true (kept for that experiment).
-                                  # Bracketed around goal.target_accuracy_drop above. NOTE that
-                                  # alpha compensates for ONE fixed target, so a sampled target
-                                  # re-introduces the scale problem the alpha pairing solves: a
-                                  # 0.05-target round gets 2x the damage authority of a
-                                  # 0.20-target round. That is a second reason this stays off
-                                  # while the curriculum is enabled.
-  # --- WHICH clients get poisoned ---
-  fixed_poison_clients: 10        # THE POISONED SET IS FIXED: clients 0..9 are poisoned EVERY
-                                  # round. Null/0 restores the old behaviour (a pool of
-                                  # fl.n_compromisable clients, a per-round quota, and the
-                                  # attacker LLM choosing which of its pool fills it).
-                                  #
-                                  # Implemented by making the controllable pool exactly these N
-                                  # clients AND the quota exactly N, which is what forces it:
-                                  # AttackerAgent.select_and_apply fills unfilled quota slots from
-                                  # the pool in id order, so a quota equal to the pool size always
-                                  # yields the whole pool. The policy's action is then purely the
-                                  # per-client attack plan.
-                                  #
-                                  # Why: with the set fixed, two rounds differ only by the plans and
-                                  # by the round's local data, so a reward difference is
-                                  # attributable to the attack. With a sampled quota and a
-                                  # model-chosen set, one scalar reward also absorbed how many and
-                                  # which clients were hit — three sources of variance in the signal
-                                  # GRPO differentiates.
-                                  #
-                                  # It OVERRIDES fl.n_compromisable, max_poison_clients and
-                                  # sample_budget_in_training below, and collapses the curriculum's
-                                  # poisoner sweep to this single count (the defense sweep is kept).
-                                  # Each override is logged at startup.
-  max_poison_clients: 10          # TRAINING quota cap; also the default upper end of the curriculum's
-                                  # poisoner sweep (legacy key name; must be <= n_compromisable).
-                                  # Not consulted while fixed_poison_clients is set.
-  sample_budget_in_training: false # randomly draw the exact per-round quota in
-                                  # [1..max_poison_clients] for budget-aware generalization.
-                                  # IGNORED while `curriculum:` is enabled or fixed_poison_clients
-                                  # is set — the quota is then the block's count / the fixed set.
-  eval_poison_clients: 10         # EVALUATION exact quota — matches the fixed set so the benchmark
-                                  # poisons the same clients 0..9 training used
-                                  # (benchmark --max-poison-clients overrides it)
+    # label: 7                    # targeted_label (per-class eval is a TODO; falls back
+                                  # to overall accuracy)
+  sample_target_in_training: false # true = redraw the reporting target each round from
+                                  # target_choices. Off: a target that moves round to round
+                                  # makes `attack_effectiveness` incomparable between rounds
+                                  # for no gain, since nothing trains on it.
+  target_choices: [0.05, 0.10, 0.15, 0.20]  # only read when sample_target_in_training is true
 
-# Server-side defense — what the attacker actually faces every Phase-2 round.
+# Server-side defense — what the label-flip attack faces every Phase-2 round.
 defense:
-  mode: "algorithmic"             # algorithmic | llm
-                                  # algorithmic = the DEFENDER LLM IS DISABLED. The server
-                                  #   defends with the published algorithms below instead;
-                                  #   only the attacker trains (rl/schedule.py runs
-                                  #   attacker-only phases and never touches the defender
-                                  #   adapter on disk, so `llm` can be restored later).
-                                  # llm = the original two-sided arms race (trainable
-                                  #   defender LLM + FedAvg over the un-flagged clients).
+  mode: "llm"                     # llm | algorithmic
+                                  # llm = the TRAINABLE DEFENDER LLM (the only learner in
+                                  #   the system). It classifies every client from weight-
+                                  #   delta statistics, FedAvg averages the un-flagged, and
+                                  #   GRPO updates it on the soft-F1 of its verdicts against
+                                  #   ground truth. Its verdicts also drive the attack's
+                                  #   ladder, so the two co-adapt.
+                                  # algorithmic = the published algorithms below defend
+                                  #   instead. The attack is a fixed schedule, so this
+                                  #   leaves NOTHING to train: `python main.py` refuses,
+                                  #   and it is meant for --dry-run / --baseline / the
+                                  #   benchmark, where it measures those algorithms against
+                                  #   the same label-flip ladder.
   algorithms: ["fltrust", "defl", "dnc", "multikrum"]
                                   # the rotation pool. ONE is used per round and defends
                                   # the whole round (clean counterfactual, all G scored
@@ -214,7 +189,7 @@ defense:
                                   # A dedicated stream, so it never shifts the env's
                                   # poison/budget/target sampling.
   assumed_byzantine: null         # DnC / Multi-Krum assumed #malicious (a hyperparameter,
-                                  # never per-round truth). null = attack.max_poison_clients
+                                  # never per-round truth). null = len(attack.poison_client_ids)
                                   # clamped to keep an honest majority.
   fltrust:
     root_size: 100                # clean server-side root examples (FLTrust bootstrap)
@@ -288,22 +263,25 @@ defense:
 #
 # Resume-safe: the sweep position is one integer, checkpointed with the rest of the
 # Phase-2 resume state, so a restart continues mid-block.
+# Deterministic DEFENSE-ALGORITHM sweep, for defense.mode: algorithmic only.
+#
+# Instead of drawing the round's algorithm uniformly, hold one algorithm for a whole
+# block of consecutive rounds and sweep the pool in order. That matters because DeFL
+# and DnC are stateful: under a random rotation an algorithm's memory advanced on ~1
+# round in 4, scattered; here it advances over 10 consecutive rounds, much closer to
+# how it behaves deployed alone.
+#
+# INACTIVE under defense.mode: llm (the default) — there is no algorithm axis, and the
+# attack strength is the label-flip ladder's, not a schedule's. Logged at startup.
+#
+# Resume-safe: the sweep position is one integer, checkpointed with the rest of the
+# Phase-2 resume state, so a restart continues mid-block.
 curriculum:
-  enabled: true                   # false = go back to the random per-round draws
-  rounds_per_block: 10            # consecutive GRPO rounds per (algorithm, #poisoners) pair
-  poisoner_counts: [10]           # the attack strengths swept, in order. null = 1..
-                                  # attack.max_poison_clients. Counts above
-                                  # fl.n_compromisable are dropped (with a warning),
-                                  # never clamped — clamping would silently give the
-                                  # largest quota several blocks per cycle.
-                                  # COLLAPSED to [attack.fixed_poison_clients] while that
-                                  # is set: the same 10 clients are poisoned every round,
-                                  # so there is no attack-strength axis left to sweep and
-                                  # only the defense algorithm rotates (4 algorithms x
-                                  # rounds_per_block = a 40-round cycle).
+  enabled: true                   # false = go back to the random per-round algorithm draw
+  rounds_per_block: 10            # consecutive rounds per algorithm
   algorithms: null                # null = defense.algorithms, in listed order. Set a
-                                  # list to narrow or reorder the outer loop; every
-                                  # name must be one defense.algorithms builds.
+                                  # list to narrow or reorder the sweep; every name must
+                                  # be one defense.algorithms builds.
 
 # Inference-only LLM defaults (used by --dry-run and the OpenAI path).
 llm:
@@ -315,68 +293,35 @@ rl:
   model: "unsloth/Qwen2.5-3B-Instruct"  # HF/Unsloth base for QLoRA training
   attn_implementation: "eager"    # broadly compatible; Qwen2.5 also supports "sdpa"
   use_fast_generate: true         # KV-cached generation (fast); auto-falls back to no-cache on failure
-  max_seq_len: 16384              # well within Qwen2.5-3B's 32k native context.
-                                  # Raised from 8192 when the poisoned set went to 10 clients:
-                                  # the attacker's prompt carries per-layer update statistics for
-                                  # EVERY client in the pool, so doubling the pool roughly doubled
-                                  # the observation. At 8192 the full-detail observation measured
-                                  # ~54% of the window (prompt + max_new_tokens) and only fit under
-                                  # max_context_fill by dropping two per-layer statistics. This is
-                                  # a CAP, not an allocation — attention memory scales with the
-                                  # ~3.4k tokens actually used, so raising it costs effectively
-                                  # nothing at these lengths.
-  max_context_fill: 0.5           # HARD CEILING on how much of max_seq_len ONE attacker call may
-                                  # occupy, counting max_new_tokens reserved for the completion:
-                                  #     prompt_tokens + max_new_tokens <= max_context_fill * max_seq_len
-                                  # A 3B instruct model's output quality falls off well before its
-                                  # context is actually full — long prompts make the instructions at
-                                  # the top compete with the data in the middle, and the attacker's
-                                  # prompt is mostly data. Staying under half the window keeps the
-                                  # plans well-formed.
-                                  # ENFORCED, not just checked: the observation is emitted at the
-                                  # first compaction level that fits (see
-                                  # agents/attacker_agent.py::_COMPACTION) — 4 significant figures,
-                                  # then 3, then core per-layer statistics only, then whole-model
-                                  # statistics only. It is never truncated and no client is ever
-                                  # dropped, so what the policy sees stays a complete observation.
-                                  # The level in use is logged whenever it changes; at the shipped
-                                  # settings (16384 window, 10 clients) it is level 0, ~30% filled.
-                                  # Set to 1.0 to disable the cap.
+  max_seq_len: 16384              # well within Qwen2.5-3B's 32k native context. The defender's
+                                  # prompt carries per-layer feature vectors for EVERY client, so
+                                  # it scales with fl.n_clients; at 20 clients it sits around 3k
+                                  # tokens. This is a CAP, not an allocation — attention memory
+                                  # scales with the tokens actually used, so headroom is nearly
+                                  # free.
   load_in_4bit: false             # bf16 LoRA: 3B needs ~12GB+ VRAM; set true (4-bit QLoRA) if tight
   lora_r: 16
   lora_alpha: 32
   G: 4                            # rollouts per GRPO step (group size)
   kl_beta: 0.02                   # KL penalty toward the frozen base model
   lr: 1.0e-5
-  temperature: 1.0                # learner sampling temperature (exploration)
-  opponent_temperature: 0.0       # frozen opponent plays greedily when a round is COMMITTED
-  scoring_opponent_temperature: 0.7 # frozen opponent temp while SCORING the G rollouts;
-                                  # >0 so candidates see varied opponent verdicts -> restores
-                                  # within-group reward spread (fixes attacker zero-advantage)
-                                  # NOTE: both opponent temperatures apply only to the defender
-                                  # LLM (defense.mode: llm). An algorithm is deterministic given
-                                  # the updates, so under defense.mode: algorithmic the
-                                  # within-group spread comes from the attack plans themselves.
-  # first_learner / K_a / K_d below are attacker-only under defense.mode: algorithmic
-  # (there is no defender policy to train — see the `defense:` block).
-  max_new_tokens: 1536            # headroom for the defender's 20-client verdict list and the
-                                  # attacker's per-client plans (raise if outputs get truncated).
-                                  # 10 poisoned clients means 10 plans in one JSON object — at
-                                  # ~55 tokens per client plan the old 1024 left little margin,
-                                  # and a plan truncated mid-JSON parses as nothing at all.
-                                  # Counted against rl.max_context_fill above, so raising this
-                                  # tightens the attacker's prompt budget one-for-one.
+  temperature: 1.0                # defender sampling temperature (exploration). The G rollouts
+                                  # all classify the SAME cohort of updates, so this is the only
+                                  # source of within-group reward spread — at 0 every rollout is
+                                  # identical, the advantages collapse and no step is ever taken.
+  max_new_tokens: 1536            # headroom for the defender's 20-client verdict list (raise if
+                                  # outputs get truncated — a verdict cut mid-JSON parses as
+                                  # nothing, and every client then defaults to benign).
   grad_clip: 1.0
   save_every: 25                  # checkpoint adapters + progress every N rounds (resume granularity)
-  league_snapshot_every: 100      # snapshot adapters into the opponent league
-  league_prob: 0.25               # chance a training phase faces a league snapshot
-  league_max_snapshots: 10        # HARD CAP on retained snapshots per adapter (ring buffer —
-                                  # oldest evicted). Each snapshot is a full copy of one adapter's
-                                  # LoRA tensors: ~115 MB for Qwen2.5-3B at lora_r=16, so the
-                                  # league costs about league_max_snapshots x 2 x 115 MB of host
-                                  # RAM (~2.3 GB at 10). Unbounded, it OOMs a long run.
+  league_snapshot_every: 100      # snapshot the defender adapter into the league every N rounds
+  league_max_snapshots: 10        # HARD CAP on retained snapshots (ring buffer — oldest evicted).
+                                  # Each is a full copy of the adapter's LoRA tensors: ~115 MB for
+                                  # Qwen2.5-3B at lora_r=16, so the league costs about
+                                  # league_max_snapshots x 115 MB of host RAM (~1.2 GB at 10).
+                                  # Unbounded, it OOMs a long run.
 
-  # --- Zero-advantage guard (stops the attacker un-learning toward base) ---
+  # --- Zero-advantage guard (stops the defender un-learning toward base) ---
   resample_on_zero_advantage: true # if a group has no reward spread, re-roll once at higher temp
   resample_temperature: 1.3       # temperature for that re-roll
   skip_zero_advantage: true       # if still degenerate, skip the step (apply NO gradient)
@@ -404,155 +349,56 @@ rl:
                                   # much better the winning rollout was. Above this std it reduces
                                   # to standard GRPO. Set both to 0 for textbook GRPO.
 
-  # --- Schedule: success-gated iterated best response (the arms-race ratchet) ---
-  switch_mode: "best_response"    # best_response | fixed (legacy K_a/K_d alternation)
-  first_learner: "attacker"       # who trains first
-  min_phase_rounds: 3             # earliest a phase may switch on a sustained win. Set equal to
-                                  # success_streak so a phase switches as soon as the learner wins
+  # --- Schedule: defender phases ---
+  # A phase runs until the defender sustains a win, then its adapter is frozen and a
+  # fresh phase starts. The opponent is not static: the label-flip ladder backs the
+  # attack off every time the defender catches it, so winning a phase means the
+  # defender has driven the attack down to a weaker level — and the phase boundary is
+  # what checkpoints it at each rung it has actually mastered.
+  min_phase_rounds: 3             # earliest a phase may end on a sustained win. Set equal to
+                                  # success_streak so a phase ends as soon as the defender wins
                                   # success_streak times IN A ROW (no extra minimum-length gate).
-                                  # Raise it above success_streak to require a longer phase.
-  max_phase_rounds: 200           # hard cap: switch even without a win (prevents a stuck phase).
-                                  # Was 4000, which with a win gate the attacker cleared once in
-                                  # 262 rounds meant the phase NEVER ended: the recorded run sat
-                                  # at phase 0 for its entire length, so the between-phase honest
-                                  # FL interlude (fl_interlude_between_phases) never fired once
-                                  # and curriculum_on_cap never fired either. Both are documented
-                                  # as live parts of the ratchet. 200 keeps a hopeless phase from
-                                  # running forever without cutting a productive one short —
-                                  # a winning phase ends after 3 rounds, not 200.
-  success_streak: 3               # consecutive winning rounds needed to freeze + switch
-  fl_interlude_between_phases: true # before every phase AFTER the first, run ONE honest FL round
-                                  # (like Phase 1): all benign clients retrain from the current
-                                  # global, FedAvg into a new global, and the refreshed per-client
-                                  # weights become what the next learner / frozen opponent /
-                                  # aggregator consume. false = keep the frozen Phase-1 weights.
-                                  # NO EFFECT while fl.freeze_global_in_phase2 is true — advancing
-                                  # the shared global is exactly what a simulated round must not do,
-                                  # so env.run_benign_fl_round() skips and logs instead.
-  curriculum_on_cap: true         # after a phase caps without a win, next learner faces an
-                                  # earlier opponent snapshot so it can find a foothold
-  attacker_min_drop: 0.10         # FALLBACK absolute drop bar, used only when the round's goal
-                                  # is unknown; normally the relative win_fraction gate applies.
-                                  # Tracks attack.goal.target_accuracy_drop so the fallback and
-                                  # the relative gate ask for the same thing.
-  win_fraction: 0.6               # "attack passed" = committed drop >= win_fraction * the round's
-                                  # requested target_accuracy_drop — a RELATIVE bar, so the gate
-                                  # tracks whatever target the round asked for (0.02 by default =>
-                                  # a 0.012 drop wins) rather than one absolute floor. It also
-                                  # stays correct if attack.sample_target_in_training is re-enabled.
-                                  # This same bar now defines the recorded attack_success metric
-                                  # (see rl.switch.success_drop_bar), so the headline number and
-                                  # the phase gate cannot disagree. At target 0.10 the bar is a
-                                  # 0.06 drop. That is FAR out of reach of the current policy (1
-                                  # win in 262 rounds against a 0.012 bar), which is why
-                                  # max_phase_rounds above was brought back to a value that
-                                  # actually caps — the phase is expected to end on the cap until
-                                  # the attacker gets substantially stronger, and the cap is what
-                                  # runs the FL interlude and the opponent curriculum.
-  attacker_min_evaded: 1.0        # fraction of poisoned clients that must evade detection
-  defender_min_tpr: 0.99          # defender "win": catches the poisoned client(s)...
+  max_phase_rounds: 200           # hard cap: end the phase even without a win, so a defender
+                                  # stuck on an attack level it cannot handle does not sit in
+                                  # one phase forever (which would also mean the between-phase
+                                  # FL interlude never fires).
+  success_streak: 3               # consecutive winning rounds needed to freeze the adapter
+  defender_min_tpr: 0.99          # defender "win": catches every poisoned client...
   defender_max_fpr: 0.10          # ...without over-flagging honest clients
-  # Legacy fixed-mode knobs (used only when switch_mode: fixed):
-  K_a: 4                          # attacker rounds per alternation
-  K_d: 4                          # defender rounds per alternation
+  fl_interlude_between_phases: true # before every phase AFTER the first, run ONE honest FL round
+                                  # (like Phase 1): all clients retrain from the current global
+                                  # with real labels and FedAvg into a new global, and the
+                                  # refreshed per-client weights become what the attack and the
+                                  # aggregator consume next.
+                                  # NO EFFECT while fl.freeze_global_in_phase2 is true — advancing
+                                  # the shared global is exactly what a simulated round must not
+                                  # do, so env.run_benign_fl_round() skips and logs instead.
+
+  # --- The DAMAGE BAR (reporting only; nothing trains on it) ---
+  # Defines the recorded `attack_damaging` / `attack_success` metric: did this round's
+  # flipped labels actually cost the model something? A run where the defender wins
+  # every round but the attack was never damaging is a defender that learned to detect
+  # a formality.
+  win_fraction: 0.6               # a round counts as damaging when the measured drop is at
+                                  # least win_fraction x the round's requested
+                                  # attack.goal.target_accuracy_drop. RELATIVE, so it stays
+                                  # correct if the target is ever re-drawn per round. At target
+                                  # 0.10 the bar is a 0.06 drop.
+  attacker_min_drop: 0.10         # FALLBACK absolute bar, used only when the round's goal is
+                                  # unknown. Tracks attack.goal.target_accuracy_drop so the
+                                  # fallback and the relative bar ask for the same thing.
+
   adapter_paths:
-    attacker: "checkpoints/attacker_adapter"
     defender: "checkpoints/defender_adapter"
   reward:
-    # These weights must stay ORDERED BY THE CONTROLLABLE RANGE they buy, not just by
-    # size, or the reward's stated priority is not the one the policy optimizes. With
-    # alpha 5.0 against target 0.10 a 1pp drop is worth 0.5 and hitting the goal is
-    # worth 5.0, so: damage (~5.0 controllable) > stealth (0.5) ~ malformed (0.5) >
-    # collaboration (0.2). Re-check this WHENEVER you change target_accuracy_drop —
-    # the pair (alpha, target) is what sets the damage weight, not alpha alone.
-    #
-    # Ordering on paper is not enough, which is the lesson of the recorded 262-round
-    # run: the order above held, and the damage term still supplied only ~11% of the
-    # attacker's reward, because the ACHIEVABLE range of a term is what it is worth,
-    # not its configured range. Drops of ~0.001 make damage worth ~0.05 while an
-    # untouched-looking client collects the full stealth payment. That is fixed at the
-    # source now — stealth is gated on rl.rewards.attack_potency, so it cannot be
-    # earned without actually attacking — but the same trap applies to any term you
-    # add here. Check what a term pays for the behaviour the policy CURRENTLY has,
-    # not for the behaviour you want it to reach.
-    attacker:
-      alpha: 5.0                  # weight on accuracy-drop term. Paired with
-                                  # attack.goal.target_accuracy_drop: 0.10 — the damage
-                                  # term is alpha * drop/target, so 5.0/0.10 keeps a
-                                  # point of accuracy worth exactly what it was at the
-                                  # old 1.0/0.02 while the target (= where the reward
-                                  # stops asking for more damage) moves out 5x. Keep the
-                                  # RATIO alpha/target = 50 when retargeting, or the
-                                  # absolute noise floors below silently re-scale.
-      beta: 0.10                  # weight on evasion term. A real signal in [0, 1]:
-                                  # every defense reports a boundary-calibrated
-                                  # p_malicious (p >= 0.5 iff flagged), so 1 - p means
-                                  # "undetected" instead of "far from the cohort median".
-                                  # GATED on attack_potency (‖poison‖/‖honest update‖,
-                                  # squashed into [0,1)). Un-gated at 0.5 this paid up
-                                  # to 0.5 for submitting a NEAR-HONEST update, which
-                                  # beat the ~0.05 an achievable drop earned — so the
-                                  # reward-maximizing policy was "don't attack".
-                                  # Measured over 262 rounds: stealth 0.83 (FLTrust) /
-                                  # 0.91 (Multi-Krum) at a median drop of 0.0000, while
-                                  # the global model GAINED 0.097 accuracy.
-                                  #
-                                  # The gate alone was NOT enough, which is the second
-                                  # half of the same lesson: a large, evading, entirely
-                                  # harmless perturbation has potency ~0.5, so at beta
-                                  # 0.5 it still collected 0.245 — about what a 0.5pp
-                                  # real drop pays. Damage led on paper and tied in
-                                  # practice. Hence the budget cut: the gate removes
-                                  # the free lunch, the weight removes the paid one.
-                                  #
-                                  # EVASION IS NOT LOST BY SHRINKING THIS. A flagged
-                                  # client is dropped from the aggregate and therefore
-                                  # causes no damage, so the damage term already prices
-                                  # evasion — this term only makes the gradient denser
-                                  # while damage is still near zero.
-      gamma: 0.5                  # penalty for malformed weight output (a wasted quota
-                                  # slot now costs about what 1pp of accuracy earns). At
-                                  # 1.0 this single term was ~10x the damage spread, so
-                                  # `mean_r` landed on exact multiples of -0.25/-0.5/-0.75
-                                  # (k of G rollouts scoring the flat -1.0) and GRPO's
-                                  # advantage was dominated by JSON validity. The penalty
-                                  # is kept — unusable output must still cost — just not
-                                  # at a scale that hides the attack-quality gradient.
-      zeta: 0.05                  # bonus for COLLABORATIVE multi-client attacks:
-                                  # zeta * diversity * STEALTH * POTENCY, where diversity =
-                                  # 1 - mean pairwise cosine of chosen clients' perturbations
-                                  # (0 for a single client). Rewards distinct, coordinated roles.
-                                  # Keep this the SMALLEST term: diversity is almost free to
-                                  # maximize (emit distinct per-client plans and it goes to
-                                  # ~1.0 regardless of whether the attack works), so if it
-                                  # outranks damage it becomes the policy's shortcut. The
-                                  # stealth/potency factors are what stop it being a flat
-                                  # payment for formatting — one recorded round collected
-                                  # 0.197 of it while every poisoned client was detected and
-                                  # the model got BETTER. It also matches why diversity is
-                                  # worth anything: identical clones are exactly what the
-                                  # defender's max_pairwise_cos feature looks for, so
-                                  # coordination only pays in an attack that survives.
-      # --- THE SHAPING BUDGET INVARIANT (check this after ANY edit above) ---
-      # Damage is the objective. Stealth and collaboration are SHAPING: they exist
-      # only to keep the gradient dense while damage is still near zero, and neither
-      # is worth anything on its own. So their combined ceiling must stay below what
-      # the smallest drop worth calling an attack earns:
-      #
-      #     beta + zeta  <  alpha * (min real drop) / target
-      #     0.10 + 0.05 = 0.15  <  5.0 * 0.01 / 0.10 = 0.5      (a 1pp drop)
-      #
-      # i.e. ANY genuine damage outbids everything a non-damaging rollout can
-      # collect, by >3x. Both previous settings violated this and the policy found
-      # out before we did: at beta 0.5 / zeta 0.2 the budget was 0.7 against 0.5, so
-      # the reward-maximizing move was to look busy and harmless.
-      #
-      # Expect FEWER gradient steps under this balance, not more — with the shaping
-      # income cut, groups of uniformly-harmless rollouts now correctly land inside
-      # min_reward_spread and get skipped instead of training the policy on which
-      # rollout hid best. Watch `zero_adv`/`SKIP-degenerate` in system.log and the
-      # per-term `reward_terms` block in the round log; a run where `damage` is not
-      # the dominant term is a run that is not learning to attack.
     defender:
       mode: "soft_f1"             # soft_f1 | tpr_minus_fpr
-      fpr_penalty: 1.0
+                                  # soft_f1 weights every client by the defender's own stated
+                                  # confidence, so the reward moves continuously as the verdicts
+                                  # shift — which is what gives GRPO a gradient when several
+                                  # rollouts happen to agree on the hard flags. tpr_minus_fpr
+                                  # uses the hard flags only and is much coarser.
+      fpr_penalty: 1.0            # tpr_minus_fpr only: how hard a false positive is charged.
+                                  # False positives are genuinely costly here — a flagged honest
+                                  # client is dropped from the aggregate, so an over-eager
+                                  # defender degrades the model it is defending.

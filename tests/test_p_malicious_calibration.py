@@ -4,23 +4,25 @@
 
     p_malicious >= 0.5   if and only if   is_suspicious
 
-and the attacker's ``stealth`` reward (``1 - p`` averaged over the poisoned clients,
-see ``rl.rewards.attacker_reward``) is built directly on that. Every producer here
+and the defender's soft-F1 reward (``rl.rewards.defender_reward``, which weights every
+client by ``_soft_malicious_prob``) is built directly on that. Every producer here
 violated it, in both directions, and the consequences were invisible in the logs
 because a broken probability still looks like a number:
 
 * FLTrust reported ``1 - ReLU(cos(delta_i, g0))``. Cosines between one client's delta
   and the root update are ~0.05 on a small model, so every client it ACCEPTED reported
-  ``p ~ 0.95``. Stealth was ~0.03 whether the attack evaded detection or not — 3% of
-  its configured weight, i.e. a dead term.
+  ``p ~ 0.95`` — i.e. it looked, to anything reading the field, like it had flagged
+  the entire cohort.
 * DeFL reported ``votes/L`` against an ADAPTIVE threshold. On this codebase's
   two-layer model the rule settles at ``votes >= 1``, so a client it had just FLAGGED
-  reported ``p = 1/2 = 0.5`` and the attacker still collected half the stealth bonus.
-  One recorded round paid 0.44 — the highest attacker reward in the sample — for an
-  attack that was fully detected and did no damage.
+  reported ``p = 1/2 = 0.5``: maximal uncertainty about a decision it had already made.
 * Multi-Krum and DnC reported the cohort RANK. Bounded and monotone, but the mean is
   ~0.5 every round by construction, so ``p`` moved when OTHER clients moved and said
   nothing about whether this client was detected.
+
+These defenses are not the trained defender, but they are what the ``--dry-run`` /
+``--baseline`` / benchmark paths score, and the same accessor reads both — so a raw
+score in this field corrupts every reported number on those paths.
 
 These tests run the actual defenses on constructed updates, so they fail if any future
 change starts reporting a raw suspicion score in this field again.
@@ -42,7 +44,7 @@ from benchmark.defenses.fltrust import FLTrust  # noqa: E402
 from benchmark.defenses.multikrum import MultiKrum  # noqa: E402
 from core.types import ModelUpdate  # noqa: E402
 from model.mnist_net import MnistNet  # noqa: E402
-from rl.rewards import _soft_malicious_prob, attacker_reward  # noqa: E402
+from rl.rewards import _soft_malicious_prob, defender_reward  # noqa: E402
 
 N_CLIENTS = 20
 N_POISONED = 4
@@ -100,12 +102,13 @@ def test_every_defense_agrees_with_its_own_hard_flag():
             )
 
 
-def test_stealth_never_pays_more_for_being_caught_than_for_evading():
+def test_catching_the_poison_never_scores_worse_than_missing_it():
     """The reward-level consequence of the invariant.
 
-    Whatever a defense does internally, an attacker whose clients were ALL flagged
-    must not out-score an otherwise identical attacker whose clients all evaded.
-    Under ``votes/L`` (DeFL) it did.
+    Whatever a defense does internally, a verdict set that FLAGGED the poisoned
+    clients must out-score an otherwise identical one that let them through. Under
+    ``votes/L`` (DeFL) it did not: a flagged client reported p = 0.5, so catching it
+    scored as half a miss.
     """
     for name, defense in _defenses().items():
         verdicts = _run(name, defense)
@@ -114,27 +117,30 @@ def test_stealth_never_pays_more_for_being_caught_than_for_evading():
         evaded = [v for v in verdicts if not v.is_suspicious]
         if not caught or not evaded:
             continue                          # nothing to compare in this round
-        # Same damage, same quota, same everything — only the verdicts differ.
-        r_caught = attacker_reward(0.80, 0.79, GOAL, poisoned,
-                                   [_relabel(v, cid) for cid, v in
-                                    zip(poisoned, _cycle(caught, len(poisoned)))], 0)
-        r_evaded = attacker_reward(0.80, 0.79, GOAL, poisoned,
-                                   [_relabel(v, cid) for cid, v in
-                                    zip(poisoned, _cycle(evaded, len(poisoned)))], 0)
-        assert r_evaded > r_caught, (
-            f"{name}: evading scored {r_evaded:.4f} but being caught scored "
-            f"{r_caught:.4f} — the stealth gradient is inverted"
+        # Same ground truth, same cohort — only the verdicts on the poisoned
+        # clients differ. The honest clients are held at a confident "benign" in
+        # both, so the comparison isolates the poisoned side.
+        honest = [_relabel(evaded[0], cid) for cid in range(N_POISONED, N_CLIENTS)]
+        r_caught = defender_reward(
+            [_relabel(v, cid) for cid, v in zip(poisoned, _cycle(caught, len(poisoned)))]
+            + honest, poisoned)
+        r_missed = defender_reward(
+            [_relabel(v, cid) for cid, v in zip(poisoned, _cycle(evaded, len(poisoned)))]
+            + honest, poisoned)
+        assert r_caught > r_missed, (
+            f"{name}: catching the poison scored {r_caught:.4f} but missing it scored "
+            f"{r_missed:.4f} — the defender's gradient is inverted"
         )
 
 
 def test_every_defense_keeps_a_usable_gradient_among_accepted_clients():
-    """Stealth must stay CONTINUOUS on the accepted side.
+    """``p_malicious`` must stay CONTINUOUS on the accepted side.
 
-    This is what the attacker can still improve: once a plan is flagged the reward
-    can only tell it "caught", but among the plans that survived, a more honest-looking
-    one must score better than one sitting on the boundary. A mean-based scale collapsed
-    this (four extreme outliers pushed every accepted client to within 0.002 of 0.5),
-    which is why the scale is a median.
+    The soft F1 weights every client by its probability, so if every accepted client
+    reports the same value the reward cannot separate two verdict sets that agree on
+    the hard flags — and the within-group spread GRPO differentiates collapses. A
+    mean-based scale destroyed this (four extreme outliers pushed every accepted
+    client to within 0.002 of 0.5), which is why the scale is a median.
     """
     for name, defense in _defenses().items():
         accepted = [v.p_malicious for v in _run(name, defense) if not v.is_suspicious]

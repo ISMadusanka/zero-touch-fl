@@ -1,47 +1,40 @@
-"""TrainingCurriculum — the deterministic (defense algorithm, #poisoners) sweep.
+"""TrainingCurriculum — the deterministic defense-algorithm sweep.
 
-Phase-2 rounds used to draw their two hardest knobs INDEPENDENTLY AT RANDOM: the
-defense algorithm came from ``AlgorithmicDefender.choose()`` (uniform over
-``defense.algorithms``) and the exact poison quota from
-``FLArmsRaceEnv._round_budget`` (uniform over ``[1, attack.max_poison_clients]``).
-Two uniform draws give every (algorithm, quota) pair the same *expected* share of
-rounds, but not an even one: over 200 rounds with 4 algorithms x 5 quotas each
-cell is Binomial(200, 1/20) — mean 10, sd ~3.1 — so cells routinely differ by
-2-3x and the attacker's gradient budget lands wherever the RNG happened to point.
-It also re-rolled the pair EVERY round, so the policy never got a contiguous
-stretch against one defense at one attack strength, which is precisely the
-regime it has to learn to exploit.
+Only relevant under ``defense.mode: algorithmic``, where the round's defense used
+to be drawn uniformly by ``AlgorithmicDefender.choose()``. A uniform draw gives
+every algorithm the same *expected* share of rounds but not an even one, and it
+re-rolls EVERY round, so no algorithm ever gets a contiguous stretch — which
+matters because several of them are stateful.
 
-This module replaces both draws with a fixed sweep::
+This module replaces that draw with a fixed sweep::
 
     for algorithm in defense.algorithms:          # e.g. fltrust, defl, dnc, multikrum
-        for k in curriculum.poisoner_counts:      # e.g. 1, 2, 3, 4, 5
-            run `rounds_per_block` (default 10) consecutive GRPO rounds,
-            defended by `algorithm`, poisoning exactly `k` clients
+        run `rounds_per_block` (default 10) consecutive rounds defended by it
     # ... then the cycle repeats from the first algorithm.
 
-With the shipped settings one cycle is 4 x 5 x 10 = 200 rounds and every
-algorithm gets exactly 50 rounds, 10 at each attack strength — the fair-and-equal
-opportunity the random draw only gave in expectation. The training round budget
-is millions of rounds, so the cycle simply repeats; a partial final cycle is the
-only source of imbalance, and it is bounded by one cycle.
+**Stateful defenses advance contiguously.** DeFL carries Beta reputation counts
+and S(t-1) across rounds and DnC carries a subsampling RNG. Under the random
+rotation a given algorithm's memory advanced on ~1 round in 4, scattered; here it
+advances over 10 consecutive rounds, much closer to how it behaves when deployed
+alone.
 
-Two side effects worth knowing:
+**The attack strength is NOT swept.** It used to be the second axis (a per-round
+poison quota the attacker LLM filled), but the attack is now a fixed set of
+label-flipping clients whose poison level is set by its own detection-adaptive
+ladder (:mod:`agents.label_flip_attacker`). ``n_poisoners`` therefore survives on
+:class:`CurriculumSlot` as a constant — how many clients flip labels — so round
+logs stay self-describing, and there is nothing left for the curriculum to vary
+on that axis.
 
-* **Stateful defenses advance contiguously.** DeFL carries Beta reputation counts
-  and S(t-1) across rounds and DnC carries a subsampling RNG. Under the random
-  rotation a given algorithm's memory advanced on ~1 round in 4, scattered; here
-  it advances over 10 consecutive rounds, which is much closer to how it behaves
-  when deployed alone.
-* **It supersedes ``defense.selection`` and ``attack.sample_budget_in_training``.**
-  Those knobs describe the random draws this curriculum replaces; when a
-  curriculum is attached they are simply not consulted (and the builder says so).
+Under ``defense.mode: llm`` (the default) there is no algorithm axis either, so
+:func:`build_training_curriculum` returns ``None`` and the defense is simply the
+defender LLM every round.
 
 The curriculum is a pure function of ONE integer — the number of rounds it has
 handed out — so the whole schedule position is ``{"step": n}``. That is persisted
 with the rest of the Phase-2 resume state (``checkpoints/rl_progress.json``) and
 restored on resume, so a restart continues in the middle of the block it was in
-rather than restarting the sweep and re-doing FLTrust-with-1-poisoner forever.
+rather than restarting the sweep from the first algorithm every time.
 
 This module is deliberately torch-free and dependency-free so the schedule logic
 is unit-testable without a GPU or a dataset.
@@ -52,7 +45,7 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-#: Consecutive rounds spent on one (algorithm, #poisoners) pair.
+#: Consecutive rounds spent on one algorithm.
 DEFAULT_ROUNDS_PER_BLOCK = 10
 
 
@@ -60,9 +53,10 @@ DEFAULT_ROUNDS_PER_BLOCK = 10
 class CurriculumSlot:
     """What one Phase-2 round is scheduled to face.
 
-    ``algorithm`` is ``None`` when the defender LLM defends (``defense.mode:
-    llm``) — there is no algorithm axis to sweep there, so the curriculum drives
-    only the poisoner count.
+    ``algorithm`` is the defense for this block. ``n_poisoners`` is a CONSTANT —
+    how many clients flip labels every round (``len(attack.poison_client_ids)``) —
+    carried here so a round log names the attack size without re-deriving it from
+    the config; it is not an axis the curriculum varies.
     """
 
     algorithm: str | None
@@ -86,13 +80,14 @@ class CurriculumSlot:
 
 
 class TrainingCurriculum:
-    """Deterministic round-by-round sweep over (algorithm, #poisoners) blocks.
+    """Deterministic round-by-round sweep over defense-algorithm blocks.
 
-    ``algorithms`` is the ordered defense pool (``[None]`` when the defender LLM
-    defends), ``poisoner_counts`` the ordered attack strengths, and
-    ``rounds_per_block`` how many consecutive rounds each pair holds. The outer
-    loop is the ALGORITHM and the inner loop the poisoner count: one algorithm is
-    faced at 1, 2, ... poisoners before the next algorithm is picked up.
+    ``algorithms`` is the ordered defense pool, ``rounds_per_block`` how many
+    consecutive rounds each holds, and ``poisoner_counts`` the constant number of
+    label-flipping clients (normally a single-element list — see
+    :class:`CurriculumSlot`). The generic two-axis machinery is retained so a
+    future experiment can sweep a second axis without rewriting the sweep, but
+    with one count the schedule is simply one algorithm per block.
     """
 
     def __init__(self, algorithms, poisoner_counts,
@@ -214,81 +209,43 @@ class TrainingCurriculum:
 # Construction from configs/base.yaml
 # ---------------------------------------------------------------------------
 
-def resolve_poisoner_counts(configured, max_poison_clients: int,
-                            n_compromisable: int) -> list[int]:
-    """The ordered attack strengths the sweep cycles through.
-
-    ``configured is None`` means "every count the attack budget allows", i.e.
-    ``1 .. attack.max_poison_clients``. Counts above the attacker's controllable
-    pool are dropped with a warning rather than clamped: clamping would silently
-    turn ``[1, 2, 3, 4, 5]`` with a 3-client pool into ``[1, 2, 3, 3, 3]`` and
-    hand the largest quota three times the rounds of every other one, which is
-    exactly the imbalance this curriculum exists to remove.
-    """
-    pool = max(1, int(n_compromisable))
-    if configured is None:
-        raw = list(range(1, max(1, int(max_poison_clients)) + 1))
-    else:
-        raw = [int(k) for k in configured]
-    counts, seen = [], set()
-    for k in raw:
-        if k < 1:
-            raise ValueError(f"curriculum.poisoner_counts must be >= 1, got {k}")
-        if k > pool:
-            logger.warning(
-                f"curriculum.poisoner_counts: dropping {k} — the attacker controls "
-                f"only {pool} client(s) (fl.n_compromisable), so a {k}-poisoner round "
-                f"is not expressible. Raise fl.n_compromisable to sweep it."
-            )
-            continue
-        if k in seen:
-            logger.warning(f"curriculum.poisoner_counts: dropping duplicate {k} "
-                           f"(a repeated count would get extra rounds)")
-            continue
-        counts.append(k)
-        seen.add(k)
-    if not counts:
-        raise ValueError(
-            f"curriculum.poisoner_counts is empty after validation (pool is "
-            f"{pool} client(s)) — list at least one count in 1..{pool}"
-        )
-    return counts
-
 
 def build_training_curriculum(cfg: dict, algorithms=None) -> TrainingCurriculum | None:
-    """Build the sweep described by ``cfg`` (the whole base config), or ``None``.
+    """Build the defense sweep described by ``cfg`` (the whole base config), or ``None``.
 
-    Returns ``None`` when the config has no ``curriculum:`` block (so older
-    configs keep the original random draws) or when it sets ``enabled: false``.
+    Returns ``None`` when the config has no ``curriculum:`` block, when it sets
+    ``enabled: false``, or when there is no algorithm axis to sweep — which is the
+    case under ``defense.mode: llm`` (``algorithms`` is empty/``None``), where the
+    defender LLM defends every round and the attack strength is set by its own
+    ladder rather than by a schedule.
 
-    ``algorithms`` is the defender's VALIDATED rotation pool in listed order —
-    pass ``AlgorithmicDefender.names``, or ``None`` under ``defense.mode: llm``
-    where there is no algorithm axis and only the poisoner count is swept.
-    ``curriculum.algorithms`` may narrow/reorder that pool; every name it lists
-    must be one the defender actually built.
+    ``algorithms`` is the defender's VALIDATED rotation pool in listed order — pass
+    ``AlgorithmicDefender.names``. ``curriculum.algorithms`` may narrow/reorder that
+    pool; every name it lists must be one the defender actually built.
     """
     ccfg = cfg.get("curriculum")
     if not ccfg:
         return None
     if not ccfg.get("enabled", True):
         logger.info("Training curriculum disabled (curriculum.enabled: false) — "
-                    "the defense algorithm and poison quota are drawn at random per round")
+                    "the defense algorithm is drawn at random per round")
         return None
-
-    fl = cfg.get("fl", {})
-    attack = cfg.get("attack", {})
-    n_clients = int(fl.get("n_clients", 1))
-    n_compromisable = max(1, min(int(fl.get("n_compromisable", n_clients)), n_clients))
 
     available = list(algorithms) if algorithms else []
     requested = ccfg.get("algorithms")
+    if requested and not available:
+        raise ValueError(
+            "curriculum.algorithms was given but no algorithmic defense is active "
+            "(defense.mode: llm) — remove it, or set defense.mode: algorithmic"
+        )
+    if not available:
+        logger.info(
+            "Training curriculum inactive: the defender LLM defends every round "
+            "(defense.mode: llm), so there is no algorithm to sweep. The attack "
+            "strength is the label-flip ladder's, not the curriculum's."
+        )
+        return None
     if requested:
-        if not available:
-            raise ValueError(
-                "curriculum.algorithms was given but no algorithmic defense is "
-                "active (defense.mode: llm) — remove it, or set "
-                "defense.mode: algorithmic"
-            )
         names, seen = [], set()
         for item in requested:
             name = str(item).strip().lower()
@@ -302,60 +259,22 @@ def build_training_curriculum(cfg: dict, algorithms=None) -> TrainingCurriculum 
             seen.add(name)
         available = names
 
-    # A fixed poisoner set (attack.fixed_poison_clients) removes the attack-strength
-    # axis entirely: every round poisons the same N clients, so a sweep over counts
-    # has nothing left to vary. Collapse it to that single count rather than letting
-    # the curriculum request quotas the env will not honour — env._round_budget
-    # ignores the slot's count in this mode, so a sweep would show up in the logs
-    # and in RoundLog.attack_metadata as blocks that never actually differed.
-    fixed_poison = attack.get("fixed_poison_clients")
-    if fixed_poison not in (None, False, 0, ""):
-        fixed_n = max(1, min(int(fixed_poison), n_clients))
-        counts = [fixed_n]
-        configured = ccfg.get("poisoner_counts")
-        if configured and [int(k) for k in configured] != counts:
-            logger.info(
-                f"  curriculum supersedes curriculum.poisoner_counts {list(configured)}: "
-                f"attack.fixed_poison_clients={fixed_n} poisons clients "
-                f"0..{fixed_n - 1} every round, so the sweep collapses to [{fixed_n}] "
-                f"and only the defense algorithm is swept."
-            )
-    else:
-        counts = resolve_poisoner_counts(
-            ccfg.get("poisoner_counts"),
-            max_poison_clients=int(attack.get("max_poison_clients", n_compromisable)),
-            n_compromisable=n_compromisable,
-        )
+    # The number of label-flipping clients is fixed by attack.poison_client_ids, so
+    # it is a constant carried on every slot rather than an axis to sweep.
+    poison_ids = (cfg.get("attack") or {}).get("poison_client_ids", [0])
+    if isinstance(poison_ids, int):
+        poison_ids = [poison_ids]
+    n_poisoners = max(1, len(list(poison_ids or [0])))
+
     curriculum = TrainingCurriculum(
         algorithms=available,
-        poisoner_counts=counts,
+        poisoner_counts=[n_poisoners],
         rounds_per_block=int(ccfg.get("rounds_per_block", DEFAULT_ROUNDS_PER_BLOCK)),
     )
-
     logger.info(f"Training curriculum ACTIVE: {curriculum.describe()}")
-    # Say plainly which knobs it takes over, so a config that still sets them
-    # doesn't read as if it were in charge.
-    if available:
-        logger.info(
-            f"  curriculum supersedes defense.selection "
-            f"({(cfg.get('defense') or {}).get('selection', 'random')!r}): the round's "
-            f"algorithm is the block's, not a draw"
-        )
-    if attack.get("sample_budget_in_training", True):
-        logger.info(
-            "  curriculum supersedes attack.sample_budget_in_training: the round's "
-            "poison quota is "
-            + ("the fixed poisoner set, not a draw in [1, max_poison_clients]"
-               if len(counts) == 1 and fixed_poison not in (None, False, 0, "")
-               else "the block's, not a draw in [1, max_poison_clients]")
-        )
-    if attack.get("sample_target_in_training", False):
-        logger.warning(
-            "attack.sample_target_in_training is ON while the curriculum is active. "
-            "The curriculum holds the defense and the poisoner count fixed for a whole "
-            "block so those blocks are comparable; a target_accuracy_drop that keeps "
-            "moving round-to-round re-introduces exactly the variance it removes. Set "
-            "attack.sample_target_in_training: false and pin attack.goal."
-            "target_accuracy_drop (0.10 is the shipped training default)."
-        )
+    logger.info(
+        f"  curriculum supersedes defense.selection "
+        f"({(cfg.get('defense') or {}).get('selection', 'random')!r}): the round's "
+        f"algorithm is the block's, not a draw"
+    )
     return curriculum

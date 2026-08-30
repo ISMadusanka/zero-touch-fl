@@ -36,16 +36,47 @@ roughly uniform mix of all ten digits.
 
 ## Client training (`clients/benign_client.py`)
 
-Each round the server sends the current global weights to every client; each
-client loads them into a local copy, runs `local_epochs` of SGD on its own shard
-(batch size 64, cross-entropy loss), and returns a `ModelUpdate` (updated weights
-+ train accuracy/loss/sample count) — never its raw data. The server FedAvgs the
-accepted updates into the next global model. In Phase 1 all clients are honest, so
-no update is filtered.
+Each round the server sends the current global weights to every client; each client
+loads them into a local copy, runs `local_epochs` of SGD on its own shard (batch
+size 64, cross-entropy loss), and returns a `ModelUpdate` (updated weights + train
+accuracy/loss/sample count) — never its raw data. The server FedAvgs the accepted
+updates into the next global model. In Phase 1 all clients are honest, so no update
+is filtered.
+
+In Phase 2 each client trains on a **fresh slice of its own shard** per round
+(`data/round_sampler.py`, `fl.client_round_fraction`, default 0.25 ≈ 750 examples).
+That is what makes consecutive rounds differ when the global model is frozen: the
+starting point is fixed, so without new local data every round would reproduce the
+same honest updates. A slice always comes from the client's OWN shard, so the
+non-IID skew above is preserved.
+
+## Poisoned clients (`clients/malicious_client.py`)
+
+A poisoned client runs **exactly the same procedure** — same examples, same batch
+size, same epochs, same learning rate — on a dataset whose labels have been flipped
+symmetrically (`y → 9 − y`, see `data/label_flip.py`). Nothing edits the weights
+afterwards, so the update it submits is a genuine SGD trajectory of a real (if
+wrong) objective.
+
+How many of its labels are flipped is set per round by the attack ladder
+(`agents/label_flip_attacker.py`): it starts at 100% of the client's round data and
+backs off a notch every time the defense catches it, resetting to 100% once it
+bottoms out at 50%. Because the fraction is applied to each client's **own**
+per-round sample count, an unequal non-IID partition still flips the same
+*proportion* everywhere.
+
+`train_accuracy` in a poisoned client's metadata is measured against its **flipped**
+labels, so it is that client's fit to its poisoned objective — expect it to be high
+even though the model is being pushed away from the real task. The metadata also
+carries `n_flipped`, `n_local_samples` and `flip_fraction`.
 
 ## Threat model note
 
-Only the **first `fl.n_compromisable` clients** (default 5: ids `0..4`) are
-reachable by the attacker; the remaining 15 are always honest. Because ≤ 5 of 20
-clients can ever be poisoned, the honest majority the defender's robust
-statistics rely on always holds.
+Only the clients listed in **`attack.poison_client_ids`** (default `[0]` — a single
+insider) flip labels; every other client is always honest. Keep that set below half
+of `fl.n_clients` and the honest majority the defender's robust statistics rely on
+always holds. Once it reaches half, that assumption is gone and the robust
+aggregators (Multi-Krum, DnC, FLTrust's trust scores) are outside the regime they
+are proved in — a legitimate experiment (it is the standard "attack success vs
+fraction malicious" sweep), just one to read with the caveat. It is logged at
+startup.

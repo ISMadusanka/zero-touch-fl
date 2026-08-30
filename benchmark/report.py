@@ -52,8 +52,9 @@ def render(summaries: list[dict], n_rounds: int, baseline_accuracy: float,
            out_dir: str | None = None, goal: dict | None = None,
            n_poisoners: int | None = None) -> str:
     goal_s = _goal_str(goal)
-    # ``n_poisoners`` is the exact per-round poison quota. Pull the realised mean
-    # from each summary as an audit check (the held-fixed attack makes them agree).
+    # ``n_poisoners`` is how many clients are configured to flip labels. Pull the
+    # realised mean from each summary as an audit check: it is lower when a ladder
+    # level rounds to zero flips on some client, which leaves that client honest.
     used = None
     if summaries:
         used = summaries[0].get("mean_poisoned")
@@ -61,8 +62,8 @@ def render(summaries: list[dict], n_rounds: int, baseline_accuracy: float,
     if n_poisoners is not None:
         poisoner_s = f", Num of poisoners={n_poisoners}"
         if used is not None:
-            poisoner_s += (" (exact quota)" if abs(used - n_poisoners) < 0.05
-                           else f" quota, {used:.1f} effective/round")
+            poisoner_s += (" (all effective)" if abs(used - n_poisoners) < 0.05
+                           else f" configured, {used:.1f} effective/round")
     title = (f"DEFENSE BENCHMARK — {n_rounds} attack rounds  "
              f"(clean baseline acc = {baseline_accuracy:.3f}"
              f"{f'; goal = {goal_s}' if goal_s else ''})"

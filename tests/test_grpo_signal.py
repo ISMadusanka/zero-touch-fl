@@ -6,8 +6,8 @@ produced plausible logs while the gradient pointed somewhere other than intended
 1. ``_soft_malicious_prob`` reads a calibrated ``p_malicious`` when the detector
    supplies one. The algorithmic defenses report a suspicion score, not certainty
    in their verdict, so reconstructing P(malicious) from ``(is_suspicious,
-   confidence)`` ran BACKWARDS over every un-flagged client — the attacker's
-   stealth reward paid it for creeping up to the detection boundary.
+   confidence)`` ran BACKWARDS over every un-flagged client, so the soft signal
+   said "confidently benign" about the clients the defense had nearly dropped.
 2. FLTrust computes its trusted reference ``g0`` once per global model. It is the
    output of SGD over a shuffled root loader, so re-running it per call gave every
    scored rollout in a group a different defense, and GRPO fit that noise.
@@ -37,11 +37,19 @@ from benchmark.defenses.base import (  # noqa: E402
 from core.types import DetectionVerdict  # noqa: E402
 from rl.grpo import grpo_step  # noqa: E402
 from rl.rewards import (  # noqa: E402
-    DEFAULT_MIN_REWARD_SPREAD, _soft_malicious_prob, attacker_reward,
+    DEFAULT_MIN_REWARD_SPREAD, _soft_malicious_prob, defender_reward,
     group_advantages,
 )
 
-GOAL = {"type": "untargeted_degrade", "target_accuracy_drop": 0.20}
+
+def _verdicts(p_poisoned, n_clients=20, n_poisoned=1):
+    """A cohort where every poisoned client reports ``p_poisoned`` and every honest
+    one is confidently benign — so ``defender_reward`` varies only with how well the
+    poison was detected."""
+    return ([DetectionVerdict(i, p_poisoned >= 0.5, 1.0, "", p_malicious=p_poisoned)
+             for i in range(n_poisoned)]
+            + [DetectionVerdict(i, False, 1.0, "", p_malicious=0.0)
+               for i in range(n_poisoned, n_clients)])
 
 
 # --- 1. the soft evasion signal points the right way -------------------------
@@ -62,23 +70,22 @@ def test_confidence_reconstruction_still_used_for_the_llm_defender():
     assert _soft_malicious_prob(DetectionVerdict(0, False, 0.0, "no idea")) == 0.5
 
 
-def test_stealth_increases_as_a_surviving_client_looks_more_honest():
-    """THE bug this suite exists for. Two un-flagged poisoned clients: one the
-    defense nearly dropped, one it comfortably kept. Stealth must reward the
-    comfortable one. Under the old confidence reconstruction the ordering was
-    inverted, so the attacker was trained to sit ON the detection boundary."""
-    nearly_caught = [DetectionVerdict(0, False, 0.98, "trust=0.01", p_malicious=0.99)]
-    comfortable = [DetectionVerdict(0, False, 0.20, "trust=0.60", p_malicious=0.40)]
-    r_nearly = attacker_reward(0.9, 0.7, GOAL, [0], nearly_caught, 0)
-    r_comfy = attacker_reward(0.9, 0.7, GOAL, [0], comfortable, 0)
-    assert r_comfy > r_nearly, (r_comfy, r_nearly)
+def test_soft_probability_is_monotone_in_how_suspicious_a_client_looks():
+    """THE bug this suite exists for. Two un-flagged clients: one the defense nearly
+    dropped, one it comfortably kept. The soft probability must rank the
+    nearly-dropped one as MORE suspicious. Under the old confidence reconstruction
+    the ordering was inverted over the whole accepted half of the cohort, which is
+    where the defender's remaining gradient lives once the obvious poison is caught."""
+    nearly_caught = DetectionVerdict(0, False, 0.98, "trust=0.01", p_malicious=0.49)
+    comfortable = DetectionVerdict(0, False, 0.20, "trust=0.60", p_malicious=0.10)
+    assert _soft_malicious_prob(nearly_caught) > _soft_malicious_prob(comfortable)
 
     # The inverted mapping the fix removed, shown explicitly: it ranked the
-    # nearly-caught client as the STEALTHIER of the two.
+    # nearly-caught client as the LESS suspicious of the two.
     def old_soft_p(v):
         c = max(0.0, min(1.0, v.confidence))
         return 0.5 + 0.5 * c if v.is_suspicious else 0.5 - 0.5 * c
-    assert old_soft_p(nearly_caught[0]) < old_soft_p(comfortable[0])
+    assert old_soft_p(nearly_caught) < old_soft_p(comfortable)
 
 
 def test_unbounded_scores_are_boundary_calibrated_not_clipped_or_ranked():
@@ -124,11 +131,10 @@ def test_calibration_survives_a_tie_across_the_boundary():
 # --- 2. one defense per round, identical for every scored rollout ------------
 
 def test_fltrust_reference_is_stable_across_scored_rollouts():
-    """All G rollouts in a GRPO group must be graded by the same defense. FLTrust's
-    g0 comes from SGD over a shuffled root loader, so without caching each rollout
-    got its own trust direction AND its own aggregate scale (Eq. 3 rescales to
-    ||g0||) — reward noise that GRPO cannot distinguish from the attacker's own
-    effect on the outcome."""
+    """Every scored round must be graded by the same defense. FLTrust's g0 comes
+    from SGD over a shuffled root loader, so without caching each call got its own
+    trust direction AND its own aggregate scale (Eq. 3 rescales to ||g0||) — reward
+    noise indistinguishable from a real change in the updates."""
     import random
 
     from benchmark.defenses.fltrust import FLTrust
@@ -164,14 +170,11 @@ def test_fltrust_reference_is_stable_across_scored_rollouts():
 
 # --- 3. measurement noise is not a learning signal --------------------------
 
-def test_test_set_quantization_noise_is_treated_as_degenerate():
-    """10k test examples -> accuracy quantized to 1e-4 -> ~2e-3 of reward per single
-    flipped example at the smallest sampled target. The old `std < 1e-6` gate let
-    that through and z-scored it to A = +-1.2."""
-    posts = [0.7000, 0.7001, 0.6999, 0.7000]        # one example apart
-    rs = [attacker_reward(0.9, p, GOAL, [0],
-                          [DetectionVerdict(0, False, 0.0, "x", p_malicious=0.2)], 0)
-          for p in posts]
+def test_sampling_noise_is_treated_as_degenerate():
+    """Four verdict sets that differ only by a thousandth of confidence on one client
+    are behaviourally identical. The old `std < 1e-6` gate let that through and
+    z-scored it to A = +-1.2 — GRPO confidently reinforcing a coin flip."""
+    rs = [defender_reward(_verdicts(p), [0]) for p in (0.90, 0.901, 0.899, 0.90)]
     assert 0 < (max(rs) - min(rs)) < DEFAULT_MIN_REWARD_SPREAD, rs   # real but tiny
     adv, zero_frac = group_advantages(rs)
     assert zero_frac == 1.0 and adv == [0.0] * 4
@@ -193,11 +196,9 @@ def test_advantage_magnitude_tracks_real_reward_differences():
 
 
 def test_a_genuinely_separated_group_still_learns():
-    """The noise gate must not swallow real signal: a 1% accuracy difference at the
-    default target clears it comfortably."""
-    rs = [attacker_reward(0.9, p, GOAL, [0],
-                          [DetectionVerdict(0, False, 0.0, "x", p_malicious=0.2)], 0)
-          for p in (0.75, 0.74, 0.73, 0.72)]
+    """The noise gate must not swallow real signal: verdict sets that genuinely
+    disagree about the poisoned client clear it comfortably."""
+    rs = [defender_reward(_verdicts(p), [0]) for p in (0.1, 0.4, 0.7, 1.0)]
     adv, zero_frac = group_advantages(rs)
     assert zero_frac == 0.0 and max(abs(a) for a in adv) > 1.0
 
@@ -284,7 +285,7 @@ class _StubOptimizer:
 def _run(ids, *reward_groups, **kw):
     policy = _StubPolicy(ids, reward_groups[0])
     opt = _StubOptimizer()
-    stats = grpo_step(policy, "attacker", opt, _StubTurn(*reward_groups),
+    stats = grpo_step(policy, "defender", opt, _StubTurn(*reward_groups),
                       G=len(reward_groups[0]), max_new_tokens=8, **kw)
     return policy, opt, stats
 
@@ -346,7 +347,7 @@ def _length_weighted_grads(lengths, rewards):
     ids = [torch.arange(L) for L in lengths]
     policy = _StubPolicy(ids, rewards)
     policy.per_rollout_lengths = list(lengths)
-    stats = grpo_step(policy, "attacker", _StubOptimizer(), _StubTurn(rewards),
+    stats = grpo_step(policy, "defender", _StubOptimizer(), _StubTurn(rewards),
                       G=len(rewards), max_new_tokens=64, kl_beta=0.0,
                       grad_clip=1e9)
     return [float(p.grad) for p in policy.params], stats["advantages"], stats
@@ -392,7 +393,7 @@ def test_stub_generators_without_ids_fall_back_to_the_text_path():
             return texts
 
     policy = _NoIds([torch.tensor([1]), torch.tensor([2])], [0.0, 1.0])
-    stats = grpo_step(policy, "attacker", _StubOptimizer(), _StubTurn([0.0, 1.0]),
+    stats = grpo_step(policy, "defender", _StubOptimizer(), _StubTurn([0.0, 1.0]),
                       G=2, max_new_tokens=8)
     assert stats["temperature"] == 1.0
     assert stats["stepped"]

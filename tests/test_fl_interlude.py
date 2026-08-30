@@ -43,16 +43,15 @@ def _cfg():
             # default frozen simulated rounds there is no shared FL state to advance,
             # so run_benign_fl_round() skips (asserted in test_frozen_rounds.py).
             "freeze_global_in_phase2": False,
-            "benign_retrain_each_round": False,  # honest updates replay client_weights
             "training_rounds": TRAINING_ROUNDS,
-            "n_compromisable": N_COMPROMISABLE,
+            "poison_seed": 0,
             "lr": 0.05,
             "local_epochs": 1,
         },
         "attack": {
+            "type": "label_flip",
+            "poison_client_ids": [0],
             "goal": {"type": "untargeted_degrade", "target_accuracy_drop": 0.20},
-            "max_poison_clients": 2,
-            "sample_budget_in_training": True,
         },
     }
 
@@ -63,6 +62,7 @@ def _make_env():
     test_loader = _loader(999, n=128)
     env = FLArmsRaceEnv(_cfg(), client_loaders, test_loader, random.Random(0))
 
+    torch.manual_seed(1234)
     net = MnistNet()
     global_weights = {k: v.clone() for k, v in net.state_dict().items()}
     # Distinct per-client "frozen Phase-1" weights so we can detect a refresh.
@@ -104,25 +104,33 @@ def test_refreshes_client_weights_and_global():
     assert _differs(global_before, env.global_weights), "global model not advanced"
 
 
-def test_next_begin_round_consumes_refreshed_weights():
-    """With benign_retrain_each_round=False the honest updates of the NEXT round
-    must be exactly the FL round's refreshed client weights."""
+def test_next_begin_round_trains_from_the_advanced_global():
+    """The point of the interlude: the round after it must be built on the model the
+    interlude produced, not on the pre-interlude one.
+
+    Every client trains locally each round (the label-flip poison IS that training),
+    so this is checked at the source — the global the clients start from — rather
+    than by comparing the resulting weights, which SGD also moves.
+    """
     env, _, _, _ = _make_env()
+    before_interlude = copy.deepcopy(env.global_weights)
     info = env.run_benign_fl_round()
-    refreshed = [copy.deepcopy(w) for w in env.client_weights]
+    advanced = copy.deepcopy(env.global_weights)
+    assert _differs(before_interlude, advanced)
+
     ctx = env.begin_round()
     # Round numbers are sequential across the interlude (no collision/reuse).
     assert ctx.round_num == info["round_num"] + 1
+    # The anchor the clients trained from this round is the advanced global...
+    for k in advanced:
+        assert torch.allclose(env.global_weights[k], advanced[k])
+    # ...and their updates are close to it (one local epoch from that start), not to
+    # the model the interlude replaced.
     for cid in range(N_CLIENTS):
         hu = env.honest_updates[cid].weights
-        for k in hu:
-            assert torch.allclose(hu[k], refreshed[cid][k]), (
-                f"begin_round did not replay refreshed weights for client {cid}"
-            )
-    # The attacker's controllable pool now points at the refreshed weights.
-    for cid in ctx.pool_ids:
-        for k in ctx.pool_benign[cid]:
-            assert torch.allclose(ctx.pool_benign[cid][k], refreshed[cid][k])
+        near = sum(float((hu[k] - advanced[k]).norm()) for k in hu)
+        far = sum(float((hu[k] - before_interlude[k]).norm()) for k in hu)
+        assert near < far, f"client {cid} did not train from the advanced global"
 
 
 def test_sequential_round_numbers_across_multiple_interludes():

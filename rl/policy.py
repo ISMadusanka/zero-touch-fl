@@ -1,4 +1,4 @@
-"""LLMPolicy — one frozen Qwen2.5-3B-Instruct base, two trainable LoRA adapters.
+"""LLMPolicy — one frozen Qwen2.5-3B-Instruct base + trainable LoRA adapters.
 
 This is the only module with heavy GPU dependencies (unsloth / peft /
 transformers / torch + a CUDA box). It is imported only on the training path;
@@ -7,9 +7,12 @@ stays importable on a CPU machine.
 
 Design — "separate checkpoints on the same LLM":
   * One (optionally 4-bit / QLoRA) Qwen2.5-3B-Instruct base, loaded once and frozen.
-  * Two LoRA adapters over it: ``"attacker"`` and ``"defender"``. Each is an
-    independent set of low-rank deltas → two separate checkpoints
+  * One LoRA adapter per trainable agent over it — currently just ``"defender"``,
+    since the attack is a fixed schedule with no policy. Each adapter is an
+    independent set of low-rank deltas, i.e. its own checkpoint
     (``adapter_model.safetensors`` + ``adapter_config.json``) sharing one base.
+    The multi-adapter machinery is kept: it costs nothing with one adapter and is
+    what lets a second trainable agent be added back without reworking this class.
   * ``set_adapter(name)`` activates one adapter for both generation and the
     log-prob forward pass; ``disable_adapter()`` exposes the base as the KL
     reference policy.
@@ -43,7 +46,7 @@ class LLMPolicy:
         load_in_4bit: bool = True,
         target_modules: list[str] | None = None,
         seed: int = 0,
-        adapters: tuple[str, ...] = ("attacker", "defender"),
+        adapters: tuple[str, ...] = ("defender",),
         attn_implementation: str = "eager",
         use_fast_generate: bool = True,
     ):
@@ -97,7 +100,7 @@ class LLMPolicy:
             random_state=seed,
         )
 
-        # Add the two named adapters we actually train; "default" stays unused.
+        # Add the named adapters we actually train; "default" stays unused.
         lora_cfg = LoraConfig(
             r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
             bias="none", target_modules=target_modules, task_type="CAUSAL_LM",
@@ -207,8 +210,8 @@ class LLMPolicy:
         # Deliver the instructions in the model's NATIVE system role (Qwen2.5,
         # Llama, Mistral all support it) so they carry system-level authority and
         # the model adopts the role cleanly — this matters for a small instruct
-        # model and, for the attacker, keeps the adversarial framing from being
-        # overridden by the template's default "helpful assistant" system persona.
+        # model — it keeps the defender's detection framing and output contract
+        # from being diluted by the template's default "helpful assistant" persona.
         # Templates without a system role (e.g. Gemma) fall back to folding
         # system+user into one user turn — resolved once in _render_chat.
         # Render to text (tokenize=False → str), then tokenize with the raw
@@ -221,11 +224,12 @@ class LLMPolicy:
     def count_prompt_tokens(self, system: str, user: str) -> int:
         """Exact prompt length in tokens, chat template included.
 
-        This is what the agents' ``PromptBudget`` measures the context fill
-        against (``AttackerAgent.bind_tokenizer``), so it deliberately goes
-        through the same ``_render_chat`` path generation uses — an estimate off
-        by the template's own scaffolding would mis-size the budget. It only
-        tokenizes (no model forward), so it is cheap enough to call per round.
+        Goes through the same ``_render_chat`` path generation uses, so a caller
+        checking how much of the context window a prompt occupies gets the real
+        number rather than one off by the template's own scaffolding. The
+        defender's prompt carries per-layer features for every client, so it
+        scales with ``fl.n_clients``. Only tokenizes (no model forward), so it is
+        cheap enough to call per round.
         """
         text = self._render_chat(system, user)
         return len(self._tok(text, add_special_tokens=False).input_ids)
@@ -360,8 +364,8 @@ class LLMPolicy:
         distribution while GRPO differentiated the untruncated softmax. The policy
         gradient's ``ratio == 1`` assumption (see rl/grpo.py) requires the sampler
         and the log-prob pass to be the SAME distribution, and a repetition penalty
-        is especially damaging here because the attacker's output is repetitive JSON
-        (``op``/``target``/``id`` once per client).
+        is especially damaging here because the defender's output is repetitive JSON
+        (``client_id``/``is_suspicious``/``confidence`` once per client).
 
         So: every logits warper is explicitly neutralized and temperature is the only
         shaping left — matched by ``_completion_token_logprobs(temperature=...)``.
