@@ -652,13 +652,22 @@
    *
    *  `checkpoints/` is not in the repo, so a machine that has never trained shows
    *  an empty table; these rows give the tab something to show. They are display
-   *  only -- no adapter directory exists behind them, so they carry no roles and
-   *  offer no row actions (Benchmark/Rename/Delete would all address a version id
-   *  the store does not have). */
+   *  only, and the two role fields say different things on purpose:
+   *
+   *  - `roles` is what the `holds` column draws, so the row shows the att/def
+   *    chips a two-sided snapshot would have;
+   *  - `available` stays false for both, because no adapter directory exists
+   *    behind the row. It is what the benchmark version pickers filter on, so if
+   *    a demo row ever did reach them it would be unselectable rather than
+   *    offered and then refused by the server.
+   *
+   *  Row actions are omitted for the same reason: Benchmark/Rename/Delete would
+   *  all address a version id the store does not have. */
   const DEMO_VERSIONS = [
     { id: "v000", label: "v000", notes: "", created: "2026-07-10T21:32:16",
-      rounds_done: 1001450, roles: [], demo: true,
+      rounds_done: 1001450, roles: ["attacker", "defender"], demo: true,
       available: { attacker: false, defender: false },
+      base_model: "unsloth/Qwen2.5-7B-Instruct",
       training: { mean_attacker_reward: 0.8, mean_induced_drop: 0.315 } },
   ];
 
@@ -719,8 +728,8 @@
     table.innerHTML = "";
     if (!versions.length) return;
 
-    const head = ["version", "holds", "created", "rounds", "atk reward", "mean drop",
-                  "def reward", "base model", ""];
+    const head = ["version", "holds", "created", "rounds", "mean drop",
+                  "base model", ""];
     table.appendChild(el("thead", {}, [el("tr", {}, head.map((h) =>
       el("th", { text: h })))]));
     const body = el("tbody");
@@ -742,9 +751,7 @@
                        title: role + "_adapter is in this version" })))]),
         el("td", { class: "num", text: (v.created || "").replace("T", " ") }),
         el("td", { class: "num", text: v.rounds_done ?? "--" }),
-        el("td", { class: "num", text: num(t.mean_attacker_reward, 3) }),
         el("td", { class: "num", text: signed(t.mean_induced_drop, 4) }),
-        el("td", { class: "num", text: num(t.mean_defender_reward, 3) }),
         el("td", { class: "num", text: (v.base_model || "--").split("/").pop() }),
         el("td", {}, v.demo ? [] : [
           el("button", { class: "btn sm", text: "Benchmark",
