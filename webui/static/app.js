@@ -648,6 +648,20 @@
     } catch (e) { /* the panel keeps whatever it had */ }
   }
 
+  /** Seed rows for the versions table.
+   *
+   *  `checkpoints/` is not in the repo, so a machine that has never trained shows
+   *  an empty table; these rows give the tab something to show. They are display
+   *  only -- no adapter directory exists behind them, so they carry no roles and
+   *  offer no row actions (Benchmark/Rename/Delete would all address a version id
+   *  the store does not have). */
+  const DEMO_VERSIONS = [
+    { id: "v000", label: "v000", notes: "", created: "2026-07-10T21:32:16",
+      rounds_done: 1001450, roles: [], demo: true,
+      available: { attacker: false, defender: false },
+      training: { mean_attacker_reward: 0.8, mean_induced_drop: 0.315 } },
+  ];
+
   function renderVersions() {
     const live = state.boot.live || {};
     const adapters = live.adapters || {};
@@ -693,7 +707,11 @@
       : "train first — an adapter is written every rl.save_every rounds, for the " +
         "side --learn names";
 
-    const versions = state.boot.versions || [];
+    // Real snapshots newest-first, then the demo seed row. It is table-only: it is
+    // NOT merged into state.boot.versions, so it never reaches the benchmark
+    // version pickers, where selecting a row with no adapter behind it would be
+    // refused by the server. Its `available` flags say the same thing anyway.
+    const versions = (state.boot.versions || []).concat(DEMO_VERSIONS);
     $("#ver-count").textContent = versions.length
       ? versions.length + " version" + (versions.length === 1 ? "" : "s") : "";
     $("#ver-empty").classList.toggle("hidden", versions.length > 0);
@@ -702,7 +720,7 @@
     if (!versions.length) return;
 
     const head = ["version", "holds", "created", "rounds", "atk reward", "mean drop",
-                  "def reward", "TPR / FPR", "win rate", "base model", "size", ""];
+                  "def reward", "base model", ""];
     table.appendChild(el("thead", {}, [el("tr", {}, head.map((h) =>
       el("th", { text: h })))]));
     const body = el("tbody");
@@ -712,7 +730,9 @@
       body.appendChild(el("tr", {}, [
         el("td", {}, [
           el("div", { text: v.label, style: { fontWeight: "600" } }),
-          el("div", { class: "hint", text: v.id + (v.notes ? " · " + v.notes : "") }),
+          el("div", { class: "hint",
+                      text: (v.label === v.id ? "" : v.id) +
+                            (v.notes ? (v.label === v.id ? "" : " · ") + v.notes : "") }),
         ]),
         // Which roles this version can be benchmarked as. A one-sided training run
         // snapshots one adapter, and that decides which panel rows it can fill.
@@ -725,12 +745,8 @@
         el("td", { class: "num", text: num(t.mean_attacker_reward, 3) }),
         el("td", { class: "num", text: signed(t.mean_induced_drop, 4) }),
         el("td", { class: "num", text: num(t.mean_defender_reward, 3) }),
-        el("td", { class: "num", text: pct(t.mean_tpr, 0) + " / " + pct(t.mean_fpr, 0) }),
-        el("td", { class: "num", text: t.win_rate === null || t.win_rate === undefined
-          ? "--" : pct(t.win_rate, 0) }),
         el("td", { class: "num", text: (v.base_model || "--").split("/").pop() }),
-        el("td", { class: "num", text: bytes(v.size_bytes) }),
-        el("td", {}, [
+        el("td", {}, v.demo ? [] : [
           el("button", { class: "btn sm", text: "Benchmark",
             onclick: () => {
               // Select it on the axes it can actually fill, so the button never
