@@ -251,25 +251,12 @@
     });
 
     const accSeries = [
-      { key: "post", label: "after the attack", color: P.attack, width: 2 },
-      { key: "clean", label: "clean counterfactual", color: P.good, width: 1.6, dash: [4, 3] },
-      { key: "baseline", label: "Phase-1 baseline", color: P.faint, width: 1, dash: [2, 4] },
+      { key: "post", label: "global accuracy", color: P.attack, width: 2 },
     ];
     T.acc = new C.LineChart($("#chart-acc"), {
       series: accSeries, yFormat: (v) => (v * 100).toFixed(1) + "%",
     });
     legend("#legend-acc", accSeries);
-
-    const dropSeries = [
-      { key: "drop", label: "induced drop", color: P.attack, width: 2 },
-      { key: "target", label: "target", color: P.warn, width: 1.2, dash: [5, 4] },
-      { key: "gate", label: "win gate", color: P.accent, width: 1.2, dash: [2, 3] },
-    ];
-    T.drop = new C.LineChart($("#chart-drop"), {
-      series: dropSeries, zeroLine: true,
-      yFormat: (v) => (v * 100).toFixed(1) + "pp",
-    });
-    legend("#legend-drop", dropSeries);
 
     const rewardSeries = [
       { key: "total", label: "total", color: P.text, width: 2 },
@@ -317,14 +304,6 @@
     });
     legend("#legend-detect", detectSeries);
 
-    const potencySeries = [
-      { key: "potency", label: "potency", color: P.attack, width: 1.8 },
-      { key: "diversity", label: "plan diversity", color: P.accent, width: 1.4 },
-    ];
-    T.potency = new C.LineChart($("#chart-potency"), {
-      series: potencySeries, yMin: 0, yMax: 1, yFormat: (v) => v.toFixed(2),
-    });
-    legend("#legend-potency", potencySeries);
   }
 
   function resetTrainCharts() {
@@ -342,8 +321,6 @@
     const m = record.attack_metadata || {};
     const train = m.train || {};
     const terms = m.reward_terms || {};
-    const goal = record.attack_goal || {};
-    const target = goal.target_accuracy_drop;
     const verdicts = record.predicted_labels || [];
     const poisoned = new Set(record.poisoned_client_ids || []);
 
@@ -367,10 +344,7 @@
 
     const x = record.round_num;
     const T = state.train.charts;
-    T.acc.push(x, { post: record.test_accuracy, clean: m.clean_accuracy,
-                    baseline: record.baseline_accuracy });
-    T.drop.push(x, { drop: m.induced_drop, target: target,
-                     gate: target !== undefined ? target * winFraction() : undefined });
+    T.acc.push(x, { post: record.test_accuracy });
     T.reward.push(x, { total: record.attacker_reward, damage: terms.damage,
                        stealth: terms.stealth, malformed: terms.malformed,
                        collab: terms.collab });
@@ -378,9 +352,7 @@
                      spread: train.reward_spread, zero_adv: train.zero_advantage_fraction });
     T.detect.push(x, { tpr: row.tpr, fpr: row.fpr });
     T.defReward.push(x, { reward: record.defender_reward, tpr: row.tpr, fpr: row.fpr });
-    T.potency.push(x, { potency: m.attack_potency, diversity: m.attack_diversity });
-    [T.acc, T.drop, T.reward, T.defReward, T.grpo, T.detect, T.potency]
-      .forEach((c) => c.draw());
+    [T.acc, T.reward, T.defReward, T.grpo, T.detect].forEach((c) => c.draw());
 
     renderTrainKpis();
     renderFederation($("#train-federation"), {
@@ -421,37 +393,26 @@
       `— they have nothing to learn and there is no defender policy to train. `;
   }
 
-  function winFraction() {
-    const f = state.boot && state.boot.config.fields["rl.win_fraction"];
-    const o = state.overrides["rl.win_fraction"];
-    return parseFloat(o !== undefined ? o : (f ? f.value : 0.6)) || 0.6;
-  }
-
   /* The KPI strip, ordered by WHO IS LEARNING.
 
      The same round record describes both sides, but only one of them is being
      optimised: under `--learn defender` every attacker series is a frozen
      policy's flat line and the defender's reward is the number that moves. A
-     strip that always led with attacker reward and damage share therefore
-     reported a defender run as "nothing is happening". So the learner's block
-     comes first and the opponent's follows, labelled as frozen. */
+     strip that always led with the attacker's numbers therefore reported a
+     defender run as "nothing is happening". So the learner's block comes first
+     and the opponent's follows, labelled as frozen. */
   function renderTrainKpis() {
     const rows = state.train.rounds;
     if (!rows.length) return;
     const last = rows[rows.length - 1];
     const r = last.record, m = r.attack_metadata || {}, t = m.train || {};
     const terms = m.reward_terms || {};
-    const target = (r.attack_goal || {}).target_accuracy_drop;
     const recent = rows.slice(-50);
     const measured = recent.filter((x) => x.measured);
     const winRate = recent.length ? recent.filter((x) => x.win).length / recent.length : null;
     // Only the GRPO path breaks the reward into terms; --baseline and --dry-run
-    // report a scalar. Without the guard a mode that has no terms showed a
-    // confident "0%" damage share, which reads as "the policy is farming stealth".
+    // report a scalar, so the reward's dmg/stl split is not always available.
     const hasTerms = typeof terms.damage === "number";
-    const totalAbs = Object.values(terms).reduce(
-      (a, b) => a + (typeof b === "number" ? Math.abs(b) : 0), 0) - Math.abs(terms.total || 0);
-    const damageShare = hasTerms && totalAbs ? Math.abs(terms.damage) / totalAbs : null;
     const cur = m.curriculum;
 
     // Which side this run is training. The round log is authoritative; before the
@@ -495,22 +456,13 @@
     ];
 
     const attackerBlock = [
-      { k: "induced drop", v: signed(m.induced_drop, 4),
-        tone: (m.induced_drop || 0) > 0 ? "atk" : "",
-        s: target !== undefined ? "target " + num(target, 2) +
-           (m.clean_measured === false ? " · UNMEASURED" : "") : "",
-        title: "clean counterfactual minus the post-attack accuracy" },
       { k: "attacker reward", v: num(r.attacker_reward, 3), tone: "atk",
         s: hasTerms ? `dmg ${signed(terms.damage, 2)} stl ${signed(terms.stealth, 2)}`
                     : "not broken out in this mode" },
-      { k: "damage share", v: damageShare === null ? "--" : pct(damageShare, 0),
-        tone: damageShare !== null && damageShare < 0.3 ? "bad" : "",
-        s: hasTerms ? "of the reward's magnitude" : "GRPO training only",
-        title: "A reward carried by stealth is a policy learning to hide, not to attack" },
       { k: "mean drop", v: signed(mean(measured.map((x) => x.drop)), 4),
-        s: measured.length + " measured rounds" },
-      { k: "potency", v: num(m.attack_potency, 2), tone: "atk",
-        s: "diversity " + num(m.attack_diversity, 2) },
+        s: measured.length + " measured rounds",
+        title: "clean counterfactual minus the post-attack accuracy, over the "
+             + "rounds where the counterfactual was actually measured" },
     ];
 
     // The frozen side is still worth reading -- it is what the learner is scored
@@ -901,24 +853,17 @@
     });
   }
 
-  /** Grey the defender row out when nothing in the panel would load it. The row
-   *  is left visible rather than hidden: "this column is not in your panel" is
-   *  the thing worth saying, and a field that vanishes says nothing. */
+  /** Grey the defender row out when nothing in the panel would load it. The row is
+   *  left visible rather than hidden: a field that vanishes says nothing, and the
+   *  dimming is what tells you this column is not in your panel. The reason lives
+   *  in the tooltip, so the panel itself stays free of prose. */
   function renderDefenderVersionHint() {
     const on = benchSelection.defenses.has("llm_defender");
     const node = $("#bench-defender-versions");
-    const doc = $("#bench-defender-versions-doc");
-    if (!node || !doc) return;
+    if (!node) return;
     node.classList.toggle("inert", !on);
-    doc.classList.toggle("hint-off", !on);
-    doc.textContent = on
-      ? "Which defender adapter the llm_defender column loads. Chosen separately from " +
-        "the attacker because --learn trains one side at a time, so the two adapters " +
-        "normally come from different snapshots. Several sweep the same way; both axes " +
-        "at once runs their product."
-      : "Add the llm_defender column to the defense panel to use this — without it no " +
-        "defender adapter is loaded at all and every version here would produce the " +
-        "same numbers.";
+    node.title = on ? "" :
+      "add the llm_defender column to the defense panel to use this";
   }
 
   /* ------------------------------------------------------------------ */
@@ -1017,7 +962,11 @@
                               placeholder: def === "" ? "CLI default" : String(def) });
       }
       field.appendChild(input);
-      if (doc) field.appendChild(el("div", { class: "doc", text: doc }));
+      // The note lives on the field rather than under it: this panel is a dense
+      // grid of ~25 knobs, and a line of prose per knob is what made it a wall of
+      // text. Hover still explains what "blank" means for the ones where it
+      // decides something.
+      if (doc) field.title = doc;
       node.appendChild(field);
     });
     // Switches that are flags rather than values.
@@ -1035,7 +984,7 @@
         box.addEventListener("change", () => {
           box.nextElementSibling.textContent = box.checked ? "on" : "off";
         });
-        if (doc) field.appendChild(el("div", { class: "doc", text: doc }));
+        if (doc) field.title = doc;
         node.appendChild(field);
       });
   }
@@ -1797,7 +1746,12 @@
 
   async function startTraining() {
     const payload = {
-      mode: $("#train-mode").value,
+      // The panel starts GRPO training runs only. --dry-run (frozen LLM, no
+      // training) and --baseline (best-of-N reward harness, no LLM) are still
+      // accepted by /api/train/start and by main.py; they are diagnostics, and
+      // offering them here made the first control on the page a choice between
+      // "train" and two things that train nothing.
+      mode: "train",
       env: $("#train-env").value,
       rounds: numeric("#train-rounds"),
       poisoners: numeric("#train-poisoners"),
@@ -1896,9 +1850,6 @@
     if (f["attack.goal.target_accuracy_drop"]) {
       $("#bench-goal-value").value = f["attack.goal.target_accuracy_drop"].value;
     }
-    $("#win-gate-note").textContent =
-      `${winFraction()} × target = ${num(winFraction() * (f["attack.goal.target_accuracy_drop"] || {}).value, 3)}`;
-
     renderLearnWarning();
     applyStatus("train", state.boot.train);
     applyStatus("bench", state.boot.bench);

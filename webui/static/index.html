@@ -43,16 +43,6 @@
         <div class="body">
           <div class="fields">
             <div class="field">
-              <label>Mode</label>
-              <select id="train-mode">
-                <option value="train">train &mdash; full GRPO (needs a GPU)</option>
-                <option value="dry-run">dry-run &mdash; frozen LLM via Ollama, no training</option>
-                <option value="baseline">baseline &mdash; best-of-N reward harness, no LLM</option>
-              </select>
-              <div class="doc">GRPO training fine-tunes the attacker LoRA adapter. dry-run and
-                baseline exercise the same round loop without touching a checkpoint.</div>
-            </div>
-            <div class="field">
               <label>Round budget <span class="path">--rounds</span></label>
               <input type="number" id="train-rounds" min="1" placeholder="config: fl.simulation_rounds">
               <div class="doc">ABSOLUTE budget, not "this many more": rounds already done on a
@@ -131,18 +121,9 @@
 
       <div class="charts" id="train-charts">
         <div class="chart-card">
-          <h3>Accuracy vs the clean counterfactual</h3>
-          <div class="sub">The drop is measured against the accuracy the SAME defense reaches with
-            no poison at all &mdash; not against the previous round.</div>
+          <h3>Accuracy</h3>
           <div class="chart-wrap"><canvas id="chart-acc"></canvas></div>
           <div class="legend" id="legend-acc"></div>
-        </div>
-        <div class="chart-card">
-          <h3>Induced drop vs target</h3>
-          <div class="sub">Above the shaded band the round counts as a win
-            (<span class="mono" id="win-gate-note">win_fraction &times; target</span>).</div>
-          <div class="chart-wrap"><canvas id="chart-drop"></canvas></div>
-          <div class="legend" id="legend-drop"></div>
         </div>
         <div class="chart-card">
           <h3>Attacker reward, by term</h3>
@@ -172,13 +153,6 @@
             much of the honest federation it rejected.</div>
           <div class="chart-wrap"><canvas id="chart-detect"></canvas></div>
           <div class="legend" id="legend-detect"></div>
-        </div>
-        <div class="chart-card">
-          <h3>Attack potency</h3>
-          <div class="sub">&#8214;poison&#8214; / &#8214;honest update&#8214;, squashed into [0,1).
-            Near zero with a high reward means the stealth term is being farmed.</div>
-          <div class="chart-wrap"><canvas id="chart-potency"></canvas></div>
-          <div class="legend" id="legend-potency"></div>
         </div>
       </div>
 
@@ -274,25 +248,14 @@
             <div class="field" style="grid-column: span 2">
               <label>Attacker version(s) <span class="path">--attacker-adapter</span></label>
               <div class="chips" id="bench-versions"></div>
-              <div class="doc">Which attacker adapter the <code>llm</code> row loads. Pick
-                several to sweep them: each runs as its own benchmark, back to back, against
-                the identical rounds &mdash; and the panel builds a comparison as they finish.
-                The live checkpoint is whatever training last wrote.</div>
             </div>
             <div class="field" style="grid-column: span 2">
               <label>Defender version(s) <span class="path">--defender-adapter</span></label>
               <div class="chips" id="bench-defender-versions"></div>
-              <div class="doc" id="bench-defender-versions-doc">Which defender adapter the
-                <code>llm_defender</code> column loads. Chosen separately from the attacker
-                because <span class="mono">--learn</span> trains one side at a time, so the two
-                adapters normally come from different snapshots. Several sweep the same way; both
-                axes at once runs their product.</div>
             </div>
             <div class="field">
               <label>Rounds <span class="path">--rounds</span></label>
               <input type="number" id="bench-rounds" value="30" min="1">
-              <div class="doc">Every attack is scored over the same rounds; a round with no usable
-                attacker action is dropped for the whole panel.</div>
             </div>
             <div class="field">
               <label>Goal <span class="path">--goal</span></label>
@@ -304,20 +267,14 @@
                 </select>
                 <input type="number" id="bench-goal-value" value="0.1" step="0.01" style="flex:1">
               </div>
-              <div class="doc">Fixed for the whole run &mdash; evaluation never samples the target.
-                It is the denominator of the weighted goal-success column.</div>
             </div>
             <div class="field">
               <label>Poisoned clients <span class="path">--max-poison-clients</span></label>
               <input type="number" id="bench-poison" min="1" placeholder="config: attack.eval_poison_clients">
-              <div class="doc">Exact quota every round. Past ~1/3 of the federation the robust
-                aggregators lose their guarantees &mdash; the run says so in the log.</div>
             </div>
             <div class="field">
               <label>Federation size <span class="path">--n-clients</span></label>
               <input type="number" id="bench-nclients" min="2" placeholder="config: fl.n_clients">
-              <div class="doc">A count different from the Phase-1 checkpoint re-runs Phase 1
-                in-process; nothing is written, so training checkpoints stay intact.</div>
             </div>
             <div class="field">
               <label>Adversary knowledge <span class="path">--baseline-knowledge</span></label>
@@ -325,8 +282,6 @@
                 <option value="partial">partial &mdash; only the compromised clients' updates</option>
                 <option value="full">full &mdash; every client's (the omniscient setting)</option>
               </select>
-              <div class="doc">partial matches what the trained attacker observes; full is how most
-                papers state their attack.</div>
             </div>
             <div class="field">
               <label>Device <span class="path">--device</span></label>
@@ -335,31 +290,23 @@
                 <option value="cuda">cuda</option>
                 <option value="cpu">cpu</option>
               </select>
-              <div class="doc">A baselines-only panel (no <code>llm</code> row) needs no adapter and
-                no GPU.</div>
             </div>
             <div class="field">
               <label>Attack temperature <span class="path">--attack-temperature</span></label>
               <input type="number" id="bench-temp" value="0.7" step="0.05" min="0" max="5">
-              <div class="doc">Sampling temperature for the trained policy's plan.</div>
             </div>
             <div class="field">
               <label>Seed <span class="path">--seed</span></label>
               <input type="number" id="bench-seed" placeholder="config: fl.poison_seed">
-              <div class="doc">Fixes the partition, the poison draw and the defenses' RNG.</div>
             </div>
           </div>
 
           <div class="mt">
-            <label class="hint" style="display:block;margin-bottom:6px">Attack panel &mdash;
-              rows of the matrix. Every attack poisons the same clients and sees the same honest
-              updates, so the only difference between rows is the attack.</label>
+            <label class="hint" style="display:block;margin-bottom:6px">Attack panel</label>
             <div class="chips" id="bench-attacks"></div>
           </div>
           <div class="mt">
-            <label class="hint" style="display:block;margin-bottom:6px">Defense panel &mdash;
-              columns. Each attack gets its own defense instances, so rows cannot contaminate
-              each other.</label>
+            <label class="hint" style="display:block;margin-bottom:6px">Defense panel</label>
             <div class="chips" id="bench-defenses"></div>
           </div>
 
