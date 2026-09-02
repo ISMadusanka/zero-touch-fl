@@ -45,15 +45,10 @@
             <div class="field">
               <label>Round budget <span class="path">--rounds</span></label>
               <input type="number" id="train-rounds" min="1" placeholder="config: fl.simulation_rounds">
-              <div class="doc">ABSOLUTE budget, not "this many more": rounds already done on a
-                resumed run count toward it. Blank uses the config.</div>
             </div>
             <div class="field">
               <label>Poisoners per round <span class="path">--poisoners</span></label>
               <input type="number" id="train-poisoners" min="1" placeholder="config">
-              <div class="doc">Rewrites every key that implements the count: the fixed poison set
-                or per-round quota, the curriculum sweep, the eval quota and the
-                DnC/Multi-Krum assumed adversary.</div>
             </div>
             <div class="field">
               <label>Which side learns <span class="path">--learn</span></label>
@@ -63,8 +58,6 @@
                 <option value="defender">defender only (needs defense.mode: llm)</option>
                 <option value="both">both (two-sided arms race)</option>
               </select>
-              <div class="doc">The untrained side still plays; its adapter on disk is left
-                untouched.</div>
               <div class="doc hint-off hidden" id="train-learn-warn">
                 <span id="train-learn-warn-text"></span>
                 <button class="btn sm" id="train-learn-fix">Set defense.mode: llm</button>
@@ -76,8 +69,6 @@
                 <option value="linux">linux &mdash; Ollama</option>
                 <option value="windows">windows &mdash; OpenAI</option>
               </select>
-              <div class="doc">Only used by dry-run / baseline paths. GRPO training always runs
-                the local Unsloth policy.</div>
             </div>
             <div class="field">
               <label>Options</label>
@@ -127,30 +118,21 @@
         </div>
         <div class="chart-card">
           <h3>Attacker reward, by term</h3>
-          <div class="sub">Damage must dominate on any round the attack worked. A reward carried
-            by stealth is a policy learning to hide, not to attack.</div>
           <div class="chart-wrap"><canvas id="chart-reward"></canvas></div>
           <div class="legend" id="legend-reward"></div>
         </div>
         <div class="chart-card">
           <h3>Defender reward</h3>
-          <div class="sub">Soft-F1 over the per-client verdicts. This is the series that moves
-            under <span class="mono">--learn defender</span>; the attacker's above is a frozen
-            policy&rsquo;s flat line.</div>
           <div class="chart-wrap"><canvas id="chart-def-reward"></canvas></div>
           <div class="legend" id="legend-def-reward"></div>
         </div>
         <div class="chart-card">
           <h3>GRPO step health</h3>
-          <div class="sub">Reward spread is what the degeneracy gate tests: a collapsed group
-            gives no gradient and the step is skipped.</div>
           <div class="chart-wrap"><canvas id="chart-grpo"></canvas></div>
           <div class="legend" id="legend-grpo"></div>
         </div>
         <div class="chart-card">
           <h3>Detection</h3>
-          <div class="sub">TPR is how much of the attack the round's defense caught; FPR is how
-            much of the honest federation it rejected.</div>
           <div class="chart-wrap"><canvas id="chart-detect"></canvas></div>
           <div class="legend" id="legend-detect"></div>
         </div>
