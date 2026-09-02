@@ -191,6 +191,7 @@
       if (same) delete state.overrides[f.path];
       else state.overrides[f.path] = value;
       wrap.classList.toggle("changed", f.path in state.overrides);
+      if (f.path === "defense.mode") renderLearnWarning();
       const n = Object.keys(state.overrides).length;
       $("#train-config-count").textContent = n ? `${n} override${n === 1 ? "" : "s"}` : "base.yaml as shipped";
     };
@@ -282,6 +283,20 @@
     });
     legend("#legend-reward", rewardSeries);
 
+    // The DEFENDER's score sheet. Its reward is logged every round (RoundLog
+    // .defender_reward) but only becomes the thing being optimised under
+    // `--learn defender`, where every attacker series above is a frozen policy's
+    // flat line and this is the one that moves.
+    const defRewardSeries = [
+      { key: "reward", label: "defender reward", color: P.defense, width: 2 },
+      { key: "tpr", label: "TPR (attack caught)", color: P.good, width: 1.4 },
+      { key: "fpr", label: "FPR (honest rejected)", color: P.warn, width: 1.4, dash: [3, 3] },
+    ];
+    T.defReward = new C.LineChart($("#chart-def-reward"), {
+      series: defRewardSeries, yMin: 0, yMax: 1, yFormat: (v) => v.toFixed(2),
+    });
+    legend("#legend-def-reward", defRewardSeries);
+
     const grpoSeries = [
       { key: "loss", label: "GRPO loss", color: P.accent, width: 1.8 },
       { key: "mean_reward", label: "mean reward", color: P.good, width: 1.4 },
@@ -362,8 +377,10 @@
     T.grpo.push(x, { loss: train.loss, mean_reward: train.mean_reward,
                      spread: train.reward_spread, zero_adv: train.zero_advantage_fraction });
     T.detect.push(x, { tpr: row.tpr, fpr: row.fpr });
+    T.defReward.push(x, { reward: record.defender_reward, tpr: row.tpr, fpr: row.fpr });
     T.potency.push(x, { potency: m.attack_potency, diversity: m.attack_diversity });
-    [T.acc, T.drop, T.reward, T.grpo, T.detect, T.potency].forEach((c) => c.draw());
+    [T.acc, T.drop, T.reward, T.defReward, T.grpo, T.detect, T.potency]
+      .forEach((c) => c.draw());
 
     renderTrainKpis();
     renderFederation($("#train-federation"), {
@@ -380,12 +397,44 @@
       ` · ${tp} caught / ${fn} through / ${fp} false alarms`;
   }
 
+  /* --learn defender|both needs a trainable defender, and the shipped config
+     defends with published algorithms -- so the most obvious first click in this
+     panel names a side that cannot learn. The server refuses it (reusing the
+     CLI's own resolver), but being told to change a setting that lives three
+     fields away in the SAME panel is a poor way to find out, so the requirement
+     is stated next to the selector with the one-click fix. */
+  function effectiveDefenseMode() {
+    if ("defense.mode" in state.overrides) return String(state.overrides["defense.mode"]);
+    const f = state.boot && state.boot.config.fields["defense.mode"];
+    return f ? String(f.value) : "algorithmic";
+  }
+
+  function renderLearnWarning() {
+    const learn = $("#train-learn").value;
+    const needsLLM = learn === "defender" || learn === "both";
+    const mode = effectiveDefenseMode();
+    const bad = needsLLM && mode !== "llm";
+    $("#train-learn-warn").classList.toggle("hidden", !bad);
+    if (!bad) return;
+    $("#train-learn-warn-text").textContent =
+      `defense.mode is "${mode}", so the server defends with published algorithms ` +
+      `— they have nothing to learn and there is no defender policy to train. `;
+  }
+
   function winFraction() {
     const f = state.boot && state.boot.config.fields["rl.win_fraction"];
     const o = state.overrides["rl.win_fraction"];
     return parseFloat(o !== undefined ? o : (f ? f.value : 0.6)) || 0.6;
   }
 
+  /* The KPI strip, ordered by WHO IS LEARNING.
+
+     The same round record describes both sides, but only one of them is being
+     optimised: under `--learn defender` every attacker series is a frozen
+     policy's flat line and the defender's reward is the number that moves. A
+     strip that always led with attacker reward and damage share therefore
+     reported a defender run as "nothing is happening". So the learner's block
+     comes first and the opponent's follows, labelled as frozen. */
   function renderTrainKpis() {
     const rows = state.train.rounds;
     if (!rows.length) return;
@@ -405,7 +454,13 @@
     const damageShare = hasTerms && totalAbs ? Math.abs(terms.damage) / totalAbs : null;
     const cur = m.curriculum;
 
-    kpi($("#train-kpis"), [
+    // Which side this run is training. The round log is authoritative; before the
+    // first round arrives the run's own --learn flag stands in.
+    const learner = r.learning_agent ||
+      (state.train.status && state.train.status.learn) || "none";
+    const forDefender = learner === "defender";
+
+    const context = [
       // The FL round index, which keeps climbing across resumes. It is NOT the
       // --rounds budget: that counts Phase-2 rounds DONE (across every run), so
       // pairing them as "53 of 8" would be two different counters in one reading.
@@ -415,6 +470,31 @@
            (state.train.rounds.length === 1 ? "" : "s") + " this run" },
       { k: "accuracy", v: pct(r.test_accuracy, 2), tone: "def",
         s: "clean " + pct(m.clean_accuracy, 2) },
+      { k: "learner", v: learner, tone: forDefender ? "def" : "atk",
+        s: m.phase_index === undefined ? "no GRPO schedule"
+                                       : `phase ${m.phase_index}/${m.phase_round}` },
+    ];
+
+    const win = {
+      k: (forDefender ? "defender" : "attacker") + " win rate",
+      v: winRate === null ? "--" : pct(winRate, 0),
+      tone: winRate > 0 ? "good" : "", s: "last " + recent.length + " rounds",
+      title: "rounds the LEARNING side cleared its win gate on (learner_success)",
+    };
+
+    const defenderBlock = [
+      { k: "defender reward", v: num(r.defender_reward, 3), tone: "def",
+        s: "mean " + num(mean(recent.map((x) => x.record.defender_reward)), 3),
+        title: "soft-F1 over the per-client verdicts (rl.reward.defender.mode)" },
+      { k: "detection", v: pct(last.tpr, 0), tone: "def",
+        s: "FPR " + pct(last.fpr, 0),
+        title: "how much of the round's attack the defense caught, and how much of "
+             + "the honest federation it rejected" },
+      { k: "mean detection", v: pct(mean(recent.map((x) => x.tpr)), 0),
+        s: "mean FPR " + pct(mean(recent.map((x) => x.fpr)), 0) },
+    ];
+
+    const attackerBlock = [
       { k: "induced drop", v: signed(m.induced_drop, 4),
         tone: (m.induced_drop || 0) > 0 ? "atk" : "",
         s: target !== undefined ? "target " + num(target, 2) +
@@ -427,23 +507,30 @@
         tone: damageShare !== null && damageShare < 0.3 ? "bad" : "",
         s: hasTerms ? "of the reward's magnitude" : "GRPO training only",
         title: "A reward carried by stealth is a policy learning to hide, not to attack" },
-      { k: "detection", v: pct(last.tpr, 0), tone: "def",
-        s: "FPR " + pct(last.fpr, 0) },
-      { k: "win rate", v: winRate === null ? "--" : pct(winRate, 0),
-        tone: winRate > 0 ? "good" : "", s: "last " + recent.length + " rounds" },
       { k: "mean drop", v: signed(mean(measured.map((x) => x.drop)), 4),
         s: measured.length + " measured rounds" },
-      { k: "GRPO loss", v: num(t.loss, 4),
-        s: t.stepped === false ? "step SKIPPED" : "spread " + num(t.reward_spread, 3),
-        tone: t.stepped === false ? "bad" : "" },
-      { k: "defense", v: m.defense || "llm",
-        s: cur ? `blk ${cur.block}/${cur.block_round} · ${cur.n_poisoners}p` : "" },
-      { k: "learner", v: r.learning_agent || "none",
-        s: m.phase_index === undefined ? "no GRPO schedule"
-                                       : `phase ${m.phase_index}/${m.phase_round}` },
       { k: "potency", v: num(m.attack_potency, 2), tone: "atk",
         s: "diversity " + num(m.attack_diversity, 2) },
-    ]);
+    ];
+
+    // The frozen side is still worth reading -- it is what the learner is scored
+    // against -- so it is kept, just marked as not being optimised.
+    const frozen = forDefender ? attackerBlock : defenderBlock;
+    frozen.forEach((k) => {
+      k.s = (k.s ? k.s + " · " : "") + "frozen";
+    });
+
+    kpi($("#train-kpis"), context
+      .concat(win)
+      .concat(forDefender ? defenderBlock : attackerBlock)
+      .concat([
+        { k: "GRPO loss", v: num(t.loss, 4),
+          s: t.stepped === false ? "step SKIPPED" : "spread " + num(t.reward_spread, 3),
+          tone: t.stepped === false ? "bad" : "" },
+        { k: "defense", v: m.defense || "llm",
+          s: cur ? `blk ${cur.block}/${cur.block_round} · ${cur.n_poisoners}p` : "" },
+      ])
+      .concat(frozen));
   }
 
   /* ------------------------------------------------------------------ */
@@ -607,28 +694,48 @@
 
   function renderVersions() {
     const live = state.boot.live || {};
-    const att = (live.adapters || {}).attacker || {};
+    const adapters = live.adapters || {};
+    const att = adapters.attacker || {};
+    const def = adapters.defender || {};
     const tr = live.training || {};
-    $("#live-modified").textContent = att.exists
-      ? "adapter last written " + att.modified : "no adapter on disk yet";
+    // Either adapter is worth snapshotting on its own: `rl/schedule.py` writes
+    // ONLY the side --learn named, so a defender-only run leaves no attacker
+    // adapter at all and gating the button on the attacker's made the one adapter
+    // that run produced unversionable.
+    const anyAdapter = att.exists || def.exists;
+    const newest = [att, def].filter((a) => a.exists).map((a) => a.modified).sort().pop();
+    $("#live-modified").textContent = anyAdapter
+      ? "adapter last written " + newest : "no adapter on disk yet";
+    const learners = tr.learners_seen || [];
     kpi($("#live-kpis"), [
       { k: "attacker adapter", v: att.exists ? "present" : "none",
-        tone: att.exists ? "good" : "bad", s: att.exists ? bytes(att.size_bytes) : att.path },
+        tone: att.exists ? "good" : "", s: att.exists ? bytes(att.size_bytes) : att.path },
+      { k: "defender adapter", v: def.exists ? "present" : "none",
+        tone: def.exists ? "good" : "",
+        s: def.exists ? bytes(def.size_bytes)
+                      : "written only under defense.mode: llm with --learn defender",
+        title: "the llm_defender benchmark column loads this" },
       { k: "rounds done", v: (live.progress || {}).rounds_done ?? "--",
         s: "FL round " + ((live.progress || {}).round_index ?? "--") },
-      { k: "recent reward", v: num(tr.mean_attacker_reward, 3), tone: "atk",
-        s: `over ${tr.rounds || 0} rounds` },
-      { k: "recent mean drop", v: signed(tr.mean_induced_drop, 4),
-        s: `max ${signed(tr.max_induced_drop, 4)}` },
+      { k: "trained side", v: learners.length ? learners.join(" + ") : "--",
+        s: "over the last " + (tr.rounds || 0) + " rounds",
+        title: "learning_agent in the round log — which policy those rounds updated" },
+      { k: "attacker reward", v: num(tr.mean_attacker_reward, 3), tone: "atk",
+        s: `mean drop ${signed(tr.mean_induced_drop, 4)}` },
+      { k: "defender reward", v: num(tr.mean_defender_reward, 3), tone: "def",
+        s: `TPR ${pct(tr.mean_tpr, 0)} · FPR ${pct(tr.mean_fpr, 0)}` },
       { k: "win rate", v: tr.win_rate === null || tr.win_rate === undefined
-          ? "--" : pct(tr.win_rate, 0), tone: tr.win_rate > 0 ? "good" : "" },
+          ? "--" : pct(tr.win_rate, 0), tone: tr.win_rate > 0 ? "good" : "",
+        s: "the learning side's gate" },
       { k: "defenses seen", v: (tr.defenses_seen || []).length || "--",
         s: (tr.defenses_seen || []).join(", ") },
     ]);
-    $("#ver-save").disabled = !att.exists;
-    $("#ver-save-hint").textContent = att.exists
-      ? "copies checkpoints/attacker_adapter (and the defender's, if present) into checkpoints/versions/"
-      : "train first — an adapter is written every rl.save_every rounds";
+    $("#ver-save").disabled = !anyAdapter;
+    $("#ver-save-hint").textContent = anyAdapter
+      ? "copies whichever of checkpoints/attacker_adapter and " +
+        "checkpoints/defender_adapter exist into checkpoints/versions/"
+      : "train first — an adapter is written every rl.save_every rounds, for the " +
+        "side --learn names";
 
     const versions = state.boot.versions || [];
     $("#ver-count").textContent = versions.length
@@ -638,33 +745,53 @@
     table.innerHTML = "";
     if (!versions.length) return;
 
-    const head = ["version", "created", "rounds", "mean reward", "mean drop", "win rate",
-                  "potency", "base model", "size", ""];
+    const head = ["version", "holds", "created", "rounds", "atk reward", "mean drop",
+                  "def reward", "TPR / FPR", "win rate", "base model", "size", ""];
     table.appendChild(el("thead", {}, [el("tr", {}, head.map((h) =>
       el("th", { text: h })))]));
     const body = el("tbody");
     versions.forEach((v) => {
       const t = v.training || {};
+      const roles = v.roles || Object.keys(v.adapters || {});
       body.appendChild(el("tr", {}, [
         el("td", {}, [
           el("div", { text: v.label, style: { fontWeight: "600" } }),
           el("div", { class: "hint", text: v.id + (v.notes ? " · " + v.notes : "") }),
         ]),
+        // Which roles this version can be benchmarked as. A one-sided training run
+        // snapshots one adapter, and that decides which panel rows it can fill.
+        el("td", {}, [el("div", { class: "chips" }, roles.map((role) =>
+          el("span", { class: "chip on" + (role === "attacker" ? " atk" : ""),
+                       text: role.slice(0, 3),
+                       title: role + "_adapter is in this version" })))]),
         el("td", { class: "num", text: (v.created || "").replace("T", " ") }),
         el("td", { class: "num", text: v.rounds_done ?? "--" }),
         el("td", { class: "num", text: num(t.mean_attacker_reward, 3) }),
         el("td", { class: "num", text: signed(t.mean_induced_drop, 4) }),
+        el("td", { class: "num", text: num(t.mean_defender_reward, 3) }),
+        el("td", { class: "num", text: pct(t.mean_tpr, 0) + " / " + pct(t.mean_fpr, 0) }),
         el("td", { class: "num", text: t.win_rate === null || t.win_rate === undefined
           ? "--" : pct(t.win_rate, 0) }),
-        el("td", { class: "num", text: num(t.mean_potency, 2) }),
         el("td", { class: "num", text: (v.base_model || "--").split("/").pop() }),
         el("td", { class: "num", text: bytes(v.size_bytes) }),
         el("td", {}, [
           el("button", { class: "btn sm", text: "Benchmark",
             onclick: () => {
-              versionSelection.clear();
-              versionSelection.add(v.id);
+              // Select it on the axes it can actually fill, so the button never
+              // lands the user on a panel the server would refuse.
+              if (roles.includes("attacker")) {
+                versionSelection.clear();
+                versionSelection.add(v.id);
+              }
+              if (roles.includes("defender")) {
+                defenderSelection.clear();
+                defenderSelection.add(v.id);
+                benchSelection.defenses.add("llm_defender");
+                renderChips("#bench-defenses", state.boot.defenses.available,
+                            benchSelection.defenses, DEFENSE_NOTE);
+              }
               renderVersionSelect();
+              renderDefenderVersionHint();
               showView("bench");
             } }),
           document.createTextNode(" "),
@@ -701,43 +828,97 @@
     } catch (e) { toast(e.message, "error"); }
   }
 
-  /** Version chips. Multi-select, because the queue runs one benchmark per picked
-   *  version; a single pick behaves exactly as it did before the sweep existed. */
+  /** Version chips, one row per ROLE. Multi-select, because the queue runs one
+   *  benchmark per picked version; a single pick behaves exactly as it did before
+   *  the sweep existed.
+   *
+   *  The two rows are independent because the adapters are: `--learn` trains one
+   *  side against a frozen opponent, so the defender worth evaluating and the
+   *  attacker worth evaluating it against are normally different snapshots. A
+   *  version that does not hold a role is shown but not selectable for it --
+   *  clicking it would queue a run the server refuses, and the reason is easier to
+   *  read on the chip than in an error toast. */
   const versionSelection = new Set(["current"]);
+  const defenderSelection = new Set(["current"]);
 
   function renderVersionSelect() {
-    const node = $("#bench-versions");
-    const known = new Set(["current"]);
-    (state.boot.versions || []).forEach((v) => known.add(v.id));
-    Array.from(versionSelection).forEach((id) => {
-      if (!known.has(id)) versionSelection.delete(id);   // a deleted version
-    });
-    if (!versionSelection.size) versionSelection.add("current");
+    renderRoleVersions("#bench-versions", versionSelection, "attacker");
+    renderRoleVersions("#bench-defender-versions", defenderSelection, "defender");
+  }
 
-    const entries = [{ id: "current", label: "live checkpoint",
-                       note: "whatever training last wrote to checkpoints/attacker_adapter" }]
-      .concat((state.boot.versions || []).map((v) => ({
-        id: v.id, label: v.label,
-        note: `${v.id}` +
-          (v.rounds_done !== null && v.rounds_done !== undefined ? ` · ${v.rounds_done} rounds done` : "") +
-          (v.created ? ` · ${v.created.replace("T", " ")}` : "") +
-          (v.notes ? `\n${v.notes}` : ""),
-      })));
+  function renderRoleVersions(container, selected, role) {
+    const node = $(container);
+    if (!node) return;
+    const all = state.boot.versions || [];
+    const holds = (v) => (v.available || {})[role] !== false;
+    const live = ((state.boot.live || {}).adapters || {})[role] || {};
+    // What can actually be selected for this role. "current" is in here only when
+    // the live checkpoint HOLDS this role: the default selection is "current", and
+    // keeping an unselectable id in the set rendered a row with nothing lit up
+    // while still sending that id to the server -- so the page said "no version
+    // picked" and the run was refused for picking one.
+    const usableIds = new Set(all.filter(holds).map((v) => v.id));
+    if (live.exists !== false) usableIds.add("current");
+    Array.from(selected).forEach((id) => {
+      if (!usableIds.has(id)) selected.delete(id);
+    });
+    if (!selected.size && usableIds.size) {
+      // Prefer the live checkpoint, else the newest version that holds the role
+      // (the listing is newest-first).
+      selected.add(usableIds.has("current") ? "current"
+                   : all.filter(holds)[0].id);
+    }
+
+    const entries = [{
+      id: "current", label: "live checkpoint", usable: live.exists !== false,
+      note: live.exists === false
+        ? `nothing at ${live.path || "checkpoints/" + role + "_adapter"} yet`
+        : `whatever training last wrote to checkpoints/${role}_adapter`,
+    }].concat(all.map((v) => ({
+      id: v.id, label: v.label, usable: holds(v),
+      note: v.id +
+        (holds(v) ? "" : ` · no ${role} adapter in this version`) +
+        (v.rounds_done !== null && v.rounds_done !== undefined ? ` · ${v.rounds_done} rounds done` : "") +
+        (v.created ? ` · ${v.created.replace("T", " ")}` : "") +
+        (v.notes ? `\n${v.notes}` : ""),
+    })));
 
     node.innerHTML = "";
     entries.forEach((e) => {
+      const on = e.usable && selected.has(e.id);
       node.appendChild(el("button", {
-        class: "chip" + (versionSelection.has(e.id) ? " on" : ""),
-        text: e.label, title: e.note,
+        class: "chip" + (on ? " on" : "") + (e.usable ? "" : " locked"),
+        text: e.label, title: e.note, disabled: !e.usable,
         onclick: () => {
-          if (versionSelection.has(e.id)) {
-            if (versionSelection.size === 1) { toast("Keep at least one version selected"); return; }
-            versionSelection.delete(e.id);
-          } else versionSelection.add(e.id);
+          if (!e.usable) return;
+          if (selected.has(e.id)) {
+            if (selected.size === 1) { toast("Keep at least one version selected"); return; }
+            selected.delete(e.id);
+          } else selected.add(e.id);
           renderVersionSelect();
         },
       }));
     });
+  }
+
+  /** Grey the defender row out when nothing in the panel would load it. The row
+   *  is left visible rather than hidden: "this column is not in your panel" is
+   *  the thing worth saying, and a field that vanishes says nothing. */
+  function renderDefenderVersionHint() {
+    const on = benchSelection.defenses.has("llm_defender");
+    const node = $("#bench-defender-versions");
+    const doc = $("#bench-defender-versions-doc");
+    if (!node || !doc) return;
+    node.classList.toggle("inert", !on);
+    doc.classList.toggle("hint-off", !on);
+    doc.textContent = on
+      ? "Which defender adapter the llm_defender column loads. Chosen separately from " +
+        "the attacker because --learn trains one side at a time, so the two adapters " +
+        "normally come from different snapshots. Several sweep the same way; both axes " +
+        "at once runs their product."
+      : "Add the llm_defender column to the defense panel to use this — without it no " +
+        "defender adapter is loaded at all and every version here would produce the " +
+        "same numbers.";
   }
 
   /* ------------------------------------------------------------------ */
@@ -783,6 +964,7 @@
           } else selected.add(name);
           renderChips(container, names, selected, notes, cls);
           renderFocusSelects();
+          renderDefenderVersionHint();
         },
       });
       node.appendChild(chip);
@@ -905,7 +1087,17 @@
         } else {
           resetBenchLeg();
         }
-        state.bench.version = { id: q.version || ev.version, label: q.label || ev.version_label };
+        // A leg is identified by the version on the axis being swept: in a
+        // defender sweep the attacker is pinned, so labelling every row with the
+        // attacker id would print the same id on all of them.
+        const legAxis = q.axis || "attacker";
+        state.bench.version = {
+          id: (legAxis === "defender" ? q.defender_version : q.version)
+              || ev.version || "current",
+          label: q.label || ev.version_label,
+          attacker: q.version || null,
+          defender: q.defender_version || null,
+        };
         state.bench.queue = q;
         appendLog("bench", (q.total > 1
           ? `── version ${q.index + 1} of ${q.total}: ${q.label} ──\n` : "") +
@@ -930,6 +1122,21 @@
           `panel: ${ev.attacks.length} attack(s) × ${ev.defenses.length} defense(s), ` +
           `${ev.n_poisoners}/${ev.n_clients} poisoned per round, baseline ${pct(ev.baseline_accuracy, 2)}`,
           "ev");
+        if (ev.defender_adapter) {
+          appendLog("bench", "llm_defender loads " + ev.defender_adapter, "ev");
+        }
+        // The CLI drops the llm_defender column when no defender adapter is on
+        // disk and carries on -- correct for a run whose other six columns are
+        // still worth measuring, and invisible on a page that only reads the
+        // resulting `defenses` list. A missing row and a row never asked for look
+        // identical in the matrix, so the difference is said out loud.
+        if (ev.llm_defender_skipped) {
+          appendLog("bench",
+            "the llm_defender column was DROPPED: no trained defender adapter was " +
+            "found, so this matrix has no defender-LLM row. Train a defender " +
+            "(defense.mode: llm with --learn defender) to include it.", "warn");
+          toast("llm_defender dropped — no defender adapter", "error");
+        }
         break;
       case "round":
         onBenchRound(ev);
@@ -1288,57 +1495,103 @@
     $("#bench-report").textContent = ev.report || "";
   }
 
-  /** Collapse one version's whole matrix into the handful of numbers that answer
-   *  "did this checkpoint attack better than that one?".
+  /** Collapse one leg's whole matrix into the handful of numbers that answer
+   *  "did this checkpoint do its job better than that one?".
    *
-   *  Only the `llm` row counts here: the published baselines are identical across
-   *  legs by construction (same rounds, same honest updates, same poisoned set), so
-   *  they are the control that says the legs really were comparable, not a result.
+   *  Which slice of the matrix answers that depends on WHICH ADAPTER is varying:
+   *
+   *  - an attacker sweep reads the `llm` ROW -- how much damage this attacker got
+   *    through each defense. The published baselines are identical across legs by
+   *    construction (same rounds, same honest updates, same poisoned set), so they
+   *    are the control that says the legs really were comparable, not a result.
+   *  - a defender sweep reads the `llm_defender` COLUMN -- how much damage this
+   *    defender ALLOWED, and what it caught, across the attacks. Here `drop` is a
+   *    cost rather than an achievement, so the best leg is the lowest one.
    */
-  function versionScore(summary) {
+  function versionScore(summary, axis) {
+    if (axis === "defender") return defenderScore(summary);
     const real = summary.defenses.filter((d) => d !== "oracle" && d !== "fedavg");
     const scored = real.length ? real : summary.defenses;
     const row = summary.summaries.llm || {};
     const cells = scored.map((d) => row[d]).filter(Boolean);
     const undefended = (row.fedavg || {});
     return {
-      defenses: scored,
+      axis: "attacker", against: scored, lowerIsBetter: false,
       rounds: cells.length ? cells[0].rounds : 0,
       drop: mean(cells.map((c) => c.mean_acc_drop)),
       goal: mean(cells.map((c) => c.goal_success_rate)),
       goalFull: mean(cells.map((c) => c.goal_full_success_rate)),
       detected: mean(cells.map((c) => c.detection_rate)),
       evasion: mean(cells.map((c) => c.attack_success_rate)),
-      undefendedDrop: undefended.mean_acc_drop,
-      perDefense: Object.fromEntries(scored.map((d) => [d, (row[d] || {}).mean_acc_drop])),
-      hasLLM: Boolean(summary.summaries.llm),
+      reference: undefended.mean_acc_drop,
+      perCell: Object.fromEntries(scored.map((d) => [d, (row[d] || {}).mean_acc_drop])),
+      usable: Boolean(summary.summaries.llm),
+    };
+  }
+
+  function defenderScore(summary) {
+    // `clean` poisons nothing, so it measures the defense's false-alarm cost, not
+    // its defending -- averaging it into "drop allowed" would reward a defense for
+    // the rounds there was nothing to stop.
+    const attacks = Object.keys(summary.summaries).filter((a) => a !== "clean");
+    const cells = attacks.map((a) => (summary.summaries[a] || {}).llm_defender)
+      .filter(Boolean);
+    return {
+      axis: "defender", against: attacks, lowerIsBetter: true,
+      rounds: cells.length ? cells[0].rounds : 0,
+      drop: mean(cells.map((c) => c.mean_acc_drop)),
+      goal: mean(cells.map((c) => c.goal_success_rate)),
+      goalFull: mean(cells.map((c) => c.goal_full_success_rate)),
+      detected: mean(cells.map((c) => c.detection_rate)),
+      evasion: mean(cells.map((c) => c.attack_success_rate)),
+      fpr: mean(cells.map((c) => c.fpr)),
+      f1: mean(cells.map((c) => c.f1)),
+      reference: undefined,
+      perCell: Object.fromEntries(attacks.map((a) =>
+        [a, ((summary.summaries[a] || {}).llm_defender || {}).mean_acc_drop])),
+      usable: cells.length > 0,
     };
   }
 
   function renderVersionComparison() {
-    const legs = state.bench.byVersion.filter((l) => l.summary.summaries.llm);
+    const axis = (state.bench.queue || {}).axis || "attacker";
     const panel = $("#bench-compare-panel");
-    if (legs.length < 2) { panel.classList.add("hidden"); return; }
+    const scored = state.bench.byVersion
+      .map((l) => ({ version: l.version, ...versionScore(l.summary, axis) }))
+      .filter((s) => s.usable);
+    if (scored.length < 2) { panel.classList.add("hidden"); return; }
     panel.classList.remove("hidden");
 
-    const scores = legs.map((l) => ({ version: l.version, ...versionScore(l.summary) }));
-    const defenses = scores[0].defenses;
-    const best = scores.reduce((a, b) => ((b.drop || -Infinity) > (a.drop || -Infinity) ? b : a));
+    const against = scored[0].against;
+    const lower = scored[0].lowerIsBetter;
+    // "Best" flips with the axis: an attacker wants the drop it caused to be
+    // large, a defender wants the drop it allowed to be small.
+    const best = scored.reduce((a, b) => {
+      const x = a.drop, y = b.drop;
+      if (y === null || y === undefined) return a;
+      if (x === null || x === undefined) return b;
+      return (lower ? y < x : y > x) ? b : a;
+    });
     const q = state.bench.queue || {};
     $("#bench-compare-caption").textContent =
-      `${scores.length} version(s)` +
-      (q.total && q.total > scores.length ? ` of ${q.total} — sweep in progress` : "") +
-      ` · ${scores[0].rounds} rounds each · llm row only`;
+      `${scored.length} ${axis === "defender" ? "defender" : "attacker"} version(s)` +
+      (q.total && q.total > scored.length ? ` of ${q.total} — sweep in progress` : "") +
+      ` · ${scored[0].rounds} rounds each · ` +
+      (axis === "defender"
+        ? "llm_defender column only — lower drop is a better defense"
+        : "llm row only");
 
     const table = $("#bench-compare-table");
     table.innerHTML = "";
-    const head = ["version", "rounds", "mean acc drop", "goal (weighted)", "goal (full)",
-                  "detected", "evasion", "undefended drop"]
-      .concat(defenses.map((d) => "drop vs " + d));
+    const head = ["version", "rounds",
+                  axis === "defender" ? "mean drop allowed" : "mean acc drop",
+                  "goal (weighted)", "goal (full)", "detected", "evasion"]
+      .concat(axis === "defender" ? ["FPR", "F1"] : ["undefended drop"])
+      .concat(against.map((d) => (axis === "defender" ? "drop under " : "drop vs ") + d));
     table.appendChild(el("thead", {}, [el("tr", {}, head.map((h) => el("th", { text: h })))]));
     const body = el("tbody");
-    scores.forEach((s) => {
-      body.appendChild(el("tr", { class: s === best ? "best" : "" }, [
+    scored.forEach((s) => {
+      const cells = [
         el("td", {}, [
           el("div", { text: s.version.label, style: { fontWeight: "600" } }),
           el("div", { class: "hint", text: s.version.id }),
@@ -1350,9 +1603,18 @@
         el("td", { class: "num", text: pct(s.goalFull, 1) }),
         el("td", { class: "num", text: pct(s.detected, 0) }),
         el("td", { class: "num", text: pct(s.evasion, 0) }),
-        el("td", { class: "num", text: signed(s.undefendedDrop, 4),
-                   title: "the same attack against plain FedAvg — its ceiling with no defense" }),
-      ].concat(defenses.map((d) => el("td", { class: "num", text: signed(s.perDefense[d], 4) })))));
+      ];
+      if (axis === "defender") {
+        cells.push(el("td", { class: "num", text: pct(s.fpr, 0),
+                              title: "honest clients this defender rejected" }));
+        cells.push(el("td", { class: "num", text: pct(s.f1, 0) }));
+      } else {
+        cells.push(el("td", { class: "num", text: signed(s.reference, 4),
+          title: "the same attack against plain FedAvg — its ceiling with no defense" }));
+      }
+      body.appendChild(el("tr", { class: s === best ? "best" : "" },
+        cells.concat(against.map((d) =>
+          el("td", { class: "num", text: signed(s.perCell[d], 4) })))));
     });
     table.appendChild(body);
   }
@@ -1558,6 +1820,7 @@
     const goalValue = $("#bench-goal-value").value.trim();
     const payload = {
       versions: Array.from(versionSelection),
+      defender_versions: Array.from(defenderSelection),
       rounds: numeric("#bench-rounds"),
       goal: goalValue === "" ? goalType : `${goalType}=${goalValue}`,
       max_poison_clients: numeric("#bench-poison"),
@@ -1621,6 +1884,7 @@
     renderChips("#bench-defenses", state.boot.defenses.available,
                 benchSelection.defenses, DEFENSE_NOTE);
     renderFocusSelects();
+    renderDefenderVersionHint();
 
     // Prefill from the config so the benchmark form shows the shipped defaults.
     const f = state.boot.config.fields;
@@ -1635,6 +1899,7 @@
     $("#win-gate-note").textContent =
       `${winFraction()} × target = ${num(winFraction() * (f["attack.goal.target_accuracy_drop"] || {}).value, 3)}`;
 
+    renderLearnWarning();
     applyStatus("train", state.boot.train);
     applyStatus("bench", state.boot.bench);
     loadRuns();
@@ -1661,11 +1926,20 @@
     $("#bench-start").addEventListener("click", startBenchmark);
     $("#bench-stop").addEventListener("click", () => stopRun("bench"));
 
+    $("#train-learn").addEventListener("change", renderLearnWarning);
+    $("#train-learn-fix").addEventListener("click", () => {
+      state.overrides["defense.mode"] = "llm";
+      renderConfig();
+      renderLearnWarning();
+      toast("defense.mode: llm — the defender LLM defends and can be trained", "ok");
+    });
+
     $("#cfg-search").addEventListener("input", renderConfig);
     $("#cfg-primary-only").addEventListener("change", renderConfig);
     $("#cfg-reset").addEventListener("click", () => {
       state.overrides = {};
       renderConfig();
+      renderLearnWarning();
       toast("Config overrides cleared — back to base.yaml", "ok");
     });
 

@@ -27,12 +27,14 @@ Endpoints
 ``GET  /api/run``              one past run's saved artifacts (``?id=``)
 """
 import argparse
+import contextlib
 import datetime
 import json
 import logging
 import mimetypes
 import os
 import posixpath
+import shutil
 import sys
 import threading
 import webbrowser
@@ -56,6 +58,12 @@ MAX_BODY = 2 * 1024 * 1024
 #: for a :meth:`Runner.start`; the whole list is dropped when the user stops.
 _QUEUE: list = []
 _QUEUE_LOCK = threading.Lock()
+
+#: Hard cap on the legs one sweep may queue. Selecting several attacker versions
+#: AND several defender versions asks for their cartesian product, and each leg
+#: re-runs every (attack, defense) cell with the 3B policy on the GPU -- so a
+#: 4x4 pick is 16 full benchmarks. Refused up front rather than queued quietly.
+MAX_SWEEP_LEGS = 12
 
 
 def _bench_finished(runner, state, _code):
@@ -314,14 +322,81 @@ def _write_config(payload: dict, run_id: str, run_dir: str):
     return dest, changes, merged
 
 
+@contextlib.contextmanager
+def _discard_on_failure(claimed: list):
+    """Remove the run directories in ``claimed`` if the block does not launch.
+
+    A run directory is claimed (by creating it) before the run is known to be
+    valid, because the derived config has to exist on disk before the flags can be
+    checked against it -- so a refusal has to take its directory back, or every
+    rejected click leaves a contentless run in the history list.
+
+    ``claimed`` is read on the way out rather than copied on the way in, so a
+    sweep can keep appending to it as it builds each leg and a refusal on leg 3
+    still removes legs 0-2.
+    """
+    try:
+        yield
+    except BaseException:
+        for run_dir in claimed:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        raise
+
+
+def _validate_flags_against_config(payload: dict, merged: dict):
+    """Refuse an impossible ``--poisoners`` / ``--learn`` HERE, not 400ms later.
+
+    ``--learn defender`` needs a trainable defender, so it is an error under
+    ``defense.mode: algorithmic`` -- and the shipped config IS algorithmic, which
+    makes "train the defender" the most natural first click in the panel and a
+    run that starts, prints an argparse error and dies. The rule already exists,
+    once, in the CLI's own resolver, so it is REUSED rather than restated: the
+    flags are applied to a throwaway copy of the config this run would use, and
+    whatever ``main.py`` would have refused is refused now, in the response to
+    the click, with the same wording.
+
+    ``core.config_overrides`` is deliberately torch-free and import-light (its
+    module docstring says so), so this costs the panel nothing.
+    """
+    import copy
+    import logging as _logging
+
+    from core.config_overrides import apply_learner_choice, apply_poisoner_count
+
+    probe = copy.deepcopy(merged)
+    # These resolvers narrate what they changed, and warn about e.g. a poisoner
+    # count past half the federation. That narration belongs to the run that
+    # actually applies them -- the subprocess emits all of it a moment later, so
+    # echoing it from the server would put two accounts of one override in two
+    # logs. Verbosity is all that races here.
+    quiet = _logging.getLogger("core.config_overrides")
+    before = quiet.level
+    quiet.setLevel(_logging.ERROR)
+    try:
+        if payload.get("poisoners") not in (None, ""):
+            apply_poisoner_count(probe, int(payload["poisoners"]))
+        if payload.get("learn"):
+            apply_learner_choice(probe, str(payload["learn"]))
+    except (ValueError, TypeError) as exc:
+        raise RunError(str(exc)) from None
+    finally:
+        quiet.setLevel(before)
+
+
 def start_training(payload: dict) -> dict:
     _guard_concurrency(payload, BENCH, "training")
     mode = str(payload.get("mode", "train"))
     if mode not in ("train", "dry-run", "baseline"):
         raise RunError(f"unknown mode {mode!r}; use train | dry-run | baseline")
 
+    # The run directory is claimed before the run is known to be startable (the
+    # config has to be MATERIALISED before it can be validated), so a refusal has
+    # to take its directory back with it -- otherwise every rejected click leaves a
+    # contentless run in the history list.
     run_id, run_dir = _new_run("train")
-    cfg_path, changes, merged = _write_config(payload, run_id, run_dir)
+    with _discard_on_failure([run_dir]):
+        cfg_path, changes, merged = _write_config(payload, run_id, run_dir)
+        _validate_flags_against_config(payload, merged)
 
     argv = [python_exe(), "-u", "main.py", "--config", cfg_path]
     argv += _build_flags(TRAIN_SPEC, payload)
@@ -342,6 +417,10 @@ def start_training(payload: dict) -> dict:
         "max_poison_clients": attack.get("max_poison_clients"),
         "goal": attack.get("goal"),
         "defense_mode": (merged.get("defense", {}) or {}).get("mode"),
+        # Which side --learn pinned, so the page can orient itself (defender
+        # charts vs attacker charts) before the first round log arrives. None =
+        # the config's own rl.learners decides.
+        "learn": payload.get("learn") or None,
         "defense_algorithms": (merged.get("defense", {}) or {}).get("algorithms"),
         "curriculum": merged.get("curriculum"),
         "device": fl.get("device"),
@@ -354,15 +433,18 @@ def start_training(payload: dict) -> dict:
                        label=payload.get("label", ""), meta=meta, tail_rounds=True)
 
 
-def _selected_versions(payload: dict) -> list:
-    """The version ids this benchmark should sweep, in the order the user picked.
+def _selected_versions(payload: dict, plural: str = "versions",
+                       single: str = "version") -> list:
+    """The version ids one ROLE should sweep, in the order the user picked them.
 
     ``version`` (one) and ``versions`` (several) both work, so a single-version
-    request stays exactly what it was before the queue existed.
+    request stays exactly what it was before the queue existed. The key names are
+    parameters because the two adapters are chosen independently -- see
+    :func:`_sweep_axis`.
     """
-    raw = payload.get("versions")
+    raw = payload.get(plural)
     if raw is None:
-        raw = [payload.get("version") or "current"]
+        raw = [payload.get(single) or "current"]
     if not isinstance(raw, list):
         raw = [raw]
     out, seen = [], set()
@@ -376,17 +458,82 @@ def _selected_versions(payload: dict) -> list:
             versions.get(vid)         # validates the id, raises VersionError
         out.append(vid)
     if not out:
-        raise RunError("pick at least one model version to benchmark")
+        raise RunError(f"pick at least one model version for the {single} role")
     return out
 
 
+def _sweep_axis(ids: list, relevant: bool, role: str, needs: str) -> list:
+    """One role's version axis, collapsed when the panel cannot tell its versions apart.
+
+    A role's adapter only changes a leg's numbers when the panel actually RUNS
+    that role: the attacker version is inert without the ``llm`` attack row, and
+    the defender version is inert without the ``llm_defender`` defense column.
+    Several picks on an inert axis would queue byte-identical benchmarks and then
+    lay them out as a comparison, so that is refused rather than silently
+    collapsed -- the user asked for a difference the panel cannot produce.
+
+    Returns ``[None]`` for an inert axis: one leg, and no adapter flag for that
+    role, which is exactly what a baselines-only or algorithmic-defense-only run
+    was already doing.
+    """
+    if relevant:
+        return list(ids)
+    if len(ids) > 1:
+        raise RunError(
+            f"{len(ids)} {role} versions were selected but the panel has no "
+            f"{needs}, so every leg would run identical numbers and the "
+            f"comparison would be N copies of one result. Add the {needs} to "
+            f"the panel, or pick one {role} version.")
+    return [None]
+
+
+def _version_label(version_id) -> str:
+    """A leg's human name for one role. ``None`` is an axis the panel does not
+    run at all (no ``llm`` attack, no ``llm_defender`` column), which is different
+    from "the live checkpoint" and should not be labelled as it."""
+    if version_id is None:
+        return "n/a"
+    if version_id in ("current", "live"):
+        return "live checkpoint"
+    return versions.get(version_id).get("label", version_id)
+
+
+def _resolve_adapter(version_id, role: str, needs: str, hint: str) -> str:
+    """Where this leg loads ``role`` from -- or a refusal naming what is missing.
+
+    The silent alternative is the trap this closes. ``adapter_path`` returns
+    ``None`` for a version that does not hold the role, and passing no
+    ``--<role>-adapter`` does not mean "skip it": the CLI falls back to the LIVE
+    ``checkpoints/<role>_adapter``. So selecting a version whose defender was
+    never trained used to benchmark whatever the last training run happened to
+    leave on disk and label the result with the selected version -- or, with
+    nothing on disk, drop the column and leave a gap in the matrix with the
+    reason only in the console. Both are worse than not starting.
+    """
+    path = versions.adapter_path(version_id, role)
+    if path is not None:
+        return path
+    where = ("the live checkpoint has none" if version_id in (None, "current")
+             else f"version {version_id} has none")
+    raise RunError(
+        f"{needs} needs a trained {role} adapter and {where} -- {hint}")
+
+
 def start_benchmark(payload: dict) -> dict:
-    """Queue one benchmark subprocess per selected version and start the first.
+    """Queue one benchmark subprocess per swept version and start the first.
 
     Each leg is an ordinary ``benchmark.run_benchmark`` invocation with its own
-    output directory and its own ``--attacker-adapter`` -- the sweep is a sequence
-    of the runs you would have typed, not a new evaluation mode. They run one at a
-    time because each loads the 3B policy onto the GPU.
+    output directory and its own ``--attacker-adapter`` / ``--defender-adapter``
+    -- the sweep is a sequence of the runs you would have typed, not a new
+    evaluation mode. They run one at a time because each loads the 3B policy onto
+    the GPU.
+
+    The two adapters are picked INDEPENDENTLY, because that is how they are
+    produced: ``--learn`` trains one side against a frozen opponent, so the
+    defender worth evaluating and the attacker worth evaluating it against
+    normally come from different snapshots. The legs are therefore the product of
+    the two axes -- and an axis the panel cannot distinguish (no ``llm`` attack,
+    no ``llm_defender`` defense) collapses to one leg. See :func:`_sweep_axis`.
     """
     from benchmark.attacks import AVAILABLE as ATTACKS
     from benchmark.defenses import AVAILABLE as DEFENSES
@@ -398,70 +545,100 @@ def start_benchmark(payload: dict) -> dict:
     attacks = _csv(ATTACKS)(payload.get("attacks") or ["llm"])
     defenses = _csv(DEFENSES)(payload.get("defenses") or ["fedavg"])
     wants_llm = "llm" in attacks.split(",")
-    selected = _selected_versions(payload)
-    if len(selected) > 1 and not wants_llm:
+    wants_llm_defender = "llm_defender" in defenses.split(",")
+
+    attacker_axis = _sweep_axis(_selected_versions(payload),
+                                wants_llm, "attacker", "'llm' row")
+    defender_axis = _sweep_axis(
+        _selected_versions(payload, "defender_versions", "defender_version"),
+        wants_llm_defender, "defender", "'llm_defender' column")
+
+    legs = [(a, d) for a in attacker_axis for d in defender_axis]
+    if len(legs) > MAX_SWEEP_LEGS:
         raise RunError(
-            "several versions were selected but the attack panel has no 'llm' row, "
-            "so every leg would run the identical published baselines. Add 'llm' "
-            "or pick one version.")
+            f"{len(attacker_axis)} attacker x {len(defender_axis)} defender "
+            f"versions is {len(legs)} full benchmarks, past the cap of "
+            f"{MAX_SWEEP_LEGS}. Sweep one axis at a time: pin one side and vary "
+            f"the other.")
+    # Which axis this sweep is a comparison ALONG. The page needs it to know
+    # whether to score the `llm` row or the `llm_defender` column, and a leg's
+    # label should name the version that is actually varying.
+    axis = ("both" if len(attacker_axis) > 1 and len(defender_axis) > 1
+            else "defender" if len(defender_axis) > 1
+            else "attacker")
 
     common = _build_flags(BENCH_SPEC, payload)
     jobs = []
-    for index, version_id in enumerate(selected):
-        run_id, run_dir = _new_run("bench")
-        cfg_path, changes, merged = _write_config(payload, run_id, run_dir)
+    # A sweep claims every leg's directory in one pass, and a refusal on leg 3
+    # has to take legs 0-2 with it: the sweep is not starting, so its half-built
+    # run records are not history.
+    claimed: list = []
+    with _discard_on_failure(claimed):
+        for index, (version_id, defender_version_id) in enumerate(legs):
+            run_id, run_dir = _new_run("bench")
+            claimed.append(run_dir)
+            cfg_path, changes, merged = _write_config(payload, run_id, run_dir)
 
-        # Validate what the BROWSER sent; trust what we built ourselves. Running
-        # the server-generated default through _outdir would only re-check a path
-        # this process just constructed -- and would reject it outright under a
-        # test or a deployment whose runs directory is absolute.
-        supplied_out = payload.get("out")
-        out_dir = (_outdir(supplied_out) if supplied_out and len(selected) == 1
-                   else posixpath.join(run_dir.replace("\\", "/"), "result"))
+            # Validate what the BROWSER sent; trust what we built ourselves. Running
+            # the server-generated default through _outdir would only re-check a path
+            # this process just constructed -- and would reject it outright under a
+            # test or a deployment whose runs directory is absolute.
+            supplied_out = payload.get("out")
+            out_dir = (_outdir(supplied_out) if supplied_out and len(legs) == 1
+                       else posixpath.join(run_dir.replace("\\", "/"), "result"))
 
-        attacker_adapter = defender_adapter = None
-        if wants_llm:
-            attacker_adapter = versions.adapter_path(version_id, "attacker")
-            if attacker_adapter is None:
-                where = ("the live checkpoint has none" if version_id == "current"
-                         else f"version {version_id} has none")
-                raise RunError(
-                    f"the 'llm' attack needs a trained attacker adapter and {where} "
-                    f"-- train first, or drop 'llm' from the attack panel to run the "
-                    f"published baselines only.")
-        if "llm_defender" in defenses.split(","):
-            defender_adapter = versions.adapter_path(version_id, "defender")
+            attacker_adapter = defender_adapter = None
+            if wants_llm:
+                attacker_adapter = _resolve_adapter(
+                    version_id, "attacker", "the 'llm' attack",
+                    "train first, or drop 'llm' from the attack panel to run the "
+                    "published baselines only.")
+            if wants_llm_defender:
+                defender_adapter = _resolve_adapter(
+                    defender_version_id, "defender", "the 'llm_defender' defense",
+                    "train a defender first (defense.mode: llm with --learn "
+                    "defender), or drop 'llm_defender' from the defense panel.")
 
-        argv = [python_exe(), "-u", "-m", "benchmark.run_benchmark",
-                "--events", "-", "--config", cfg_path, "--out", out_dir]
-        argv += list(common)
-        argv += ["--attacks", attacks, "--defenses", defenses]
-        if attacker_adapter:
-            argv += ["--attacker-adapter", attacker_adapter.replace("\\", "/")]
-        if defender_adapter:
-            argv += ["--defender-adapter", defender_adapter.replace("\\", "/")]
+            argv = [python_exe(), "-u", "-m", "benchmark.run_benchmark",
+                    "--events", "-", "--config", cfg_path, "--out", out_dir]
+            argv += list(common)
+            argv += ["--attacks", attacks, "--defenses", defenses]
+            if attacker_adapter:
+                argv += ["--attacker-adapter", attacker_adapter.replace("\\", "/")]
+            if defender_adapter:
+                argv += ["--defender-adapter", defender_adapter.replace("\\", "/")]
 
-        label = ("live checkpoint" if version_id == "current"
-                 else versions.get(version_id).get("label", version_id))
-        meta = {
-            "config": cfg_path.replace("\\", "/"),
-            "overrides": changes,
-            "version": version_id,
-            "version_label": label,
-            "attacker_adapter": attacker_adapter,
-            "attacks": attacks.split(","),
-            "defenses": defenses.split(","),
-            "out": out_dir,
-            "rounds": payload.get("rounds"),
-            "goal": payload.get("goal"),
-            "n_clients": (merged.get("fl", {}) or {}).get("n_clients"),
-            "queue": {"index": index, "total": len(selected),
-                      "versions": selected, "version": version_id, "label": label},
-        }
-        _record_manifest(run_dir, run_id, "bench", argv, meta)
-        jobs.append({"argv": argv, "run_id": run_id, "run_dir": run_dir,
-                     "label": payload.get("label", ""), "meta": meta,
-                     "tail_rounds": False, "clear_bus": index == 0})
+            att_label = _version_label(version_id)
+            def_label = _version_label(defender_version_id)
+            label = ({"defender": def_label,
+                      "both": f"{att_label} att x {def_label} def"}
+                     .get(axis, att_label))
+            meta = {
+                "config": cfg_path.replace("\\", "/"),
+                "overrides": changes,
+                "version": version_id,
+                "version_label": att_label,
+                "defender_version": defender_version_id,
+                "defender_version_label": def_label,
+                "attacker_adapter": attacker_adapter,
+                "defender_adapter": defender_adapter,
+                "attacks": attacks.split(","),
+                "defenses": defenses.split(","),
+                "out": out_dir,
+                "rounds": payload.get("rounds"),
+                "goal": payload.get("goal"),
+                "n_clients": (merged.get("fl", {}) or {}).get("n_clients"),
+                "queue": {"index": index, "total": len(legs), "axis": axis,
+                          "versions": attacker_axis,
+                          "defender_versions": defender_axis,
+                          "version": version_id,
+                          "defender_version": defender_version_id,
+                          "label": label},
+            }
+            _record_manifest(run_dir, run_id, "bench", argv, meta)
+            jobs.append({"argv": argv, "run_id": run_id, "run_dir": run_dir,
+                         "label": payload.get("label", ""), "meta": meta,
+                         "tail_rounds": False, "clear_bus": index == 0})
 
     with _QUEUE_LOCK:
         _QUEUE.clear()

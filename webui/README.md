@@ -49,37 +49,87 @@ the YAML's own inline comments as the help text.
 
 While it runs: accuracy against the clean counterfactual, induced drop against the
 target and the win gate, the attacker reward split into its damage / stealth /
-malformed / collab terms, GRPO step health (loss, mean reward, reward spread,
-zero-advantage fraction), detection TPR/FPR, attack potency, the live client grid
-(TP / FN / FP / TN per client, with the attacker's pool marked), the current
-curriculum block, and the console.
+malformed / collab terms, the defender's reward with its TPR/FPR, GRPO step health
+(loss, mean reward, reward spread, zero-advantage fraction), attack potency, the
+live client grid (TP / FN / FP / TN per client, with the attacker's pool marked),
+the current curriculum block, and the console.
+
+**Which side is learning reorders the readout.** `--learn` picks one policy to
+optimize and leaves the other frozen, so half of those numbers describe a policy
+that is not moving. The KPI strip therefore leads with the learner's block —
+defender reward and detection under `--learn defender`, induced drop and attacker
+reward under `--learn attacker` — and marks the other side `frozen`. Nothing is
+hidden; the run is just not described by its frozen half.
+
+**Training the defender** needs `defense.mode: llm`: under the shipped
+`algorithmic` the server defends with FLTrust / DeFL / DnC / Multi-Krum, which
+have no parameters, so there is no defender policy to put an optimizer on. That is
+the CLI's rule, not the panel's, and the panel **applies the CLI's own resolver**
+(`core/config_overrides.py`) to the run's config before spawning anything — so the
+combination is refused in the response to the click, with the message `main.py`
+would have printed, rather than by a process that starts and dies. The selector
+says so inline and offers the one-click `defense.mode: llm`.
 
 ### Model versions
 
-Training overwrites `checkpoints/attacker_adapter` **in place** every
-`rl.save_every` rounds. That is right for resuming and wrong for evaluating: by
-the time a benchmark finishes, the adapter it was told to load has moved on, and
-there is no way to ask "how did round 400 compare to round 900?".
+Training overwrites the adapter it is training — `checkpoints/attacker_adapter`,
+`checkpoints/defender_adapter`, or both — **in place** every `rl.save_every`
+rounds. That is right for resuming and wrong for evaluating: by the time a
+benchmark finishes, the adapter it was told to load has moved on, and there is no
+way to ask "how did round 400 compare to round 900?".
 
 A **version** is a copy of the adapter directories taken at a moment you choose,
 stored under `checkpoints/versions/<id>/` next to the resume state and a record of
-what training looked like when it was taken (rounds done, mean reward, mean induced
-drop, win rate, potency, the base model it is dimensioned for). A snapshot only
-*reads* `checkpoints/` — a run in flight is never disturbed.
+what training looked like when it was taken (rounds done, both sides' mean rewards,
+mean induced drop, detection TPR/FPR, win rate, which side those rounds were
+training, the base model it is dimensioned for). A snapshot only *reads*
+`checkpoints/` — a run in flight is never disturbed.
+
+A version holds **whichever adapters exist**, and `roles` records which. That
+matters because `rl/schedule.py` writes only the side `--learn` named: an
+attacker-only run leaves no defender adapter and a `--learn defender` run leaves no
+attacker one. The table's `holds` column shows it, and the benchmark panel will not
+let you select a version for a role it does not hold.
 
 ### Benchmark
 
 The attack panel, the defense panel, the goal, the poison quota, the federation
 size, adversary knowledge, and every per-attack and per-defense hyperparameter the
-CLI accepts. Pick **one version** or **several**: several run as one sweep — an
-ordinary benchmark subprocess per version, back to back, each with its own
-`--attacker-adapter` and its own output directory.
+CLI accepts.
+
+**The two adapters are picked independently** — an attacker row and a defender row
+— because that is how they are produced: `--learn` trains one side against a frozen
+opponent, so the defender worth evaluating and the attacker worth evaluating it
+against normally come from different snapshots. The attacker version feeds the
+`llm` attack row (`--attacker-adapter`); the defender version feeds the
+`llm_defender` defense column (`--defender-adapter`).
+
+Pick **one** on each axis or **several**: the legs are the product, run back to
+back as ordinary benchmark subprocesses, each with its own output directory. An
+axis the panel cannot distinguish collapses to one leg — the attacker version is
+inert without the `llm` row, the defender version without the `llm_defender`
+column — and selecting several on an inert axis is refused rather than queued,
+because the legs would be byte-identical and then laid out as a comparison.
+`MAX_SWEEP_LEGS` caps the product.
+
+A role's adapter is resolved **before** anything launches, and a version that does
+not hold it is a refusal, not a fallback. This is load-bearing: omitting
+`--defender-adapter` does not mean "skip it", it means the CLI falls back to the
+live `checkpoints/defender_adapter`, so a silently-unresolved defender used to
+benchmark whatever the last training run left on disk and label the result with the
+version you picked.
 
 While it runs, per round: which clients were poisoned, which the focused defense
 flagged (and how far the attack moved each one's weights), each defense's accuracy
 and drop for that round, the goal-achieved strip, and an attack × defense heat
 matrix filling in. At the end: a plain-language verdict, the full sortable matrix,
-and — for a sweep — a **version comparison** over the `llm` row.
+and — for a sweep — a **version comparison** along the swept axis: the `llm` row
+for an attacker sweep (more drop is better), the `llm_defender` column for a
+defender sweep (less drop allowed is better, shown with FPR and F1).
+
+If the CLI drops the `llm_defender` column because no defender adapter was found,
+the page says so — a missing row and a row never asked for look identical in a
+matrix.
 
 ### Run history
 

@@ -375,9 +375,13 @@ def test_a_sweep_queues_one_ordinary_run_per_version(captured_launch, store):
     assert len(captured_launch) == 1
     assert len(srv._QUEUE) == 2
     first = captured_launch[0]
-    assert first["meta"]["queue"] == {"index": 0, "total": 3,
-                                      "versions": [a["id"], b["id"], "current"],
-                                      "version": a["id"], "label": "early"}
+    assert first["meta"]["queue"] == {
+        "index": 0, "total": 3, "axis": "attacker",
+        "versions": [a["id"], b["id"], "current"],
+        # No llm_defender column, so the defender axis is inert: one leg, no
+        # adapter, and nothing for the comparison to vary along.
+        "defender_versions": [None], "defender_version": None,
+        "version": a["id"], "label": "early"}
     assert first["clear_bus"] is True
     # Each leg is a plain benchmark invocation differing only in its adapter+out.
     queued = srv._QUEUE[0]
@@ -387,6 +391,62 @@ def test_a_sweep_queues_one_ordinary_run_per_version(captured_launch, store):
         f"versions/{b['id']}/attacker_adapter")
     assert queued["meta"]["out"] != first["meta"]["out"]     # separate result dirs
     srv._QUEUE.clear()
+
+
+def test_learn_defender_is_refused_before_the_process_starts(captured_launch):
+    """``--learn defender`` needs a trainable defender, and the SHIPPED config
+    defends with algorithms -- so the most natural first click in the panel used
+    to start a run that printed an argparse error and died. The CLI's own resolver
+    decides, here, in the response to the click."""
+    from webui.server import start_training
+
+    with pytest.raises(RunError, match="defense.mode"):
+        start_training({"mode": "train", "learn": "defender"})
+    assert captured_launch == []
+
+    # With the defender LLM turned on in the same panel, it launches.
+    start_training({"mode": "train", "learn": "defender",
+                    "overrides": {"defense.mode": "llm"}})
+    argv = captured_launch[0]["argv"]
+    assert argv[argv.index("--learn") + 1] == "defender"
+    assert captured_launch[0]["meta"]["learn"] == "defender"
+    assert captured_launch[0]["meta"]["defense_mode"] == "llm"
+
+
+def test_a_refused_launch_leaves_no_run_in_the_history(captured_launch, tmp_path):
+    """A run directory is claimed before the run is known to be startable (the
+    derived config has to exist on disk before the flags can be checked against
+    it), so a refusal has to take it back -- or every rejected click adds a
+    contentless entry to the Runs tab."""
+    import os
+
+    from webui import server as srv
+
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    srv.RUNS_DIR = str(runs)
+
+    with pytest.raises(RunError):
+        srv.start_training({"mode": "train", "learn": "defender"})
+    assert os.listdir(runs) == []
+
+    # ...and a sweep abandons every leg it had already claimed, not just the one
+    # that failed.
+    with pytest.raises(RunError):
+        srv.start_benchmark({"versions": ["current"], "attacks": ["llm"],
+                             "defenses": ["fedavg"]})
+    assert os.listdir(runs) == []
+
+    srv.start_training({"mode": "train", "learn": "attacker"})
+    assert len(os.listdir(runs)) == 1
+
+
+def test_an_impossible_poisoner_count_is_refused_before_launch(captured_launch):
+    from webui.server import start_training
+
+    with pytest.raises(RunError, match="exceeds fl.n_clients"):
+        start_training({"mode": "train", "poisoners": 9999})
+    assert captured_launch == []
 
 
 def test_a_sweep_without_the_llm_row_is_refused(captured_launch, store):
@@ -427,6 +487,184 @@ def test_a_finished_leg_starts_the_next(captured_launch, store):
     assert srv._QUEUE == []
     assert len(captured_launch) == 2
     assert captured_launch[1]["meta"]["queue"]["index"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The defender adapter: trained by --learn defender, evaluated as the
+# `llm_defender` column. Its version is picked INDEPENDENTLY of the attacker's,
+# because a one-sided training run only ever writes one of the two.
+# ---------------------------------------------------------------------------
+
+def _train_a_defender(store):
+    """Put a stub defender adapter where a ``--learn defender`` run would leave one."""
+    live = store / "checkpoints" / "defender_adapter"
+    live.mkdir(parents=True, exist_ok=True)
+    (live / "adapter_config.json").write_text(json.dumps(
+        {"base_model_name_or_path": "unsloth/Qwen2.5-3B-Instruct", "r": 16,
+         "lora_alpha": 32}))
+    (live / "adapter_model.safetensors").write_bytes(b"stub defender weights")
+    return live
+
+
+def test_a_defender_only_run_can_be_snapshotted(store):
+    """``rl/schedule.py`` writes ONLY the trainable side, so a --learn defender run
+    leaves no attacker adapter at all -- and requiring one meant the single adapter
+    that run produced could not be versioned."""
+    import shutil
+    shutil.rmtree(store / "checkpoints" / "attacker_adapter")
+    _train_a_defender(store)
+
+    rec = versions.create(label="defender v1")
+    assert rec["roles"] == ["defender"]
+    assert "attacker" not in rec["adapters"]
+    # The LoRA shape is read off the adapter this version actually holds; taking it
+    # from a directory that is not there recorded base_model "" and silently
+    # disabled the benchmark's base-model check.
+    assert rec["base_model"] == "unsloth/Qwen2.5-3B-Instruct"
+    assert rec["lora_r"] == 16
+
+    listed = versions.get(rec["id"])
+    assert listed["available"] == {"attacker": False, "defender": True}
+    assert versions.adapter_path(rec["id"], "defender") is not None
+    assert versions.adapter_path(rec["id"], "attacker") is None
+
+
+def test_the_defender_column_loads_the_defender_version(captured_launch, store):
+    """The two adapters come from different snapshots, so they are chosen
+    separately: the attack row under test against the defense row under test."""
+    from webui.server import start_benchmark
+
+    attacker = versions.create(label="attacker v1")
+    _train_a_defender(store)
+    defender = versions.create(label="defender v1")
+
+    start_benchmark({"versions": [attacker["id"]],
+                     "defender_versions": [defender["id"]],
+                     "attacks": ["llm"], "defenses": ["fedavg", "llm_defender"]})
+    argv = captured_launch[0]["argv"]
+    assert argv[argv.index("--attacker-adapter") + 1].endswith(
+        "versions/" + attacker["id"] + "/attacker_adapter")
+    assert argv[argv.index("--defender-adapter") + 1].endswith(
+        "versions/" + defender["id"] + "/defender_adapter")
+    meta = captured_launch[0]["meta"]
+    assert meta["defender_version"] == defender["id"]
+    assert meta["defender_version_label"] == "defender v1"
+
+
+def test_a_version_without_the_defender_it_was_told_to_run_is_refused(
+        captured_launch, store):
+    """Passing no --defender-adapter does NOT mean "skip it": the CLI falls back to
+    the live checkpoint. So a version whose defender was never trained used to
+    benchmark whatever the last run left on disk and label it with that version."""
+    from webui.server import start_benchmark
+
+    _train_a_defender(store)                     # a live defender exists...
+    attacker_only = versions.create(label="attacker only",
+                                    roles=("attacker",))   # ...but not in here
+
+    with pytest.raises(RunError, match="'llm_defender' defense needs a trained"):
+        start_benchmark({"versions": [attacker_only["id"]],
+                         "defender_versions": [attacker_only["id"]],
+                         "attacks": ["llm"], "defenses": ["llm_defender"]})
+    assert captured_launch == []
+
+
+def test_a_defender_sweep_needs_no_llm_attack(captured_launch, store):
+    """Comparing defenders against the PUBLISHED attacks is a real experiment, and
+    the attacker axis is simply inert there -- one leg, no adapter."""
+    from webui import server as srv
+
+    _train_a_defender(store)
+    early = versions.create(label="def early")
+    late = versions.create(label="def late")
+
+    srv.start_benchmark({"defender_versions": [early["id"], late["id"]],
+                         "attacks": ["lie", "min_max"],
+                         "defenses": ["fedavg", "llm_defender"]})
+    assert len(captured_launch) == 1 and len(srv._QUEUE) == 1
+    q = captured_launch[0]["meta"]["queue"]
+    assert q["axis"] == "defender"          # what the comparison varies along
+    assert q["total"] == 2
+    assert q["label"] == "def early"        # the leg is named by the varying side
+    assert "--attacker-adapter" not in captured_launch[0]["argv"]
+    assert srv._QUEUE[0]["meta"]["defender_version"] == late["id"]
+    srv._QUEUE.clear()
+
+
+def test_a_defender_sweep_without_the_llm_defender_column_is_refused(
+        captured_launch, store):
+    from webui.server import start_benchmark
+
+    _train_a_defender(store)
+    a = versions.create(label="def a")
+    b = versions.create(label="def b")
+    with pytest.raises(RunError, match="llm_defender"):
+        start_benchmark({"defender_versions": [a["id"], b["id"]],
+                         "attacks": ["llm"], "defenses": ["fltrust"]})
+    assert captured_launch == []
+
+
+def test_sweeping_both_axes_is_their_product_and_is_capped(captured_launch, store):
+    from webui import server as srv
+
+    _train_a_defender(store)
+    picks = [versions.create(label="v" + str(i))["id"] for i in range(3)]
+
+    srv.start_benchmark({"versions": picks[:2], "defender_versions": picks[:2],
+                         "attacks": ["llm"], "defenses": ["llm_defender"]})
+    assert len(captured_launch) + len(srv._QUEUE) == 4          # 2 x 2
+    assert captured_launch[0]["meta"]["queue"]["axis"] == "both"
+    assert " att x " in captured_launch[0]["meta"]["queue"]["label"]
+    srv._QUEUE.clear()
+    captured_launch.clear()
+
+    cap = srv.MAX_SWEEP_LEGS
+    try:
+        srv.MAX_SWEEP_LEGS = 4
+        with pytest.raises(RunError, match="past the cap"):
+            srv.start_benchmark({"versions": picks, "defender_versions": picks,
+                                 "attacks": ["llm"], "defenses": ["llm_defender"]})
+    finally:
+        srv.MAX_SWEEP_LEGS = cap
+    assert captured_launch == []
+    assert srv._QUEUE == []
+
+
+def test_training_summary_scores_the_defender_side(store):
+    """A --learn defender run's reward, detection rate and win gate all belong to
+    the defender; summarising only the attacker's columns described such a snapshot
+    as a flat line."""
+    rows = [{
+        "round_num": 10, "attacker_reward": 0.1, "defender_reward": 0.75,
+        "learning_agent": "defender", "test_accuracy": 0.9,
+        "baseline_accuracy": 0.91, "attack_goal": {},
+        "poisoned_client_ids": [0, 1],
+        "predicted_labels": [
+            {"client_id": 0, "is_suspicious": True},
+            {"client_id": 1, "is_suspicious": True},
+            {"client_id": 2, "is_suspicious": True},
+            {"client_id": 3, "is_suspicious": False}],
+        "attack_metadata": {"clean_measured": True, "defense_sane": True,
+                            "induced_drop": 0.01, "learner_success": True},
+    }]
+    summary = versions.training_summary(rows)
+    assert summary["mean_defender_reward"] == 0.75
+    assert summary["mean_tpr"] == 1.0                 # both poisoned clients caught
+    assert summary["mean_fpr"] == 0.5                 # one honest client flagged
+    assert summary["learners_seen"] == ["defender"]
+
+
+def test_a_clean_round_contributes_no_tpr(store):
+    """No poisoned clients means there is no true-positive rate to average; a 0
+    there would read as a missed attack rather than as nothing to catch."""
+    rows = [{"round_num": 1, "attacker_reward": 0.0, "defender_reward": 1.0,
+             "learning_agent": "defender", "poisoned_client_ids": [],
+             "predicted_labels": [{"client_id": 0, "is_suspicious": False}],
+             "test_accuracy": 0.9, "baseline_accuracy": 0.9, "attack_goal": {},
+             "attack_metadata": {"clean_measured": True, "defense_sane": True}}]
+    summary = versions.training_summary(rows)
+    assert summary["mean_tpr"] is None
+    assert summary["mean_fpr"] == 0.0
 
 
 def test_duplicate_and_alias_versions_collapse(captured_launch, store):
@@ -545,7 +783,7 @@ def test_rename_keeps_the_id_stable(store):
 def test_snapshot_without_a_trained_adapter_says_so(store):
     import shutil
     shutil.rmtree(store / "checkpoints" / "attacker_adapter")
-    with pytest.raises(versions.VersionError, match="no trained attacker adapter"):
+    with pytest.raises(versions.VersionError, match="no trained adapter to snapshot"):
         versions.create(label="nothing to save")
 
 

@@ -54,7 +54,7 @@ ENUMS = {
     "rl.commit_selection": ["sample", "argmax"],
     "rl.switch_mode": ["best_response", "fixed"],
     "rl.first_learner": ["attacker", "defender"],
-    "rl.reward.defender.mode": ["soft_f1", "f1", "accuracy"],
+    "rl.reward.defender.mode": ["soft_f1", "tpr_minus_fpr"],
 }
 
 #: The knobs the "Essentials" panel shows, in display order. Everything else is
@@ -72,6 +72,11 @@ PRIMARY = [
     "rl.save_every", "rl.win_fraction", "rl.success_streak",
     "rl.reward.attacker.alpha", "rl.reward.attacker.beta",
     "rl.reward.attacker.gamma", "rl.reward.attacker.zeta",
+    # The defender-side knobs. Only live under defense.mode: llm, but that is
+    # now a one-click choice in the same panel, so a run that trains the
+    # defender should not have to go hunting under "All settings" for the two
+    # values that shape its reward.
+    "rl.first_learner", "rl.reward.defender.mode", "rl.reward.defender.fpr_penalty",
     "data.source", "data.max_samples", "data.n_features", "data.noniid_bias",
 ]
 

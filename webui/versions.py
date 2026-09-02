@@ -1,11 +1,13 @@
 """The fine-tuned-model version store.
 
-Training writes ONE attacker adapter, in place, at ``checkpoints/attacker_adapter``
-(``rl.save_every`` rounds and at every phase boundary -- see
-``rl/schedule.py::_save_adapters``). That is the right thing for resuming a run and
-the wrong thing for evaluating one: by the time a benchmark finishes, the adapter
-it was told to load has already moved on, and there is no way to ask "how did the
-policy at round 400 compare to the policy at round 900?".
+Training writes its adapters in place -- ``checkpoints/attacker_adapter`` and,
+when the defender LLM is the side learning, ``checkpoints/defender_adapter``
+(every ``rl.save_every`` rounds and at every phase boundary; see
+``rl/schedule.py::_save_adapters``, which writes ONLY the trainable side). That is
+the right thing for resuming a run and the wrong thing for evaluating one: by the
+time a benchmark finishes, the adapter it was told to load has already moved on,
+and there is no way to ask "how did the policy at round 400 compare to the policy
+at round 900?".
 
 A *version* fixes that: it is a copy of the adapter directories, taken at a moment
 the user chose, next to the resume state and a metadata record of what training
@@ -27,7 +29,9 @@ Layout::
 
 A version is self-describing: ``version.json`` records the base model the adapter
 is dimensioned for, so a version taken against a different ``rl.model`` can be
-refused at benchmark time rather than failing deep inside PEFT.
+refused at benchmark time rather than failing deep inside PEFT -- and ``roles``
+says which sides it can be benchmarked as, since a one-sided training run
+snapshots one adapter.
 """
 import datetime
 import json
@@ -121,6 +125,33 @@ def _mean(xs):
     return round(sum(xs) / len(xs), 6) if xs else None
 
 
+def _detection_rates(row: dict) -> dict:
+    """TPR/FPR for one round, from the verdicts and the ground-truth poisoned set.
+
+    This is the defender's score sheet, and the round log carries the two halves
+    of it rather than the rates themselves (``predicted_labels`` and
+    ``poisoned_client_ids``), so it is derived the same way the live panel derives
+    it. ``None`` where the round has no such clients -- a round with nothing
+    poisoned has no TPR, and averaging a 0 in would read as a missed attack.
+    """
+    poisoned = set(row.get("poisoned_client_ids") or [])
+    verdicts = row.get("predicted_labels") or []
+    tp = fn = fp = tn = 0
+    for v in verdicts:
+        bad = v.get("client_id") in poisoned
+        hit = bool(v.get("is_suspicious"))
+        if bad and hit:
+            tp += 1
+        elif bad:
+            fn += 1
+        elif hit:
+            fp += 1
+        else:
+            tn += 1
+    return {"tpr": tp / (tp + fn) if (tp + fn) else None,
+            "fpr": fp / (fp + tn) if (fp + tn) else None}
+
+
 def training_summary(rounds=None) -> dict:
     """Describe the recent training rounds -- the "was this a good moment to snapshot"
     record stored with a version.
@@ -139,6 +170,7 @@ def training_summary(rounds=None) -> dict:
     terms = [m.get("reward_terms") or {} for m in meta]
     train = [m.get("train") or {} for m in meta]
     wins = [bool(m.get("learner_success")) for m in meta]
+    detect = [_detection_rates(r) for r in rows]
     return {
         "rounds": len(rows),
         "first_round": rows[0].get("round_num"),
@@ -158,6 +190,19 @@ def training_summary(rounds=None) -> dict:
         "baseline_accuracy": rows[-1].get("baseline_accuracy"),
         "defenses_seen": sorted({m.get("defense") for m in meta if m.get("defense")}),
         "goal": rows[-1].get("attack_goal"),
+        # --- the defender side -------------------------------------------------
+        # A defender-only run (``--learn defender`` under ``defense.mode: llm``)
+        # produces rounds whose attacker numbers are frozen and whose reward,
+        # detection rate and win gate all belong to the DEFENDER. Summarising only
+        # the attacker's columns described such a snapshot as a flat line and said
+        # nothing about the policy that was actually trained.
+        "mean_defender_reward": _mean([r.get("defender_reward") for r in rows]),
+        "mean_tpr": _mean([d["tpr"] for d in detect if d["tpr"] is not None]),
+        "mean_fpr": _mean([d["fpr"] for d in detect if d["fpr"] is not None]),
+        # Which side(s) the rounds in this window were training -- "attacker",
+        # "defender", both (an alternating arms race) or "none" (dry-run/baseline).
+        "learners_seen": sorted({str(r.get("learning_agent")) for r in rows
+                                 if r.get("learning_agent")}),
     }
 
 
@@ -178,15 +223,27 @@ def create(label: str = "", notes: str = "", roles=("attacker", "defender"),
            base_model: str = "", extra: dict | None = None) -> dict:
     """Snapshot the live adapters into a new version. Returns its record.
 
-    Raises :class:`VersionError` when there is no attacker adapter to copy -- which
-    is the ordinary "you have not trained yet" case, and is worth a clear message
-    rather than an empty directory that fails later inside the benchmark.
+    Whichever of ``roles`` is on disk is copied, so an attacker-only run, a
+    defender-only run (``--learn defender``) and a two-sided one each snapshot
+    exactly what they trained. :attr:`roles` on the record says which.
+
+    Raises :class:`VersionError` when NONE of them is there -- the ordinary "you
+    have not trained yet" case, worth a clear message rather than an empty
+    directory that fails later inside the benchmark.
     """
-    src = LIVE_ADAPTERS["attacker"]
-    if "attacker" in roles and not adapter_exists(src):
+    # At least ONE of the requested roles has to be on disk. Requiring the
+    # ATTACKER specifically is wrong once ``--learn defender`` is a UI choice: a
+    # defender-only run writes ``checkpoints/defender_adapter`` and deliberately
+    # never touches the attacker's (see ``rl/schedule.py::_save_adapters``), so
+    # the one adapter that run produced could not be snapshotted at all.
+    present = [role for role in roles
+               if LIVE_ADAPTERS.get(role) and adapter_exists(LIVE_ADAPTERS[role])]
+    if not present:
+        looked = ", ".join(LIVE_ADAPTERS[r] for r in roles if r in LIVE_ADAPTERS)
         raise VersionError(
-            f"no trained attacker adapter at {src} -- run training first "
-            f"(an adapter is written every rl.save_every rounds)")
+            f"no trained adapter to snapshot -- looked in {looked}. Run training "
+            f"first (an adapter is written every rl.save_every rounds), and note "
+            f"that only the side named by --learn is written to disk.")
 
     index = _next_index()
     slug = _slug(label)
@@ -211,8 +268,18 @@ def create(label: str = "", notes: str = "", roles=("attacker", "defender"),
         raise VersionError(f"could not copy the adapters: {exc}") from exc
 
     progress = _read_json(os.path.join(dest, "rl_progress.json"), {}) or {}
-    adapter_cfg = _read_json(
-        os.path.join(dest, "attacker_adapter", "adapter_config.json"), {}) or {}
+    # Read the LoRA shape off whichever adapter this version actually holds. A
+    # defender-only version has no attacker_adapter/, and reading the base model
+    # from a directory that is not there recorded base_model: "" -- which is the
+    # field the benchmark uses to refuse a version dimensioned for another
+    # ``rl.model``, so an empty one silently disables that check.
+    adapter_cfg = {}
+    for role in ("attacker", "defender"):
+        if role in copied:
+            adapter_cfg = _read_json(
+                os.path.join(dest, f"{role}_adapter", "adapter_config.json"), {}) or {}
+            if adapter_cfg:
+                break
     record = {
         "id": vid,
         "index": index,
@@ -220,6 +287,10 @@ def create(label: str = "", notes: str = "", roles=("attacker", "defender"),
         "notes": notes.strip(),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "adapters": copied,
+        # The roles this version can actually be benchmarked as. ``adapters``
+        # already carries it, but a sorted list is what the UI and the benchmark
+        # panel filter on, and it survives into saved run manifests.
+        "roles": sorted(copied),
         "base_model": base_model or adapter_cfg.get("base_model_name_or_path", ""),
         "lora_r": adapter_cfg.get("r"),
         "lora_alpha": adapter_cfg.get("lora_alpha"),

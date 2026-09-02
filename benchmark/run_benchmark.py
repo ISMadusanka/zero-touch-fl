@@ -708,6 +708,12 @@ def main():
             target_drop=(float(target_drop) if target_drop is not None else None),
             goal=goal, knowledge=args.baseline_knowledge, device=str(device),
             attacker_adapter=adapter_paths["attacker"],
+            # Which defender adapter the `llm_defender` column is actually running,
+            # and whether that column survived. A consumer that only reads the
+            # `defenses` list cannot tell a dropped column from one never asked
+            # for, and cannot tell WHICH defender it is looking at.
+            defender_adapter=(adapter_paths["defender"]
+                              if "llm_defender" in defenses else None),
             llm_defender_skipped=bool(skipped_llm_defender),
             citations={n: a.citation for n, a in attacks.items()})
     summaries, _metrics, run_info = run_attack_benchmark(

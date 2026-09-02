@@ -201,6 +201,15 @@ details.group .body { padding: 4px 4px 16px; }
 .chip.on.atk { background: color-mix(in srgb, var(--attack) 20%, transparent);
   border-color: var(--attack); }
 .chip.locked { opacity: .45; cursor: not-allowed; }
+/* A whole picker the current panel would not read -- the defender version row
+   with no llm_defender column, say. Dimmed rather than hidden: "this is not in
+   your panel" is the thing worth saying, and a field that vanishes says nothing. */
+.inert { opacity: .4; pointer-events: none; }
+.doc.hint-off { color: var(--warn); opacity: .85; }
+/* An inline "here is the fix" button under a field's help text. Own line, because
+   the sentence above it wraps and a trailing button would be pushed out of the
+   column. */
+.doc.hint-off .btn { display: block; margin-top: 6px; }
 
 /* -------------------------------------------------------------- metrics -- */
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 1px;

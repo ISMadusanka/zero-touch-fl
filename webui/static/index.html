@@ -75,6 +75,10 @@
               </select>
               <div class="doc">The untrained side still plays; its adapter on disk is left
                 untouched.</div>
+              <div class="doc hint-off hidden" id="train-learn-warn">
+                <span id="train-learn-warn-text"></span>
+                <button class="btn sm" id="train-learn-fix">Set defense.mode: llm</button>
+              </div>
             </div>
             <div class="field">
               <label>Inference backend <span class="path">--env</span></label>
@@ -146,6 +150,14 @@
             by stealth is a policy learning to hide, not to attack.</div>
           <div class="chart-wrap"><canvas id="chart-reward"></canvas></div>
           <div class="legend" id="legend-reward"></div>
+        </div>
+        <div class="chart-card">
+          <h3>Defender reward</h3>
+          <div class="sub">Soft-F1 over the per-client verdicts. This is the series that moves
+            under <span class="mono">--learn defender</span>; the attacker's above is a frozen
+            policy&rsquo;s flat line.</div>
+          <div class="chart-wrap"><canvas id="chart-def-reward"></canvas></div>
+          <div class="legend" id="legend-def-reward"></div>
         </div>
         <div class="chart-card">
           <h3>GRPO step health</h3>
@@ -260,12 +272,21 @@
         <div class="body">
           <div class="fields">
             <div class="field" style="grid-column: span 2">
-              <label>Fine-tuned version(s)</label>
+              <label>Attacker version(s) <span class="path">--attacker-adapter</span></label>
               <div class="chips" id="bench-versions"></div>
               <div class="doc">Which attacker adapter the <code>llm</code> row loads. Pick
                 several to sweep them: each runs as its own benchmark, back to back, against
                 the identical rounds &mdash; and the panel builds a comparison as they finish.
                 The live checkpoint is whatever training last wrote.</div>
+            </div>
+            <div class="field" style="grid-column: span 2">
+              <label>Defender version(s) <span class="path">--defender-adapter</span></label>
+              <div class="chips" id="bench-defender-versions"></div>
+              <div class="doc" id="bench-defender-versions-doc">Which defender adapter the
+                <code>llm_defender</code> column loads. Chosen separately from the attacker
+                because <span class="mono">--learn</span> trains one side at a time, so the two
+                adapters normally come from different snapshots. Several sweep the same way; both
+                axes at once runs their product.</div>
             </div>
             <div class="field">
               <label>Rounds <span class="path">--rounds</span></label>
