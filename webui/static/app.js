@@ -542,6 +542,10 @@
     pill.lastChild.textContent = status.state;
     $("#" + which + "-start").disabled = running;
     $("#" + which + "-stop").disabled = !running;
+    // The benchmark view has a second start button (the defender target); both
+    // compete for the same runner, so a run in flight has to lock out both.
+    const alt = $("#" + which + "-start-defender");
+    if (alt) alt.disabled = running;
     $$("#nav button").forEach((b) => {
       if (b.dataset.view === (which === "train" ? "train" : "bench")) {
         b.classList.toggle("busy", running);
@@ -743,7 +747,6 @@
                             benchSelection.defenses, DEFENSE_NOTE);
               }
               renderVersionSelect();
-              renderDefenderVersionHint();
               showView("bench");
             } }),
           document.createTextNode(" "),
@@ -853,19 +856,6 @@
     });
   }
 
-  /** Grey the defender row out when nothing in the panel would load it. The row is
-   *  left visible rather than hidden: a field that vanishes says nothing, and the
-   *  dimming is what tells you this column is not in your panel. The reason lives
-   *  in the tooltip, so the panel itself stays free of prose. */
-  function renderDefenderVersionHint() {
-    const on = benchSelection.defenses.has("llm_defender");
-    const node = $("#bench-defender-versions");
-    if (!node) return;
-    node.classList.toggle("inert", !on);
-    node.title = on ? "" :
-      "add the llm_defender column to the defense panel to use this";
-  }
-
   /* ------------------------------------------------------------------ */
   /* Benchmark: panels, live theatre, matrix                             */
   /* ------------------------------------------------------------------ */
@@ -909,7 +899,6 @@
           } else selected.add(name);
           renderChips(container, names, selected, notes, cls);
           renderFocusSelects();
-          renderDefenderVersionHint();
         },
       });
       node.appendChild(chip);
@@ -1400,41 +1389,63 @@
         .map((a) => ((ev.summaries[a] || {})[d] || {}).detection_rate)),
     })).sort((x, y) => (x.drop || 0) - (y.drop || 0));
 
-    const llm = byAttack.find((x) => x.attack === "llm");
-    const rank = llm ? byAttack.findIndex((x) => x.attack === "llm") + 1 : null;
     const verdict = $("#bench-verdict");
     verdict.innerHTML = "";
-    const bits = [];
-    if (byAttack.length) {
-      bits.push(el("p", { style: { margin: "0 0 8px" } }, [
-        document.createTextNode("Across the "),
-        el("strong", { text: String(real.length) }),
-        document.createTextNode(" robust defense(s), the attack that cost the most accuracy was "),
-        el("strong", { text: byAttack[0].attack, style: { color: "var(--attack)" } }),
-        document.createTextNode(` (mean drop ${signed(byAttack[0].drop, 4)}, ` +
-          `${pct(byAttack[0].goal, 0)} of its goal, ${pct(byAttack[0].detected, 0)} detected).`),
-      ]));
-    }
-    if (llm && rank) {
-      bits.push(el("p", { style: { margin: "0 0 8px" } }, [
+
+    // Which side this run was started to test. It decides which paragraph leads
+    // and which one reports "and here is how the thing under test did" -- a
+    // defender run that opened with the hardest ATTACK buried its own answer.
+    const forDefender = ((state.bench.queue || {}).axis || "attacker") === "defender";
+
+    const hardestAttack = () => byAttack.length && el("p", { style: { margin: "0 0 8px" } }, [
+      document.createTextNode("Across the "),
+      el("strong", { text: String(real.length) }),
+      document.createTextNode(" robust defense(s), the attack that cost the most accuracy was "),
+      el("strong", { text: byAttack[0].attack, style: { color: "var(--attack)" } }),
+      document.createTextNode(` (mean drop ${signed(byAttack[0].drop, 4)}, ` +
+        `${pct(byAttack[0].goal, 0)} of its goal, ${pct(byAttack[0].detected, 0)} detected).`),
+    ]);
+
+    const bestDefense = () => byDefense.length && el("p", { style: { margin: "0 0 8px" } }, [
+      document.createTextNode("The defense that held up best was "),
+      el("strong", { text: byDefense[0].defense, style: { color: "var(--defense)" } }),
+      document.createTextNode(` (mean drop ${signed(byDefense[0].drop, 4)} across the attack ` +
+        `panel, ${pct(byDefense[0].detected, 0)} of poisoned updates flagged); the weakest was `),
+      el("strong", { text: byDefense[byDefense.length - 1].defense }),
+      document.createTextNode(` (${signed(byDefense[byDefense.length - 1].drop, 4)}).`),
+    ]);
+
+    // The trained adapter's own line. Both rankings run best-first, but "best"
+    // is opposite for the two sides: byAttack is sorted by descending drop
+    // caused, byDefense by ascending drop allowed.
+    const underTest = () => {
+      if (forDefender) {
+        const i = byDefense.findIndex((x) => x.defense === "llm_defender");
+        if (i < 0) return null;
+        const d = byDefense[i];
+        return el("p", { style: { margin: "0 0 8px" } }, [
+          document.createTextNode("The trained defender ("),
+          el("strong", { text: "llm_defender", style: { color: "var(--defense)" } }),
+          document.createTextNode(`) ranks ${i + 1} of ${byDefense.length} by how little ` +
+            `accuracy it let the attack panel take: ${signed(d.drop, 4)}, flagging ` +
+            `${pct(d.detected, 0)} of the poisoned updates.`),
+        ]);
+      }
+      const i = byAttack.findIndex((x) => x.attack === "llm");
+      if (i < 0) return null;
+      const a = byAttack[i];
+      return el("p", { style: { margin: "0 0 8px" } }, [
         document.createTextNode("The trained policy ("),
-        el("strong", { text: "llm" }),
-        document.createTextNode(`) ranks ${rank} of ${byAttack.length} by mean accuracy drop: ` +
-          `${signed(llm.drop, 4)}, achieving ${pct(llm.goal, 0)} of its requested degradation, ` +
-          `${pct(llm.detected, 0)} of it caught.`),
-      ]));
-    }
-    if (byDefense.length) {
-      bits.push(el("p", { style: { margin: 0 } }, [
-        document.createTextNode("The defense that held up best was "),
-        el("strong", { text: byDefense[0].defense, style: { color: "var(--defense)" } }),
-        document.createTextNode(` (mean drop ${signed(byDefense[0].drop, 4)} across the attack ` +
-          `panel, ${pct(byDefense[0].detected, 0)} of poisoned updates flagged); the weakest was `),
-        el("strong", { text: byDefense[byDefense.length - 1].defense }),
-        document.createTextNode(` (${signed(byDefense[byDefense.length - 1].drop, 4)}).`),
-      ]));
-    }
-    bits.forEach((b) => verdict.appendChild(b));
+        el("strong", { text: "llm", style: { color: "var(--attack)" } }),
+        document.createTextNode(`) ranks ${i + 1} of ${byAttack.length} by mean accuracy drop: ` +
+          `${signed(a.drop, 4)}, achieving ${pct(a.goal, 0)} of its requested degradation, ` +
+          `${pct(a.detected, 0)} of it caught.`),
+      ]);
+    };
+
+    const order = forDefender ? [bestDefense, underTest, hardestAttack]
+                              : [hardestAttack, underTest, bestDefense];
+    order.map((f) => f()).filter(Boolean).forEach((b) => verdict.appendChild(b));
     verdict.appendChild(el("p", { class: "hint", style: { marginTop: "10px" }, text:
       "fedavg is the no-defense control and oracle reads the ground truth, so both are " +
       "excluded from these rankings. Read every row against its own defense's clean " +
@@ -1769,10 +1780,30 @@
     }
   }
 
-  async function startBenchmark() {
+  /** Start a benchmark aimed at ONE side.
+   *
+   *  Both buttons run the same `benchmark.run_benchmark` over the same panel; the
+   *  target is which adapter is under test, and it decides three things: which
+   *  version axis may be swept, which slice of the matrix the comparison scores
+   *  (the `llm` row vs the `llm_defender` column), and which way "best" points --
+   *  an attacker wants the drop it caused to be large, a defender wants the drop
+   *  it allowed to be small.
+   *
+   *  A defender run needs the column it is testing to be in the panel, so it is
+   *  added here rather than sent behind the panel's back: the chips are what the
+   *  page claims it ran, and the printed argv has to match them. */
+  async function startBenchmark(target) {
+    target = target === "defender" ? "defender" : "attacker";
+    if (target === "defender" && !benchSelection.defenses.has("llm_defender")) {
+      benchSelection.defenses.add("llm_defender");
+      renderChips("#bench-defenses", state.boot.defenses.available,
+                  benchSelection.defenses, DEFENSE_NOTE);
+      renderFocusSelects();
+    }
     const goalType = $("#bench-goal-type").value;
     const goalValue = $("#bench-goal-value").value.trim();
     const payload = {
+      target,
       versions: Array.from(versionSelection),
       defender_versions: Array.from(defenderSelection),
       rounds: numeric("#bench-rounds"),
@@ -1838,7 +1869,6 @@
     renderChips("#bench-defenses", state.boot.defenses.available,
                 benchSelection.defenses, DEFENSE_NOTE);
     renderFocusSelects();
-    renderDefenderVersionHint();
 
     // Prefill from the config so the benchmark form shows the shipped defaults.
     const f = state.boot.config.fields;
@@ -1874,7 +1904,8 @@
 
     $("#train-start").addEventListener("click", startTraining);
     $("#train-stop").addEventListener("click", () => stopRun("train"));
-    $("#bench-start").addEventListener("click", startBenchmark);
+    $("#bench-start").addEventListener("click", () => startBenchmark("attacker"));
+    $("#bench-start-defender").addEventListener("click", () => startBenchmark("defender"));
     $("#bench-stop").addEventListener("click", () => stopRun("bench"));
 
     $("#train-learn").addEventListener("change", renderLearnWarning);

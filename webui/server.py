@@ -547,11 +547,39 @@ def start_benchmark(payload: dict) -> dict:
     wants_llm = "llm" in attacks.split(",")
     wants_llm_defender = "llm_defender" in defenses.split(",")
 
+    # Which side is UNDER TEST. The two start buttons each pin one, and that is
+    # what makes a run answerable: it fixes which slice of the matrix the
+    # comparison reads and which way "better" points -- an attacker wants the drop
+    # it caused to be large, a defender wants the drop it allowed to be small.
+    target = str(payload.get("target") or "").strip().lower() or None
+    if target not in (None, "attacker", "defender"):
+        raise RunError(f"target must be attacker|defender, got {target!r}")
+    if target == "defender" and not wants_llm_defender:
+        raise RunError(
+            "a defender benchmark has to include the 'llm_defender' column -- that "
+            "is the defense under test. Add it to the defense panel, or use the "
+            "attacker benchmark.")
+
     attacker_axis = _sweep_axis(_selected_versions(payload),
                                 wants_llm, "attacker", "'llm' row")
     defender_axis = _sweep_axis(
         _selected_versions(payload, "defender_versions", "defender_version"),
         wants_llm_defender, "defender", "'llm_defender' column")
+
+    # A targeted run sweeps its own side only. Varying the opponent as well would
+    # produce legs that differ in a dimension the comparison does not score, and
+    # then rank them as if they did not -- two legs with the same defender under a
+    # different attacker, laid out as "which defender was better".
+    if target is not None:
+        other, other_name, other_button = (
+            (defender_axis, "defender", "Benchmark defender") if target == "attacker"
+            else (attacker_axis, "attacker", "Benchmark attacker"))
+        if len(other) > 1:
+            raise RunError(
+                f"this run benchmarks the {target}, so it varies {target} versions "
+                f"and holds the {other_name} fixed -- but {len(other)} {other_name} "
+                f"versions are selected. Pick one, or start the run with "
+                f"'{other_button}' to compare those instead.")
 
     legs = [(a, d) for a in attacker_axis for d in defender_axis]
     if len(legs) > MAX_SWEEP_LEGS:
@@ -560,12 +588,13 @@ def start_benchmark(payload: dict) -> dict:
             f"versions is {len(legs)} full benchmarks, past the cap of "
             f"{MAX_SWEEP_LEGS}. Sweep one axis at a time: pin one side and vary "
             f"the other.")
-    # Which axis this sweep is a comparison ALONG. The page needs it to know
-    # whether to score the `llm` row or the `llm_defender` column, and a leg's
-    # label should name the version that is actually varying.
-    axis = ("both" if len(attacker_axis) > 1 and len(defender_axis) > 1
-            else "defender" if len(defender_axis) > 1
-            else "attacker")
+    # Which axis this run is a comparison ALONG. The page needs it to know whether
+    # to score the `llm` row or the `llm_defender` column, and a leg's label should
+    # name the version that is actually varying. A target pins it; without one
+    # (a direct API call) it is inferred from which axis is being swept.
+    axis = target or ("both" if len(attacker_axis) > 1 and len(defender_axis) > 1
+                      else "defender" if len(defender_axis) > 1
+                      else "attacker")
 
     common = _build_flags(BENCH_SPEC, payload)
     jobs = []
@@ -628,7 +657,9 @@ def start_benchmark(payload: dict) -> dict:
                 "rounds": payload.get("rounds"),
                 "goal": payload.get("goal"),
                 "n_clients": (merged.get("fl", {}) or {}).get("n_clients"),
-                "queue": {"index": index, "total": len(legs), "axis": axis,
+                "target": target,
+            "queue": {"index": index, "total": len(legs), "axis": axis,
+                      "target": target,
                           "versions": attacker_axis,
                           "defender_versions": defender_axis,
                           "version": version_id,

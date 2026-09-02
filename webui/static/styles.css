@@ -123,6 +123,12 @@ button.btn {
 button.btn:hover:not(:disabled) { border-color: var(--text-faint); }
 button.btn:disabled { opacity: .4; cursor: not-allowed; }
 button.btn.primary { background: var(--defense); border-color: var(--defense); color: #fff; }
+/* The two benchmark start buttons are peers, not a primary and its alternative:
+   one pins the comparison to the attacker under test, the other to the defender.
+   They are told apart by the side's colour -- the same red/blue the chips, charts
+   and KPI tones already use -- rather than by one of them being visually demoted.
+   Scoped to `.atk`, so every other primary button (Start training) is untouched. */
+button.btn.primary.atk { background: var(--attack); border-color: var(--attack); }
 button.btn.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
 button.btn.ghost { background: transparent; }
 button.btn.sm { padding: 4px 9px; font-size: 12px; }
@@ -201,10 +207,6 @@ details.group .body { padding: 4px 4px 16px; }
 .chip.on.atk { background: color-mix(in srgb, var(--attack) 20%, transparent);
   border-color: var(--attack); }
 .chip.locked { opacity: .45; cursor: not-allowed; }
-/* A whole picker the current panel would not read -- the defender version row
-   with no llm_defender column, say. Dimmed rather than hidden: "this is not in
-   your panel" is the thing worth saying, and a field that vanishes says nothing. */
-.inert { opacity: .4; pointer-events: none; }
 .doc.hint-off { color: var(--warn); opacity: .85; }
 /* An inline "here is the fix" button under a field's help text. Own line, because
    the sentence above it wraps and a trailing button would be pushed out of the

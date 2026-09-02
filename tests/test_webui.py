@@ -376,7 +376,8 @@ def test_a_sweep_queues_one_ordinary_run_per_version(captured_launch, store):
     assert len(srv._QUEUE) == 2
     first = captured_launch[0]
     assert first["meta"]["queue"] == {
-        "index": 0, "total": 3, "axis": "attacker",
+        # No `target` was sent (a direct API call), so the swept axis is inferred.
+        "index": 0, "total": 3, "axis": "attacker", "target": None,
         "versions": [a["id"], b["id"], "current"],
         # No llm_defender column, so the defender axis is inert: one leg, no
         # adapter, and nothing for the comparison to vary along.
@@ -665,6 +666,78 @@ def test_a_clean_round_contributes_no_tpr(store):
     summary = versions.training_summary(rows)
     assert summary["mean_tpr"] is None
     assert summary["mean_fpr"] == 0.0
+
+
+def test_a_defender_benchmark_pins_the_comparison_to_the_defender(
+        captured_launch, store):
+    """The two start buttons differ only in `target`, and that is what makes a run
+    answerable: it fixes which slice of the matrix the comparison reads and which
+    way "better" points. Inferring it from the swept axis got this wrong for a
+    single-version defender run, which is the common case."""
+    from webui import server as srv
+
+    _train_a_defender(store)
+    early = versions.create(label="def early")
+    late = versions.create(label="def late")
+
+    srv.start_benchmark({"target": "defender",
+                         "defender_versions": [early["id"], late["id"]],
+                         "attacks": ["lie", "min_max"],
+                         "defenses": ["fedavg", "llm_defender"]})
+    q = captured_launch[0]["meta"]["queue"]
+    assert q["target"] == "defender" and q["axis"] == "defender"
+    assert captured_launch[0]["meta"]["target"] == "defender"
+    srv._QUEUE.clear()
+
+    # One defender version still reports the defender axis, so the verdict and the
+    # "best" direction come out defender-side rather than being inferred away.
+    captured_launch.clear()
+    srv.start_benchmark({"target": "defender", "defender_versions": [early["id"]],
+                         "attacks": ["llm"], "defenses": ["fedavg", "llm_defender"]})
+    assert captured_launch[0]["meta"]["queue"]["axis"] == "defender"
+
+
+def test_a_defender_benchmark_needs_the_column_under_test(captured_launch, store):
+    from webui import server as srv
+
+    _train_a_defender(store)
+    rec = versions.create(label="def")
+    with pytest.raises(RunError, match="'llm_defender' column"):
+        srv.start_benchmark({"target": "defender", "defender_versions": [rec["id"]],
+                             "attacks": ["llm"], "defenses": ["fltrust"]})
+    assert captured_launch == []
+
+
+def test_a_targeted_run_refuses_to_sweep_the_opponent(captured_launch, store):
+    """Varying the opponent as well would produce legs that differ in a dimension
+    the comparison does not score, and then rank them as if they did not -- two
+    legs with the same defender under different attackers, laid out as "which
+    defender was better"."""
+    from webui import server as srv
+
+    _train_a_defender(store)
+    a = versions.create(label="a")
+    b = versions.create(label="b")
+
+    with pytest.raises(RunError, match="Benchmark attacker"):
+        srv.start_benchmark({"target": "defender", "versions": [a["id"], b["id"]],
+                             "defender_versions": [a["id"]], "attacks": ["llm"],
+                             "defenses": ["fedavg", "llm_defender"]})
+    with pytest.raises(RunError, match="Benchmark defender"):
+        srv.start_benchmark({"target": "attacker", "versions": [a["id"]],
+                             "defender_versions": [a["id"], b["id"]],
+                             "attacks": ["llm"], "defenses": ["fedavg", "llm_defender"]})
+    assert captured_launch == []
+    assert srv._QUEUE == []
+
+
+def test_an_unknown_target_is_refused(captured_launch, store):
+    from webui import server as srv
+
+    with pytest.raises(RunError, match="target must be attacker|defender"):
+        srv.start_benchmark({"target": "everyone", "attacks": ["lie"],
+                             "defenses": ["fedavg"]})
+    assert captured_launch == []
 
 
 def test_duplicate_and_alias_versions_collapse(captured_launch, store):

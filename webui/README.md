@@ -97,6 +97,15 @@ The attack panel, the defense panel, the goal, the poison quota, the federation
 size, adversary knowledge, and every per-attack and per-defense hyperparameter the
 CLI accepts.
 
+**Two start buttons, one per side under test.** *Benchmark attacker* and
+*Benchmark defender* run the same `benchmark.run_benchmark` over the same panel;
+what differs is the `target`, and that is what makes a run answerable. It fixes
+which version axis may be swept, which slice of the matrix the comparison reads
+(the `llm` row vs the `llm_defender` column) and which way *better* points — an
+attacker wants the drop it caused to be large, a defender wants the drop it
+allowed to be small. A defender run adds `llm_defender` to the defense panel if it
+is not already there, rather than sending a defense list the page does not show.
+
 **The two adapters are picked independently** — an attacker row and a defender row
 — because that is how they are produced: `--learn` trains one side against a frozen
 opponent, so the defender worth evaluating and the attacker worth evaluating it
@@ -104,13 +113,16 @@ against normally come from different snapshots. The attacker version feeds the
 `llm` attack row (`--attacker-adapter`); the defender version feeds the
 `llm_defender` defense column (`--defender-adapter`).
 
-Pick **one** on each axis or **several**: the legs are the product, run back to
-back as ordinary benchmark subprocesses, each with its own output directory. An
-axis the panel cannot distinguish collapses to one leg — the attacker version is
-inert without the `llm` row, the defender version without the `llm_defender`
-column — and selecting several on an inert axis is refused rather than queued,
-because the legs would be byte-identical and then laid out as a comparison.
-`MAX_SWEEP_LEGS` caps the product.
+Pick **one** or **several** on the target's axis: several run back to back as
+ordinary benchmark subprocesses, each with its own output directory. The opponent
+is held fixed — selecting several there is refused and names the other button,
+because those legs would differ in a dimension the comparison does not score and
+then be ranked as if they did not. An axis the panel cannot distinguish collapses
+to one leg (the attacker version is inert without the `llm` row, the defender
+version without the `llm_defender` column), and selecting several on an inert axis
+is refused too, since the legs would be byte-identical. A direct API call may omit
+`target`, in which case the swept axis is inferred and both axes may vary at once;
+`MAX_SWEEP_LEGS` caps that product.
 
 A role's adapter is resolved **before** anything launches, and a version that does
 not hold it is a refusal, not a fallback. This is load-bearing: omitting
@@ -125,7 +137,9 @@ and drop for that round, the goal-achieved strip, and an attack × defense heat
 matrix filling in. At the end: a plain-language verdict, the full sortable matrix,
 and — for a sweep — a **version comparison** along the swept axis: the `llm` row
 for an attacker sweep (more drop is better), the `llm_defender` column for a
-defender sweep (less drop allowed is better, shown with FPR and F1).
+defender sweep (less drop allowed is better, shown with FPR and F1). The plain
+language verdict leads with the side under test, so a defender run opens with how
+the trained defender ranked rather than with which attack hurt most.
 
 If the CLI drops the `llm_defender` column because no defender adapter was found,
 the page says so — a missing row and a row never asked for look identical in a
