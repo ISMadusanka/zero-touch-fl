@@ -663,7 +663,7 @@
    *
    *  Row actions are omitted for the same reason: Benchmark/Rename/Delete would
    *  all address a version id the store does not have. */
-  const DEMO_VERSIONS = [
+  let DEMO_VERSIONS = [
     { id: "v000", label: "v000", notes: "", created: "2026-07-10T21:32:16",
       rounds_done: 1001450, roles: ["attacker", "defender"], demo: true,
       available: { attacker: false, defender: false },
@@ -753,23 +753,28 @@
         el("td", { class: "num", text: v.rounds_done ?? "--" }),
         el("td", { class: "num", text: signed(t.mean_induced_drop, 4) }),
         el("td", { class: "num", text: (v.base_model || "--").split("/").pop() }),
-        el("td", {}, v.demo ? [] : [
+        el("td", {}, [
           el("button", { class: "btn sm", text: "Benchmark",
             onclick: () => {
-              // Select it on the axes it can actually fill, so the button never
-              // lands the user on a panel the server would refuse.
-              if (roles.includes("attacker")) {
-                versionSelection.clear();
-                versionSelection.add(v.id);
+              // A seed row has no adapter to point a benchmark at, so it only
+              // navigates: pushing its id into the pickers would be dropped as
+              // unselectable and would clear whatever was already picked.
+              if (!v.demo) {
+                // Select it on the axes it can actually fill, so the button never
+                // lands the user on a panel the server would refuse.
+                if (roles.includes("attacker")) {
+                  versionSelection.clear();
+                  versionSelection.add(v.id);
+                }
+                if (roles.includes("defender")) {
+                  defenderSelection.clear();
+                  defenderSelection.add(v.id);
+                  benchSelection.defenses.add("llm_defender");
+                  renderChips("#bench-defenses", state.boot.defenses.available,
+                              benchSelection.defenses, DEFENSE_NOTE);
+                }
+                renderVersionSelect();
               }
-              if (roles.includes("defender")) {
-                defenderSelection.clear();
-                defenderSelection.add(v.id);
-                benchSelection.defenses.add("llm_defender");
-                renderChips("#bench-defenses", state.boot.defenses.available,
-                            benchSelection.defenses, DEFENSE_NOTE);
-              }
-              renderVersionSelect();
               showView("bench");
             } }),
           document.createTextNode(" "),
@@ -789,6 +794,16 @@
     if (label === null) return;
     const notes = prompt("Notes", v.notes || "");
     if (notes === null) return;
+    if (v.demo) {
+      // There is no version.json behind a seed row, so it is renamed in place:
+      // the button behaves like the real one instead of erroring on an id the
+      // store does not have. The edit lives until the page is reloaded.
+      v.label = label.trim() || v.id;
+      v.notes = notes.trim();
+      renderVersions();
+      toast("Renamed " + v.id, "ok");
+      return;
+    }
     try {
       await api("/api/versions/rename", { id: v.id, label, notes });
       await refreshVersions();
@@ -797,8 +812,17 @@
   }
 
   async function deleteVersion(v) {
-    if (!confirm(`Delete version ${v.id} (${v.label})?\n\nThis removes ${v.dir} from disk. ` +
-                 `The live training checkpoint is not touched.`)) return;
+    if (!confirm(`Delete version ${v.id} (${v.label})?\n\n` + (v.demo
+        ? "This is a demo row with no directory behind it, so nothing on disk " +
+          "changes and a reload brings it back. "
+        : `This removes ${v.dir} from disk. `) +
+        "The live training checkpoint is not touched.")) return;
+    if (v.demo) {
+      DEMO_VERSIONS = DEMO_VERSIONS.filter((x) => x !== v);
+      renderVersions();
+      toast("Deleted " + v.id, "ok");
+      return;
+    }
     try {
       await api("/api/versions/delete", { id: v.id });
       await refreshVersions();
