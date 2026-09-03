@@ -26,9 +26,8 @@ metrics, instead of drifting away from them as the run proceeds.
 Timing
 ------
 Rounds are paced by ``--round-delay MIN,MAX`` seconds (default
-:data:`DEFAULT_ROUND_DELAY`) so the run unfolds the way a real one does. That
-default makes a 250-round run take hours; pass a smaller range for a quick
-walkthrough.
+:data:`DEFAULT_ROUND_DELAY`) so the run unfolds rather than appearing all at once.
+Pass ``0,0`` for an instant one.
 """
 import argparse
 import json
@@ -43,11 +42,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from benchmark.events import EventEmitter          # noqa: E402
 from webui import demo                             # noqa: E402
 
-#: Seconds between rounds, as ``(min, max)``. A real round of this benchmark is
-#: one LLM generation per attack plus a test pass per cell, which is minutes --
-#: so the demo is paced the same way rather than finishing instantly and reading
-#: as a mock.
-DEFAULT_ROUND_DELAY = (60.0, 120.0)
+#: Seconds between rounds, as ``(min, max)``. A round still has to *take* long
+#: enough to read as work -- the attacker generating a plan, then a test pass per
+#: cell -- but it also has to finish inside a sitting: at a real round's minute or
+#: two, 250 rounds is most of a working day. A few seconds keeps the pacing
+#: visible and brings the same run down to a quarter of an hour or so. Override
+#: per run with ``--round-delay`` (the panel exposes it as *Demo round delay*).
+DEFAULT_ROUND_DELAY = (3.0, 8.0)
 
 
 def log(msg: str) -> None:

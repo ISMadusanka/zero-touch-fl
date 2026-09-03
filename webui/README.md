@@ -185,10 +185,10 @@ per-round stream that converges on it — the accuracy trajectory ends at
 with the closing table on all four of its metrics instead of visibly changing its
 mind at the end.
 
-Rounds are paced like real ones — **60–120 s each** by default, so a 250-round
-replay takes 4–8 hours. *Demo round delay* under **Attack & defense
-hyperparameters** takes a `MIN,MAX` in seconds; set it to `0,0` for a walkthrough
-that finishes in a second.
+Rounds are paced so the run unfolds rather than appearing all at once — **3–8 s
+each** by default, which puts a 250-round replay at 12–33 minutes. *Demo round
+delay* under **Attack & defense hyperparameters** takes a `MIN,MAX` in seconds;
+`0,0` finishes in about a second.
 
 ### Run history
 

@@ -1230,15 +1230,6 @@
     // alarm. Fall back to the whole panel if narrowing leaves nothing.
     const real = defenses.filter((d) => d !== "oracle" && d !== "fedavg");
     const scored = real.length ? real : defenses;
-    let worstAttack = null, worstDrop = -Infinity;
-    attacks.filter((a) => a !== "clean").forEach((a) => {
-      const drops = scored.map((d) => {
-        const c = benchCell(a, d);
-        return c.n ? base - c.accSum / c.n : null;
-      }).filter((x) => x !== null);
-      const m = mean(drops);
-      if (m !== null && m > worstDrop) { worstDrop = m; worstAttack = a; }
-    });
     let bestDefense = null, bestDrop = Infinity;
     scored.forEach((d) => {
       const drops = attacks.filter((a) => a !== "clean").map((a) => {
@@ -1251,22 +1242,19 @@
 
     kpi($("#bench-kpis"), [
       { k: "round", v: `${ev.index} / ${ev.of}` },
+      // Only shown while a sweep is running, where it says which leg you are
+      // looking at. Off a sweep there is nothing to disambiguate.
       state.bench.queue && state.bench.queue.total > 1
         ? { k: "version", v: state.bench.queue.label,
             s: `${state.bench.queue.index + 1} of ${state.bench.queue.total} in the sweep` }
-        : { k: "panel", v: `${attacks.length}×${defenses.length}`,
-            s: "attacks × defenses" },
+        : null,
       { k: "poisoned", v: (ev.poisoned || []).length,
         s: "of " + ev.n_clients + " clients", tone: "atk" },
       { k: "baseline", v: pct(base, 2), s: "clean Phase-1 accuracy" },
-      { k: "strongest attack", v: worstAttack || "--", tone: "atk",
-        s: worstDrop === -Infinity ? "" : "mean drop " + signed(worstDrop, 4),
-        title: "mean accuracy drop over " + scored.join(", ") +
-               " (fedavg and oracle are excluded: one is no defense, the other reads the truth)" },
       { k: "strongest defense", v: bestDefense || "--", tone: "def",
         s: bestDrop === Infinity ? "" : "mean drop " + signed(bestDrop, 4),
         title: "the defense that lost the least accuracy across the attack panel" },
-    ]);
+    ].filter(Boolean));
   }
 
   function renderBenchRound(ev) {
