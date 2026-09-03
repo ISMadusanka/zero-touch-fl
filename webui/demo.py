@@ -88,8 +88,42 @@ ATTACK_STRENGTH = {
     "noise": 0.31, "label_flip": 0.27, "clean": 0.0,
 }
 
+#: How the attack's reach scales with HOW MANY clients it poisons, as
+#: ``(poisoners, strength)`` anchors interpolated linearly in between.
+#:
+#: The fixture was taken with 10 poisoned clients, so that is where strength is
+#: 1.0 and the table is reproduced verbatim; more than 10 does not read as
+#: stronger, because the quoted row is already what a half-poisoned federation
+#: looks like. Below it the attack has fewer updates to hide among and fewer to
+#: push with, so it lands less damage AND is easier to spot -- which is the pair
+#: of movements this models. The anchors are the bands asked for: 10+, 6-10, 3-6,
+#: 1-3, made continuous inside each band so 9 poisoners is not indistinguishable
+#: from 6.
+POISONER_ANCHORS = ((1, 0.20), (3, 0.45), (6, 0.72), (10, 1.00))
+
 #: Roles the fixture claims to hold, so it appears on both benchmark axes.
 DEMO_ROLES = ("attacker", "defender")
+
+
+def poisoner_strength(n_poison) -> float:
+    """How much of the quoted attack ``n_poison`` poisoned clients deliver, in (0, 1].
+
+    1.0 at and above the fixture's 10, falling through the bands below it. Returns
+    1.0 for ``None`` so a caller that does not care about the count gets the
+    fixture unchanged.
+    """
+    if n_poison is None:
+        return 1.0
+    n = max(1, int(n_poison))
+    lo_n, lo_s = POISONER_ANCHORS[0]
+    if n <= lo_n:
+        return lo_s
+    for hi_n, hi_s in POISONER_ANCHORS[1:]:
+        if n <= hi_n:
+            span = hi_n - lo_n
+            return lo_s + (hi_s - lo_s) * ((n - lo_n) / span if span else 1.0)
+        lo_n, lo_s = hi_n, hi_s
+    return lo_s              # at or past the last anchor: the fixture as quoted
 
 
 def _record() -> dict:
@@ -217,20 +251,26 @@ def defense_row(defense: str, rounds: int, seed: int = 0) -> dict:
     return row
 
 
-def attack_row(attack: str, defense: str, rounds: int, seed: int = 0) -> dict:
-    """One matrix cell: ``defense``'s row scaled to how hard ``attack`` pushes.
+def attack_row(attack: str, defense: str, rounds: int, seed: int = 0,
+               n_poison=None) -> dict:
+    """One matrix cell: ``defense``'s row scaled to how hard this attack pushes.
 
-    The fixture describes the ``llm`` row. Every other attack is that row moved
-    toward the clean baseline by its strength factor, which is what a real matrix
-    looks like: the same defense, less damage through it, and a bit more of the
-    attack caught because a blunter attack is easier to see.
+    Two things set that. **Which attack** it is -- the fixture describes the
+    ``llm`` row, and every other attack is that row moved toward the clean
+    baseline by its :data:`ATTACK_STRENGTH`. And **how many clients it poisons**
+    -- see :func:`poisoner_strength`. They multiply, because they are the same
+    kind of weakening: less damage through the defense, and more of the attack
+    caught, because a blunter or smaller attack is easier to see.
+
+    At the fixture's own point -- the ``llm`` row with 10 poisoners, or with the
+    count left unspecified -- nothing is scaled and the quoted row is returned.
     """
     row = defense_row(defense, rounds, seed)
-    strength = ATTACK_STRENGTH.get(attack, 0.6)
-    if attack == "llm":
+    strength = ATTACK_STRENGTH.get(attack, 0.6) * poisoner_strength(n_poison)
+    if strength >= 1.0 - 1e-9:
         return row
 
-    rng = _rng(attack, defense, rounds, seed)
+    rng = _rng(attack, defense, rounds, seed, n_poison)
     scaled = dict(row)
     if strength <= 0.0:
         # `clean` poisons nothing: no attack to detect, no damage, and any flag a
@@ -249,18 +289,36 @@ def attack_row(attack: str, defense: str, rounds: int, seed: int = 0) -> dict:
         return scaled
 
     # Damage scales with strength; accuracy is what is left of the baseline.
+    # The jitter here is deliberately SMALLER than the step between two adjacent
+    # poisoner counts. At 9 poisoners the attack is scaled to 93%, a 7% move; a
+    # +/-10% wobble on top of that let the ramp run backwards, so stepping the
+    # quota down could show the attack doing better -- the opposite of what the
+    # control is there to demonstrate.
     for key in ("mean_accuracy", "final_accuracy"):
         drop = (BASELINE_ACCURACY - row[key]) * strength
-        scaled[key] = max(0.02, BASELINE_ACCURACY - drop * rng.uniform(0.94, 1.06))
+        scaled[key] = max(0.02, BASELINE_ACCURACY - drop * rng.uniform(0.985, 1.015))
     scaled["mean_acc_drop"] = BASELINE_ACCURACY - scaled["mean_accuracy"]
     # A blunter attack is easier to catch, so detection moves the other way -- but
     # never past what the ground-truth-reading oracle achieves.
+    # Detection is the headline movement -- a smaller or blunter attack is easier
+    # to see -- so it gets the full lift. Precision and F1 move the same way but
+    # more slowly: they start high enough that the same multiplier would pin them
+    # against 1.0 and report a flawless detector on a row that is still missing
+    # two thirds of the attack.
     lift = 1.0 + (1.0 - strength) * 1.4
-    for key in ("detection_rate", "precision", "f1"):
-        scaled[key] = min(1.0, _jitter(rng, row[key] * lift, 0.08))
-    scaled["fpr"] = _jitter(rng, row["fpr"], 0.12)
-    scaled["evasion"] = min(1.0, _jitter(rng, row["evasion"] * (0.6 + 0.4 * strength), 0.08))
-    scaled["goal"] = min(1.0, _jitter(rng, row["goal"] * strength, 0.1))
+    soft = 1.0 + (1.0 - strength) * 0.7
+    scaled["detection_rate"] = min(1.0, _jitter(rng, row["detection_rate"] * lift, 0.02))
+    # The false-positive rate is about how twitchy the defense is on honest
+    # clients, which the attack's size does not drive, so it only wobbles.
+    scaled["fpr"] = _jitter(rng, row["fpr"], 0.10)
+    # These may approach 1 but must not REACH it while honest clients are still
+    # being flagged: precision 1.00 next to a 5% false-positive rate says nothing
+    # honest was ever flagged and that something was, in the same row.
+    ceiling = 1.0 if scaled["fpr"] <= 0.0 else 0.95
+    for key in ("precision", "f1"):
+        scaled[key] = min(ceiling, _jitter(rng, row[key] * soft, 0.03))
+    scaled["evasion"] = min(1.0, _jitter(rng, row["evasion"] * (0.6 + 0.4 * strength), 0.02))
+    scaled["goal"] = min(1.0, _jitter(rng, row["goal"] * strength, 0.02))
     if defense == "oracle":
         # The oracle reads the ground truth whatever the attack is.
         scaled.update({"detection_rate": 1.0, "precision": 1.0, "f1": 1.0,

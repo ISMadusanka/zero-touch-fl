@@ -175,6 +175,18 @@ reads the ground truth, and `mean_acc_drop` is always recomputed from the one
 baseline so the identity the report checks still holds. Every other attack row is
 that table moved toward the clean baseline by the attack's strength.
 
+The quota matters too. The table is quoted at **10 poisoned clients**, and 10 or
+more replays it verbatim — the quoted row already describes a half-poisoned
+federation, so more attackers do not read as stronger. Below it the attack has
+fewer updates to hide among and fewer to push with, so it lands less damage *and*
+is easier to spot: detection climbs while the accuracy drop, the goal rate and the
+evasion rate all fall. The bands are 6–10, 3–6 and 1–3, interpolated inside each
+so 9 poisoners is not indistinguishable from 6, and the per-step jitter is kept
+smaller than one step's worth of scaling — otherwise stepping the quota down could
+show the attack doing *better*, which is the opposite of what the control
+demonstrates. Structural rows never move: no defense is still no defense, and the
+oracle still reads the ground truth.
+
 The table is a fixture, not a measurement, and its columns are not all derivable
 from one another the way `benchmark.metrics` derives them from confusion counts.
 So the replay does not try to reproduce it by feeding synthetic rounds through the

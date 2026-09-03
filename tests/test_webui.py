@@ -985,6 +985,124 @@ def test_the_live_round_stream_converges_on_the_quoted_table(tmp_path):
         assert a["goal"] / a["n"] == pytest.approx(ref["goal"], abs=0.02)
 
 
+def test_ten_or_more_poisoners_replay_the_quoted_table():
+    """The fixture was taken at 10 poisoned clients, so that is where it is the
+    promise. More does not read as stronger -- the quoted row already describes a
+    half-poisoned federation."""
+    from webui import demo
+
+    for n in (10, 11, 20, 250):
+        assert demo.poisoner_strength(n) == 1.0
+        for defense, ref in demo.REFERENCE.items():
+            row = demo.attack_row("llm", defense, demo.REFERENCE_ROUNDS, 0, n)
+            for key, value in ref.items():
+                assert row[key] == pytest.approx(value), f"n={n} {defense}.{key}"
+
+
+def test_fewer_poisoners_weaken_the_attack_at_every_step():
+    """The point of the control: dropping the quota has to move every reading the
+    same way, or stepping it down can show the attack doing BETTER. The jitter is
+    deliberately smaller than one step's worth of scaling for exactly this."""
+    from webui import demo
+
+    defenses = ("fedavg", "fltrust", "defl", "dnc", "multikrum")
+    previous = {}
+    for n in range(12, 0, -1):
+        rows = {d: demo.attack_row("llm", d, 250, 0, n) for d in defenses}
+        for defense, row in rows.items():
+            before = previous.get(defense)
+            if before is None:
+                continue
+            where = f"{defense} at {n} poisoner(s)"
+            # Fewer attackers: easier to catch, less damage, less of the goal.
+            assert row["detection_rate"] >= before["detection_rate"] - 1e-9, where
+            assert row["mean_acc_drop"] <= before["mean_acc_drop"] + 1e-9, where
+            assert row["goal"] <= before["goal"] + 1e-9, where
+            assert row["evasion"] <= before["evasion"] + 1e-9, where
+            assert row["mean_accuracy"] >= before["mean_accuracy"] - 1e-9, where
+        previous = rows
+
+
+@pytest.mark.parametrize("band,lo,hi", [
+    ("slight", 6, 9), ("moderate", 3, 5), ("heavy", 1, 2),
+])
+def test_the_bands_reduce_by_the_amounts_asked_for(band, lo, hi):
+    """10+ is full strength; below it the three bands weaken progressively."""
+    from webui import demo
+
+    expected = {"slight": (0.70, 0.95), "moderate": (0.44, 0.70),
+                "heavy": (0.19, 0.46)}[band]
+    for n in range(lo, hi + 1):
+        assert expected[0] <= demo.poisoner_strength(n) <= expected[1], n
+
+
+def test_poisoner_strength_is_continuous_inside_a_band():
+    """9 poisoners should not be indistinguishable from 6 just because they share
+    a band -- the anchors are interpolated between."""
+    from webui import demo
+
+    inside = [demo.poisoner_strength(n) for n in range(6, 10)]
+    assert inside == sorted(inside)
+    assert len(set(inside)) == len(inside)
+
+
+def test_structural_rows_survive_the_quota(store):
+    """No defense is still no defense, and the oracle still reads the ground
+    truth, however few clients are poisoned."""
+    from webui import demo
+
+    for n in (1, 4, 10):
+        fedavg = demo.attack_row("llm", "fedavg", 250, 0, n)
+        oracle = demo.attack_row("llm", "oracle", 250, 0, n)
+        assert fedavg["detection_rate"] == 0.0 and fedavg["evasion"] == 1.0
+        assert oracle["detection_rate"] == 1.0 and oracle["fpr"] == 0.0
+        assert oracle["mean_acc_drop"] < 0.01, n
+        # ...but a smaller attack still does less damage even undefended.
+        assert fedavg["mean_acc_drop"] <= demo.REFERENCE["fedavg"]["mean_accuracy"]
+
+
+def test_precision_never_claims_a_flawless_flagger_that_raises_false_alarms():
+    """precision 1.00 beside a non-zero FPR says nothing honest was ever flagged
+    and that something was, in the same row."""
+    from webui import demo
+
+    for defense in ("fltrust", "defl", "dnc", "multikrum"):
+        for n in range(1, 10):
+            row = demo.attack_row("llm", defense, 250, 0, n)
+            if row["fpr"] > 0:
+                assert row["precision"] < 1.0, f"{defense} at {n}"
+
+
+def test_the_replay_honours_the_poison_quota_end_to_end(tmp_path):
+    from webui import demo, demo_bench
+
+    def summary_for(n_poison):
+        import io
+        import json as _json
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            demo_bench.main([
+                "--events", "-", "--rounds", "60", "--attacks", "llm",
+                "--defenses", "fedavg,fltrust", "--goal", "untargeted_degrade=0.1",
+                "--n-clients", "20", "--max-poison-clients", str(n_poison),
+                "--round-delay", "0,0", "--log-every", "100000", "--out", "",
+            ])
+        events = [_json.loads(line[len("@@BENCH@@ "):])
+                  for line in buf.getvalue().splitlines()
+                  if line.startswith("@@BENCH@@ ")]
+        return next(e for e in events if e["event"] == "summary")
+
+    many, few = summary_for(10), summary_for(2)
+    assert many["n_poisoners"] == 10 and few["n_poisoners"] == 2
+    big = many["summaries"]["llm"]["fltrust"]
+    small = few["summaries"]["llm"]["fltrust"]
+    assert small["detection_rate"] > big["detection_rate"]
+    assert small["mean_acc_drop"] < big["mean_acc_drop"]
+    assert small["goal_success_rate"] < big["goal_success_rate"]
+
+
 def test_duplicate_and_alias_versions_collapse(captured_launch, store):
     from webui import server as srv
 

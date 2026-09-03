@@ -150,7 +150,7 @@ class Cell:
     def __init__(self, attack, defense, rounds, n_poison, n_honest, seed,
                  target_drop):
         self.attack, self.defense = attack, defense
-        self.row = demo.attack_row(attack, defense, rounds, seed)
+        self.row = demo.attack_row(attack, defense, rounds, seed, n_poison)
         rng = random.Random(hash((attack, defense, rounds, seed)) & 0xFFFFFFFF)
         self.acc = _accuracy_curve(rng, rounds, self.row["mean_accuracy"],
                                    self.row["final_accuracy"],
@@ -289,6 +289,11 @@ def main(argv=None) -> int:
     log(f"Eval poison quota = exactly {n_poison} of pool {n_clients} "
         f"client(s) every round")
     log(f"Benchmark: {rounds} rounds | attacks={attacks} | defenses={defenses}")
+    strength = demo.poisoner_strength(n_poison)
+    if strength < 1.0:
+        log(f"[demo] the stored result is quoted at 10 poisoned clients; at "
+            f"{n_poison} the attack reaches {strength:.0%} as far — less damage "
+            f"through each defense, and more of it caught.")
     if rounds != demo.REFERENCE_ROUNDS:
         log(f"[demo] the stored result is quoted at {demo.REFERENCE_ROUNDS} rounds; "
             f"at {rounds} it is perturbed in proportion to the difference.")

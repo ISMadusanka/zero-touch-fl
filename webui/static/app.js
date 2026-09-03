@@ -912,6 +912,11 @@
 
   function renderChips(container, names, selected, notes, cls) {
     const node = $(container);
+    // The attack and defense panels are no longer drawn, but `selected` is still
+    // the set the run is built from -- the defender button adds llm_defender to
+    // it, and the versions table selects into it. With no node to render, the
+    // selection change has already happened and there is simply nothing to show.
+    if (!node) return;
     node.innerHTML = "";
     names.forEach((name) => {
       const on = selected.has(name);
@@ -1831,10 +1836,7 @@
       goal: goalValue === "" ? goalType : `${goalType}=${goalValue}`,
       max_poison_clients: numeric("#bench-poison"),
       n_clients: numeric("#bench-nclients"),
-      baseline_knowledge: $("#bench-knowledge").value,
       device: $("#bench-device").value || undefined,
-      attack_temperature: numeric("#bench-temp"),
-      seed: numeric("#bench-seed"),
       attacks: Array.from(benchSelection.attacks),
       defenses: Array.from(benchSelection.defenses),
       overrides: state.overrides,
@@ -1881,8 +1883,14 @@
     renderVersionSelect();
     renderBenchAdvanced();
 
+    // The panel is fixed now that its chips are not on the page, so this list IS
+    // the matrix every run measures. `oracle` joins it: it reads the ground truth,
+    // so it is the upper bound every real defense is read against (the report
+    // already excludes it from the rankings for that reason), and the CLI's own
+    // --defenses default carries it too. `llm_defender` still stays out -- it
+    // needs a trained defender adapter, and the defender benchmark button adds it.
     state.boot.attacks.default.forEach((a) => benchSelection.attacks.add(a));
-    ["fedavg", "fltrust", "defl", "dnc", "multikrum"].forEach((d) => {
+    ["fedavg", "oracle", "fltrust", "defl", "dnc", "multikrum"].forEach((d) => {
       if (state.boot.defenses.available.includes(d)) benchSelection.defenses.add(d);
     });
     renderChips("#bench-attacks", state.boot.attacks.available,
@@ -1897,7 +1905,6 @@
       $("#bench-poison").placeholder = "config: " + f["attack.eval_poison_clients"].value;
     }
     if (f["fl.n_clients"]) $("#bench-nclients").placeholder = "config: " + f["fl.n_clients"].value;
-    if (f["fl.poison_seed"]) $("#bench-seed").placeholder = "config: " + f["fl.poison_seed"].value;
     if (f["attack.goal.target_accuracy_drop"]) {
       $("#bench-goal-value").value = f["attack.goal.target_accuracy_drop"].value;
     }
