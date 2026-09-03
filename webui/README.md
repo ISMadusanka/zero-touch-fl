@@ -180,16 +180,39 @@ reads the ground truth, and `mean_acc_drop` is always recomputed from the one
 baseline so the identity the report checks still holds. Every other attack row is
 that table moved toward the clean baseline by the attack's strength.
 
-The quota matters too. The table is quoted at **10 poisoned clients**, and 10 or
-more replays it verbatim — the quoted row already describes a half-poisoned
+**The scenario matters too, in two independent ways.**
+
+*How much of the federation is poisoned* sets the attack's reach. The tables are
+quoted at **10 of 20 clients — half poisoned** — and any run at that fraction or
+above replays them verbatim; the quoted row already describes a half-poisoned
 federation, so more attackers do not read as stronger. Below it the attack has
 fewer updates to hide among and fewer to push with, so it lands less damage *and*
-is easier to spot: detection climbs while the accuracy drop, the goal rate and the
-evasion rate all fall. The bands are 6–10, 3–6 and 1–3, interpolated inside each
-so 9 poisoners is not indistinguishable from 6, and the per-step jitter is kept
-smaller than one step's worth of scaling — otherwise stepping the quota down could
-show the attack doing *better*, which is the opposite of what the control
-demonstrates. Structural rows never move: no defense is still no defense, and the
+is easier to spot. It is keyed on the **fraction**, not the count: what decides an
+attack's reach is how much of the averaged update it owns, and one client of five
+is a fifth of it — a serious attack — while one of twenty is a twentieth. At the
+reference size the two coincide, so the bands hold exactly there (6–10 of 20 is
+30–50%, 3–6 is 15–30%, 1–3 is 5–15%), interpolated inside each so 9 poisoners is
+not indistinguishable from 6.
+
+*How large the federation is* sets how well the **defenses** work. The published
+ones are statistical — FLTrust needs the honest updates to agree on a direction,
+DeFL votes across a cohort, DnC hunts an outlier in a cohort's top singular
+direction, Multi-Krum ranks each update by distance to its neighbours — and all of
+that needs enough honest updates to describe what normal is. With four of them and
+one attacker there is barely a cohort to be an outlier of. So below the reference
+size each defense loses a share of its edge set by `FEDERATION_ROBUSTNESS`, sliding
+toward no-defense-at-all: detection falls, false alarms rise, and more damage gets
+through. The trained defender judges each client's own update statistics rather
+than the cohort's, so it keeps most of its edge; the oracle reads the ground truth
+and keeps all of it; FedAvg has none to lose. **Five clients with one poisoner is
+therefore where the trained defender separates from the field** — it holds ~81%
+detection and a 0.034 drop while the published defenses sit at 9–17% and 0.12–0.16.
+
+The per-step jitter is kept smaller than one step's worth of scaling — otherwise
+stepping the quota down could show the attack doing *better*, the opposite of what
+the control demonstrates — and it is seeded on the *effective* scenario, so two
+quotas that come out at the same strength give one answer rather than two noisy
+ones. Structural rows never move: no defense is still no defense, and the
 oracle still reads the ground truth — and the trained defender never becomes it
 either. Detection, precision and F1 rise by closing a fraction of their gap to 1.0
 rather than by being multiplied, because multiplying saturates whatever already

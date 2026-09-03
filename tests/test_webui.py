@@ -1244,6 +1244,151 @@ def test_an_untargeted_demo_run_never_asks_for_an_impossible_target(
     assert argv[argv.index("--target") + 1] in ("attacker", "defender")
 
 
+def test_the_quota_is_read_as_a_fraction_not_a_count():
+    """One client of five owns a fifth of the averaged update -- a serious attack.
+    One of twenty owns a twentieth. Scoring both as "one poisoner" made a
+    20%-poisoned federation read as safe as a 5% one."""
+    from webui import demo
+
+    assert demo.poisoner_strength(1, 5) > demo.poisoner_strength(1, 20) * 2
+    # Equal fractions are equal attacks, whatever the federation size.
+    assert demo.poisoner_strength(1, 5) == demo.poisoner_strength(4, 20)
+    assert demo.poisoner_strength(2, 10) == demo.poisoner_strength(4, 20)
+
+
+def test_the_count_bands_still_hold_at_the_reference_size():
+    """The fraction basis has to be backward compatible: at 20 clients it must
+    reproduce the bands agreed on when they were counts."""
+    from webui import demo
+
+    for count, expected in ((10, 1.00), (9, 0.93), (6, 0.72), (3, 0.45), (1, 0.20)):
+        assert demo.poisoner_strength(count, 20) == pytest.approx(expected, abs=1e-9)
+        # ...and with the size left unstated, which is how a caller with only a
+        # count arrives.
+        assert demo.poisoner_strength(count) == pytest.approx(expected, abs=1e-9)
+
+
+def test_a_small_federation_costs_the_attacker_nothing_and_the_defenses_plenty():
+    """Shrinking the quota weakens the ATTACK. Shrinking the FEDERATION weakens
+    the published DEFENSES -- they need enough honest updates to know what normal
+    looks like. Holding the poisoned fraction fixed isolates the second."""
+    from webui import demo
+
+    for defense in ("fltrust", "defl", "dnc", "multikrum"):
+        big = demo.attack_row("llm", defense, 250, 0, 4, "defender", 20)
+        small = demo.attack_row("llm", defense, 250, 0, 1, "defender", 5)
+        assert small["detection_rate"] < big["detection_rate"], defense
+        assert small["mean_acc_drop"] > big["mean_acc_drop"], defense
+        # A blurred sense of "normal" costs honest clients too.
+        assert small["fpr"] >= big["fpr"], defense
+
+    # The trained defender reads each client's own update, so it barely notices.
+    big = demo.attack_row("llm", "llm_defender", 250, 0, 4, "defender", 20)
+    small = demo.attack_row("llm", "llm_defender", 250, 0, 1, "defender", 5)
+    assert small["detection_rate"] > big["detection_rate"] * 0.9
+    # ...and the oracle reads the ground truth, so it notices nothing at all.
+    for n_clients, n_poison in ((20, 4), (5, 1)):
+        oracle = demo.attack_row("llm", "oracle", 250, 0, n_poison, "defender", n_clients)
+        assert oracle["detection_rate"] == 1.0 and oracle["fpr"] == 0.0
+
+
+def test_five_clients_one_poisoner_hurts_the_attacked_model():
+    """The scenario, on the attacker benchmark: a fifth of the federation poisoned
+    is a real attack, and the published defenses are outside their assumptions."""
+    from webui import demo
+
+    for defense in ("fltrust", "defl", "dnc", "multikrum"):
+        row = demo.attack_row("llm", defense, 250, 0, 1, "attacker", 5)
+        # Comfortably more than the same single poisoner in a 20-client
+        # federation, which is what made this scenario read as harmless.
+        was = demo.attack_row("llm", defense, 250, 0, 1, "attacker", 20)
+        assert row["mean_acc_drop"] > was["mean_acc_drop"] * 2.5, defense
+        assert row["mean_acc_drop"] > 0.12, defense
+    undefended = demo.attack_row("llm", "fedavg", 250, 0, 1, "attacker", 5)
+    assert undefended["mean_acc_drop"] > 0.2
+
+
+def test_five_clients_one_poisoner_is_where_the_llm_defender_wins():
+    """The same scenario on the defender benchmark: the trained defender holds and
+    the published defenses do not, which is the comparison the run exists to
+    make."""
+    from webui import demo
+
+    rows = {d: demo.attack_row("llm", d, 250, 0, 1, "defender", 5)
+            for d in ("llm_defender", "defl", "fltrust", "dnc", "multikrum")}
+    trained = rows.pop("llm_defender")
+
+    assert trained["detection_rate"] > 0.7
+    assert trained["mean_acc_drop"] < 0.05
+    assert trained["goal"] < 0.15
+    for defense, row in rows.items():
+        # Every published defense is clearly worse on all three readings.
+        assert row["detection_rate"] < 0.25, defense
+        assert row["mean_acc_drop"] > trained["mean_acc_drop"] * 3, defense
+        assert row["goal"] > trained["goal"] * 4, defense
+
+
+def test_a_saturated_quota_gives_one_answer_not_two_noisy_ones():
+    """3 and 4 poisoned clients of 5 are both past the point where the fraction
+    saturates, so they are the same attack. Seeding the wobble on the raw count
+    made them differ -- sometimes in the wrong direction."""
+    from webui import demo
+
+    assert demo.poisoner_strength(3, 5) == demo.poisoner_strength(4, 5) == 1.0
+    for defense in demo.REFERENCE_DEFENDER:
+        a = demo.attack_row("llm", defense, 250, 0, 3, "defender", 5)
+        b = demo.attack_row("llm", defense, 250, 0, 4, "defender", 5)
+        assert a == b, defense
+
+
+def test_the_quota_ramp_holds_at_every_federation_size():
+    from webui import demo
+
+    for n_clients in (20, 10, 5, 4, 3):
+        for target in ("attacker", "defender"):
+            previous = None
+            for n in range(n_clients - 1, 0, -1):
+                rows = {d: demo.attack_row("llm", d, 250, 0, n, target, n_clients)
+                        for d in demo.REFERENCES[target]}
+                if previous:
+                    for defense, row in rows.items():
+                        where = f"{n_clients}c/{target}/{defense} at {n}"
+                        assert row["detection_rate"] >= previous[defense][
+                            "detection_rate"] - 1e-9, where
+                        assert row["mean_acc_drop"] <= previous[defense][
+                            "mean_acc_drop"] + 1e-9, where
+                        assert row["goal"] <= previous[defense]["goal"] + 1e-9, where
+                previous = rows
+
+
+def test_the_reference_SCENARIO_still_replays_verbatim():
+    """Everything above is a no-op at the scenario the fixtures were measured on:
+    the reference size, or any larger federation poisoned to the same FRACTION.
+
+    A bigger federation with the same poisoner COUNT is a different scenario --
+    10 of 40 is a quarter poisoned against the fixture's half -- and must not
+    replay the quoted table."""
+    from webui import demo
+
+    assert demo.federation_pressure(demo.REFERENCE_CLIENTS) == 0.0
+    same_fraction = ((demo.REFERENCE_CLIENTS, demo.REFERENCE_POISONERS),
+                     (40, 20), (60, 30), (None, demo.REFERENCE_POISONERS))
+    for target, table in demo.REFERENCES.items():
+        for defense, ref in table.items():
+            for n_clients, n_poison in same_fraction:
+                row = demo.attack_row("llm", defense, demo.REFERENCE_ROUNDS, 0,
+                                      n_poison, target, n_clients)
+                for key, value in ref.items():
+                    assert row[key] == value, f"{target}/{defense}.{key}@{n_clients}"
+
+    # Same count, four times the federation: a quarter poisoned, so a weaker
+    # attack and less damage than the quoted row.
+    diluted = demo.attack_row("llm", "fltrust", demo.REFERENCE_ROUNDS, 0,
+                              demo.REFERENCE_POISONERS, "attacker", 40)
+    assert diluted["mean_acc_drop"] < demo.REFERENCE["fltrust"]["mean_accuracy"]
+    assert diluted["detection_rate"] > demo.REFERENCE["fltrust"]["detection_rate"]
+
+
 def test_duplicate_and_alias_versions_collapse(captured_launch, store):
     from webui import server as srv
 

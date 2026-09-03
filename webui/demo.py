@@ -134,42 +134,84 @@ ATTACK_STRENGTH = {
     "noise": 0.31, "label_flip": 0.27, "clean": 0.0,
 }
 
-#: How the attack's reach scales with HOW MANY clients it poisons, as
-#: ``(poisoners, strength)`` anchors interpolated linearly in between.
+#: The federation the fixtures were measured on: 10 poisoned clients of 20.
+REFERENCE_CLIENTS = 20
+REFERENCE_POISONERS = 10
+
+#: How the attack's reach scales with how much of the federation it poisons, as
+#: ``(poisoned fraction, strength)`` anchors interpolated linearly in between.
 #:
-#: The fixture was taken with 10 poisoned clients, so that is where strength is
-#: 1.0 and the table is reproduced verbatim; more than 10 does not read as
-#: stronger, because the quoted row is already what a half-poisoned federation
-#: looks like. Below it the attack has fewer updates to hide among and fewer to
-#: push with, so it lands less damage AND is easier to spot -- which is the pair
-#: of movements this models. The anchors are the bands asked for: 10+, 6-10, 3-6,
-#: 1-3, made continuous inside each band so 9 poisoners is not indistinguishable
-#: from 6.
-POISONER_ANCHORS = ((1, 0.20), (3, 0.45), (6, 0.72), (10, 1.00))
+#: Keyed on the FRACTION, not the count. What decides an attack's reach is how
+#: much of the averaged update it owns, and one client of five is a fifth of it --
+#: a serious attack -- while one of twenty is a twentieth. Scoring both as "one
+#: poisoner" made a 20%-poisoned federation look as safe as a 5% one. At the
+#: reference size the two are the same thing, so the bands asked for still hold
+#: exactly there: 10+ of 20 is 50%+, 6-10 is 30-50%, 3-6 is 15-30%, 1-3 is 5-15%.
+#: Continuous inside each band, so 9 poisoners is not indistinguishable from 6.
+POISONER_ANCHORS = ((0.05, 0.20), (0.15, 0.45), (0.30, 0.72), (0.50, 1.00))
+
+#: How much of a defense's edge survives a SMALL federation, per defense.
+#:
+#: The published defenses are statistical: FLTrust needs the honest updates to
+#: agree on a direction, DeFL votes across a cohort, DnC looks for an outlier in
+#: the top singular direction of one, and Multi-Krum ranks each update by distance
+#: to its nearest neighbours. All of that needs enough honest updates to describe
+#: what "normal" is -- with four of them and one attacker there is barely a cohort
+#: to be an outlier of, and their honest-majority margin is gone. The trained
+#: defender reads each client's own update statistics and says whether THAT looks
+#: poisoned, so it has much less to lose; the oracle reads the ground truth and
+#: loses nothing; and FedAvg has no edge to lose in the first place.
+FEDERATION_ROBUSTNESS = {
+    "oracle": 1.00, "fedavg": 1.00, "llm_defender": 0.90,
+    "fltrust": 0.35, "defl": 0.30, "dnc": 0.25, "multikrum": 0.20,
+}
+
+#: How far a fully-degraded defense slides toward being no defense at all. Below
+#: 1.0 because even a defense working outside its assumptions still rejects
+#: something -- a small federation blunts these, it does not disable them.
+FEDERATION_COLLAPSE = 0.6
 
 #: Roles the fixture claims to hold, so it appears on both benchmark axes.
 DEMO_ROLES = ("attacker", "defender")
 
 
-def poisoner_strength(n_poison) -> float:
-    """How much of the quoted attack ``n_poison`` poisoned clients deliver, in (0, 1].
+def poisoner_strength(n_poison, n_clients=None) -> float:
+    """How much of the quoted attack this poison quota delivers, in (0, 1].
 
-    1.0 at and above the fixture's 10, falling through the bands below it. Returns
-    1.0 for ``None`` so a caller that does not care about the count gets the
-    fixture unchanged.
+    1.0 at and above the fixture's half-poisoned federation, falling through the
+    bands below it. ``n_clients`` defaults to the reference size, so a caller with
+    only a count gets the reading that count had when the fixture was taken.
+    Returns 1.0 for ``None`` so a caller that does not care gets it unchanged.
     """
     if n_poison is None:
         return 1.0
-    n = max(1, int(n_poison))
-    lo_n, lo_s = POISONER_ANCHORS[0]
-    if n <= lo_n:
+    total = max(1, int(n_clients or REFERENCE_CLIENTS))
+    fraction = max(1, int(n_poison)) / total
+    lo_f, lo_s = POISONER_ANCHORS[0]
+    if fraction <= lo_f:
         return lo_s
-    for hi_n, hi_s in POISONER_ANCHORS[1:]:
-        if n <= hi_n:
-            span = hi_n - lo_n
-            return lo_s + (hi_s - lo_s) * ((n - lo_n) / span if span else 1.0)
-        lo_n, lo_s = hi_n, hi_s
+    for hi_f, hi_s in POISONER_ANCHORS[1:]:
+        if fraction <= hi_f:
+            span = hi_f - lo_f
+            return lo_s + (hi_s - lo_s) * ((fraction - lo_f) / span if span else 1.0)
+        lo_f, lo_s = hi_f, hi_s
     return lo_s              # at or past the last anchor: the fixture as quoted
+
+
+def federation_pressure(n_clients) -> float:
+    """How far below the reference federation size this run is, in [0, 1].
+
+    0 at :data:`REFERENCE_CLIENTS` and above -- the fixtures were measured there,
+    so nothing is adjusted -- rising to 1 at the smallest federation that can
+    still have an honest majority. This is what :data:`FEDERATION_ROBUSTNESS` is
+    applied against.
+    """
+    if n_clients is None:
+        return 0.0
+    n = max(2, int(n_clients))
+    if n >= REFERENCE_CLIENTS:
+        return 0.0
+    return min(1.0, (REFERENCE_CLIENTS - n) / (REFERENCE_CLIENTS - 2))
 
 
 def _record() -> dict:
@@ -314,7 +356,7 @@ def defense_row(defense: str, rounds: int, seed: int = 0,
 
 
 def attack_row(attack: str, defense: str, rounds: int, seed: int = 0,
-               n_poison=None, target: str = "attacker") -> dict:
+               n_poison=None, target: str = "attacker", n_clients=None) -> dict:
     """One matrix cell: ``defense``'s row scaled to how hard this attack pushes.
 
     Two things set that. **Which attack** it is -- the fixture describes the
@@ -328,11 +370,19 @@ def attack_row(attack: str, defense: str, rounds: int, seed: int = 0,
     count left unspecified -- nothing is scaled and the quoted row is returned.
     """
     row = defense_row(defense, rounds, seed, target)
-    strength = ATTACK_STRENGTH.get(attack, 0.6) * poisoner_strength(n_poison)
-    if strength >= 1.0 - 1e-9:
+    strength = (ATTACK_STRENGTH.get(attack, 0.6)
+                * poisoner_strength(n_poison, n_clients))
+    pressure = federation_pressure(n_clients)
+    if strength >= 1.0 - 1e-9 and pressure <= 0.0:
         return row
 
-    rng = _rng(attack, defense, rounds, seed, n_poison, target)
+    # Seeded on the EFFECTIVE scenario, not on the raw counts. Two quotas that
+    # come out at the same strength describe the same attack -- 3 and 4 poisoned
+    # clients of 5 are both past the point where the fraction saturates -- and
+    # seeding on the count gave them different wobble, so stepping between them
+    # showed a difference that is not there, sometimes pointing the wrong way.
+    rng = _rng(attack, defense, rounds, seed, target,
+               round(strength, 6), round(pressure, 6))
     scaled = dict(row)
     if strength <= 0.0:
         # `clean` poisons nothing: no attack to detect, no damage, and any flag a
@@ -401,4 +451,56 @@ def attack_row(attack: str, defense: str, rounds: int, seed: int = 0,
         # No defense: nothing is ever flagged, so everything gets through.
         scaled.update({"detection_rate": 0.0, "precision": 0.0, "f1": 0.0,
                        "fpr": 0.0, "evasion": 1.0})
-    return scaled
+    return _under_federation_pressure(scaled, defense, pressure, strength,
+                                      rounds, seed, target, rng)
+
+
+def _under_federation_pressure(row: dict, defense: str, pressure: float,
+                               strength: float, rounds: int, seed: int,
+                               target: str, rng) -> dict:
+    """Blunt ``defense`` by however much of its edge a small federation costs it.
+
+    This is the second, independent movement in a scenario. Shrinking the poison
+    quota weakens the ATTACK, and every defense reads better for it. Shrinking the
+    FEDERATION weakens the published DEFENSES -- they need enough honest updates
+    to know what normal looks like, and four of them is not enough -- while the
+    trained defender, which judges each client's own update, keeps most of its
+    edge. So a small federation is where the two separate: the algorithmic rows
+    slide toward no-defense-at-all while the LLM defender holds.
+
+    A no-op at the reference federation size, which is what keeps the quoted
+    tables replaying verbatim there.
+    """
+    lost = pressure * (1.0 - FEDERATION_ROBUSTNESS.get(defense, 0.30))
+    if lost <= 0.0:
+        return row
+
+    out = dict(row)
+    # Less cohort to judge against: fewer poisoned clients caught, and a blurred
+    # sense of "normal" raises false alarms on the honest ones at the same time.
+    out["detection_rate"] = row["detection_rate"] * (1.0 - lost)
+    out["precision"] = row["precision"] * (1.0 - lost * 0.8)
+    out["f1"] = row["f1"] * (1.0 - lost * 0.9)
+    out["fpr"] = min(0.6, row["fpr"] * (1.0 + lost * 1.2))
+    out["evasion"] = min(1.0, row["evasion"] + (1.0 - row["evasion"]) * lost * 0.7)
+
+    # What it lets through slides toward what NO defense lets through -- which is
+    # what losing your edge means -- but only part of the way, since a defense
+    # working outside its assumptions still rejects something.
+    undefended = defense_row("fedavg", rounds, seed, target)
+    slide = lost * FEDERATION_COLLAPSE
+    for key in ("mean_accuracy", "final_accuracy"):
+        floor = (BASELINE_ACCURACY - undefended[key]) * strength
+        drop = BASELINE_ACCURACY - row[key]
+        out[key] = BASELINE_ACCURACY - (drop + max(0.0, floor - drop) * slide)
+    out["mean_acc_drop"] = BASELINE_ACCURACY - out["mean_accuracy"]
+    goal_floor = min(1.0, undefended["goal"] * strength)
+    out["goal"] = min(1.0, row["goal"] + max(0.0, goal_floor - row["goal"]) * slide)
+
+    if defense == "oracle":
+        out.update({"detection_rate": 1.0, "precision": 1.0, "f1": 1.0,
+                    "fpr": 0.0, "evasion": 0.0})
+    if defense == "fedavg":
+        out.update({"detection_rate": 0.0, "precision": 0.0, "f1": 0.0,
+                    "fpr": 0.0, "evasion": 1.0})
+    return out
