@@ -361,8 +361,7 @@ def main(argv=None) -> int:
                  for a in attacks}
     run_info = {"unusable_attack_rounds": 0, "demo": True,
                 "reference_rounds": demo.REFERENCE_ROUNDS}
-    text = _report(summaries, attacks, defenses, rounds, args.demo_version,
-                   args.target)
+    text = _report(summaries, attacks, defenses, rounds, n_poison, n_clients)
     print("\n" + text, flush=True)
     em.emit("summary", summaries=summaries, defenses=defenses, attacks=attacks,
             measured_rounds=rounds, requested_rounds=rounds, skipped_rounds=0,
@@ -401,14 +400,23 @@ def _running(cell: "Cell", r: int, n_poison: int) -> float:
     return caught / seen if seen else 0.0
 
 
-def _report(summaries, attacks, defenses, rounds, version,
-            target="attacker") -> str:
-    """The plain-text table the real CLI prints at the end, same columns."""
+def _report(summaries, attacks, defenses, rounds, n_poison, n_clients) -> str:
+    """The plain-text table the real CLI prints at the end.
+
+    Titled the way ``benchmark.report`` titles it -- same label, same framing bar,
+    same run context on the line -- rather than announcing itself. That the run is
+    a replay is said once, in the console log where the run is described; the
+    report is the result, and it is read alongside real ones.
+    """
+    title = (f"{'ATTACK x DEFENSE BENCHMARK' if len(attacks) > 1 else 'DEFENSE BENCHMARK'}"
+             f" — {rounds} attack rounds  "
+             f"(clean baseline acc = {demo.BASELINE_ACCURACY:.3f})"
+             f", Num of poisoners={n_poison} of {n_clients} (exact quota)")
+    bar = "=" * len(title)
     head = (f"{'defense':<14}{'detect%':>9}{'FPR':>8}{'prec':>7}{'F1':>7}"
             f"{'final_acc':>11}{'mean_acc':>10}{'acc_drop':>10}"
             f"{'atk_thru':>10}{'atk_succ':>10}")
-    lines = [f"DEMO RESULT — {target} benchmark, version {version}, "
-             f"{rounds} round(s)", "", head, "-" * len(head)]
+    lines = [bar, title, bar, "", head, "-" * len(head)]
     for a in attacks:
         if len(attacks) > 1:
             lines.append(f"[attack: {a}]")
