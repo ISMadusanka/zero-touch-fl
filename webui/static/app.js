@@ -648,29 +648,6 @@
     } catch (e) { /* the panel keeps whatever it had */ }
   }
 
-  /** Seed rows for the versions table.
-   *
-   *  `checkpoints/` is not in the repo, so a machine that has never trained shows
-   *  an empty table; these rows give the tab something to show. They are display
-   *  only, and the two role fields say different things on purpose:
-   *
-   *  - `roles` is what the `holds` column draws, so the row shows the att/def
-   *    chips a two-sided snapshot would have;
-   *  - `available` stays false for both, because no adapter directory exists
-   *    behind the row. It is what the benchmark version pickers filter on, so if
-   *    a demo row ever did reach them it would be unselectable rather than
-   *    offered and then refused by the server.
-   *
-   *  Row actions are omitted for the same reason: Benchmark/Rename/Delete would
-   *  all address a version id the store does not have. */
-  let DEMO_VERSIONS = [
-    { id: "v000", label: "v000", notes: "", created: "2026-07-10T21:32:16",
-      rounds_done: 1001450, roles: ["attacker", "defender"], demo: true,
-      available: { attacker: false, defender: false },
-      base_model: "unsloth/Qwen2.5-7B-Instruct",
-      training: { mean_attacker_reward: 0.8, mean_induced_drop: 0.315 } },
-  ];
-
   function renderVersions() {
     const live = state.boot.live || {};
     const adapters = live.adapters || {};
@@ -716,11 +693,10 @@
       : "train first — an adapter is written every rl.save_every rounds, for the " +
         "side --learn names";
 
-    // Real snapshots newest-first, then the demo seed row. It is table-only: it is
-    // NOT merged into state.boot.versions, so it never reaches the benchmark
-    // version pickers, where selecting a row with no adapter behind it would be
-    // refused by the server. Its `available` flags say the same thing anyway.
-    const versions = (state.boot.versions || []).concat(DEMO_VERSIONS);
+    // Real snapshots newest-first, then the built-in demo fixture -- the server
+    // appends it to the listing (see webui/demo.py), so the table, both benchmark
+    // pickers and the run router all read one record.
+    const versions = state.boot.versions || [];
     $("#ver-count").textContent = versions.length
       ? versions.length + " version" + (versions.length === 1 ? "" : "s") : "";
     $("#ver-empty").classList.toggle("hidden", versions.length > 0);
@@ -818,8 +794,11 @@
         : `This removes ${v.dir} from disk. `) +
         "The live training checkpoint is not touched.")) return;
     if (v.demo) {
-      DEMO_VERSIONS = DEMO_VERSIONS.filter((x) => x !== v);
+      // Nothing on disk to remove; drop it from the listing this page is holding
+      // so the button behaves, and let the next bootstrap bring it back.
+      state.boot.versions = (state.boot.versions || []).filter((x) => x !== v);
       renderVersions();
+      renderVersionSelect();
       toast("Deleted " + v.id, "ok");
       return;
     }
@@ -958,6 +937,8 @@
     ["attack_retries", "Attack retries", "number", 3, "resamples when the policy emits no usable plan"],
     ["defender_temperature", "Defender temperature", "number", 0, "only used by the llm_defender column"],
     ["log_every", "Log every N rounds", "number", 10, "how often the CLI prints a progress line"],
+    ["demo_round_delay", "Demo round delay (s)", "text", "",
+     "MIN,MAX seconds between rounds — demo replay only (blank = 60,120)"],
     ["root_size", "FLTrust root size", "number", 100, "clean server-held examples FLTrust bootstraps trust from"],
     ["root_epochs", "FLTrust root epochs", "number", "", "blank = iteration-matched to an honest client"],
     ["eta", "FLTrust eta", "number", 1.0, "global learning rate applied to the trust-weighted update"],
@@ -993,6 +974,11 @@
         input = el("select", { id: "adv-" + key });
         (options || []).forEach((o) => input.appendChild(el("option", { value: o, text: o })));
         input.value = def;
+      } else if (type === "text") {
+        // Not every knob is a single number -- the demo's pacing is a MIN,MAX
+        // pair, and a number input silently refuses to hold it.
+        input = el("input", { type: "text", id: "adv-" + key,
+                              placeholder: def === "" ? "CLI default" : String(def) });
       } else {
         input = el("input", { type: "number", step: "any", id: "adv-" + key,
                               placeholder: def === "" ? "CLI default" : String(def) });

@@ -41,7 +41,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from webui import configstore, versions
+from webui import configstore, demo, versions
 from webui.runner import RUNS_DIR, RunError, Runner, python_exe
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -137,6 +137,23 @@ def _csv(allowed):
                 out.append(x)
         return ",".join(out)
     return check
+
+
+def _delay(value):
+    """``MIN,MAX`` seconds for the demo's round pacing (``MIN`` alone is fixed)."""
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    if not 1 <= len(parts) <= 2:
+        raise ValueError(f"expected SECONDS or MIN,MAX, got {value!r}")
+    out = []
+    for part in parts:
+        try:
+            seconds = float(part)
+        except ValueError:
+            raise ValueError(f"not a number of seconds: {part!r}") from None
+        if not 0.0 <= seconds <= 3600.0:
+            raise ValueError(f"must be between 0 and 3600 seconds, got {seconds}")
+        out.append(seconds)
+    return ",".join(f"{v:g}" for v in (out * 2)[:2])
 
 
 def _goal(value):
@@ -237,6 +254,9 @@ BENCH_SPEC = {
     "no_eval_cache": ("--no-eval-cache", None),
     "no_plot": ("--no-plot", None),
     "fresh": ("--fresh", None),
+    # Only the demo replay reads this; the real CLI is handed it and ignores it
+    # (see webui/demo_bench.py, which parses known args only).
+    "demo_round_delay": ("--round-delay", _delay),
 }
 
 
@@ -455,7 +475,7 @@ def _selected_versions(payload: dict, plural: str = "versions",
             continue
         seen.add(vid)
         if vid != "current":
-            versions.get(vid)         # validates the id, raises VersionError
+            _version_record(vid)      # validates the id, raises VersionError
         out.append(vid)
     if not out:
         raise RunError(f"pick at least one model version for the {single} role")
@@ -487,6 +507,24 @@ def _sweep_axis(ids: list, relevant: bool, role: str, needs: str) -> list:
     return [None]
 
 
+def _version_listing() -> list:
+    """Every stored version, then the built-in demo fixture.
+
+    The fixture is served from here rather than hard-coded in the page so there is
+    one source of truth: the same record drives the versions table, both benchmark
+    pickers, and the check that routes a run to the replay.
+    """
+    return versions.listing() + list(demo.LISTING)
+
+
+def _version_record(vid: str) -> dict:
+    """One version by id, fixture included. Raises ``VersionError`` for anything
+    the store does not hold either."""
+    if demo.is_demo(vid):
+        return demo.get(vid)
+    return versions.get(vid)
+
+
 def _version_label(version_id) -> str:
     """A leg's human name for one role. ``None`` is an axis the panel does not
     run at all (no ``llm`` attack, no ``llm_defender`` column), which is different
@@ -495,7 +533,7 @@ def _version_label(version_id) -> str:
         return "n/a"
     if version_id in ("current", "live"):
         return "live checkpoint"
-    return versions.get(version_id).get("label", version_id)
+    return _version_record(version_id).get("label", version_id)
 
 
 def _resolve_adapter(version_id, role: str, needs: str, hint: str) -> str:
@@ -538,7 +576,6 @@ def start_benchmark(payload: dict) -> dict:
     from benchmark.attacks import AVAILABLE as ATTACKS
     from benchmark.defenses import AVAILABLE as DEFENSES
 
-    _guard_concurrency(payload, TRAIN, "the benchmark")
     if BENCH.running:
         raise RunError("a benchmark is already in progress")
 
@@ -581,6 +618,23 @@ def start_benchmark(payload: dict) -> dict:
                 f"versions are selected. Pick one, or start the run with "
                 f"'{other_button}' to compare those instead.")
 
+    # Is this the demo fixture? All of it, or none of it: a leg cannot pair a
+    # fixture with a real adapter, because the fixture has no adapter on disk --
+    # the run would silently fall back to the live checkpoint for the other side
+    # and report the result under the fixture's name.
+    picked = [v for v in dict.fromkeys(list(attacker_axis) + list(defender_axis))
+              if v is not None]
+    demo_run = bool(picked) and all(demo.is_demo(v) for v in picked)
+    if not demo_run and any(demo.is_demo(v) for v in picked):
+        raise RunError(
+            f"{demo.DEMO_ID} is a stored demo result, not an adapter on disk, so it "
+            f"cannot be benchmarked alongside a real version. Select it on both "
+            f"sides, or on neither.")
+    # A real benchmark loads the 3B policy; the replay loads nothing, so it has no
+    # reason to be held back by a training run.
+    if not demo_run:
+        _guard_concurrency(payload, TRAIN, "the benchmark")
+
     legs = [(a, d) for a in attacker_axis for d in defender_axis]
     if len(legs) > MAX_SWEEP_LEGS:
         raise RunError(
@@ -617,21 +671,33 @@ def start_benchmark(payload: dict) -> dict:
                        else posixpath.join(run_dir.replace("\\", "/"), "result"))
 
             attacker_adapter = defender_adapter = None
-            if wants_llm:
-                attacker_adapter = _resolve_adapter(
-                    version_id, "attacker", "the 'llm' attack",
-                    "train first, or drop 'llm' from the attack panel to run the "
-                    "published baselines only.")
-            if wants_llm_defender:
-                defender_adapter = _resolve_adapter(
-                    defender_version_id, "defender", "the 'llm_defender' defense",
-                    "train a defender first (defense.mode: llm with --learn "
-                    "defender), or drop 'llm_defender' from the defense panel.")
+            if demo_run:
+                # The replay is a DIFFERENT PROGRAM, not a mode of the real one:
+                # benchmark.run_benchmark has no idea it exists and so cannot be
+                # put into a state where it invents numbers. The two share only
+                # the event protocol and the log shape, which is what lets the
+                # page render both with no branch on the client.
+                module = "webui.demo_bench"
+                extra = ["--demo-version", str(picked[0])]
+            else:
+                module = "benchmark.run_benchmark"
+                extra = []
+                if wants_llm:
+                    attacker_adapter = _resolve_adapter(
+                        version_id, "attacker", "the 'llm' attack",
+                        "train first, or drop 'llm' from the attack panel to run "
+                        "the published baselines only.")
+                if wants_llm_defender:
+                    defender_adapter = _resolve_adapter(
+                        defender_version_id, "defender", "the 'llm_defender' defense",
+                        "train a defender first (defense.mode: llm with --learn "
+                        "defender), or drop 'llm_defender' from the defense panel.")
 
-            argv = [python_exe(), "-u", "-m", "benchmark.run_benchmark",
+            argv = [python_exe(), "-u", "-m", module,
                     "--events", "-", "--config", cfg_path, "--out", out_dir]
             argv += list(common)
             argv += ["--attacks", attacks, "--defenses", defenses]
+            argv += extra
             if attacker_adapter:
                 argv += ["--attacker-adapter", attacker_adapter.replace("\\", "/")]
             if defender_adapter:
@@ -658,6 +724,7 @@ def start_benchmark(payload: dict) -> dict:
                 "goal": payload.get("goal"),
                 "n_clients": (merged.get("fl", {}) or {}).get("n_clients"),
                 "target": target,
+            "demo": demo_run,
             "queue": {"index": index, "total": len(legs), "axis": axis,
                       "target": target,
                           "versions": attacker_axis,
@@ -758,7 +825,7 @@ def bootstrap() -> dict:
         "attacks": {"available": ATTACKS, "default": ATTACKS_DEFAULT,
                     "baselines": BASELINES},
         "defenses": {"available": DEFENSES},
-        "versions": versions.listing(),
+        "versions": _version_listing(),
         "live": versions.live_status(),
         "train": TRAIN.status(),
         "bench": BENCH.status(),
@@ -839,7 +906,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/config":
                 return self._json(configstore.describe())
             if path == "/api/versions":
-                return self._json({"versions": versions.listing(),
+                return self._json({"versions": _version_listing(),
                                    "live": versions.live_status()})
             if path == "/api/runs":
                 return self._json({"runs": list_runs()})

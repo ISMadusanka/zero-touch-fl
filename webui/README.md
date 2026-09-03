@@ -145,6 +145,51 @@ If the CLI drops the `llm_defender` column because no defender adapter was found
 the page says so — a missing row and a row never asked for look identical in a
 matrix.
 
+### The demo fixture
+
+One version id, `v000`, is a **fixture** rather than a snapshot: it has no adapter
+directory behind it, and a benchmark aimed at it runs `webui/demo_bench.py`
+instead of `benchmark.run_benchmark`. It exists so the whole benchmark path — the
+live theatre, the heat matrix filling in, the console, the closing table, the
+saved `history.json`, the Runs tab — can be walked through on a laptop with no
+GPU, no dataset and no trained adapter.
+
+It is fenced off rather than woven in:
+
+- the replay is a **separate program**. The real CLI has no idea it exists and so
+  cannot be put into a mode where it invents numbers. The two share only the event
+  protocol (`benchmark/events.py`) and the log shape, which is what lets the page
+  render both with no branch on the client;
+- `v000` is outside the range the store can mint (`_next_index` starts at 1), so
+  no real snapshot collides with it;
+- a leg pairing the fixture with a real version is **refused**, because the
+  fixture has no adapter and the run would quietly fall back to the live
+  checkpoint for the other side and report it under the fixture's name.
+
+`webui/demo.py` holds the result it replays: a per-defense table for the `llm`
+row, quoted at 250 rounds and reproduced verbatim at exactly that count. Ask for a
+different number and it is perturbed instead — deterministically in the round
+count and seed, and by more on a shorter run, because a shorter run really is
+noisier. Structural facts do not drift: FedAvg still detects nothing, Oracle still
+reads the ground truth, and `mean_acc_drop` is always recomputed from the one
+baseline so the identity the report checks still holds. Every other attack row is
+that table moved toward the clean baseline by the attack's strength.
+
+The table is a fixture, not a measurement, and its columns are not all derivable
+from one another the way `benchmark.metrics` derives them from confusion counts.
+So the replay does not try to reproduce it by feeding synthetic rounds through the
+real metrics: it emits the table as the authoritative `summary`, and generates a
+per-round stream that converges on it — the accuracy trajectory ends at
+`final_accuracy` and averages `mean_accuracy`, detection converges on
+`detection_rate`/`fpr`, and the goal score on its rate. So the heat matrix agrees
+with the closing table on all four of its metrics instead of visibly changing its
+mind at the end.
+
+Rounds are paced like real ones — **60–120 s each** by default, so a 250-round
+replay takes 4–8 hours. *Demo round delay* under **Attack & defense
+hyperparameters** takes a `MIN,MAX` in seconds; set it to `0,0` for a walkthrough
+that finishes in a second.
+
 ### Run history
 
 Every run started from the panel keeps its resolved config, console log and (for a

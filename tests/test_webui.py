@@ -740,6 +740,251 @@ def test_an_unknown_target_is_refused(captured_launch, store):
     assert captured_launch == []
 
 
+# ---------------------------------------------------------------------------
+# The demo fixture: one version id that replays a stored result instead of
+# measuring one. The tests that matter are the fence around it -- that a real
+# version can never reach the replay, and the replay can never reach a real
+# adapter -- plus the promise that at REFERENCE_ROUNDS the table is verbatim.
+# ---------------------------------------------------------------------------
+
+def test_the_fixture_replays_verbatim_at_its_quoted_round_count():
+    """The reference table is a promise for exactly this round count."""
+    from webui import demo
+
+    for defense, ref in demo.REFERENCE.items():
+        row = demo.defense_row(defense, demo.REFERENCE_ROUNDS)
+        for key, value in ref.items():
+            assert row[key] == pytest.approx(value), f"{defense}.{key}"
+        # Every quoted row's mean accuracy and drop add up to the one baseline,
+        # which is what makes the table internally checkable.
+        assert row["mean_accuracy"] + row["mean_acc_drop"] == pytest.approx(
+            demo.BASELINE_ACCURACY)
+
+
+def test_another_round_count_deviates_but_stays_recognisable():
+    from webui import demo
+
+    for rounds in (40, 120, 400, 1000):
+        row = demo.defense_row("fltrust", rounds)
+        ref = demo.REFERENCE["fltrust"]
+        assert row != ref
+        for key in ("detection_rate", "fpr", "mean_accuracy"):
+            assert row[key] == pytest.approx(ref[key], rel=0.25), f"{rounds}:{key}"
+        assert row["mean_accuracy"] + row["mean_acc_drop"] == pytest.approx(
+            demo.BASELINE_ACCURACY)
+
+
+def test_deviation_is_deterministic_in_the_round_count_and_seed():
+    """A demo shown twice has to tell the same story."""
+    from webui import demo
+
+    assert demo.defense_row("dnc", 137, 3) == demo.defense_row("dnc", 137, 3)
+    assert demo.defense_row("dnc", 137, 3) != demo.defense_row("dnc", 137, 4)
+
+
+def test_structural_rows_never_drift():
+    """FedAvg detects nothing and Oracle reads the ground truth. Those are facts
+    about the row, not measurements that could have come out differently, and a
+    shorter run must not turn the oracle into a mediocre defense."""
+    from webui import demo
+
+    for rounds in (10, 250, 900):
+        fedavg = demo.defense_row("fedavg", rounds)
+        oracle = demo.defense_row("oracle", rounds)
+        assert fedavg["detection_rate"] == 0.0 and fedavg["fpr"] == 0.0
+        assert oracle["detection_rate"] == 1.0 and oracle["fpr"] == 0.0
+        # The oracle rejects every poisoned update, so its accuracy stays a
+        # rounding error away from clean however long the run is.
+        assert oracle["mean_acc_drop"] < 0.01, rounds
+
+
+def test_a_weaker_attack_gets_less_damage_through():
+    from webui import demo
+
+    llm = demo.attack_row("llm", "fltrust", 250)
+    noise = demo.attack_row("noise", "fltrust", 250)
+    clean = demo.attack_row("clean", "fltrust", 250)
+    assert llm["mean_acc_drop"] > noise["mean_acc_drop"] > clean["mean_acc_drop"]
+    # ...and is easier to see coming.
+    assert noise["detection_rate"] > llm["detection_rate"]
+    # The control row poisons nothing, so there is nothing to detect.
+    assert clean["detection_rate"] == 0.0
+
+
+def test_only_the_fixture_id_is_a_demo():
+    from webui import demo, versions
+
+    assert demo.is_demo("v000") and demo.is_demo(" V000 ")
+    for real in ("v001", "v012-after-cycle", "current", "", None):
+        assert not demo.is_demo(real)
+    # The store cannot mint the fixture's id: it numbers from 1.
+    assert versions._next_index() >= 1
+
+
+def test_the_fixture_is_listed_and_addressable(captured_launch, store):
+    from webui import demo, server as srv
+
+    listed = srv._version_listing()
+    assert [v["id"] for v in listed if v.get("demo")] == [demo.DEMO_ID]
+    rec = srv._version_record(demo.DEMO_ID)
+    assert rec["roles"] == ["attacker", "defender"]
+    assert rec["available"] == {"attacker": True, "defender": True}
+    assert srv._version_label(demo.DEMO_ID) == demo.DEMO_ID
+
+
+def test_a_demo_benchmark_runs_the_replay_not_the_real_cli(captured_launch, store):
+    from webui import demo, server as srv
+
+    srv.start_benchmark({"target": "attacker", "versions": [demo.DEMO_ID],
+                         "defender_versions": [demo.DEMO_ID], "rounds": 250,
+                         "attacks": ["llm", "lie"],
+                         "defenses": ["fedavg", "fltrust"]})
+    argv = captured_launch[0]["argv"]
+    assert argv[argv.index("-m") + 1] == "webui.demo_bench"
+    assert "benchmark.run_benchmark" not in argv
+    assert argv[argv.index("--demo-version") + 1] == demo.DEMO_ID
+    # No adapter is resolved: there is none on disk, and pointing at one would
+    # make the replay claim to have loaded a real policy.
+    assert "--attacker-adapter" not in argv
+    assert captured_launch[0]["meta"]["demo"] is True
+
+
+def test_a_real_version_never_reaches_the_replay(captured_launch, store):
+    from webui import server as srv
+
+    rec = versions.create(label="a real one")
+    srv.start_benchmark({"target": "attacker", "versions": [rec["id"]],
+                         "attacks": ["llm"], "defenses": ["fedavg"]})
+    argv = captured_launch[0]["argv"]
+    assert argv[argv.index("-m") + 1] == "benchmark.run_benchmark"
+    assert "--demo-version" not in argv
+    assert captured_launch[0]["meta"]["demo"] is False
+
+
+def test_the_fixture_cannot_be_mixed_with_a_real_version(captured_launch, store):
+    """A leg pairing the fixture with a real adapter would silently fall back to
+    the live checkpoint for the other side and report it under the fixture."""
+    from webui import demo, server as srv
+
+    _train_a_defender(store)
+    real = versions.create(label="real")
+    with pytest.raises(RunError, match="cannot be benchmarked alongside"):
+        srv.start_benchmark({"target": "attacker", "versions": [demo.DEMO_ID],
+                             "defender_versions": [real["id"]],
+                             "attacks": ["llm"],
+                             "defenses": ["fedavg", "llm_defender"]})
+    assert captured_launch == []
+
+
+@pytest.mark.parametrize("sent,expected", [
+    ("5", "5,5"), ("60,120", "60,120"), ("0,0", "0,0"), ("1.5,3", "1.5,3"),
+])
+def test_demo_pacing_is_validated(sent, expected):
+    from webui.server import BENCH_SPEC, _build_flags
+
+    flags = _build_flags(BENCH_SPEC, {"demo_round_delay": sent})
+    assert flags == ["--round-delay", expected]
+
+
+@pytest.mark.parametrize("bad", ["abc", "1,2,3", "-1", "99999", "1,x"])
+def test_bad_demo_pacing_is_refused(bad):
+    from webui.server import BENCH_SPEC, _build_flags
+
+    with pytest.raises(RunError):
+        _build_flags(BENCH_SPEC, {"demo_round_delay": bad})
+
+
+def test_the_replay_emits_the_quoted_table(tmp_path):
+    """End to end through the actual emitter: the events a watcher receives carry
+    the fixture, so what the panel finally renders is the quoted table."""
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+
+    from webui import demo, demo_bench
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        demo_bench.main([
+            "--events", "-", "--rounds", str(demo.REFERENCE_ROUNDS),
+            "--attacks", "llm", "--defenses", "fedavg,oracle,fltrust,defl,dnc,multikrum",
+            "--goal", "untargeted_degrade=0.1", "--n-clients", "20",
+            "--max-poison-clients", "10", "--round-delay", "0,0",
+            "--out", str(tmp_path / "result"), "--log-every", "100000",
+        ])
+    events = [_json.loads(line[len("@@BENCH@@ "):])
+              for line in buf.getvalue().splitlines()
+              if line.startswith("@@BENCH@@ ")]
+    kinds = [e["event"] for e in events]
+    assert kinds[0] == "started" and kinds[-1] == "finished"
+    assert kinds.count("round") == demo.REFERENCE_ROUNDS
+
+    summary = next(e for e in events if e["event"] == "summary")
+    for defense, ref in demo.REFERENCE.items():
+        if defense == "llm_defender":
+            continue                       # not in this panel
+        cell = summary["summaries"]["llm"][defense]
+        assert cell["detection_rate"] == pytest.approx(ref["detection_rate"])
+        assert cell["fpr"] == pytest.approx(ref["fpr"])
+        assert cell["precision"] == pytest.approx(ref["precision"])
+        assert cell["f1"] == pytest.approx(ref["f1"])
+        assert cell["final_accuracy"] == pytest.approx(ref["final_accuracy"])
+        assert cell["mean_accuracy"] == pytest.approx(ref["mean_accuracy"])
+        assert cell["attack_success_rate"] == pytest.approx(ref["evasion"])
+        assert cell["goal_success_rate"] == pytest.approx(ref["goal"])
+        assert cell["mean_acc_drop"] == pytest.approx(
+            demo.BASELINE_ACCURACY - ref["mean_accuracy"])
+
+    # ...and it wrote the artifact the Runs tab rebuilds a matrix from.
+    assert (tmp_path / "result" / "history.json").is_file()
+
+
+def test_the_live_round_stream_converges_on_the_quoted_table(tmp_path):
+    """The heat matrix is accumulated from round events while the summary table is
+    the fixture, so the two have to agree or the run visibly changes its mind at
+    the end."""
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+
+    from webui import demo, demo_bench
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        demo_bench.main([
+            "--events", "-", "--rounds", str(demo.REFERENCE_ROUNDS),
+            "--attacks", "llm", "--defenses", "fedavg,fltrust,dnc",
+            "--goal", "untargeted_degrade=0.1", "--n-clients", "20",
+            "--max-poison-clients", "10", "--round-delay", "0,0",
+            "--log-every", "100000", "--out", "",
+        ])
+    events = [_json.loads(line[len("@@BENCH@@ "):])
+              for line in buf.getvalue().splitlines()
+              if line.startswith("@@BENCH@@ ")]
+
+    agg = {}
+    for ev in (e for e in events if e["event"] == "round"):
+        for c in ev["cells"]:
+            a = agg.setdefault(c["defense"], {"n": 0, "acc": 0.0, "tp": 0, "fn": 0,
+                                              "fp": 0, "tn": 0, "goal": 0.0})
+            a["n"] += 1
+            a["acc"] += c["accuracy"]
+            for k in ("tp", "fn", "fp", "tn"):
+                a[k] += c[k]
+            a["goal"] += c["goal_success"]
+
+    for defense, ref in (("fedavg", demo.REFERENCE["fedavg"]),
+                         ("fltrust", demo.REFERENCE["fltrust"]),
+                         ("dnc", demo.REFERENCE["dnc"])):
+        a = agg[defense]
+        assert a["acc"] / a["n"] == pytest.approx(ref["mean_accuracy"], abs=0.002)
+        detected = a["tp"] / (a["tp"] + a["fn"])
+        assert detected == pytest.approx(ref["detection_rate"], abs=0.005)
+        false_rate = a["fp"] / (a["fp"] + a["tn"])
+        assert false_rate == pytest.approx(ref["fpr"], abs=0.005)
+        assert a["goal"] / a["n"] == pytest.approx(ref["goal"], abs=0.02)
+
+
 def test_duplicate_and_alias_versions_collapse(captured_launch, store):
     from webui import server as srv
 
