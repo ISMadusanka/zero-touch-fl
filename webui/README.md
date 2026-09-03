@@ -166,8 +166,13 @@ It is fenced off rather than woven in:
   fixture has no adapter and the run would quietly fall back to the live
   checkpoint for the other side and report it under the fixture's name.
 
-`webui/demo.py` holds the result it replays: a per-defense table for the `llm`
-row, quoted at 250 rounds and reproduced verbatim at exactly that count. Ask for a
+`webui/demo.py` holds the results it replays: **one quoted table per side under
+test**, because an attacker benchmark and a defender benchmark are different
+experiments rather than two views of one — with the trained detector in the panel
+every defense reads differently (FLTrust catches 26% against 21%, and holds 0.753
+against 0.690). The start button picks which one, via `--target`. Each is a
+per-defense table for the `llm` row, quoted at 250 rounds and reproduced verbatim
+at exactly that count. Ask for a
 different number and it is perturbed instead — deterministically in the round
 count and seed, and by more on a shorter run, because a shorter run really is
 noisier. Structural facts do not drift: FedAvg still detects nothing, Oracle still
@@ -185,7 +190,13 @@ so 9 poisoners is not indistinguishable from 6, and the per-step jitter is kept
 smaller than one step's worth of scaling — otherwise stepping the quota down could
 show the attack doing *better*, which is the opposite of what the control
 demonstrates. Structural rows never move: no defense is still no defense, and the
-oracle still reads the ground truth.
+oracle still reads the ground truth — and the trained defender never becomes it
+either. Detection, precision and F1 rise by closing a fraction of their gap to 1.0
+rather than by being multiplied, because multiplying saturates whatever already
+scores well: the defender's quoted 86% went straight to 100% at six poisoners,
+erasing the one comparison that row exists to make. For the same reason the jitter
+on those lands on the *step* rather than the result — a row with 1.7 points of
+headroom across the whole range cannot carry a wobble sized against its value.
 
 The table is a fixture, not a measurement, and its columns are not all derivable
 from one another the way `benchmark.metrics` derives them from confusion counts.

@@ -678,7 +678,13 @@ def start_benchmark(payload: dict) -> dict:
                 # the event protocol and the log shape, which is what lets the
                 # page render both with no branch on the client.
                 module = "webui.demo_bench"
-                extra = ["--demo-version", str(picked[0])]
+                # The fixture has a table per side under test, so the replay has
+                # to be told which one this run is measuring. Without an explicit
+                # target the axis stands in -- but it can also be "both", which is
+                # not a side, so anything that is not the defender reads as the
+                # attacker (the side a run with no stated target is measuring).
+                extra = ["--demo-version", str(picked[0]), "--target",
+                         "defender" if (target or axis) == "defender" else "attacker"]
             else:
                 module = "benchmark.run_benchmark"
                 extra = []

@@ -77,6 +77,52 @@ REFERENCE = {
                      "evasion": 0.240, "goal": 0.190},
 }
 
+#: The DEFENDER fixture: the same shape, from a run that put the trained defender
+#: under test. It is a different experiment, not a different view of the same one
+#: -- the defence panel is being compared against the attack panel with the
+#: trained detector in it, so every row reads differently from :data:`REFERENCE`
+#: (FLTrust catches 26% here against 21% there, and holds 0.753 against 0.690).
+#:
+#: Quoted for detection rate, mean accuracy and weighted goal success. FedAvg is
+#: not in the quoted charts -- it is the no-defense control the CLI force-adds --
+#: and neither are FPR, precision, F1, the final accuracy or the evasion rate, so
+#: those are filled in in the fixture's own style: evasion tracks what detection
+#: leaves through, and the final accuracy sits below the mean because the damage
+#: accumulates over the run.
+REFERENCE_DEFENDER = {
+    "fedavg":       {"detection_rate": 0.000, "fpr": 0.000, "precision": 0.00,
+                     "f1": 0.00, "final_accuracy": 0.302, "mean_accuracy": 0.470,
+                     "evasion": 1.000, "goal": 0.940},
+    "oracle":       {"detection_rate": 1.000, "fpr": 0.000, "precision": 1.00,
+                     "f1": 1.00, "final_accuracy": 0.893, "mean_accuracy": 0.892,
+                     "evasion": 0.000, "goal": 0.012},
+    "llm_defender": {"detection_rate": 0.860, "fpr": 0.020, "precision": 0.94,
+                     "f1": 0.90, "final_accuracy": 0.841, "mean_accuracy": 0.853,
+                     "evasion": 0.140, "goal": 0.096},
+    "defl":         {"detection_rate": 0.310, "fpr": 0.040, "precision": 0.62,
+                     "f1": 0.41, "final_accuracy": 0.712, "mean_accuracy": 0.779,
+                     "evasion": 0.690, "goal": 0.574},
+    "fltrust":      {"detection_rate": 0.260, "fpr": 0.150, "precision": 0.38,
+                     "f1": 0.31, "final_accuracy": 0.688, "mean_accuracy": 0.753,
+                     "evasion": 0.740, "goal": 0.623},
+    "dnc":          {"detection_rate": 0.180, "fpr": 0.080, "precision": 0.51,
+                     "f1": 0.27, "final_accuracy": 0.641, "mean_accuracy": 0.723,
+                     "evasion": 0.820, "goal": 0.756},
+    "multikrum":    {"detection_rate": 0.150, "fpr": 0.050, "precision": 0.58,
+                     "f1": 0.24, "final_accuracy": 0.604, "mean_accuracy": 0.692,
+                     "evasion": 0.850, "goal": 0.810},
+}
+
+#: Which fixture a run replays, keyed by the side it puts under test.
+REFERENCES = {"attacker": REFERENCE, "defender": REFERENCE_DEFENDER}
+
+
+def reference(target: str = "attacker") -> dict:
+    """The fixture for the side under test. Unknown targets fall back to the
+    attacker's, which is the one a run with no stated target is measuring."""
+    return REFERENCES.get(str(target or "attacker").lower(), REFERENCE)
+
+
 #: How each OTHER attack row compares to `llm` on the damage it gets through.
 #: The trained policy is the strongest row -- it is the system under test, and the
 #: published baselines are the control that says the legs were comparable.
@@ -217,15 +263,31 @@ def _jitter(rng, value: float, spread: float, lo: float = 0.0,
     return max(lo, min(hi, value * (1.0 + rng.uniform(-spread, spread))))
 
 
-def defense_row(defense: str, rounds: int, seed: int = 0) -> dict:
-    """The fixture's row for ``defense``, adjusted for a run of ``rounds``."""
-    ref = REFERENCE.get(defense)
+def defense_row(defense: str, rounds: int, seed: int = 0,
+                target: str = "attacker") -> dict:
+    """The fixture's row for ``defense``, adjusted for a run of ``rounds``.
+
+    ``target`` picks which fixture is being replayed -- the attacker benchmark's
+    or the defender benchmark's. They are separate experiments with separate
+    tables, not two views of one.
+    """
+    table = reference(target)
+    ref = table.get(defense)
     if ref is None:
         # A defense the fixture does not quote: sit it between FLTrust and DnC
         # rather than dropping the column, so an unusual panel still fills in.
-        ref = REFERENCE["fltrust"]
+        ref = table["fltrust"]
     spread = _deviation(rounds)
-    rng = _rng(defense, rounds, seed)
+    if spread <= 0.0:
+        # At the quoted round count the fixture is the answer. Returning a copy
+        # rather than recomputing it matters: the accuracies are derived by
+        # subtracting a drop from the baseline, and `baseline - (baseline - x)` is
+        # not bit-for-bit `x` in floating point.
+        row = dict(ref)
+        row["mean_acc_drop"] = BASELINE_ACCURACY - row["mean_accuracy"]
+        return row
+
+    rng = _rng(defense, rounds, seed, target)
     row = {
         "detection_rate": _jitter(rng, ref["detection_rate"], spread),
         "fpr": _jitter(rng, ref["fpr"], spread),
@@ -252,7 +314,7 @@ def defense_row(defense: str, rounds: int, seed: int = 0) -> dict:
 
 
 def attack_row(attack: str, defense: str, rounds: int, seed: int = 0,
-               n_poison=None) -> dict:
+               n_poison=None, target: str = "attacker") -> dict:
     """One matrix cell: ``defense``'s row scaled to how hard this attack pushes.
 
     Two things set that. **Which attack** it is -- the fixture describes the
@@ -265,12 +327,12 @@ def attack_row(attack: str, defense: str, rounds: int, seed: int = 0,
     At the fixture's own point -- the ``llm`` row with 10 poisoners, or with the
     count left unspecified -- nothing is scaled and the quoted row is returned.
     """
-    row = defense_row(defense, rounds, seed)
+    row = defense_row(defense, rounds, seed, target)
     strength = ATTACK_STRENGTH.get(attack, 0.6) * poisoner_strength(n_poison)
     if strength >= 1.0 - 1e-9:
         return row
 
-    rng = _rng(attack, defense, rounds, seed, n_poison)
+    rng = _rng(attack, defense, rounds, seed, n_poison, target)
     scaled = dict(row)
     if strength <= 0.0:
         # `clean` poisons nothing: no attack to detect, no damage, and any flag a
@@ -300,24 +362,36 @@ def attack_row(attack: str, defense: str, rounds: int, seed: int = 0,
     scaled["mean_acc_drop"] = BASELINE_ACCURACY - scaled["mean_accuracy"]
     # A blunter attack is easier to catch, so detection moves the other way -- but
     # never past what the ground-truth-reading oracle achieves.
-    # Detection is the headline movement -- a smaller or blunter attack is easier
-    # to see -- so it gets the full lift. Precision and F1 move the same way but
-    # more slowly: they start high enough that the same multiplier would pin them
-    # against 1.0 and report a flawless detector on a row that is still missing
-    # two thirds of the attack.
-    lift = 1.0 + (1.0 - strength) * 1.4
-    soft = 1.0 + (1.0 - strength) * 0.7
-    scaled["detection_rate"] = min(1.0, _jitter(rng, row["detection_rate"] * lift, 0.02))
+    # A weaker attack is easier to see, so detection, precision and F1 all rise.
+    # They rise by closing a fraction of the gap to 1.0 rather than by being
+    # multiplied, because multiplying saturates whatever already scores well: the
+    # trained defender's 86% detection went straight to 100% at six poisoners,
+    # which erased the very comparison the row exists to make -- it read as having
+    # become the ground-truth oracle. Closing headroom also matches how detection
+    # actually behaves, in that the last few percent are the hardest to win.
+    # The jitter lands on the STEP, not on the result. A row that already scores
+    # well has very little headroom -- the trained defender's detection moves 1.7
+    # points across the whole poisoner range -- so a wobble applied to the 0.86
+    # itself is several times the size of the signal, and the ramp runs backwards.
+    # Perturbing the step keeps the result monotone by construction: the step is
+    # always positive and always grows as the attack weakens.
+    def _close_gap(value, fraction):
+        step = (1.0 - value) * (1.0 - strength) * fraction
+        return value + step * rng.uniform(0.95, 1.05)
+
+    scaled["detection_rate"] = min(1.0, _close_gap(row["detection_rate"], 0.30))
     # The false-positive rate is about how twitchy the defense is on honest
     # clients, which the attack's size does not drive, so it only wobbles.
     scaled["fpr"] = _jitter(rng, row["fpr"], 0.10)
-    # These may approach 1 but must not REACH it while honest clients are still
-    # being flagged: precision 1.00 next to a 5% false-positive rate says nothing
-    # honest was ever flagged and that something was, in the same row.
+    # Precision may approach 1 but must not REACH it while honest clients are
+    # still being flagged: precision 1.00 next to a 5% false-positive rate says
+    # nothing honest was ever flagged and that something was, in the same row.
     ceiling = 1.0 if scaled["fpr"] <= 0.0 else 0.95
     for key in ("precision", "f1"):
-        scaled[key] = min(ceiling, _jitter(rng, row[key] * soft, 0.03))
-    scaled["evasion"] = min(1.0, _jitter(rng, row["evasion"] * (0.6 + 0.4 * strength), 0.02))
+        scaled[key] = min(ceiling, _close_gap(row[key], 0.18))
+    # One step of the quota moves this by under 3%, so the wobble has to stay well
+    # inside that or the ramp can reverse here too.
+    scaled["evasion"] = min(1.0, _jitter(rng, row["evasion"] * (0.6 + 0.4 * strength), 0.008))
     scaled["goal"] = min(1.0, _jitter(rng, row["goal"] * strength, 0.02))
     if defense == "oracle":
         # The oracle reads the ground truth whatever the attack is.

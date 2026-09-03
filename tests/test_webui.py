@@ -1103,6 +1103,147 @@ def test_the_replay_honours_the_poison_quota_end_to_end(tmp_path):
     assert small["goal_success_rate"] < big["goal_success_rate"]
 
 
+def test_the_defender_fixture_replays_verbatim():
+    """A defender benchmark is a different experiment, not a different view of the
+    attacker one, so it has its own quoted table."""
+    from webui import demo
+
+    for defense, ref in demo.REFERENCE_DEFENDER.items():
+        row = demo.attack_row("llm", defense, demo.REFERENCE_ROUNDS, 0, 10, "defender")
+        for key, value in ref.items():
+            # Bit-exact, not approximate: at the quoted point the fixture IS the
+            # answer, and deriving accuracy by subtracting a drop from the
+            # baseline does not round-trip in floating point.
+            assert row[key] == value, f"{defense}.{key}"
+        assert row["mean_accuracy"] + row["mean_acc_drop"] == pytest.approx(
+            demo.BASELINE_ACCURACY)
+
+
+def test_the_two_fixtures_are_different_experiments():
+    from webui import demo
+
+    for defense in ("fltrust", "defl", "dnc"):
+        a = demo.REFERENCE[defense]
+        d = demo.REFERENCE_DEFENDER[defense]
+        assert a["detection_rate"] != d["detection_rate"]
+        # The defender run puts a real detector in the panel, so the whole
+        # federation holds more accuracy than in the attacker run.
+        assert d["mean_accuracy"] > a["mean_accuracy"], defense
+
+
+def test_the_target_picks_the_fixture():
+    from webui import demo
+
+    assert demo.reference("defender") is demo.REFERENCE_DEFENDER
+    assert demo.reference("attacker") is demo.REFERENCE
+    # A run with no stated target is measuring the attacker.
+    assert demo.reference(None) is demo.REFERENCE
+    assert demo.reference("both") is demo.REFERENCE
+    att = demo.attack_row("llm", "fltrust", 250, 0, 10, "attacker")
+    dfd = demo.attack_row("llm", "fltrust", 250, 0, 10, "defender")
+    assert att["detection_rate"] == 0.21 and dfd["detection_rate"] == 0.26
+
+
+def test_the_trained_defender_never_becomes_the_oracle():
+    """Its detection is quoted at 86%, a hair under the ground-truth reader. A
+    multiplicative lift sent it to 100% at six poisoners, which erased the one
+    comparison the row exists to make."""
+    from webui import demo
+
+    for n in range(1, 11):
+        row = demo.attack_row("llm", "llm_defender", 250, 0, n, "defender")
+        assert row["detection_rate"] < 1.0, n
+        assert row["detection_rate"] < 0.95, n      # still clearly short of oracle
+        assert row["detection_rate"] >= demo.REFERENCE_DEFENDER["llm_defender"][
+            "detection_rate"] - 1e-9, n
+
+
+def test_both_fixtures_scale_monotonically_with_the_quota():
+    """Every reading has to move the same way at every step, on both fixtures --
+    this is what the jitter budget is sized against."""
+    from webui import demo
+
+    for target in ("attacker", "defender"):
+        previous = {}
+        for n in range(12, 0, -1):
+            rows = {d: demo.attack_row("llm", d, 250, 0, n, target)
+                    for d in demo.REFERENCES[target]}
+            for defense, row in rows.items():
+                before = previous.get(defense)
+                if before is None:
+                    continue
+                where = f"{target}/{defense} at {n}"
+                for key in ("detection_rate", "precision", "f1", "mean_accuracy"):
+                    assert row[key] >= before[key] - 1e-9, f"{where}.{key} fell"
+                for key in ("mean_acc_drop", "goal", "evasion"):
+                    assert row[key] <= before[key] + 1e-9, f"{where}.{key} rose"
+            previous = rows
+
+
+def test_a_defender_replay_emits_the_quoted_charts(tmp_path):
+    """End to end: what a watcher receives for a defender run is the three quoted
+    series -- detection rate, mean accuracy and weighted attack success."""
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+
+    from webui import demo, demo_bench
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        demo_bench.main([
+            "--events", "-", "--target", "defender",
+            "--rounds", str(demo.REFERENCE_ROUNDS), "--attacks", "llm",
+            "--defenses", "fedavg,oracle,llm_defender,defl,fltrust,dnc,multikrum",
+            "--goal", "untargeted_degrade=0.1", "--n-clients", "20",
+            "--max-poison-clients", "10", "--round-delay", "0,0",
+            "--log-every", "100000", "--out", "",
+        ])
+    events = [_json.loads(line[len("@@BENCH@@ "):])
+              for line in buf.getvalue().splitlines()
+              if line.startswith("@@BENCH@@ ")]
+    summary = next(e for e in events if e["event"] == "summary")
+
+    charted = {
+        "oracle":       (1.000, 0.892, 0.012),
+        "llm_defender": (0.860, 0.853, 0.096),
+        "defl":         (0.310, 0.779, 0.574),
+        "fltrust":      (0.260, 0.753, 0.623),
+        "dnc":          (0.180, 0.723, 0.756),
+        "multikrum":    (0.150, 0.692, 0.810),
+    }
+    for defense, (detection, mean_acc, success) in charted.items():
+        cell = summary["summaries"]["llm"][defense]
+        assert cell["detection_rate"] == pytest.approx(detection), defense
+        assert cell["mean_accuracy"] == pytest.approx(mean_acc), defense
+        assert cell["goal_success_rate"] == pytest.approx(success), defense
+
+
+def test_a_defender_run_is_routed_with_its_target(captured_launch, store):
+    from webui import demo, server as srv
+
+    srv.start_benchmark({"target": "defender", "versions": [demo.DEMO_ID],
+                         "defender_versions": [demo.DEMO_ID], "rounds": 250,
+                         "attacks": ["llm"],
+                         "defenses": ["fedavg", "llm_defender"]})
+    argv = captured_launch[0]["argv"]
+    assert argv[argv.index("-m") + 1] == "webui.demo_bench"
+    assert argv[argv.index("--target") + 1] == "defender"
+
+
+def test_an_untargeted_demo_run_never_asks_for_an_impossible_target(
+        captured_launch, store):
+    """Without an explicit target the swept axis stands in -- and that axis can be
+    "both", which is not a side the fixture has a table for."""
+    from webui import demo, server as srv
+
+    srv.start_benchmark({"versions": [demo.DEMO_ID],
+                         "defender_versions": [demo.DEMO_ID],
+                         "attacks": ["llm"], "defenses": ["fedavg", "llm_defender"]})
+    argv = captured_launch[0]["argv"]
+    assert argv[argv.index("--target") + 1] in ("attacker", "defender")
+
+
 def test_duplicate_and_alias_versions_collapse(captured_launch, store):
     from webui import server as srv
 

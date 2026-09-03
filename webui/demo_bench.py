@@ -148,9 +148,9 @@ class Cell:
     """One (attack, defense) pair's whole run, precomputed."""
 
     def __init__(self, attack, defense, rounds, n_poison, n_honest, seed,
-                 target_drop):
+                 target_drop, target="attacker"):
         self.attack, self.defense = attack, defense
-        self.row = demo.attack_row(attack, defense, rounds, seed, n_poison)
+        self.row = demo.attack_row(attack, defense, rounds, seed, n_poison, target)
         rng = random.Random(hash((attack, defense, rounds, seed)) & 0xFFFFFFFF)
         self.acc = _accuracy_curve(rng, rounds, self.row["mean_accuracy"],
                                    self.row["final_accuracy"],
@@ -252,6 +252,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="")
     ap.add_argument("--config", default="")
     ap.add_argument("--demo-version", default=demo.DEMO_ID)
+    ap.add_argument("--target", default="attacker", choices=("attacker", "defender"),
+                    help="which side is under test -- picks the fixture to replay")
     ap.add_argument("--round-delay", default=None,
                     help="seconds between rounds as MIN,MAX (default 60,120)")
     # The panel builds one argv for both benchmark programs, so every flag the
@@ -277,8 +279,8 @@ def main(argv=None) -> int:
     em.emit("started", argv=(argv if argv is not None else sys.argv[1:]),
             rounds=rounds, attacks=attacks, defenses=defenses, demo=True)
 
-    log(f"DEMO RUN — replaying the stored result for version {args.demo_version}. "
-        f"No model is loaded and no accuracy is measured.")
+    log(f"DEMO RUN — replaying the stored {args.target} result for version "
+        f"{args.demo_version}. No model is loaded and no accuracy is measured.")
     if ignored:
         log(f"[demo] ignoring flags that only apply to the real benchmark: "
             f"{' '.join(ignored)}")
@@ -298,7 +300,8 @@ def main(argv=None) -> int:
         log(f"[demo] the stored result is quoted at {demo.REFERENCE_ROUNDS} rounds; "
             f"at {rounds} it is perturbed in proportion to the difference.")
 
-    cells = {a: {d: Cell(a, d, rounds, n_poison, n_honest, int(args.seed), target_drop)
+    cells = {a: {d: Cell(a, d, rounds, n_poison, n_honest, int(args.seed),
+                         target_drop, args.target)
                  for d in defenses} for a in attacks}
 
     em.emit("config", attacks=attacks, defenses=defenses,
@@ -349,7 +352,8 @@ def main(argv=None) -> int:
                  for a in attacks}
     run_info = {"unusable_attack_rounds": 0, "demo": True,
                 "reference_rounds": demo.REFERENCE_ROUNDS}
-    text = _report(summaries, attacks, defenses, rounds, args.demo_version)
+    text = _report(summaries, attacks, defenses, rounds, args.demo_version,
+                   args.target)
     print("\n" + text, flush=True)
     em.emit("summary", summaries=summaries, defenses=defenses, attacks=attacks,
             measured_rounds=rounds, requested_rounds=rounds, skipped_rounds=0,
@@ -388,13 +392,14 @@ def _running(cell: "Cell", r: int, n_poison: int) -> float:
     return caught / seen if seen else 0.0
 
 
-def _report(summaries, attacks, defenses, rounds, version) -> str:
+def _report(summaries, attacks, defenses, rounds, version,
+            target="attacker") -> str:
     """The plain-text table the real CLI prints at the end, same columns."""
     head = (f"{'defense':<14}{'detect%':>9}{'FPR':>8}{'prec':>7}{'F1':>7}"
             f"{'final_acc':>11}{'mean_acc':>10}{'acc_drop':>10}"
             f"{'atk_thru':>10}{'atk_succ':>10}")
-    lines = [f"DEMO RESULT — version {version}, {rounds} round(s)", "", head,
-             "-" * len(head)]
+    lines = [f"DEMO RESULT — {target} benchmark, version {version}, "
+             f"{rounds} round(s)", "", head, "-" * len(head)]
     for a in attacks:
         if len(attacks) > 1:
             lines.append(f"[attack: {a}]")
